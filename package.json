@@ -1,26 +1,14 @@
 {
-  "name": "momso",
+  "name": "momso-desktop-workspace",
   "private": true,
-  "workspaces": [
-    "apps/inbodylike-demo",
-    "apps/web",
-    "apps/mobile"
-  ],
+  "workspaces": ["apps/alpha/desktop"],
   "scripts": {
-    "dev": "npm run dev --workspace apps/inbodylike-demo",
-    "build": "npm run build --workspace apps/inbodylike-demo",
-    "lint": "npm run lint --workspace apps/inbodylike-demo",
-    "supabase:init": "supabase init",
-    "supabase:start": "supabase start",
-    "supabase:stop": "supabase stop",
-    "supabase:status": "supabase status",
-    "supabase:login": "supabase login",
-    "supabase:db:reset": "supabase db reset",
-    "vercel:dev": "npx vercel dev",
-    "vercel:link": "npx vercel link --repo"
-  },
-  "devDependencies": {
-    "pptxgenjs": "^4.0.1",
-    "supabase": "^2.84.0"
+    "desktop:dev": "npm run tauri dev --workspace @momso/alpha-desktop",
+    "desktop:ui": "npm run dev --workspace @momso/alpha-desktop",
+    "desktop:build": "npm run tauri build --workspace @momso/alpha-desktop",
+    "desktop:ui:build": "npm run build --workspace @momso/alpha-desktop",
+    "desktop:version:check": "node scripts/check-desktop-version.mjs",
+    "desktop:artifact:metadata": "node scripts/create-desktop-artifact-metadata.mjs",
+    "desktop:artifact:metadata:test": "node --test scripts/create-desktop-artifact-metadata.test.mjs"
   }
 }

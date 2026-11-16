@@ -1,0 +1,16 @@
+/* AI 세 곳의 로고와 올렸을 때의 효과. 첫 화면(AiWelcome.css)에 있던 것을 그대로 옮겨 와 같이 쓴다. */
+
+.provider-mark { position: relative; display: grid; place-items: center; flex: none; }
+.provider-mark img { display: block; width: 100%; height: 100%; object-fit: contain; color-scheme: light; transition: transform 320ms cubic-bezier(.2,.8,.2,1), filter 320ms ease; }
+.provider-mark--claude img { width: 70%; height: 70%; }
+/* 공식 ChatGPT 로고 파일은 어두운 색 체계에서 흰색으로 칠해진다. 어두운 띠 위에서는 그 흰색판을 쓴다. */
+.provider-mark--chatgpt.provider-mark--on-dark img { color-scheme: dark; }
+.provider-mark--gemini img { width: 76%; height: 76%; }
+.provider-mark-trigger:is(:hover, :focus-visible) .provider-mark--chatgpt img { animation: ai-logo-spin 5s linear infinite; }
+.provider-mark .claude-motion { position: absolute; inset: 15%; width: 70%; height: 70%; }
+.provider-mark--claude:has(.claude-motion) > img { opacity: 0; }
+.provider-mark--gemini::after { content: ''; position: absolute; inset: 12%; opacity: 0; pointer-events: none; background: linear-gradient(115deg, transparent 30%, #fff 50%, transparent 70%) 0 0 / 200% 100%; mask: url('/brand/gemini-official.png') center / contain no-repeat; -webkit-mask: url('/brand/gemini-official.png') center / contain no-repeat; }
+.provider-mark-trigger:is(:hover, :focus-visible) .provider-mark--gemini::after { opacity: .9; animation: gemini-shine 2s linear infinite; }
+@keyframes ai-logo-spin { to { transform: rotate(-360deg); } }
+@keyframes gemini-shine { from { background-position: 200% 0; } to { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) { .provider-mark img { transition: none; } .provider-mark-trigger:is(:hover, :focus-visible) .provider-mark img { animation: none; opacity: 1; } .provider-mark--claude .claude-motion, .provider-mark-trigger:is(:hover, :focus-visible) .provider-mark--gemini::after { display: none; } .provider-mark--claude:has(.claude-motion) > img { opacity: 1; } }

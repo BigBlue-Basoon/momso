@@ -1,0 +1,64 @@
+/* 대화 칸 왼쪽 가장자리의 막대 목차. 색은 App.css 의 기존 값만 쓴다. */
+
+.message-rail {
+  position: absolute;
+  z-index: 2;
+  left: 0;
+  display: flex;
+  width: 12px;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 막대가 띠보다 많을 때는 위아래 끝을 흐리게 해서 더 있다는 것을 보여 준다. */
+.message-rail[data-overflowing='true'] {
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 22px, #000 calc(100% - 22px), transparent 100%);
+  mask-image: linear-gradient(180deg, transparent 0, #000 22px, #000 calc(100% - 22px), transparent 100%);
+}
+
+.message-rail button {
+  position: relative;
+  flex: 0 0 10px;
+  width: 12px;
+  height: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.message-rail button::before {
+  position: absolute;
+  top: 4px;
+  left: 3px;
+  width: 6px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--line-strong);
+  content: '';
+  transition: background 140ms ease, width 140ms ease;
+}
+
+.message-rail button:hover::before {
+  background: var(--muted);
+}
+
+.message-rail button.current::before {
+  width: 8px;
+  background: var(--ink);
+}
+
+.message-rail button:focus-visible {
+  outline: 2px solid #315f8f;
+  outline-offset: -1px;
+}
+
+@media (forced-colors: active) {
+  .message-rail button::before {
+    background: GrayText;
+  }
+
+  .message-rail button.current::before {
+    background: Highlight;
+  }
+}

@@ -1,0 +1,41 @@
+/* 미디어 화면: 날짜별 격자, 누르면 크게 보기. 색은 App.css 의 값만 쓴다. */
+
+.media-view {
+  display: grid;
+  grid-column: 2 / -1;
+  grid-template-rows: 56px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  background: var(--surface);
+  animation: screen-enter 200ms var(--material-ease) both;
+}
+
+.media-header {
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.media-header h1 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.media-scroll {
+  min-width: 0;
+  min-height: 0;
+  padding: 4px 24px 32px;
+  overflow-y: auto;
+}
+
+@keyframes screen-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .media-view { animation: none; }
+}

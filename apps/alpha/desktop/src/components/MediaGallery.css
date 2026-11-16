@@ -1,0 +1,266 @@
+/* 미디어 갤러리(미디어 화면, 오른쪽 패널). 같은 높이의 줄로 가로세로 비를 살려 꽉 채운다.
+   칸 사이 4px(패널 3px), 모서리 4px, 올리면 아래쪽에 어둡게 깔리는 정보 띠(채팅방, 누가, 언제). */
+
+.media-gallery {
+  min-width: 0;
+  /* 폭은 바깥 칸이 정한다(안의 줄 폭이 갤러리를 넓히지 않게. 창을 줄이면 줄을 다시 짠다). */
+  contain: inline-size;
+}
+
+.media-day + .media-day {
+  margin-top: 20px;
+}
+
+.media-day h2 {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  margin: 0;
+  padding: 8px 0 8px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.media-row {
+  display: flex;
+  gap: var(--media-gap);
+  margin-bottom: var(--media-gap);
+  /* 100장이 넘어도 끊기지 않게: 화면 밖 줄은 그리지 않는다. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto var(--row-height);
+}
+
+.media-tile {
+  position: relative;
+  display: block;
+  flex: none;
+  height: 100%;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 4px;
+  background: var(--surface-muted);
+  cursor: zoom-in;
+}
+
+.media-tile img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 260ms var(--material-ease), filter 200ms ease;
+}
+
+.media-tile:hover img { transform: scale(1.025); }
+
+.media-tile:focus-visible {
+  outline: 2px solid var(--ink-soft);
+  outline-offset: 2px;
+}
+
+.media-audio-face {
+  display: grid;
+  height: 100%;
+  place-content: center;
+  justify-items: center;
+  gap: 6px;
+  padding: 10px;
+  background: linear-gradient(160deg, #eef1ee, #e2e7e3);
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  text-align: center;
+}
+
+.media-audio-face span {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.media-length {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #ffffff;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 올렸을 때(또는 키보드로 고를 때) 아래쪽에 드러나는 정보. 사진의 윗부분은 가리지 않는다. */
+.media-info {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: grid;
+  gap: 2px;
+  padding: 18px 8px 6px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.66), rgba(0, 0, 0, 0));
+  color: #ffffff;
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: left;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 160ms ease, transform 200ms var(--material-ease);
+  pointer-events: none;
+}
+
+.media-tile:hover .media-info,
+.media-tile:focus-visible .media-info {
+  opacity: 1;
+  transform: none;
+}
+
+.media-info-chat {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-info-line {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  color: rgba(255, 255, 255, 0.86);
+  white-space: nowrap;
+}
+
+.media-info-line time { flex: none; }
+
+.media-by {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+}
+
+.media-by > span:not(.media-by-how) { overflow: hidden; text-overflow: ellipsis; }
+.media-by-how { flex: none; opacity: 0.86; }
+.media-by-mark { width: 14px; height: 14px; flex: none; }
+.media-by:not(.is-small) .media-by-mark { width: 16px; height: 16px; }
+
+/* 오른쪽 패널(그 채팅방의 것만): 채팅방 이름은 빼고 한 줄로 */
+.media-gallery.is-compact .media-info-chat { display: none; }
+.media-gallery.is-compact .media-info { padding: 14px 6px 5px; font-size: 10.5px; }
+
+/* 크게 보기: 어두운 바탕, 가운데 그림, 아래 정보는 늘 보임. 좌우 화살표 키와 단추로 넘기고 Esc 로 닫는다. */
+.media-lightbox {
+  position: fixed;
+  z-index: 70;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 48px 72px 36px;
+  background: rgba(20, 22, 21, 0.9);
+  animation: media-fade 160ms ease both;
+}
+
+.media-lightbox-body {
+  display: grid;
+  max-width: 100%;
+  max-height: 100%;
+  margin: 0;
+  gap: 12px;
+  justify-items: center;
+  animation: media-fade 180ms ease both;
+}
+
+.media-lightbox-body img,
+.media-lightbox-body video {
+  max-width: 100%;
+  max-height: calc(100vh - 160px);
+  border-radius: 4px;
+  object-fit: contain;
+}
+
+.media-lightbox-audio {
+  display: grid;
+  justify-items: center;
+  gap: 18px;
+  padding: 36px 48px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.86);
+}
+
+.media-lightbox-caption {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 12px;
+}
+
+.media-lightbox-caption strong { font-size: 13px; font-weight: 600; }
+
+.media-lightbox-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 12px;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.media-lightbox-chat {
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+
+.media-lightbox-chat:hover { background: rgba(255, 255, 255, 0.22); }
+
+.media-lightbox-nav,
+.media-lightbox-close {
+  position: absolute;
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+.media-lightbox-nav:hover,
+.media-lightbox-close:hover { background: rgba(255, 255, 255, 0.2); }
+
+.media-lightbox-nav.is-prev { left: 16px; top: 50%; transform: translateY(-50%); }
+.media-lightbox-nav.is-next { right: 16px; top: 50%; transform: translateY(-50%); }
+.media-lightbox-close { top: 14px; right: 16px; }
+
+@media (max-width: 640px) {
+  .media-lightbox { padding: 48px 12px 24px; }
+  .media-lightbox-nav { bottom: 14px; top: auto; transform: none; }
+}
+
+@keyframes media-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .media-lightbox, .media-lightbox-body { animation: none; }
+  .media-tile img, .media-info { transition: none; }
+}

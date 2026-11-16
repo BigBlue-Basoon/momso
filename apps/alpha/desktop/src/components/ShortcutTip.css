@@ -1,0 +1,71 @@
+/* 단축키 풍선. 어두운 바탕의 풍선이라 어두운 띠 위(테두리로 가름)와 밝은 바탕 위 둘 다에서 또렷하다. */
+
+.shortcut-tip-anchor {
+  display: inline-flex;
+}
+
+.shortcut-tip {
+  position: fixed;
+  z-index: 80;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 7px;
+  background: #2b2f2d;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+  color: #f2f4f3;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  animation: shortcut-tip-enter 120ms ease both;
+}
+
+.shortcut-tip[data-leaving='true'] {
+  animation: shortcut-tip-leave 110ms ease both;
+}
+
+.shortcut-tip:has(.shortcut-tip-keys) {
+  padding-right: 6px;
+}
+
+.shortcut-tip-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.shortcut-tip kbd {
+  display: inline-grid;
+  min-width: 20px;
+  height: 20px;
+  place-items: center;
+  padding: 0 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  font: 600 11px/1 ui-monospace, 'Cascadia Mono', monospace;
+}
+
+.shortcut-tip-plus {
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 11px;
+}
+
+@keyframes shortcut-tip-enter {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shortcut-tip-leave {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shortcut-tip,
+  .shortcut-tip[data-leaving='true'] { animation: none; }
+}

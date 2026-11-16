@@ -1,0 +1,600 @@
+/*
+ * 입력 칸(2026-11-15). Claude 앱의 입력 칸을 재어 맞췄다(배율 1.75 화면, 화면 픽셀 ÷ 1.75).
+ *   Claude 앱: 빈 칸 높이 약 43px, 글 한 줄 약 20px, 왼쪽 + 단추 약 28px, 칸 아래 오른쪽 줄의 단추 높이 약 24px.
+ *   이 앱: 빈 칸 44px(테두리 포함), 글 13px·줄 높이 20px, 단추 28px, 칸 안 여백 7px, 아래 줄 단추 24px.
+ *   자라는 한계는 200px(약 10줄). Claude 앱은 글을 적어 봐야 알 수 있어 재지 않았다.
+ * 색과 유리 느낌은 App.css 의 .prompt-composer 를 그대로 쓴다.
+ */
+
+.workbench-grid .prompt-composer.composer-compact {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  padding: 7px;
+  border-radius: 12px;
+}
+
+.workbench-grid .prompt-composer.composer-compact textarea {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  min-height: 28px;
+  max-height: none;
+  padding: 4px 4px;
+  overflow-y: hidden;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+/* 좁은 칸에서 안내 글이 두 줄로 넘어가 칸이 커지지 않게 한다. */
+.workbench-grid .prompt-composer.composer-compact textarea::placeholder {
+  white-space: nowrap;
+}
+
+.prompt-composer.composer-compact .composer-icon,
+.prompt-composer.composer-compact .send-button {
+  position: relative;
+  z-index: 1;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+}
+
+/* 칸 아래 오른쪽 줄: 모델, 권한 단계, 대화가 찬 정도 */
+
+.composer-status {
+  display: flex;
+  min-width: 0;
+  min-height: 24px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+  margin-top: 6px;
+}
+
+.composer-chip {
+  display: inline-flex;
+  min-width: 0;
+  height: 24px;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 5px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.composer-chip:hover,
+.composer-chip[aria-expanded='true'] {
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.composer-chip:focus-visible {
+  outline: 2px solid #8aa4bd;
+  outline-offset: -2px;
+}
+
+.composer-chip svg {
+  flex: none;
+}
+
+.composer-chip-mark {
+  width: 16px;
+  height: 16px;
+}
+
+.composer-chip-label {
+  min-width: 0;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-context {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  place-items: center;
+  border-radius: 6px;
+  animation: composer-fade 200ms var(--material-ease) both;
+}
+
+.composer-context:focus-visible {
+  outline: 2px solid #8aa4bd;
+  outline-offset: -2px;
+}
+
+.composer-context svg {
+  width: 16px;
+  height: 16px;
+  transform: rotate(-90deg);
+}
+
+.composer-context circle {
+  fill: none;
+  stroke-width: 2;
+}
+
+.composer-context-track {
+  stroke: var(--line);
+}
+
+.composer-context-fill {
+  stroke: var(--ink-soft);
+  stroke-linecap: round;
+  transition: stroke-dasharray 400ms var(--material-ease);
+}
+
+/* 단추가 여는 작은 창 */
+
+.composer-menu {
+  position: fixed;
+  z-index: 60;
+  display: grid;
+  width: max-content;
+  min-width: 0; /* 폭은 내용(가장 긴 줄 + 체크 자리 + 안쪽 여백)에 맞춘다 */
+  max-width: min(300px, calc(100vw - 16px));
+  max-height: min(640px, calc(100vh - 120px));
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--ink);
+  animation: composer-menu-enter 160ms var(--material-ease) both;
+}
+
+.model-menu-group + .model-menu-group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+.model-menu-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 8px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.model-menu-heading.is-inline {
+  padding: 0;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+/* 회사 로고는 감싸지 않고 바탕 위에 바로(SCREEN_RULES 2절). 옆 글자(11px 굵게)보다 조금 크게. */
+.model-menu-mark {
+  width: 16px;
+  height: 16px;
+}
+
+.composer-menu-item {
+  display: flex;
+  width: 100%;
+  min-height: 32px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.composer-menu-item:hover:not(:disabled),
+.composer-menu-item:focus-visible {
+  outline: 0;
+  background: var(--surface-muted);
+}
+
+.composer-menu-item:disabled {
+  cursor: default;
+}
+
+.composer-menu-item:disabled .composer-menu-name {
+  color: var(--faint);
+}
+
+.composer-menu-item > svg {
+  flex: none;
+  color: var(--ink-soft);
+}
+
+.composer-menu-text {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.composer-menu-name {
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.composer-menu-note {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  word-break: keep-all;
+}
+
+@keyframes composer-menu-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes composer-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer-menu,
+  .composer-context { animation: none; }
+}
+
+/* 단추 안 글이 바뀔 때(회사를 바꿔 모델·추론 수준이 따라 바뀔 때) 새 글이 부드럽게 나타난다. */
+.composer-chip-swap {
+  animation: composer-chip-swap 220ms var(--material-ease) both;
+}
+
+@keyframes composer-chip-swap {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.effort-menu {
+  min-width: 0;
+  max-width: min(320px, calc(100vw - 16px));
+}
+
+/* 추론 수준 전체의 설명 한 줄(그 회사의 글) */
+.effort-note {
+  margin: 0;
+  padding: 6px 8px 8px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+  word-break: keep-all;
+}
+
+/* 그 회사에만 있는 특별한 수준은 선 아래에 따로 */
+.effort-special {
+  display: grid;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+
+/* 단추 줄이 좁을 때(좁은 창, 보는 창을 연 때): 회사 단추는 로고만, 나머지 글은 짧게 줄임표로. */
+.composer-status {
+  container-type: inline-size;
+}
+
+/* 짧은 이름(모델, 추론 수준)은 줄이지 않고, 긴 권한 이름만 줄임표로 줄어든다. */
+.composer-status .composer-chip { flex-shrink: 0; }
+.composer-status .permission-chip { flex-shrink: 1; }
+
+@container (max-width: 400px) {
+  .company-chip .composer-chip-label { display: none; }
+  .composer-status .composer-chip > svg:last-child { display: none; }
+  .permission-chip .composer-chip-label { max-width: 120px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer-chip-swap { animation: none; }
+}
+
+/* 권한 단계 고르기: 설명이 두 줄이 되어도 깨지지 않게 폭을 조금 넓게, 줄은 단어 단위로 꺾는다. */
+.permission-menu {
+  width: max-content;
+  min-width: 0;
+  max-width: min(380px, calc(100vw - 16px));
+}
+
+.permission-menu .composer-menu-item {
+  align-items: flex-start;
+}
+
+.permission-menu .composer-menu-item > svg {
+  margin-top: 3px;
+}
+
+/* 가장 높은 단계에 회사가 붙이는 경고(오면 그대로) */
+.composer-menu-warning {
+  color: var(--coral);
+  font-size: 11px;
+  line-height: 1.45;
+  word-break: keep-all;
+}
+
+/* 빠른 모드: 켜짐은 번개를 채우고 짙게, 꺼짐은 흐리게, 못 쓰면 더 흐리고 눌리지 않음 */
+.fast-chip { gap: 4px; }
+.fast-chip.is-on { color: var(--ink); background: var(--surface-muted); }
+.fast-chip.is-on svg { color: #c26a1d; }
+.fast-chip[aria-disabled='true'] { cursor: default; opacity: 0.45; }
+.fast-chip[aria-disabled='true']:hover { background: transparent; color: var(--muted); }
+
+/* 채팅방이 줄이기 가까이 찼을 때 고리를 짙게 */
+.composer-context.is-near .composer-context-fill { stroke: #c26a1d; }
+
+/* 모델 목록: 목록 전체를 한 격자로 두고 줄마다 같은 칸을 쓴다(subgrid). 이름은 줄마다 왼쪽에서 시작하고
+   판 번호는 이름 바로 뒤에 작고 흐리게(사진 495 의 "나", ModelName). */
+.model-menu {
+  grid-template-columns: max-content max-content minmax(0, 1fr) auto;
+}
+
+.model-menu > .model-menu-heading,
+.model-menu > .model-menu-group {
+  grid-column: 1 / -1;
+}
+
+.model-menu > .composer-menu-item {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  column-gap: 6px;
+  justify-content: stretch;
+}
+
+.model-menu-name {
+  font-size: 12.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.model-menu .model-menu-name { grid-column: 1 / 3; }
+.model-menu-note { grid-column: 1 / 4; grid-row: 2; }
+.model-menu-check { grid-column: 4; grid-row: 1; display: flex; justify-content: flex-end; min-width: 14px; color: var(--ink-soft); }
+
+/* 가장 높은 권한 단계: 주의를 주는 색으로(글자와 작은 그림만, 선이나 띠는 넣지 않는다). */
+.permission-chip.is-strongest { color: #c26a1d; gap: 4px; }
+.permission-chip.is-strongest:hover { color: #a95a16; }
+/* 경고 색은 고를 수 있을 때만. 쓸 수 없는 단계(available false)는 다른 쓸 수 없는 단계처럼 흐리게. */
+.permission-menu .composer-menu-item.is-strongest:not(:disabled) .composer-menu-name,
+.permission-menu .composer-menu-item.is-strongest:not(:disabled) .composer-menu-note,
+.permission-menu .composer-menu-item.is-strongest:not(:disabled) .permission-menu-icon { color: #c26a1d; }
+.permission-menu-icon { flex: none; margin-top: 2px; color: var(--ink-soft); }
+.permission-menu .composer-menu-item { justify-content: flex-start; }
+.permission-menu .composer-menu-item > .composer-menu-text { flex: 1; }
+
+/* 추론 수준 슬라이더(Codex 앱의 추론 수준 창을 밝은 바탕에 맞춤): 위에 지금 수준 이름, 아래 둥근 길에 수준마다 점,
+   지금 수준까지 짙게 채우고 끝에 흰 손잡이. 쓸 수 없는 끝 구간은 흐리게. */
+.effort-slider-menu {
+  width: 248px;
+  min-width: 0;
+  max-width: calc(100vw - 16px);
+  padding: 12px 12px 10px;
+}
+
+.effort-slider { display: grid; gap: 10px; }
+
+.effort-slider-head {
+  display: flex;
+  min-height: 22px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.effort-slider-name {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.4;
+  animation: composer-chip-swap 200ms var(--material-ease) both;
+}
+
+.effort-slider-tag {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.effort-track {
+  position: relative;
+  height: 28px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  cursor: pointer;
+  touch-action: none;
+}
+
+.effort-track-off {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  border-radius: 0 999px 999px 0;
+  background: repeating-linear-gradient(135deg, rgba(40, 43, 42, 0.04) 0 4px, transparent 4px 8px);
+}
+
+.effort-track-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: 999px;
+  background: var(--ink-soft);
+  transition: width 180ms var(--material-ease);
+}
+
+.effort-track-dot {
+  position: absolute;
+  top: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--faint);
+  transform: translate(-50%, -50%);
+}
+
+.effort-track-dot.is-covered { background: rgba(255, 255, 255, 0.45); }
+.effort-track-dot.is-off { background: var(--line-strong); opacity: 0.6; }
+.effort-track-dot.is-recommended { width: 7px; height: 7px; background: transparent; box-shadow: inset 0 0 0 1.5px var(--muted); }
+.effort-track-dot.is-recommended.is-covered { box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.7); }
+
+.effort-thumb {
+  position: absolute;
+  top: 2px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(35, 42, 38, 0.28);
+  transition: left 180ms var(--material-ease);
+  outline: none;
+}
+
+.effort-thumb.is-empty { opacity: 0; }
+.effort-thumb:focus-visible { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--ink-soft); }
+
+.effort-slider-note {
+  margin: 8px 2px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+  word-break: keep-all;
+}
+
+.effort-toggles {
+  display: grid;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+
+.effort-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 2px;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.effort-switch {
+  position: relative;
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+
+.effort-switch::after {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(35, 42, 38, 0.2);
+  content: '';
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .effort-track-fill, .effort-thumb, .effort-slider-name { transition: none; animation: none; }
+}
+
+/* 고르는 창의 줄: 이름과 체크 사이는 16px 만, 체크 뒤는 안쪽 여백만(Claude 앱 창처럼 오른쪽이 비지 않게). */
+.composer-menu-item { gap: 16px; }
+.model-menu > .composer-menu-item { column-gap: 6px; }
+.model-menu-check { margin-left: 10px; }
+
+/* / 로 스킬 고르기: 입력 칸 바로 위에 뜨는 목록(입력 칸과 같은 폭). 한 줄 = 그림, 한글 이름과 한 줄 설명, 오른쪽에 /부르는 이름. */
+/* 입력 칸과 같은 폭: 바닥 띠(.composer-dock)의 안쪽 여백만큼 양옆을 들인다. */
+.slash-menu {
+  position: absolute;
+  z-index: 40;
+  right: 10px;
+  bottom: calc(100% - 2px);
+  left: 10px;
+  display: grid;
+  max-height: 260px;
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  animation: composer-menu-enter 160ms var(--material-ease) both;
+}
+.slash-item {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.slash-item.is-active { background: var(--surface-muted); color: var(--ink); }
+.slash-item-text { display: grid; min-width: 0; gap: 1px; }
+.slash-item-title { color: var(--ink); font-size: 12.5px; }
+.slash-item-description { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.slash-item-name { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+/* 입력 칸 안의 스킬 조각: 지우면 통째로 사라진다. */
+.composer-skill {
+  display: inline-flex;
+  flex: none;
+  max-width: 40%;
+  align-items: center;
+  gap: 5px;
+  align-self: center;
+  height: 24px;
+  padding: 0 4px 0 8px;
+  border-radius: 6px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  font-size: 12px;
+  animation: composer-chip-swap 180ms var(--material-ease) both;
+}
+.composer-skill-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-skill button {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.composer-skill button:hover { background: rgba(40, 43, 42, 0.08); color: var(--ink); }
+
+.workbench-grid .slash-menu { right: var(--chat-gutter); left: var(--chat-gutter); }

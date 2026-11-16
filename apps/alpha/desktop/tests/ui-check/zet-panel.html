@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/brand/agar.png" />
+    <title>momso</title>
+  </head>
+  <body>
+    <!--
+      읽는 글 패널을 브라우저에서 확인하는 쪽. 가짜 백엔드(fake-archive.js)를 먼저 올린 뒤 앱을 그대로 띄운다.
+      개발 서버를 VITE_MOMSO_OPEN_WORKBENCH=1 로 켠 다음 http://localhost:1420/tests/ui-check/zet-panel.html 을 연다.
+    -->
+    <div id="root"></div>
+    <script src="./fake-archive.js"></script>
+    <script type="module">
+      // 주소에 ?records=1 을 붙이면 앱에 들어 있는 견본 기록을 가짜 백엔드가 돌려준다(기록 보기와 AI 패널이 함께 있을 때의 배치 확인용).
+      import { workspaceRecordCreateInput } from '/src/record-persistence.ts'
+      import { WORKSPACE_RECORDS } from '/src/workbench-data.ts'
+      window.__fakeRecordDetails = WORKSPACE_RECORDS.map((record, index) => {
+        const input = workspaceRecordCreateInput(record)
+        return {
+          id: `1111111${index}-1111-4111-8111-111111111111`,
+          recordKind: input.recordKind,
+          title: input.title,
+          status: 'needs_review',
+          currentVersion: 1,
+          summary: input.summary,
+          summaryState: 'unconfirmed',
+          bodyBytes: new TextEncoder().encode(input.body).byteLength,
+          updatedAt: '2026-11-15T01:02:03.000Z',
+          body: input.body,
+          bodySha256: 'a'.repeat(64),
+          createdBy: 'momso-desktop',
+          updatedBy: 'momso-desktop',
+          reviewedBy: null,
+          reviewedAt: null,
+          createdAt: '2026-11-15T01:02:03.000Z',
+        }
+      })
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

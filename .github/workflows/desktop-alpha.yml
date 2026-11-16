@@ -1,0 +1,131 @@
+name: Desktop alpha
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/desktop-alpha.yml'
+      - 'apps/alpha/desktop/**'
+      - 'scripts/check-desktop-version.mjs'
+      - 'scripts/create-desktop-artifact-metadata.mjs'
+      - 'scripts/create-desktop-artifact-metadata.test.mjs'
+      - 'package.json'
+      - 'package-lock.json'
+  pull_request:
+    paths:
+      - '.github/workflows/desktop-alpha.yml'
+      - 'apps/alpha/desktop/**'
+      - 'scripts/check-desktop-version.mjs'
+      - 'scripts/create-desktop-artifact-metadata.mjs'
+      - 'scripts/create-desktop-artifact-metadata.test.mjs'
+      - 'package.json'
+      - 'package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-alpha-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-build:
+    name: Windows native build
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt
+          rustup component add clippy
+
+      - name: Resolve Rust cache key
+        shell: pwsh
+        run: |
+          $rustVersion = (rustc --version).Trim() -replace '[^A-Za-z0-9._-]', '-'
+          "RUST_CACHE_KEY=$rustVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/alpha/desktop/src-tauri/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ env.RUST_CACHE_KEY }}-${{ hashFiles('apps/alpha/desktop/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-${{ env.RUST_CACHE_KEY }}-
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Verify desktop version metadata
+        run: npm run desktop:version:check
+
+      - name: Test installer provenance generator
+        run: npm run desktop:artifact:metadata:test
+
+      - name: Test AI conversation importers
+        run: npm test --workspace @momso/alpha-desktop
+
+      - name: Build desktop webview
+        run: npm run desktop:ui:build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path apps/alpha/desktop/src-tauri/Cargo.toml -- --check
+
+      - name: Test Rust runtime
+        run: cargo test --manifest-path apps/alpha/desktop/src-tauri/Cargo.toml
+
+      - name: Lint Rust runtime
+        run: cargo clippy --manifest-path apps/alpha/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Clear cached installer bundle
+        shell: pwsh
+        run: |
+          $workspace = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $bundle = [System.IO.Path]::GetFullPath(
+            (Join-Path $workspace 'apps/alpha/desktop/src-tauri/target/release/bundle')
+          )
+          $workspacePrefix = $workspace.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+          if (-not $bundle.StartsWith($workspacePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to remove a bundle directory outside the GitHub workspace: $bundle"
+          }
+          if (Test-Path -LiteralPath $bundle) {
+            Remove-Item -LiteralPath $bundle -Recurse -Force
+          }
+
+      - name: Build Windows installer
+        run: npm run desktop:build
+
+      - name: Write installer checksum and provenance
+        run: npm run desktop:artifact:metadata
+
+      - name: Keep unsigned test installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: momso-windows-alpha-unsigned-${{ github.run_number }}
+          path: |
+            apps/alpha/desktop/src-tauri/target/release/bundle/nsis/*.exe
+            apps/alpha/desktop/src-tauri/target/release/bundle/nsis/*.sha256
+            apps/alpha/desktop/src-tauri/target/release/bundle/nsis/momso-build-manifest.json
+          if-no-files-found: error
+          retention-days: 14

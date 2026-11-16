@@ -1,0 +1,385 @@
+//! Skill file format and bundled skill installation.
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+// Real built-in content is deliberately absent until the product owner supplies it.
+const BUNDLED_SKILLS: &[(&str, &str)] = &[];
+
+pub(crate) fn install_bundled(root: &Path, resources: &Path) -> Result<(), &'static str> {
+    install(root, resources, BUNDLED_SKILLS)
+}
+
+fn install(root: &Path, resources: &Path, bundled: &[(&str, &str)]) -> Result<(), &'static str> {
+    for (name, content) in bundled {
+        crate::skills_write::install_builtin(root, resources, name, content)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkillHead {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) title: String,
+}
+
+pub(crate) fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+pub(crate) fn parse(name: &str, content: &str) -> Result<(SkillHead, String), &'static str> {
+    if !valid_name(name) {
+        return Err("invalid_name");
+    }
+    let (yaml, body) = if let Some(rest) = content.strip_prefix("---\r\n") {
+        rest.split_once("\r\n---\r\n").ok_or("invalid_format")?
+    } else {
+        content
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .ok_or("invalid_format")?
+    };
+    let head: SkillHead = serde_yaml::from_str(yaml).map_err(|_| "invalid_format")?;
+    if head.name != name || head.title.trim().is_empty() || head.description.trim().is_empty() {
+        return Err("invalid_format");
+    }
+    Ok((head, body.to_owned()))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillSummary {
+    name: String,
+    title: String,
+    description: String,
+    enabled: bool,
+    builtin: bool,
+    updated_at: Option<String>,
+    providers: Vec<&'static str>,
+    sync_state: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillRead {
+    #[serde(flatten)]
+    summary: SkillSummary,
+    body: String,
+    content_hash: String,
+}
+
+pub(crate) fn skill_path(
+    root: &Path,
+    folder: &str,
+    name: &str,
+) -> Result<std::path::PathBuf, &'static str> {
+    if !valid_name(name) {
+        return Err("invalid_name");
+    }
+    let mut path = root.to_path_buf();
+    for part in folder.split('/').chain([name, "SKILL.md"]) {
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if crate::archive_location::is_link_or_reparse(&meta) => {
+                return Err("conflict")
+            }
+            Ok(_) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err("io_error"),
+        }
+    }
+    Ok(path)
+}
+
+fn read(root: &Path, name: &str) -> Result<SkillRead, &'static str> {
+    match crate::skills_write::reconcile(root, name) {
+        Ok(()) | Err("conflict") => (),
+        Err(error) => return Err(error),
+    }
+    let path = skill_path(root, "skills", name)?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(value) => value,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("not_found"),
+        Err(_) => return Err("io_error"),
+    };
+    let (head, body) = parse(name, &content)?;
+    let mut providers = Vec::new();
+    let mut found = 0;
+    let mut conflict = false;
+    for (folder, tools) in [
+        (".agents/skills", &["codex", "antigravity"][..]),
+        (".claude/skills", &["claude"][..]),
+    ] {
+        let copy = skill_path(root, folder, name)?;
+        match std::fs::read_to_string(copy) {
+            Ok(value) => {
+                found += 1;
+                providers.extend_from_slice(tools);
+                conflict |= value != content;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err("io_error"),
+        }
+    }
+    if found == 1 {
+        conflict = true;
+    }
+    let updated_at = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+    let content_hash = crate::archive_zet::content_hash(&content);
+    Ok(SkillRead {
+        summary: SkillSummary {
+            name: name.into(),
+            title: head.title,
+            description: head.description,
+            enabled: found == 2 && !conflict,
+            builtin: BUNDLED_SKILLS.iter().any(|(builtin, _)| *builtin == name),
+            updated_at,
+            providers,
+            sync_state: if conflict {
+                "conflict"
+            } else if found == 0 {
+                "disabled"
+            } else {
+                "ok"
+            },
+        },
+        body,
+        content_hash,
+    })
+}
+
+pub(crate) fn callable(root: &Path, name: &str) -> Result<bool, &'static str> {
+    Ok(read(root, name)?.summary.enabled)
+}
+
+#[tauri::command]
+pub(crate) async fn skill_read(
+    state: tauri::State<'_, crate::AppState>,
+    name: String,
+) -> Result<SkillRead, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    tauri::async_runtime::spawn_blocking(move || read(&root, &name).map_err(str::to_owned))
+        .await
+        .map_err(|_| "io_error".to_string())?
+}
+
+#[tauri::command]
+pub(crate) async fn skill_list(
+    state: tauri::State<'_, crate::AppState>,
+) -> Result<Vec<SkillSummary>, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    tauri::async_runtime::spawn_blocking(move || list(&root).map_err(str::to_owned))
+        .await
+        .map_err(|_| "io_error".to_string())?
+}
+
+fn list(root: &Path) -> Result<Vec<SkillSummary>, &'static str> {
+    let base = root.join("skills");
+    if std::fs::symlink_metadata(&base).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("conflict");
+    }
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err("io_error"),
+    };
+    let mut items = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| "io_error")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "invalid_name")?;
+        if valid_name(&name) {
+            match read(root, &name) {
+                Ok(item) => items.push(item.summary),
+                Err("not_found") => (),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(items)
+}
+
+pub(crate) fn render(head: &SkillHead, body: &str) -> Result<String, &'static str> {
+    if !valid_name(&head.name) {
+        return Err("invalid_name");
+    }
+    if head.title.trim().is_empty() || head.description.trim().is_empty() {
+        return Err("invalid_format");
+    }
+    let yaml = serde_yaml::to_string(head).map_err(|_| "invalid_format")?;
+    Ok(format!(
+        "---\n{}---\n{}",
+        yaml.trim_start_matches("---\n"),
+        body
+    ))
+}
+
+pub(crate) fn is_builtin(name: &str) -> bool {
+    BUNDLED_SKILLS.iter().any(|(builtin, _)| *builtin == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn korean_and_yaml_punctuation_round_trip() {
+        let head = SkillHead {
+            name: "yoga-1".into(),
+            title: "요가: 수업".into(),
+            description: "수업 정리\n두 번째 줄".into(),
+        };
+        let content = render(&head, "지시 본문\n").unwrap();
+        assert_eq!(
+            parse("yoga-1", &content).unwrap(),
+            (head, "지시 본문\n".into())
+        );
+        let windows = "---\r\nname: yoga-1\r\ndescription: desc\r\ntitle: 제목\r\n---\r\n첫 줄\r\n둘째 줄\r\n";
+        assert_eq!(parse("yoga-1", windows).unwrap().1, "첫 줄\r\n둘째 줄\r\n");
+    }
+    #[test]
+    fn names_reject_paths_and_ambiguous_forms() {
+        for name in ["", "../x", "Upper", "-a", "a-", "a--b", "한글", "a_b"] {
+            assert!(!valid_name(name), "{name}");
+        }
+        assert!(valid_name("yoga-1"));
+    }
+    #[test]
+    fn list_and_read_report_provider_presence_and_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        assert!(list(root).unwrap().is_empty());
+        let text = "---\nname: probe\ndescription: 설명\ntitle: 제목\n---\n본문\n";
+        for folder in ["skills", ".agents/skills", ".claude/skills"] {
+            let dir = root.join(folder).join("probe");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), text).unwrap();
+        }
+        let skill = read(root, "probe").unwrap();
+        assert_eq!(skill.body, "본문\n");
+        assert!(skill.summary.enabled);
+        assert_eq!(skill.summary.providers, ["codex", "antigravity", "claude"]);
+        assert_eq!(skill.summary.sync_state, "ok");
+        std::fs::write(root.join(".claude/skills/probe/SKILL.md"), "changed").unwrap();
+        let conflict = list(root).unwrap();
+        assert!(!conflict[0].enabled);
+        assert_eq!(conflict[0].sync_state, "conflict");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/skills/probe/SKILL.md")).unwrap(),
+            "changed"
+        );
+        std::fs::remove_file(root.join(".agents/skills/probe/SKILL.md")).unwrap();
+        std::fs::remove_file(root.join(".claude/skills/probe/SKILL.md")).unwrap();
+        assert_eq!(read(root, "probe").unwrap().summary.sync_state, "disabled");
+    }
+    #[test]
+    fn bundled_updates_only_an_untouched_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        let old = "---\nname: probe\ndescription: Test\ntitle: Test\n---\nold";
+        let new = "---\nname: probe\ndescription: Test\ntitle: Test\n---\nnew";
+        install(&root, dir.path(), &[("probe", old)]).unwrap();
+        let tool = crate::archive::storage_tool(dir.path()).unwrap().0;
+        let tracked = crate::archive::run_storage_tool(
+            &tool,
+            &root,
+            &["ls-tree", "-r", "--name-only", "HEAD"],
+        )
+        .unwrap();
+        for path in [
+            "skills/probe/SKILL.md",
+            ".agents/skills/probe/SKILL.md",
+            ".claude/skills/probe/SKILL.md",
+        ] {
+            assert!(tracked.lines().any(|line| line == path));
+        }
+        let file = root.join("skills/probe/SKILL.md");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), old);
+        let agent = root.join(".agents/skills/probe/SKILL.md");
+        let claude = root.join(".claude/skills/probe/SKILL.md");
+        assert_eq!(std::fs::read_to_string(&agent).unwrap(), old);
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), old);
+        install(&root, dir.path(), &[("probe", new)]).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), new);
+        assert_eq!(std::fs::read_to_string(&agent).unwrap(), new);
+        assert_eq!(std::fs::read_to_string(&claude).unwrap(), new);
+        std::fs::write(&file, old).unwrap();
+        install(&root, dir.path(), &[("probe", new)]).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), old);
+        crate::skills_write::disable_for_test(&root, "probe").unwrap();
+        install(&root, dir.path(), &[("probe", new)]).unwrap();
+        assert!(!agent.exists());
+        assert!(!claude.exists());
+    }
+    #[test]
+    fn builtin_failure_restores_files_and_tracking_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        let old = "---\nname: probe\ndescription: Test\ntitle: Test\n---\nold";
+        let new = "---\nname: probe\ndescription: Test\ntitle: Test\n---\nnew";
+        install(&root, dir.path(), &[("probe", old)]).unwrap();
+        let state = std::fs::read(dir.path().join("skill-builtin-state.json")).unwrap();
+        std::fs::write(root.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        assert_eq!(
+            install(&root, dir.path(), &[("probe", new)]),
+            Err("save_failed")
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("skills/probe/SKILL.md")).unwrap(),
+            old
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".agents/skills/probe/SKILL.md")).unwrap(),
+            old
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/skills/probe/SKILL.md")).unwrap(),
+            old
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("skill-builtin-state.json")).unwrap(),
+            state
+        );
+    }
+    #[test]
+    fn archive_upgrades_only_unchanged_legacy_rules_with_a_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        crate::archive::profile_set(&root, dir.path(), "봄".into(), "".into(), "".into()).unwrap();
+        let line = "- `skills/` 와 `.agents/skills/`, `.claude/skills/` 는 몸소가 관리한다. AI는 사람이 시켰을 때만 스킬을 고친다.";
+        for name in ["AGENTS.md", "CLAUDE.md", "GEMINI.md"] {
+            let path = root.join(name);
+            let current = std::fs::read_to_string(&path).unwrap();
+            let legacy = current
+                .replace(&format!("{line}\r\n"), "")
+                .replace(&format!("{line}\n"), "");
+            std::fs::write(path, legacy).unwrap();
+        }
+        let custom = root.join("CLAUDE.md");
+        std::fs::write(&custom, "custom").unwrap();
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        assert!(std::fs::read_to_string(root.join("AGENTS.md"))
+            .unwrap()
+            .contains(line));
+        assert!(std::fs::read_to_string(root.join("GEMINI.md"))
+            .unwrap()
+            .contains(line));
+        assert_eq!(std::fs::read_to_string(custom).unwrap(), "custom");
+    }
+}
