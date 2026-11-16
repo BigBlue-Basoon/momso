@@ -188,6 +188,7 @@ fn context_values(value: &Value) -> Option<(i64, Option<i64>, Option<&str>)> {
 fn fast_available(initialization: &Value) -> bool {
     initialization["response"]["response"]["fast_mode_state"] == "on"
 }
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FastProbe {
     Available,
@@ -795,7 +796,7 @@ pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
                 let requested_effort = effort.filter(|s| !s.trim().is_empty()).map(str::to_owned);
                 let reason = result_finish_reason(&v);
                 let msg = chat::append_finished_with_optional_reason(db, id, &answer, "claude".into(), actual_model, requested_effort, actual_effort.clone(), reason)?;
-                let mut done = json!({"chatId": id, "messageId": msg.id, "actualEffort": actual_effort, "fastState":null,"stopReason":null,"finishReason":reason});
+                let mut done = json!({"chatId": id, "messageId": msg.id, "actualEffort": actual_effort, "actualSpecialEffort":null,"fastState":null,"stopReason":null,"finishReason":reason});
                 if reason == Some(chat::FinishReason::LengthLimit) { done["stopReason"] = json!("max_tokens"); }
                 if reason == Some(chat::FinishReason::TurnLimit) { done["stopReason"] = json!("max_turn_requests"); }
                 if reason == Some(chat::FinishReason::Refusal) { done["stopReason"] = json!("refusal"); }
@@ -1168,11 +1169,11 @@ $null = [Console]::In.ReadLine()
         let db = d.path().join("db.sqlite");
         let c = Connection::open(&db).unwrap();
         for sql in [
-            include_str!("../migrations/0009_chats.sql"),
-            include_str!("../migrations/0010_chat_codex.sql"),
-            include_str!("../migrations/0011_chat_effort.sql"),
-            include_str!("../migrations/0012_chat_groups.sql"),
-            include_str!("../migrations/0013_chat_context.sql"),
+            include_str!("../migrations/0010_chats.sql"),
+            include_str!("../migrations/0011_chat_codex.sql"),
+            include_str!("../migrations/0012_chat_effort.sql"),
+            include_str!("../migrations/0013_chat_groups.sql"),
+            include_str!("../migrations/0014_chat_context.sql"),
             include_str!("../migrations/0040_chat_claude.sql"),
             include_str!("../migrations/0070_chat_skill.sql"),
             include_str!("../migrations/0072_chat_delivery.sql"),
@@ -1282,11 +1283,11 @@ $null = [Console]::In.ReadLine()
         let db = d.path().join("db.sqlite");
         let c = Connection::open(&db).unwrap();
         for sql in [
-            include_str!("../migrations/0009_chats.sql"),
-            include_str!("../migrations/0010_chat_codex.sql"),
-            include_str!("../migrations/0011_chat_effort.sql"),
-            include_str!("../migrations/0012_chat_groups.sql"),
-            include_str!("../migrations/0013_chat_context.sql"),
+            include_str!("../migrations/0010_chats.sql"),
+            include_str!("../migrations/0011_chat_codex.sql"),
+            include_str!("../migrations/0012_chat_effort.sql"),
+            include_str!("../migrations/0013_chat_groups.sql"),
+            include_str!("../migrations/0014_chat_context.sql"),
             include_str!("../migrations/0040_chat_claude.sql"),
             include_str!("../migrations/0070_chat_skill.sql"),
             include_str!("../migrations/0072_chat_delivery.sql"),
@@ -1419,11 +1420,11 @@ exit 20
             let db = d.path().join("db.sqlite");
             let c = Connection::open(&db).unwrap();
             for sql in [
-                include_str!("../migrations/0009_chats.sql"),
-                include_str!("../migrations/0010_chat_codex.sql"),
-                include_str!("../migrations/0011_chat_effort.sql"),
-                include_str!("../migrations/0012_chat_groups.sql"),
-                include_str!("../migrations/0013_chat_context.sql"),
+                include_str!("../migrations/0010_chats.sql"),
+                include_str!("../migrations/0011_chat_codex.sql"),
+                include_str!("../migrations/0012_chat_effort.sql"),
+                include_str!("../migrations/0013_chat_groups.sql"),
+                include_str!("../migrations/0014_chat_context.sql"),
                 include_str!("../migrations/0040_chat_claude.sql"),
                 include_str!("../migrations/0070_chat_skill.sql"),
                 include_str!("../migrations/0072_chat_delivery.sql"),
@@ -1667,7 +1668,7 @@ exit 20
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("test.db");
         let c = Connection::open(&p).unwrap();
-        c.execute_batch(include_str!("../migrations/0009_chats.sql"))
+        c.execute_batch(include_str!("../migrations/0010_chats.sql"))
             .unwrap();
         c.execute_batch(include_str!("../migrations/0040_chat_claude.sql"))
             .unwrap();
@@ -1708,11 +1709,11 @@ exit 20
         let db = d.path().join("db.sqlite");
         let c = Connection::open(&db).unwrap();
         for sql in [
-            include_str!("../migrations/0009_chats.sql"),
-            include_str!("../migrations/0010_chat_codex.sql"),
-            include_str!("../migrations/0011_chat_effort.sql"),
-            include_str!("../migrations/0012_chat_groups.sql"),
-            include_str!("../migrations/0013_chat_context.sql"),
+            include_str!("../migrations/0010_chats.sql"),
+            include_str!("../migrations/0011_chat_codex.sql"),
+            include_str!("../migrations/0012_chat_effort.sql"),
+            include_str!("../migrations/0013_chat_groups.sql"),
+            include_str!("../migrations/0014_chat_context.sql"),
             include_str!("../migrations/0040_chat_claude.sql"),
             include_str!("../migrations/0070_chat_skill.sql"),
             include_str!("../migrations/0072_chat_delivery.sql"),

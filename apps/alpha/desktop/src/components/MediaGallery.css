@@ -226,6 +226,17 @@
 }
 
 .media-lightbox-chat:hover { background: rgba(255, 255, 255, 0.22); }
+/* 원자료 지우기(2026-11-17): 채팅방 이름 단추와 같은 꼴. */
+.media-lightbox-delete {
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+.media-lightbox-delete:hover { background: rgba(255, 255, 255, 0.22); }
 
 .media-lightbox-nav,
 .media-lightbox-close {
@@ -264,3 +275,6 @@
   .media-lightbox, .media-lightbox-body { animation: none; }
   .media-tile img, .media-info { transition: none; }
 }
+
+/* 크게 보기 위에서 원자료를 지울 때 묻는 창이 크게 보기 위에 뜨게(그때만). */
+body:has(.media-lightbox) .zet-confirm-backdrop { z-index: 72; }

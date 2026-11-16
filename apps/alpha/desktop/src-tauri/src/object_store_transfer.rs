@@ -61,7 +61,7 @@ struct ListEntry {
 struct ListResponse {
     #[serde(rename = "Contents", default)]
     contents: Vec<ListEntry>,
-    #[serde(rename = "IsTruncated", default)]
+    #[serde(rename = "IsTruncated")]
     truncated: bool,
     #[serde(rename = "NextContinuationToken")]
     next: Option<String>,
@@ -98,6 +98,31 @@ pub(crate) fn identity(database: &Path) -> Result<x25519::Identity, &'static str
 
 pub(crate) fn safe_relative(path: &Path) -> bool {
     !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
+}
+
+// Legacy objects can have arbitrary names. Only the reserved, canonical
+// content-addressed layout promises that the file name is its SHA-256.
+pub(crate) fn validate_content_address(relative: &str, hash: &str) -> Result<(), &'static str> {
+    let mut parts = Path::new(relative).components();
+    let mismatch = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (
+            Some(Component::Normal(folder)),
+            Some(Component::Normal(prefix)),
+            Some(Component::Normal(name)),
+            None,
+        ) => {
+            folder == "sha256"
+                && name.to_str().is_some_and(|name| {
+                    crate::archive_zet::valid_asset_id(&format!("sha256:{name}"))
+                        && (prefix != &name[..2] || name != hash)
+                })
+        }
+        _ => false,
+    };
+    if mismatch {
+        return Err("source_integrity_mismatch");
+    }
+    Ok(())
 }
 
 pub(crate) fn hash_file(path: &Path) -> Result<(String, u64), &'static str> {
@@ -175,8 +200,18 @@ pub(crate) async fn list_keys(
             .await
             .map_err(|_| "remote_list_failed")?;
         let body = String::from_utf8(body).map_err(|_| "remote_list_failed")?;
-        let page: ListResponse =
-            quick_xml::de::from_str(&body).map_err(|_| "remote_list_failed")?;
+        let page: ListResponse = if crate::r2_oauth::uses_oauth(config) {
+            r2_list_response(&body, prefix)?
+        } else {
+            s3_list_response(&body)?
+        };
+        if page
+            .contents
+            .iter()
+            .any(|entry| !entry.key.starts_with(prefix))
+        {
+            return Err("remote_list_failed");
+        }
         result.extend(page.contents.into_iter().map(|e| e.key));
         if !page.truncated {
             break;
@@ -191,6 +226,66 @@ pub(crate) async fn list_keys(
         continuation = Some(next);
     }
     Ok(result)
+}
+
+fn s3_list_response(body: &str) -> Result<ListResponse, &'static str> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(body);
+    loop {
+        match reader.read_event().map_err(|_| "remote_list_failed")? {
+            Event::Start(element) if element.local_name().as_ref() == b"ListBucketResult" => break,
+            Event::Decl(_) | Event::Comment(_) | Event::PI(_) => (),
+            Event::Text(text) if text.iter().all(u8::is_ascii_whitespace) => (),
+            _ => return Err("remote_list_failed"),
+        }
+    }
+    quick_xml::de::from_str(body).map_err(|_| "remote_list_failed")
+}
+
+fn r2_list_response(body: &str, prefix: &str) -> Result<ListResponse, &'static str> {
+    let data: serde_json::Value = serde_json::from_str(body).map_err(|_| "remote_list_failed")?;
+    if data.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return Err("remote_list_failed");
+    }
+    let values = data
+        .get("result")
+        .and_then(|v| v.as_array())
+        .ok_or("remote_list_failed")?;
+    let mut contents = Vec::with_capacity(values.len());
+    for value in values {
+        let key = value
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or("remote_list_failed")?;
+        if !key.starts_with(prefix)
+            || !key.starts_with("momso/object-store/v1/")
+            || key
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err("remote_list_failed");
+        }
+        contents.push(ListEntry {
+            key: key.to_owned(),
+        });
+    }
+    let info = data
+        .get("result_info")
+        .and_then(|v| v.as_object())
+        .ok_or("remote_list_failed")?;
+    let truncated = info
+        .get("is_truncated")
+        .and_then(|v| v.as_bool())
+        .ok_or("remote_list_failed")?;
+    let next = info
+        .get("cursor")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    Ok(ListResponse {
+        contents,
+        truncated,
+        next,
+    })
 }
 
 pub(crate) async fn get_bytes(
@@ -227,13 +322,46 @@ async fn read_bounded(
     Ok(bytes)
 }
 
-async fn put_once(
+pub(crate) async fn put_once(
     config: &object_store::Config,
     keys: &object_store::Keys,
     key: &str,
     bytes: Vec<u8>,
 ) -> Result<(), &'static str> {
     if config.write_safety == Some(object_store::WriteSafety::CheckThenWrite) {
+        if crate::r2_oauth::uses_oauth(config) {
+            let existing = get_bytes(config, keys, key, bytes.len())
+                .await
+                .map_err(|error| {
+                    if error == "invalid_remote_object" {
+                        "remote_conflict"
+                    } else {
+                        error
+                    }
+                })?;
+            if let Some(existing) = existing {
+                return if existing == bytes {
+                    Ok(())
+                } else {
+                    Err("remote_conflict")
+                };
+            }
+            let response =
+                object_store::request(config, keys, reqwest::Method::PUT, key, &[], bytes.clone())
+                    .await?;
+            if !response.status().is_success() {
+                return Err("remote_write_failed");
+            }
+            return match get_bytes(config, keys, key, bytes.len()).await? {
+                Some(existing)
+                    if existing.len() == bytes.len()
+                        && object_store::digest(&existing) == object_store::digest(&bytes) =>
+                {
+                    Ok(())
+                }
+                _ => Err("remote_conflict"),
+            };
+        }
         let response =
             object_store::request(config, keys, reqwest::Method::HEAD, key, &[], vec![]).await?;
         if response.status().is_success() {
@@ -291,7 +419,7 @@ async fn put_once(
     Err("remote_write_failed")
 }
 
-fn manifest_key(
+pub(crate) fn manifest_key(
     config: &object_store::Config,
     created_at: &str,
     unique: &str,
@@ -314,42 +442,23 @@ fn manifest_key(
     }
 }
 
-async fn publish_existing_content(
-    config: &object_store::Config,
-    keys: &object_store::Keys,
-    identity: &x25519::Identity,
-    existing: &Manifest,
-    relative_path: &str,
-) -> Result<Manifest, &'static str> {
-    if !safe_relative(Path::new(relative_path)) {
-        return Err("unsafe_path");
-    }
-    let mut manifest = existing.clone();
-    manifest.relative_path = relative_path.to_owned();
-    manifest.created_at = chrono::Utc::now().to_rfc3339();
-    let plain = serde_json::to_vec(&manifest).map_err(|_| "invalid_manifest")?;
-    if plain.len() > MAX_MANIFEST_PLAINTEXT {
-        return Err("file_too_large");
-    }
-    let encrypted = encrypt_bytes(&plain, identity)?;
-    if encrypted.len() > MAX_MANIFEST {
-        return Err("file_too_large");
-    }
-    let key = manifest_key(
-        config,
-        &manifest.created_at,
-        &Uuid::new_v4().to_string(),
-        &encrypted,
-    );
-    put_once(config, keys, &key, encrypted).await?;
-    Ok(manifest)
-}
-
 pub(crate) async fn catalog(
     config: &object_store::Config,
     keys: &object_store::Keys,
     identity: &x25519::Identity,
 ) -> Result<Vec<Manifest>, &'static str> {
+    Ok(catalog_with_keys(config, keys, identity)
+        .await?
+        .into_iter()
+        .map(|(_, manifest, _)| manifest)
+        .collect())
+}
+
+pub(crate) async fn catalog_with_keys(
+    config: &object_store::Config,
+    keys: &object_store::Keys,
+    identity: &x25519::Identity,
+) -> Result<Vec<(String, Manifest, String)>, &'static str> {
     let prefix = format!("{}/manifests/", object_store::PREFIX);
     let mut result = Vec::new();
     for key in list_keys(config, keys, &prefix).await? {
@@ -366,6 +475,7 @@ pub(crate) async fn catalog(
                 return Err("hash_mismatch");
             }
         }
+        let encrypted_hash = object_store::digest(&encrypted);
         let plain = decrypt_bytes(&encrypted, identity, MAX_MANIFEST)?;
         let manifest: Manifest = serde_json::from_slice(&plain).map_err(|_| "invalid_manifest")?;
         if name.len() > 100 {
@@ -397,7 +507,7 @@ pub(crate) async fn catalog(
         {
             return Err("invalid_manifest");
         }
-        result.push(manifest);
+        result.push((key, manifest, encrypted_hash));
     }
     Ok(result)
 }
@@ -414,6 +524,9 @@ fn prepare_journal(
         return Err("unsafe_path");
     }
     let (sha256, size) = hash_file(source)?;
+    if kind == "object" {
+        validate_content_address(relative, &sha256)?;
+    }
     let parent = stage.parent().ok_or("unsafe_path")?;
     for directory in [parent, stage] {
         match fs::symlink_metadata(directory) {
@@ -714,22 +827,249 @@ pub(crate) fn object_files(root: &Path) -> Result<Vec<(String, PathBuf, u64)>, &
     Ok(files)
 }
 
+// Interrupted uploads contain encrypted recoverable originals. Only remove a
+// staged file after authenticating and hashing its decrypted content.
+pub(crate) fn purge_staged_source(
+    data_root: &Path,
+    target_hash: &str,
+    identity: Option<&x25519::Identity>,
+    mut preserve_remote: impl FnMut(&str, &Manifest, Option<&[u8]>) -> Result<(), &'static str>,
+) -> Vec<String> {
+    let root = data_root.join("object-store-staging");
+    let metadata = match fs::symlink_metadata(&root) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => return vec!["upload_staging_unverified".into()],
+    };
+    if !metadata.is_dir() || crate::archive_location::is_link_or_reparse(&metadata) {
+        return vec!["upload_staging_unverified".into()];
+    }
+    let Ok(parent) = fs::symlink_metadata(data_root) else {
+        return vec!["upload_staging_unverified".into()];
+    };
+    if !parent.is_dir() || crate::archive_location::is_link_or_reparse(&parent) {
+        return vec!["upload_staging_unverified".into()];
+    }
+    let Some(identity) = identity else {
+        return vec!["upload_staging_unverified".into()];
+    };
+    let mut remaining = Vec::new();
+    let Ok(directories) = fs::read_dir(&root) else {
+        return vec!["upload_staging_unverified".into()];
+    };
+    for directory in directories {
+        let Ok(directory) = directory else {
+            remaining.push("upload_staging_unverified".into());
+            continue;
+        };
+        let dir = directory.path();
+        let Ok(meta) = fs::symlink_metadata(&dir) else {
+            remaining.push("upload_staging_unverified".into());
+            continue;
+        };
+        if !meta.is_dir()
+            || crate::archive_location::is_link_or_reparse(&meta)
+            || Uuid::parse_str(&directory.file_name().to_string_lossy()).is_err()
+        {
+            remaining.push("upload_staging_unverified".into());
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            remaining.push("upload_staging_unverified".into());
+            continue;
+        };
+        let mut journals = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) if entry.path().extension().is_some_and(|ext| ext == "json") => {
+                    journals.push(entry.path())
+                }
+                Ok(_) => (),
+                Err(_) => remaining.push("upload_staging_unverified".into()),
+            }
+        }
+        for journal_path in journals {
+            let result = (|| -> Result<(), &'static str> {
+                let meta = fs::symlink_metadata(&journal_path).map_err(|_| "unverified")?;
+                if !meta.is_file()
+                    || crate::archive_location::is_link_or_reparse(&meta)
+                    || meta.len() > MAX_MANIFEST as u64
+                {
+                    return Err("unverified");
+                }
+                let data = fs::read(&journal_path).map_err(|_| "unverified")?;
+                let journal: Journal = serde_json::from_slice(&data).map_err(|_| "unverified")?;
+                if journal.manifest.kind != "object" || journal.manifest.sha256 != target_hash {
+                    return Ok(());
+                }
+                if !safe_relative(Path::new(&journal.manifest.relative_path)) {
+                    return Err("unverified");
+                }
+                let id = object_store::digest(
+                    format!(
+                        "object\0{}\0{}",
+                        journal.manifest.relative_path, target_hash
+                    )
+                    .as_bytes(),
+                );
+                if journal_path.file_name().and_then(|v| v.to_str()) != Some(&format!("{id}.json"))
+                {
+                    return Err("unverified");
+                }
+                let cipher = dir.join(format!("{id}.age"));
+                let meta = fs::symlink_metadata(&cipher).map_err(|_| "unverified")?;
+                if !meta.is_file()
+                    || crate::archive_location::is_link_or_reparse(&meta)
+                    || hash_file(&cipher).map_err(|_| "unverified")?.0 != journal.encrypted_sha256
+                {
+                    return Err("unverified");
+                }
+                if !matches!(journal.manifest.version, 1 | 2)
+                    || Uuid::parse_str(&journal.manifest.upload_id).is_err()
+                {
+                    return Err("unverified");
+                }
+                let mut encrypted_chunks = File::open(&cipher).map_err(|_| "unverified")?;
+                let mut chunk_buffer = vec![0u8; CHUNK_SIZE];
+                let mut index = 0usize;
+                loop {
+                    let mut used = 0;
+                    while used < chunk_buffer.len() {
+                        let n = encrypted_chunks
+                            .read(&mut chunk_buffer[used..])
+                            .map_err(|_| "unverified")?;
+                        if n == 0 {
+                            break;
+                        }
+                        used += n;
+                    }
+                    if used == 0 {
+                        break;
+                    }
+                    if journal.manifest.chunks.get(index)
+                        != Some(&object_store::digest(&chunk_buffer[..used]))
+                    {
+                        return Err("unverified");
+                    }
+                    index += 1;
+                }
+                if index != journal.manifest.chunks.len() {
+                    return Err("unverified");
+                }
+                let encrypted = File::open(&cipher).map_err(|_| "unverified")?;
+                let decryptor = age::Decryptor::new(encrypted).map_err(|_| "unverified")?;
+                let mut reader = decryptor
+                    .decrypt(std::iter::once(identity as &dyn age::Identity))
+                    .map_err(|_| "unverified")?;
+                let mut digest = Sha256::new();
+                let mut length = 0u64;
+                let mut buffer = [0u8; 65536];
+                loop {
+                    let count = reader.read(&mut buffer).map_err(|_| "unverified")?;
+                    if count == 0 {
+                        break;
+                    }
+                    length = length.checked_add(count as u64).ok_or("unverified")?;
+                    if length > journal.manifest.size {
+                        return Err("unverified");
+                    }
+                    digest.update(&buffer[..count]);
+                }
+                if length != journal.manifest.size
+                    || format!("{:x}", digest.finalize()) != target_hash
+                {
+                    return Err("unverified");
+                }
+                let manifest = dir.join(format!("{id}.manifest.age"));
+                let encrypted_manifest = match fs::symlink_metadata(&manifest) {
+                    Ok(meta) => {
+                        if !meta.is_file()
+                            || crate::archive_location::is_link_or_reparse(&meta)
+                            || meta.len() > MAX_MANIFEST as u64
+                        {
+                            return Err("unverified");
+                        }
+                        let encrypted = fs::read(&manifest).map_err(|_| "unverified")?;
+                        if decrypt_bytes(&encrypted, identity, MAX_MANIFEST)
+                            .map_err(|_| "unverified")?
+                            != serde_json::to_vec(&journal.manifest).map_err(|_| "unverified")?
+                        {
+                            return Err("unverified");
+                        }
+                        Some(encrypted)
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(_) => return Err("unverified"),
+                };
+                let stage_id = directory.file_name();
+                let stage_id = stage_id.to_str().ok_or("unverified")?;
+                preserve_remote(stage_id, &journal.manifest, encrypted_manifest.as_deref())?;
+                if encrypted_manifest.is_some() {
+                    fs::remove_file(&manifest).map_err(|_| "unverified")?;
+                }
+                fs::remove_file(&cipher).map_err(|_| "unverified")?;
+                fs::remove_file(&journal_path).map_err(|_| "unverified")?;
+                Ok(())
+            })();
+            if result.is_err() {
+                remaining.push(journal_path.to_string_lossy().into_owned());
+            }
+        }
+        // Orphaned encrypted files without a complete journal cannot safely be classified.
+        if fs::read_dir(&dir)
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(true)
+        {
+            remaining.push("upload_staging_unverified".into());
+        }
+    }
+    remaining.sort();
+    remaining.dedup();
+    remaining
+}
+
 pub(crate) async fn pending_files<F: FnMut(Option<&str>)>(
     config: &object_store::Config,
     keys: &object_store::Keys,
     identity: &x25519::Identity,
+    database: &Path,
     objects: &Path,
     mut on_file: F,
 ) -> Result<Vec<(String, PathBuf, u64)>, &'static str> {
+    let (deleted_hashes, deleted_paths) = {
+        let db = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| "unavailable")?;
+        let mut statement = db.prepare("SELECT a.content_sha256,a.storage_relative_path FROM momso_source_assets a JOIN source_asset_deletions d ON d.asset_id=a.id").map_err(|_| "unavailable")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| "unavailable")?;
+        let mut hashes = std::collections::HashSet::new();
+        let mut paths = std::collections::HashSet::new();
+        for row in rows {
+            let (hash, path) = row.map_err(|_| "unavailable")?;
+            hashes.insert(hash);
+            paths.insert(path.replace('\\', "/"));
+        }
+        (hashes, paths)
+    };
     let catalog = catalog(config, keys, identity).await?;
     let available = list_keys(config, keys, &format!("{}/data/", object_store::PREFIX)).await?;
     let available: std::collections::HashSet<_> = available.into_iter().collect();
     let mut pending = Vec::new();
     for (relative, path, size) in object_files(objects)? {
+        if deleted_paths.contains(&relative) {
+            continue;
+        }
         on_file(Some(&relative));
         let (hash, observed) = hash_file(&path)?;
         if observed != size {
             return Err("source_changed");
+        }
+        validate_content_address(&relative, &hash)?;
+        if deleted_hashes.contains(&hash) {
+            continue;
         }
         let backed_up = catalog.iter().any(|m| {
             m.kind == "object"
@@ -856,51 +1196,53 @@ pub(crate) async fn object_store_backup(
         let mut config = object_store::load_config(&paths.data_root)?.ok_or("not_connected")?;
         let keys = object_store::load_keys(&config)?;
         let identity = identity(&paths.database_path)?;
-        let stage = paths
-            .data_root
-            .join("object-store-staging")
-            .join(&config.credential_id);
-        cleanup_completed(&config, &keys, &identity, &stage).await?;
-        let pending = pending_files(&config, &keys, &identity, &paths.objects_path, |file| {
-            active_file = file.map(str::to_owned)
-        })
-        .await?;
-        let mut reusable = catalog(&config, &keys, &identity).await?;
-        let mut available: std::collections::HashSet<_> =
-            list_keys(&config, &keys, &format!("{}/data/", object_store::PREFIX))
-                .await?
-                .into_iter()
-                .collect();
-        let total_bytes = pending
-            .iter()
-            .try_fold(0u64, |sum, item| sum.checked_add(item.2))
-            .ok_or("unavailable")?;
-        let mut progress = BackupProgress {
-            completed_count: 0,
-            completed_bytes: 0,
-            total_count: pending.len() as u64,
-            total_bytes,
+        let remote_lock = if crate::object_store_lock::supported(&config) {
+            Some(
+                crate::object_store_lock::SourceMutationLock::acquire(
+                    &paths.data_root,
+                    &config,
+                    &keys,
+                )
+                .await?,
+            )
+        } else {
+            None
         };
-        let _ = app.emit("object-store-progress", progress.clone());
-        for (relative, path, size) in pending {
-            active_file = Some(relative.clone());
-            let initial_progress = progress.clone();
-            let (hash, observed) = hash_file(&path)?;
-            if observed != size {
-                return Err("source_changed");
-            }
-            let existing = reusable.iter().find(|m| {
-                m.kind == "object"
-                    && m.sha256 == hash
-                    && m.size == size
-                    && m.chunks
-                        .iter()
-                        .enumerate()
-                        .all(|(i, _)| available.contains(&chunk_key(m, i)))
-            });
-            let manifest = if let Some(existing) = existing {
-                publish_existing_content(&config, &keys, &identity, existing, &relative).await?
-            } else {
+        let work: Result<BackupProgress, &'static str> = async {
+            let stage = paths
+                .data_root
+                .join("object-store-staging")
+                .join(&config.credential_id);
+            cleanup_completed(&config, &keys, &identity, &stage).await?;
+            let pending = pending_files(
+                &config,
+                &keys,
+                &identity,
+                &paths.database_path,
+                &paths.objects_path,
+                |file| active_file = file.map(str::to_owned),
+            )
+            .await?;
+            let total_bytes = pending
+                .iter()
+                .try_fold(0u64, |sum, item| sum.checked_add(item.2))
+                .ok_or("unavailable")?;
+            let mut progress = BackupProgress {
+                completed_count: 0,
+                completed_bytes: 0,
+                total_count: pending.len() as u64,
+                total_bytes,
+            };
+            let _ = app.emit("object-store-progress", progress.clone());
+            for (relative, path, size) in pending {
+                active_file = Some(relative.clone());
+                let initial_progress = progress.clone();
+                let (_, observed) = hash_file(&path)?;
+                if observed != size {
+                    return Err("source_changed");
+                }
+                // Each new manifest owns its own upload ID and chunks. Sharing
+                // another manifest's chunks races with a delete on a different PC.
                 upload_file(
                     &config,
                     &keys,
@@ -920,44 +1262,45 @@ pub(crate) async fn object_store_backup(
                         let _ = app.emit("object-store-progress", update);
                     },
                 )
-                .await?
-            };
-            for (i, _) in manifest.chunks.iter().enumerate() {
-                available.insert(chunk_key(&manifest, i));
+                .await?;
+                progress.completed_count += 1;
+                progress.completed_bytes += size;
+                let _ = app.emit("object-store-progress", progress.clone());
             }
-            reusable.push(manifest);
-            progress.completed_count += 1;
-            progress.completed_bytes += size;
-            let _ = app.emit("object-store-progress", progress.clone());
-        }
-        let safe_stage = fs::symlink_metadata(&stage)
-            .ok()
-            .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink());
-        let safe_parent = stage
-            .parent()
-            .and_then(|p| fs::symlink_metadata(p).ok())
-            .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink());
-        if safe_stage
-            && safe_parent
-            && fs::read_dir(&stage)
-                .map_err(|_| "local_read_failed")?
-                .next()
-                .is_none()
-        {
-            fs::remove_dir(&stage).map_err(|_| "local_write_failed")?;
-            if let Some(parent) = stage.parent() {
-                if fs::read_dir(parent)
+            let safe_stage = fs::symlink_metadata(&stage)
+                .ok()
+                .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink());
+            let safe_parent = stage
+                .parent()
+                .and_then(|p| fs::symlink_metadata(p).ok())
+                .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink());
+            if safe_stage
+                && safe_parent
+                && fs::read_dir(&stage)
                     .map_err(|_| "local_read_failed")?
                     .next()
                     .is_none()
-                {
-                    fs::remove_dir(parent).map_err(|_| "local_write_failed")?;
+            {
+                fs::remove_dir(&stage).map_err(|_| "local_write_failed")?;
+                if let Some(parent) = stage.parent() {
+                    if fs::read_dir(parent)
+                        .map_err(|_| "local_read_failed")?
+                        .next()
+                        .is_none()
+                    {
+                        fs::remove_dir(parent).map_err(|_| "local_write_failed")?;
+                    }
                 }
             }
+            config.last_backup_at = Some(chrono::Utc::now().to_rfc3339());
+            object_store::save_config(&paths.data_root, &config)?;
+            Ok(progress)
         }
-        config.last_backup_at = Some(chrono::Utc::now().to_rfc3339());
-        object_store::save_config(&paths.data_root, &config)?;
-        Ok(progress)
+        .await;
+        if let Some(lock) = remote_lock {
+            lock.release(&config, &keys).await?;
+        }
+        work
     }
     .await;
     match result {
@@ -990,6 +1333,149 @@ mod tests {
         },
         time::Duration,
     };
+
+    #[test]
+    fn corrupted_content_address_is_not_staged_for_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::write(&source, b"changed original").unwrap();
+        let expected = object_store::digest(b"original");
+        let relative = format!("sha256/{}/{}", &expected[..2], expected);
+        let stage = temp.path().join("staging").join("upload");
+        let identity = x25519::Identity::generate();
+        assert!(matches!(
+            prepare_journal(&source, &relative, "object", &stage, &identity, true),
+            Err("source_integrity_mismatch")
+        ));
+        assert!(!stage.exists());
+        assert_eq!(fs::read(&source).unwrap(), b"changed original");
+        assert!(validate_content_address("legacy/source.txt", &expected).is_ok());
+        assert!(validate_content_address(&relative, &expected).is_ok());
+        let native_relative = Path::new("sha256").join(&expected[..2]).join(&expected);
+        assert_eq!(
+            validate_content_address(
+                native_relative.to_str().unwrap(),
+                &object_store::digest(b"different")
+            ),
+            Err("source_integrity_mismatch")
+        );
+        let wrong_prefix = if &expected[..2] == "00" { "01" } else { "00" };
+        let wrong_directory = Path::new("sha256").join(wrong_prefix).join(&expected);
+        assert_eq!(
+            validate_content_address(wrong_directory.to_str().unwrap(), &expected),
+            Err("source_integrity_mismatch")
+        );
+    }
+
+    #[test]
+    fn purge_staging_removes_only_verified_matching_originals() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp
+            .path()
+            .join("object-store-staging")
+            .join(Uuid::new_v4().to_string());
+        let source = temp.path().join("source");
+        let other = temp.path().join("other");
+        fs::write(&source, b"synthetic private original").unwrap();
+        fs::write(&other, b"different source").unwrap();
+        let identity = x25519::Identity::generate();
+        let (journal, journal_path, cipher_path) =
+            prepare_journal(&source, "sha256/first", "object", &stage, &identity, true).unwrap();
+        let (_, second_journal, second_cipher) =
+            prepare_journal(&source, "sha256/second", "object", &stage, &identity, true).unwrap();
+        let manifest_path = journal_path.with_extension("manifest.age");
+        fs::write(
+            &manifest_path,
+            encrypt_bytes(&serde_json::to_vec(&journal.manifest).unwrap(), &identity).unwrap(),
+        )
+        .unwrap();
+        let (_, other_journal, other_cipher) =
+            prepare_journal(&other, "sha256/other", "object", &stage, &identity, true).unwrap();
+        let other_before = fs::read(&other_cipher).unwrap();
+        let hash = object_store::digest(b"synthetic private original");
+        assert_eq!(
+            purge_staged_source(temp.path(), &hash, None, |_, _, _| Ok(())),
+            ["upload_staging_unverified"]
+        );
+        assert!(journal_path.exists() && cipher_path.exists() && manifest_path.exists());
+        let remaining = purge_staged_source(temp.path(), &hash, Some(&identity), |_, _, _| Ok(()));
+        assert!(!journal_path.exists() && !cipher_path.exists() && !manifest_path.exists());
+        assert!(!second_journal.exists() && !second_cipher.exists());
+        assert!(other_journal.exists());
+        assert_eq!(fs::read(&other_cipher).unwrap(), other_before);
+        assert!(remaining.contains(&"upload_staging_unverified".to_owned()));
+    }
+
+    #[test]
+    fn purge_staging_refuses_forged_journal_and_keeps_ciphertext() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp
+            .path()
+            .join("object-store-staging")
+            .join(Uuid::new_v4().to_string());
+        let source = temp.path().join("other");
+        fs::write(&source, b"different source").unwrap();
+        let identity = x25519::Identity::generate();
+        let (mut journal, old_journal, old_cipher) =
+            prepare_journal(&source, "sha256/forged", "object", &stage, &identity, true).unwrap();
+        let target_hash = object_store::digest(b"synthetic private original");
+        journal.manifest.sha256 = target_hash.clone();
+        let new_id = object_store::digest(
+            format!(
+                "object\0{}\0{}",
+                journal.manifest.relative_path, target_hash
+            )
+            .as_bytes(),
+        );
+        let forged_journal = stage.join(format!("{new_id}.json"));
+        let forged_cipher = stage.join(format!("{new_id}.age"));
+        fs::rename(old_cipher, &forged_cipher).unwrap();
+        fs::remove_file(old_journal).unwrap();
+        fs::write(&forged_journal, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let before = fs::read(&forged_cipher).unwrap();
+        let remaining =
+            purge_staged_source(temp.path(), &target_hash, Some(&identity), |_, _, _| Ok(()));
+        assert_eq!(fs::read(&forged_cipher).unwrap(), before);
+        assert!(forged_journal.exists());
+        assert!(remaining
+            .iter()
+            .any(|item| item.ends_with(&format!("{new_id}.json"))));
+    }
+
+    #[test]
+    fn purge_staging_preserves_files_when_remote_plan_cannot_be_saved_or_chunks_are_forged() {
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp
+            .path()
+            .join("object-store-staging")
+            .join(Uuid::new_v4().to_string());
+        let source = temp.path().join("source");
+        fs::write(&source, b"original").unwrap();
+        let identity = x25519::Identity::generate();
+        let (mut journal, journal_path, cipher) =
+            prepare_journal(&source, "sha256/item", "object", &stage, &identity, true).unwrap();
+        let encrypted =
+            encrypt_bytes(&serde_json::to_vec(&journal.manifest).unwrap(), &identity).unwrap();
+        let manifest_path = journal_path.with_extension("manifest.age");
+        fs::write(&manifest_path, encrypted).unwrap();
+        let hash = object_store::digest(b"original");
+        let mut called = false;
+        let remaining = purge_staged_source(temp.path(), &hash, Some(&identity), |_, _, _| {
+            called = true;
+            Err("remote_plan_changed")
+        });
+        assert!(called && !remaining.is_empty());
+        assert!(journal_path.exists() && cipher.exists() && manifest_path.exists());
+        journal.manifest.chunks[0] = "a".repeat(64);
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let mut called = false;
+        let remaining = purge_staged_source(temp.path(), &hash, Some(&identity), |_, _, _| {
+            called = true;
+            Ok(())
+        });
+        assert!(!called && !remaining.is_empty());
+        assert!(journal_path.exists() && cipher.exists() && manifest_path.exists());
+    }
 
     #[test]
     fn missing_recovery_profile_does_not_create_a_database_record() {
@@ -1046,6 +1532,109 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn oauth_r2_encrypted_backup_resume_and_restore() {
+        exercise_server("r2_oauth", false).await;
+    }
+
+    #[test]
+    fn oauth_listing_rejects_error_and_outside_prefix() {
+        let prefix = "momso/object-store/v1/manifests/";
+        assert!(r2_list_response(
+            r#"{"success":false,"result":[],"result_info":{"is_truncated":false}}"#,
+            prefix
+        )
+        .is_err());
+        assert!(r2_list_response(
+            r#"{"success":true,"result":[{"key":"outside"}],"result_info":{"is_truncated":false}}"#,
+            prefix
+        )
+        .is_err());
+        assert!(r2_list_response(r#"{"success":true,"result":[]}"#, prefix).is_err());
+        let page = r2_list_response(r#"{"success":true,"result":[{"key":"momso/object-store/v1/manifests/a.age"}],"result_info":{"is_truncated":true,"cursor":"next"}}"#, prefix).unwrap();
+        assert_eq!(page.contents.len(), 1);
+        assert!(page.truncated);
+        assert_eq!(page.next.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn s3_listing_requires_explicit_pagination_status() {
+        let incomplete = "<ListBucketResult><Contents><Key>momso/object-store/v1/manifests/a.age</Key></Contents></ListBucketResult>";
+        assert!(s3_list_response(incomplete).is_err());
+        let complete = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+        assert!(!s3_list_response(complete).unwrap().truncated);
+        let error_document = "<Error><IsTruncated>false</IsTruncated></Error>";
+        assert!(s3_list_response(error_document).is_err());
+        let namespaced = "<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated></ListBucketResult>";
+        assert!(!s3_list_response(namespaced).unwrap().truncated);
+    }
+
+    #[tokio::test]
+    async fn s3_listing_refuses_incomplete_or_outside_pages() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let pages = [
+                "<ListBucketResult><Contents><Key>momso/object-store/v1/manifests/a.age</Key></Contents></ListBucketResult>",
+                "<Error><IsTruncated>false</IsTruncated></Error>",
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>outside</Key></Contents></ListBucketResult>",
+                "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken><Contents><Key>momso/object-store/v1/manifests/a.age</Key></Contents></ListBucketResult>",
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>momso/object-store/v1/manifests/b.age</Key></Contents></ListBucketResult>",
+            ];
+            for (index, body) in pages.iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = [0u8; 8192];
+                let read = stream.read(&mut request).unwrap();
+                if index == 4 {
+                    assert!(String::from_utf8_lossy(&request[..read])
+                        .contains("continuation-token=next"));
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let config = object_store::Config {
+            provider: "s3_compatible".into(),
+            endpoint: format!("http://{address}"),
+            region: "auto".into(),
+            bucket: "bucket".into(),
+            credential_id: "test".into(),
+            last_backup_at: None,
+            write_safety: Some(object_store::WriteSafety::Conditional),
+        };
+        let keys = object_store::Keys {
+            access_key_id: "TEST".into(),
+            secret_access_key: "test".into(),
+        };
+        let prefix = "momso/object-store/v1/manifests/";
+        assert!(matches!(
+            list_keys(&config, &keys, prefix).await,
+            Err("remote_list_failed")
+        ));
+        assert!(matches!(
+            list_keys(&config, &keys, prefix).await,
+            Err("remote_list_failed")
+        ));
+        assert!(matches!(
+            list_keys(&config, &keys, prefix).await,
+            Err("remote_list_failed")
+        ));
+        let complete = list_keys(&config, &keys, prefix).await.unwrap();
+        assert_eq!(
+            complete,
+            vec![format!("{prefix}a.age"), format!("{prefix}b.age")]
+        );
+        server.join().unwrap();
+    }
+
     async fn exercise_server(provider: &str, conditional: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1057,6 +1646,7 @@ mod tests {
         let server_writes = Arc::clone(&writes);
         let server_stop = Arc::clone(&stop);
         let google = provider == "gcp";
+        let oauth = provider == "r2_oauth";
         let server = std::thread::spawn(move || {
             let mut failed_once = false;
             while !server_stop.load(Ordering::Relaxed) {
@@ -1079,6 +1669,11 @@ mod tests {
                     }
                 };
                 let head = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                if oauth {
+                    assert!(head
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token")));
+                }
                 let line = head.lines().next().unwrap();
                 let mut fields = line.split_whitespace();
                 let method = fields.next().unwrap();
@@ -1096,24 +1691,76 @@ mod tests {
                     assert_ne!(n, 0);
                     bytes.extend_from_slice(&buffer[..n]);
                 }
+                let oauth_path = format!(
+                    "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects",
+                    "a".repeat(32)
+                );
+                let oauth_bucket = oauth_path.strip_suffix("/objects").unwrap();
+                let oauth_collection = oauth_bucket.strip_suffix("/momso-fixture").unwrap();
+                if oauth {
+                    assert!(
+                        path == oauth_path
+                            || path.starts_with(&format!("{oauth_path}/"))
+                            || path.starts_with(&format!("{oauth_path}?"))
+                            || (method == "GET" && path == oauth_bucket)
+                            || (method == "POST" && path == oauth_collection)
+                    );
+                }
+                let oauth_object_prefix = format!("{oauth_path}/");
                 let key = path
-                    .trim_start_matches("/bucket/")
+                    .trim_start_matches(if oauth {
+                        &oauth_object_prefix
+                    } else {
+                        "/bucket/"
+                    })
                     .split('?')
                     .next()
-                    .unwrap();
-                let (status, body) = if method == "GET" && path.starts_with("/bucket?") {
+                    .unwrap()
+                    .to_owned();
+                let (status, body) = if oauth && method == "GET" && path == oauth_bucket {
+                    ("404 Not Found", Vec::new())
+                } else if oauth && method == "POST" && path == oauth_collection {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(
+                            &bytes[header_end..header_end + length]
+                        )
+                        .unwrap(),
+                        serde_json::json!({"name":"momso-fixture"})
+                    );
+                    (
+                        "200 OK",
+                        serde_json::to_vec(
+                            &serde_json::json!({"success":true,"result":{"name":"momso-fixture"}}),
+                        )
+                        .unwrap(),
+                    )
+                } else if method == "GET"
+                    && ((oauth && path.starts_with(&format!("{oauth_path}?")))
+                        || (!oauth && path.starts_with("/bucket?")))
+                {
                     let objects = server_data.lock().unwrap();
                     let data_list = path.contains("data%2F");
-                    let entries = objects
-                        .keys()
-                        .filter(|key| {
-                            key.contains(if data_list { "/data/" } else { "/manifests/" })
-                        })
-                        .map(|key| format!("<Contents><Key>{key}</Key></Contents>"))
-                        .collect::<String>();
-                    ("200 OK", format!("<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>").into_bytes())
+                    if oauth {
+                        let entries: Vec<_> = objects
+                            .keys()
+                            .filter(|key| {
+                                key.contains(if data_list { "/data/" } else { "/manifests/" })
+                            })
+                            .map(|key| serde_json::json!({"key":key}))
+                            .collect();
+                        ("200 OK", serde_json::to_vec(&serde_json::json!({"success":true,"result":entries,"result_info":{"is_truncated":false}})).unwrap())
+                    } else {
+                        let entries = objects
+                            .keys()
+                            .filter(|key| {
+                                key.contains(if data_list { "/data/" } else { "/manifests/" })
+                            })
+                            .map(|key| format!("<Contents><Key>{key}</Key></Contents>"))
+                            .collect::<String>();
+                        ("200 OK", format!("<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>").into_bytes())
+                    }
                 } else if method == "GET" || method == "HEAD" {
-                    match server_data.lock().unwrap().get(key) {
+                    match server_data.lock().unwrap().get(&key) {
                         Some(value) => ("200 OK", value.clone()),
                         None => ("404 Not Found", Vec::new()),
                     }
@@ -1133,7 +1780,7 @@ mod tests {
                             line.eq_ignore_ascii_case("if-none-match: *")
                         }
                     });
-                    if conditional && create_only && objects.contains_key(key) {
+                    if conditional && create_only && objects.contains_key(&key) {
                         ("412 Precondition Failed", Vec::new())
                     } else {
                         objects.insert(
@@ -1161,10 +1808,10 @@ mod tests {
             }
         });
         let config = object_store::Config {
-            provider: provider.into(),
+            provider: if oauth { "cloudflare" } else { provider }.into(),
             endpoint: format!("http://{address}"),
-            region: "auto".into(),
-            bucket: "bucket".into(),
+            region: if oauth { "wrangleroauth" } else { "auto" }.into(),
+            bucket: if oauth { "momso-fixture" } else { "bucket" }.into(),
             credential_id: "test".into(),
             last_backup_at: None,
             write_safety: Some(if conditional {
@@ -1173,18 +1820,32 @@ mod tests {
                 object_store::WriteSafety::CheckThenWrite
             }),
         };
+        #[cfg(windows)]
+        let fake_secret = if oauth {
+            crate::r2_oauth::fake_wrangler_and_create(&format!("http://{address}/"))
+                .await
+                .unwrap()
+        } else {
+            "test".to_owned()
+        };
+        #[cfg(not(windows))]
+        let fake_secret = if oauth { "test-token" } else { "test" }.to_owned();
         let keys = object_store::Keys {
             access_key_id: "TEST".into(),
-            secret_access_key: "test".into(),
+            secret_access_key: fake_secret,
         };
-        assert_eq!(
-            object_store::probe_connection(&config, &keys)
-                .await
-                .unwrap(),
-            config.write_safety.unwrap()
-        );
+        if !oauth {
+            assert_eq!(
+                object_store::probe_connection(&config, &keys)
+                    .await
+                    .unwrap(),
+                config.write_safety.unwrap()
+            );
+        }
         let identity = x25519::Identity::generate();
         let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        crate::storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
         let objects = temp.path().join("objects");
         let source = objects.join("sha256/ab/file");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
@@ -1261,23 +1922,86 @@ mod tests {
         let second = objects.join("sha256/cd/second");
         fs::create_dir_all(second.parent().unwrap()).unwrap();
         fs::write(&second, &original).unwrap();
-        let linked =
-            publish_existing_content(&config, &keys, &identity, &manifest, "sha256/cd/second")
+        // A second PC backs up equal bytes under another path while the
+        // first backup is being deleted. Its new manifest must not share the
+        // first upload's chunks; removing those chunks must not break it.
+        let independent = upload_file(
+            &config,
+            &keys,
+            &identity,
+            UploadSpec {
+                source: &second,
+                relative: "sha256/cd/second",
+                kind: "object",
+                stage: &stage,
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_ne!(independent.upload_id, manifest.upload_id);
+        for index in 0..manifest.chunks.len() {
+            assert_ne!(chunk_key(&independent, index), chunk_key(&manifest, index));
+        }
+        let mut removed = Vec::new();
+        {
+            let mut remote = data.lock().unwrap();
+            for index in 0..manifest.chunks.len() {
+                let key = chunk_key(&manifest, index);
+                removed.push((key.clone(), remote.remove(&key).unwrap()));
+            }
+        }
+        let recovered = crate::object_store_restore::download_verified(
+            &config,
+            &keys,
+            &identity,
+            &independent,
+            temp.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read(recovered.path()).unwrap(), original);
+        {
+            let mut remote = data.lock().unwrap();
+            remote.extend(removed);
+        }
+        assert!(
+            pending_files(&config, &keys, &identity, &database, &objects, |_| {})
                 .await
-                .unwrap();
-        assert_eq!(linked.upload_id, manifest.upload_id);
-        assert_eq!(
-            data.lock()
                 .unwrap()
-                .keys()
-                .filter(|key| key.contains("/data/"))
-                .count(),
-            2
+                .is_empty()
         );
-        assert!(pending_files(&config, &keys, &identity, &objects, |_| {})
-            .await
-            .unwrap()
-            .is_empty());
+        // A crash after the deletion marker can leave bytes at the old path.
+        // Neither that path nor the same content under another path may be re-uploaded.
+        let deleted_bytes = b"deleted synthetic source";
+        let deleted_hash = object_store::digest(deleted_bytes);
+        let relative = format!("sha256/{}/{}", &deleted_hash[..2], deleted_hash);
+        let deleted_file = objects.join(&relative);
+        fs::create_dir_all(deleted_file.parent().unwrap()).unwrap();
+        fs::write(&deleted_file, deleted_bytes).unwrap();
+        fs::write(objects.join("same-deleted-content"), deleted_bytes).unwrap();
+        let db = crate::storage::open_writable_connection(&database).unwrap();
+        db.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('deleted-asset','other',?1,?2,?3,'deleted','test','now')", rusqlite::params![deleted_hash,deleted_bytes.len() as i64,relative]).unwrap();
+        db.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('deleted-asset',?1,'pending','now','later')", [Uuid::new_v4().to_string()]).unwrap();
+        drop(db);
+        assert!(
+            pending_files(&config, &keys, &identity, &database, &objects, |_| {})
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            pending_files(
+                &config,
+                &keys,
+                &identity,
+                &temp.path().join("missing.db"),
+                &objects,
+                |_| {}
+            )
+            .await,
+            Err("unavailable")
+        ));
         assert!(writes
             .lock()
             .unwrap()

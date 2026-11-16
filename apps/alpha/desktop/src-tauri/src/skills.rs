@@ -46,6 +46,7 @@ pub(crate) fn install_bundled(root: &Path, resources: &Path) -> Result<(), &'sta
 }
 
 fn install(root: &Path, resources: &Path, bundled: &[(&str, &str)]) -> Result<(), &'static str> {
+    crate::skills_write::validate_repository(root, resources)?;
     for (name, content) in bundled {
         crate::skills_write::install_builtin(root, resources, name, content)?;
     }
@@ -97,6 +98,8 @@ pub(crate) struct SkillSummary {
     title: String,
     description: String,
     enabled: bool,
+    available: bool,
+    unavailable_reason: Option<&'static str>,
     builtin: bool,
     updated_at: Option<String>,
     providers: Vec<&'static str>,
@@ -135,6 +138,28 @@ pub(crate) fn skill_path(
     Ok(path)
 }
 
+fn unavailable_reason(
+    root: &Path,
+    name: &str,
+    enabled: bool,
+    conflict: bool,
+    browser_available: bool,
+) -> Option<&'static str> {
+    if conflict {
+        Some("skill_conflict")
+    } else if !enabled {
+        Some("disabled")
+    } else if crate::browser_gateway::builtin_browser_name(name) {
+        match crate::browser_gateway::Policy::from_skill(root, name) {
+            Err("browser_policy_modified") => Some("policy_modified"),
+            Err(_) | Ok(None) => Some("policy_unavailable"),
+            Ok(Some(_)) if !browser_available => Some("browser_unavailable"),
+            Ok(Some(_)) => None,
+        }
+    } else {
+        None
+    }
+}
 fn read(root: &Path, name: &str) -> Result<SkillRead, &'static str> {
     match crate::skills_write::reconcile(root, name) {
         Ok(()) | Err("conflict") => (),
@@ -173,12 +198,22 @@ fn read(root: &Path, name: &str) -> Result<SkillRead, &'static str> {
         .ok()
         .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
     let content_hash = crate::archive_zet::content_hash(&content);
+    let enabled = found == 2 && !conflict;
+    let unavailable_reason = unavailable_reason(
+        root,
+        name,
+        enabled,
+        conflict,
+        crate::browser_driver::available(),
+    );
     Ok(SkillRead {
         summary: SkillSummary {
             name: name.into(),
             title: head.title,
             description: head.description,
-            enabled: found == 2 && !conflict,
+            enabled,
+            available: unavailable_reason.is_none(),
+            unavailable_reason,
             builtin: BUNDLED_SKILLS.iter().any(|(builtin, _)| *builtin == name),
             updated_at,
             providers,
@@ -196,7 +231,14 @@ fn read(root: &Path, name: &str) -> Result<SkillRead, &'static str> {
 }
 
 pub(crate) fn callable(root: &Path, name: &str) -> Result<bool, &'static str> {
-    Ok(read(root, name)?.summary.enabled)
+    Ok(read(root, name)?.summary.available)
+}
+
+pub(crate) fn call_unavailable_reason(
+    root: &Path,
+    name: &str,
+) -> Result<Option<&'static str>, &'static str> {
+    Ok(read(root, name)?.summary.unavailable_reason)
 }
 
 #[tauri::command]
@@ -271,6 +313,34 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_skill_availability_tracks_tool_and_policy_without_changing_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let name = "naver-smartplace";
+        let path = root.join("skills").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let content = BUNDLED_SKILLS.iter().find(|(n, _)| *n == name).unwrap().1;
+        std::fs::write(path.join("SKILL.md"), content).unwrap();
+        assert_eq!(
+            unavailable_reason(root, name, true, false, false),
+            Some("browser_unavailable")
+        );
+        assert_eq!(unavailable_reason(root, name, true, false, true), None);
+        std::fs::write(path.join("SKILL.md"), format!("{content}\nmodified")).unwrap();
+        assert_eq!(
+            unavailable_reason(root, name, true, false, true),
+            Some("policy_modified")
+        );
+        assert_eq!(
+            unavailable_reason(root, name, false, false, true),
+            Some("disabled")
+        );
+        assert_eq!(
+            unavailable_reason(root, name, false, true, true),
+            Some("skill_conflict")
+        );
+    }
     #[test]
     fn bundled_setup_skill_sources_parse() {
         for &(name, source) in BUNDLED_SKILLS {

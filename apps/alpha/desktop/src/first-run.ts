@@ -5,7 +5,8 @@
 //   momso_username_set({ username }) → { state: 'ok' | 'invalid_username' | 'unavailable', username }
 //   받는 글자: 영문자·숫자·- _ . (94자까지, .git·.wiki 로 끝나면 안 됨)
 import { invoke } from '@tauri-apps/api/core'
-import { getProviderAuth, isConnected } from './provider-auth'
+import { isMissingCommand } from './ai-models'
+import { getProviderAuth, isConnected, providerFirstRunEligible } from './provider-auth'
 
 export type UsernameResult = { state: string; username: string | null }
 
@@ -55,7 +56,7 @@ export async function checkFirstRun(): Promise<FirstRunCheck> {
   if (username && firstRunMarked()) return { show: false, username, nameStep }
   let connected = false
   try {
-    connected = (await getProviderAuth()).some(isConnected)
+    connected = await firstRunEligible()
   } catch {
     return { show: true, username, nameStep }
   }
@@ -65,4 +66,17 @@ export async function checkFirstRun(): Promise<FirstRunCheck> {
     return { show: false, username, nameStep }
   }
   return { show: true, username, nameStep }
+}
+
+/**
+ * 첫 실행을 넘어갈 수 있는가. 뒤쪽 provider_first_run_eligible() 의 불리언을 그대로 쓴다(2026-11-17 계약: 화면이 조건을 다시 짜지 않는다).
+ * 그 명령이 없는 예전 뒤쪽에서만 회사 줄의 연결 조건(isConnected)으로 센다. 읽지 못하면 오류를 던진다.
+ */
+export async function firstRunEligible(): Promise<boolean> {
+  try {
+    return await providerFirstRunEligible()
+  } catch (error) {
+    if (!isMissingCommand(error)) throw error
+    return (await getProviderAuth()).some(isConnected)
+  }
 }

@@ -3,7 +3,7 @@
 // 백엔드가 들어오면 momso-public-prep/archive-backend-port-notes.md 의 대화 절과 견준다.
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import type { AiProvider } from './ai-models'
+import { isMissingCommand, type AiProvider } from './ai-models'
 import { isDesktopRuntime } from './runtime'
 
 export type ChatRole = 'user' | 'assistant'
@@ -97,6 +97,56 @@ export async function importChatExport(path: string, provider: ChatImportSource)
   } as ChatImportCounts
 }
 
+/**
+ * 가져오기 전에 세기, 진행, 그만두기(desktop-screen-backend-contract.md "다른 AI의 대화 가져오기", chat-export-import-contract.md).
+ *   chat_import_export_preview({ path, provider }) → { conversations, alreadyImported, unreadable, oldest, newest } (날짜는 UTC 글 또는 null, 저장하지 않음)
+ *   chat_import_export_progress({ requestId, path, provider }) → chat_import_export 와 같은 센 수. 대화 하나마다 chat-import-progress { requestId, processed }.
+ *   chat_import_export_cancel({ requestId }) → 대화 경계에서 멈추고 그 요청 전체를 되돌린다. 그러면 가져오기는 'cancelled' 오류로 끝난다.
+ *   alreadyImported 는 같은 회사·대화 번호가 있는 수(새 말이 이어졌으면 더한다).
+ */
+export type ChatImportPreview = { conversations: number; alreadyImported: number; unreadable: number; oldest: string | null; newest: string | null }
+export async function previewChatExport(path: string, provider: ChatImportSource) {
+  requireChats()
+  const value = await invoke<Partial<ChatImportPreview> | null>('chat_import_export_preview', { path, provider })
+  const n = (v: unknown) => (typeof v === 'number' ? v : 0)
+  return { conversations: n(value?.conversations), alreadyImported: n(value?.alreadyImported), unreadable: n(value?.unreadable), oldest: value?.oldest ?? null, newest: value?.newest ?? null } as ChatImportPreview
+}
+export async function importChatExportWithProgress(requestId: string, path: string, provider: ChatImportSource, onProgress: (processed: number) => void) {
+  requireChats()
+  const stop = await listen<{ requestId: string; processed: number }>('chat-import-progress', (event) => {
+    if (event.payload?.requestId === requestId) onProgress(event.payload.processed)
+  })
+  try {
+    const value = await invoke<Partial<ChatImportCounts> | null>('chat_import_export_progress', { requestId, path, provider })
+    const n = (key: keyof ChatImportCounts) => (typeof value?.[key] === 'number' ? value[key] as number : 0)
+    return {
+      imported: n('imported'), duplicate: n('duplicate'), skipped: n('skipped'), omittedNonTextMessages: n('omittedNonTextMessages'),
+      omittedAttachments: n('omittedAttachments'), updated: n('updated'), addedMessages: n('addedMessages'), conflicts: n('conflicts'),
+    } as ChatImportCounts
+  } finally {
+    stop()
+  }
+}
+export async function cancelChatImport(requestId: string) {
+  requireChats()
+  await invoke<null>('chat_import_export_cancel', { requestId })
+}
+
+/**
+ * 채팅방 GitHub 백업(archive-backend-port-notes.md "채팅방 GitHub 백업 계약").
+ *   chat_archive_redaction_count({ chatId }) → 마지막 사본에서 가린 부분의 수, 사본이 없으면 null(읽기 실패는 오류).
+ *   chat-archive-changed { chatId, state: 'saved' | 'unavailable' } — 사본을 쓰고 나면 온다.
+ */
+export async function chatRedactionCount(chatId: string) {
+  requireChats()
+  const value = await invoke<number | null>('chat_archive_redaction_count', { chatId })
+  return typeof value === 'number' ? value : null
+}
+export async function listenChatArchiveChanged(onChanged: (chatId: string | null, state: string | null) => void) {
+  if (!isDesktopRuntime()) return () => {}
+  return listen<{ chatId?: string | null; state?: string | null }>('chat-archive-changed', (event) => onChanged(event.payload?.chatId ?? null, event.payload?.state ?? null))
+}
+
 export async function createChat() {
   requireChats()
   return invoke<ChatEntry>('chat_create')
@@ -115,6 +165,32 @@ export async function renameChat(id: string, title: string) {
 export async function searchChats(query: string) {
   requireChats()
   return invoke<ChatSearchResult[]>('chat_search', { query })
+}
+
+/**
+ * 채팅 찾기 쪽 나눔(2026-11-17, 여섯째 줄 CHAT-SEARCH-PAGING-G33, 본부가 옮겨 준 알맹이).
+ *   chat_search_page({ query, offset }) → { items, hasMore, nextOffset }. items 는 chat_search 와 같은 꼴, 한 번에 많아야 80개.
+ *   처음엔 offset 0, 이어 받을 땐 앞의 nextOffset. 차례: 고정한 것 먼저, 최근에 고친 순, 같은 때면 ID 내림차순.
+ *   결과가 바뀌는 동안 이어 받으면 겹치거나 빠질 수 있다 → 찾는 말이나 채팅방 목록이 바뀌면 처음부터 다시 찾는다.
+ * 이 명령이 아직 없는 뒤쪽이면 옛 chat_search 의 배열을 한 쪽으로 돌려준다(hasMore false). 한 번 없다고 알면 다시 묻지 않는다.
+ */
+export type ChatSearchPage = { items: ChatSearchResult[]; hasMore: boolean; nextOffset: number | null }
+let searchPageMissing = false
+export async function searchChatsPage(query: string, offset = 0): Promise<ChatSearchPage> {
+  requireChats()
+  if (!searchPageMissing) {
+    try {
+      const value = await invoke<Partial<ChatSearchPage> | null>('chat_search_page', offset ? { query, offset } : { query })
+      const items = Array.isArray(value?.items) ? value.items : []
+      const nextOffset = typeof value?.nextOffset === 'number' ? value.nextOffset : null
+      return { items, hasMore: value?.hasMore === true && nextOffset !== null, nextOffset }
+    } catch (error) {
+      if (!isMissingCommand(error)) throw error
+      searchPageMissing = true
+    }
+  }
+  if (offset) return { items: [], hasMore: false, nextOffset: null }
+  return { items: await searchChats(query), hasMore: false, nextOffset: null }
 }
 
 // ---- 채팅방 고정·보관·되돌리기·영구 삭제(2026-11-16 김성균 개발자의 지시). 계약: archive-backend-port-notes.md "T38 채팅방 지우기".
@@ -174,11 +250,16 @@ export async function listenChatListUpdated(handler: () => void) {
 // 클로드가 연결되지 않았으면 { status: 'not_connected' }. 클로드 고속 모드를 지금 쓸 수 없다고 보내기 전에 확인되면 { status: 'fast_unavailable' }.
 // 둘 다 말을 저장하지 않는다. 코덱스의 fast 는 그대로 전달된다(적용됐는지는 확인되지 않아 chat-done 의 fastState 가 unavailable).
 // 고속 모드로 보낸 뒤 실패하면 백엔드가 그 말에 다시 보내기 표시를 남기고, 같은 글을 다시 보내면 그 말을 다시 쓴다(두 번 남지 않는다).
-export type SendResult = { status: 'started' | 'unavailable' | 'not_connected' | 'skill_unavailable' | 'fast_unavailable' | string }
+/**
+ * chat_send 의 결과. 보내기가 시작되면 { status: 'started', userMessageId, handoffLimit }.
+ * retryMessageId(답을 받지 못한 내 말의 id)를 주면 저장된 그 말(글·스킬·첨부)로 다시 보내고 새 말을 더하지 않는다.
+ * 다시 보낼 수 없는 말이면 { status: 'retry_unavailable' } (archive-backend-port-notes.md T52·T55).
+ */
+export type SendResult = { status: 'started' | 'unavailable' | 'not_connected' | 'skill_unavailable' | 'fast_unavailable' | 'retry_unavailable' | string; userMessageId?: string | null }
 
-export async function sendChatMessage(chatId: string, text: string, provider: AiProvider, model: string | null, effort: string | null, fast: boolean | null = null, skill: string | null = null) {
+export async function sendChatMessage(chatId: string, text: string, provider: AiProvider, model: string | null, effort: string | null, fast: boolean | null = null, skill: string | null = null, retryMessageId: string | null = null) {
   requireChats()
-  return invoke<SendResult>('chat_send', { chatId, text, provider, model, effort, ...(fast === null ? {} : { fast }), ...(skill === null ? {} : { skill }) })
+  return invoke<SendResult>('chat_send', { chatId, text, provider, model, effort, ...(fast === null ? {} : { fast }), ...(skill === null ? {} : { skill }), ...(retryMessageId === null ? {} : { retryMessageId }) })
 }
 
 /**
@@ -228,7 +309,8 @@ export type ChatDoneEvent = { chatId: string; messageId?: string | null; message
  * checkBilling, switchModel, switchProvider, shorten(그리고 뒤쪽 코드의 install). providerCode 는 확인된 제한 코드만(화면에 보이지 않는다).
  */
 export type ChatFailureInfo = { kind: string; retryAt?: number | string | null; actions?: string[] | null; providerCode?: string | null }
-export type ChatErrorEvent = { chatId: string; reason?: string | null; message?: string | null; status?: string | null; notHandedOver?: number | null; messageId?: string | null; error?: ChatFailureInfo | null }
+/** userMessageId: 답을 받지 못한 내 말의 id(다시 보내기에 쓴다). messageId 는 끊긴 답의 id 로 둘은 다르다. */
+export type ChatErrorEvent = { chatId: string; reason?: string | null; message?: string | null; status?: string | null; notHandedOver?: number | null; messageId?: string | null; userMessageId?: string | null; error?: ChatFailureInfo | null }
 
 export type ChatEventHandlers = {
   onStream: (event: ChatStreamEvent) => void

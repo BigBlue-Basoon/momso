@@ -39,15 +39,19 @@ export function AppFolderSetting({ fallbackOpen }: { fallbackOpen: (path: string
   const [oneDrive, setOneDrive] = useState(false)
   // 옮긴 뒤 그대로 남은 예전 폴더의 경로(경로를 모르면 빈 글자).
   const [kept, setKept] = useState<string | null>(null)
+  // 위치를 읽는 중 / 읽음 / 읽지 못함(두 명령 모두 실패). 위치가 비고 단추만 잠겨 있지 않게 한 줄(2026-11-17).
+  const [pathState, setPathState] = useState<'loading' | 'ok' | 'failed'>('loading')
 
-  useEffect(() => {
+  const loadPath = useCallback(() => {
+    setPathState('loading')
     getFolderLocation()
-      .then((location) => { setPath(location.path); setMovable(true) })
+      .then((location) => { setPath(location.path); setMovable(true); setPathState('ok') })
       .catch(() => {
         setMovable(false)
-        getArchiveStatus().then((status) => setPath(status.path)).catch(() => setPath(null))
+        getArchiveStatus().then((status) => { setPath(status.path); setPathState('ok') }).catch(() => { setPath(null); setPathState('failed') })
       })
   }, [])
+  useEffect(() => { loadPath() }, [loadPath])
 
   // 옮긴 결과를 화면에 적는다(위치 바꾸기의 결과와 끝 이벤트가 같은 길로 온다).
   const applyResult = useCallback(async (result: FolderMoveResult, picked?: string) => {
@@ -114,6 +118,13 @@ export function AppFolderSetting({ fallbackOpen }: { fallbackOpen: (path: string
         </div>
       </div>
       {path && <p className="app-folder-path" title={path}>{path}</p>}
+      {!path && pathState === 'loading' && <p className="settings-checking" role="status">{W.appSettingsParts.pathLoading(W.appFolder)}</p>}
+      {!path && pathState === 'failed' && (
+        <div className="settings-problem" role="alert">
+          <p>{W.appSettingsParts.pathFailed(W.appFolder)}</p>
+          <button className="secondary-button" type="button" onClick={loadPath}>{W.firstRun.retry}</button>
+        </div>
+      )}
       {moving && (
         ratio === null ? (
           <div className="app-folder-progress is-indeterminate" role="status" aria-label={W.appSettingsParts.aria1}>

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Check } from 'lucide-react'
 import { archiveErrorMessage } from '../archive'
 import { getUserProfile, setUserProfile } from '../profile'
@@ -19,7 +19,8 @@ export function UserProfileSettings() {
   const [notice, setNotice] = useState<{ kind: 'done' | 'error'; text: string } | null>(null)
   const noticeTimer = useRef<number | null>(null)
 
-  useEffect(() => {
+  const load = useCallback(() => {
+    setReady(null)
     getUserProfile()
       .then((profile) => {
         const value = { name: profile.name ?? '', about: profile.about ?? '', style: profile.style ?? '' }
@@ -28,10 +29,13 @@ export function UserProfileSettings() {
         setReady(true)
       })
       .catch(() => setReady(false))
+  }, [])
+  useEffect(() => {
+    load()
     return () => {
       if (noticeTimer.current) window.clearTimeout(noticeTimer.current)
     }
-  }, [])
+  }, [load])
 
   const dirty = draft.name !== saved.name || draft.about !== saved.about || draft.style !== saved.style
   const disabled = ready !== true
@@ -63,6 +67,14 @@ export function UserProfileSettings() {
   return (
     <section className="settings-group user-profile" aria-label={W.userProfileSettings.aria1} aria-disabled={disabled || undefined}>
       <p className="user-profile-lead">{W.userProfileSettings.text3(W.provider.codex, W.provider.claude, W.provider.gemini)}</p>
+      {/* 읽는 동안·읽지 못했을 때 칸만 잠겨 있지 않게 한 줄(2026-11-17). 읽지 못하면 저장은 계속 막는다(덮어쓰지 않게). */}
+      {ready === null && <p className="settings-checking" role="status">{W.userProfileSettings.loading}</p>}
+      {ready === false && (
+        <div className="settings-problem" role="alert">
+          <p>{W.userProfileSettings.failed}</p>
+          <button className="secondary-button" type="button" onClick={load}>{W.firstRun.retry}</button>
+        </div>
+      )}
       <label className="setting-field">
         <span>{W.userProfileSettings.text4}</span>
         <input

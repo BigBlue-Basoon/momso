@@ -1,7 +1,7 @@
-import { Check, Copy, Wand2 } from 'lucide-react'
+import { Check, Copy, Globe, Wand2 } from 'lucide-react'
 import { ShortcutTip } from './ShortcutTip'
 import { W } from '../words'
-import { Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
+import { Fragment, memo, type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { PROVIDER_NAME, type AiProvider } from '../ai-models'
 import type { ApprovalChoice } from '../approvals'
 import { ApprovalCard, type ApprovalItem } from './ApprovalCard'
@@ -30,6 +30,12 @@ export type ChatViewMessage = {
 }
 
 const MARK: Record<AiProvider, ProviderMarkId> = { codex: 'chatgpt', claude: 'claude', gemini: 'gemini' }
+/**
+ * 말이 많은 채팅방을 열 때 처음에 그리는 말의 수와, 그 위의 옛 말을 이어서 그리는 한 번의 수(2026-11-17 많이 쌓였을 때 재기:
+ * 말 500개 채팅방을 여는 데 1.4초). 다 그려진 뒤의 모습은 같다. 처음 보이는 것은 늘 맨 아래 말들이다.
+ */
+const FIRST_WINDOW = 60
+const FILL_STEP = 40
 
 // 답의 모습. 'a'(기본): 글씨는 세 곳이 같고 답 머리에 회사 로고. 'b': a + 회사마다 아주 조금 다른 글자 색.
 // 개발용 실행에서만 localStorage 'momso.dev.answerStyle' 에 'b' 를 넣고 새로 고치면 b 로 볼 수 있다. 내보내는 빌드는 늘 'a'.
@@ -63,6 +69,8 @@ type AssistantPanelProps = {
   onOpenDocument: (id: string) => void
   /** 채팅방 안의 알림 한 줄(앞의 내용을 줄여 담음 등). at 은 그때까지의 말 수. */
   notices?: Array<{ id: string; at: number; text: string }>
+  /** 이 채팅방의 몸소 브라우저가 열려 있는지(browser-session-updated, browser_session_status). */
+  browserOpen?: boolean
   /** 스킬로 하는 연결에서 키를 넣어 달라는 물음(끝난 것은 한 줄로 남는다). */
   secretRequests?: SecretItem[]
   onSubmitSecret?: (requestId: string, values: Record<string, string>) => void
@@ -89,19 +97,50 @@ export function AssistantPanel({
   onAnswerApproval,
   onOpenDocument,
   notices = [],
+  browserOpen = false,
   secretRequests = [],
   onSubmitSecret,
   onCancelSecret,
   failure = null,
 }: AssistantPanelProps) {
   // 답은 보는 창과 같은 도구로 그린다(목록, 굵은 글씨, 제목, 코드, 표, 링크). 링크는 앱의 여는 방식(opener)으로.
-  const openAddress = (address: string) => { void openWebAddress(address).catch(() => {}) }
+  // 두 손잡이는 늘 같은 함수로 넘긴다: 입력창에 글자를 칠 때나 답이 흘러 들어올 때 지난 말들을 다시 그리지 않게(2026-11-17 많이 쌓였을 때 재기).
+  const openAddress = useCallback((address: string) => { void openWebAddress(address).catch(() => {}) }, [])
+  const openDocumentRef = useRef(onOpenDocument)
+  openDocumentRef.current = onOpenDocument
+  const openDocument = useCallback((id: string) => openDocumentRef.current(id), [])
   const panelRef = useRef<HTMLElement>(null)
   const streamRef = useRef<HTMLDivElement>(null)
   const userMessageCount = messages.filter((message) => message.role === 'user').length
   // 마지막 답의 복사 단추와 때는 늘 보이고(Aside 앱 사진처럼), 나머지 말은 올렸을 때만 보인다.
   const lastAssistantIndex = messages.map((message) => message.role).lastIndexOf('assistant')
   const shownTitle = title.trim() || W.assistantPanel.text1
+
+  // 채팅방이 바뀌면(첫 말이 다르면) 맨 아래 FIRST_WINDOW 개만 먼저 그리고, 옛 말은 쉬는 틈마다 FILL_STEP 개씩 위에 더한다.
+  const firstId = messages[0]?.id ?? ''
+  const [windowStart, setWindowStart] = useState(() => ({ firstId, from: Math.max(0, messages.length - FIRST_WINDOW) }))
+  if (windowStart.firstId !== firstId) setWindowStart({ firstId, from: Math.max(0, messages.length - FIRST_WINDOW) })
+  const shownFrom = windowStart.firstId === firstId ? Math.min(windowStart.from, messages.length) : 0
+  useEffect(() => {
+    if (shownFrom <= 0) return
+    const timer = window.setTimeout(() => {
+      const stream = streamRef.current
+      fillAnchor.current = stream ? stream.scrollHeight - stream.scrollTop : null
+      setWindowStart((current) => (current.firstId === firstId ? { firstId, from: Math.max(0, current.from - FILL_STEP) } : current))
+    }, 16)
+    return () => window.clearTimeout(timer)
+  }, [firstId, shownFrom])
+  // 옛 말을 위에 더해도 보던 자리를 지킨다: 위로 올려 읽지 않았으면 맨 아래에, 올려 읽는 중이면 보던 말 그대로.
+  const fillAnchor = useRef<number | null>(null)
+  const readingUp = useRef(false)
+  useEffect(() => { readingUp.current = false }, [firstId])
+  useLayoutEffect(() => {
+    const stream = streamRef.current
+    const anchor = fillAnchor.current
+    fillAnchor.current = null
+    if (!stream || anchor === null) return
+    stream.scrollTop = readingUp.current ? stream.scrollHeight - anchor : stream.scrollHeight
+  }, [shownFrom])
 
   // 답한 물음은 물음이 왔던 자리(그때까지의 말 뒤)에 한 줄로 남고, 답을 기다리는 물음은 대화 끝에 뜬다.
   const answeredAt = (index: number) => approvals.filter((item) => item.status === 'answered' && Math.min(item.at, messages.length) === index)
@@ -143,12 +182,24 @@ export function AssistantPanel({
     <section ref={panelRef} className="assistant-panel" aria-label={W.assistantPanel.aria1} data-answer-style={ANSWER_STYLE}>
       <header className="assistant-header">
         <ChatTitle key={shownTitle} title={shownTitle} canRename={canRename} onRename={onRename} />
+        {browserOpen && (
+          <span className="assistant-browser" role="status">
+            <Globe size={13} aria-hidden />{W.assistantPanel.browserOpen}
+          </span>
+        )}
         {headerActions && <div className="assistant-header-actions">{headerActions}</div>}
       </header>
 
       <MessageRail streamRef={streamRef} userMessageCount={userMessageCount} />
 
-      <div ref={streamRef} className="message-stream" aria-live="polite">
+      <div
+        ref={streamRef}
+        className="message-stream"
+        aria-live="polite"
+        onWheel={(event) => { if (event.deltaY < 0) readingUp.current = true }}
+        onKeyDown={(event) => { if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) readingUp.current = true }}
+        onPointerDown={(event) => { if (event.target === event.currentTarget) readingUp.current = true }}
+      >
         {/* 아직 말이 없는 채팅방(홈): 한가운데에 몸소 CI 와 한 줄(2026-11-16 그의 말, Codex 앱의 빈 화면처럼). 첫 말을 보내면 사라진다.
             CI 는 docs/brand 의 메인 로고 agar yoga(인앱 로고) 심볼만, Codex 앱처럼 무채색으로(2026-11-16 그의 말 "심볼 넣을 떄 무채색으로").
             public/brand/agar-yoga-mono-mask.png 는 원본(agar-yoga.png = agar-yoga-mark-transparent.png)에서 만든 한 색 가림판 사본이다. */}
@@ -158,48 +209,23 @@ export function AssistantPanel({
             <p className="chat-empty-title">{W.assistantPanel.emptyTitle}</p>
           </div>
         )}
-        {messages.map((message, index) => (
+        {messages.slice(shownFrom).map((message, offset) => {
+          const index = shownFrom + offset
+          return (
           <Fragment key={message.id}>
             {answeredAt(index).map(renderApproval)}
             {secretsDoneAt(index).map(renderSecret)}
             {noticesAt(index).map(renderNotice)}
-            {Boolean(message.notHandedOver) && message.provider && (
-              <p className="message-notice" role="note">{W.assistantPanel.text2(PROVIDER_NAME[message.provider], message.notHandedOver ?? 0)}</p>
-            )}
-            {message.role === 'user' ? (
-              // 내 말: 이름표 없이 말풍선만(두 앱처럼 오른쪽에).
-              <div className="message user">
-                {message.skill && (
-                  <span className="message-skill" aria-label={W.skills.usedLabel(message.skill)}>
-                    <Wand2 size={12} aria-hidden />{message.skill}
-                  </span>
-                )}
-                {message.text && <p>{message.text}</p>}
-                {message.text && <MessageActions text={message.text} at={message.createdAt} side="user" />}
-              </div>
-            ) : (
-              // AI 의 답: 말풍선 없이 바탕 위에 글. 답한 회사를 알면 머리에 그 회사 로고를 작게(올리면 모델 이름).
-              <div className="message assistant" data-provider={message.provider ?? undefined}>
-                {message.provider && (
-                  <span className="message-by" title={answeredBy(message.provider, message.modelLabel)}>
-                    <ProviderMark provider={MARK[message.provider]} className="message-by-mark" />
-                    <span className="sr-only">{answeredBy(message.provider, message.modelLabel)}</span>
-                  </span>
-                )}
-                <ZetMarkdown text={message.text} onOpenZet={onOpenDocument} onOpenAddress={openAddress} />
-                {message.text && (
-                  <MessageActions text={message.text} at={message.createdAt} side="assistant" always={index === lastAssistantIndex && !isGenerating} />
-                )}
-              </div>
-            )}
-            {/* 끊긴 답에만 그 아래 한 줄. 까닭은 답에 저장돼 앱을 다시 켜도 남는다. 모르는 값이면 적지 않는다. */}
-            {/* 답이 오지 않은 까닭 줄(failure)이 보이면 마지막 답의 "문제가 생겨 끊겼습니다"는 같은 말이라 두지 않는다. */}
-            {message.role === 'assistant' && message.endReason && W.assistantPanel.endReason[message.endReason]
-              && !(failure && !isGenerating && index === lastAssistantIndex && message.endReason === 'error') && (
-              <p className="message-notice message-end" role="note">{W.assistantPanel.endReason[message.endReason]}</p>
-            )}
+            <MessageItem
+              message={message}
+              always={message.role === 'assistant' && index === lastAssistantIndex && !isGenerating}
+              hideEnd={Boolean(failure && !isGenerating && index === lastAssistantIndex && message.endReason === 'error')}
+              onOpenDocument={openDocument}
+              onOpenAddress={openAddress}
+            />
           </Fragment>
-        ))}
+          )
+        })}
         {answeredAt(messages.length).map(renderApproval)}
         {secretsDoneAt(messages.length).map(renderSecret)}
         {noticesAt(messages.length).map(renderNotice)}
@@ -235,6 +261,69 @@ export function AssistantPanel({
     </section>
   )
 }
+
+type MessageItemProps = {
+  message: ChatViewMessage
+  /** 마지막 답이면 복사 단추와 때를 늘 보인다. */
+  always: boolean
+  /** 답이 오지 않은 까닭 줄이 보이면 마지막 답의 "문제가 생겨 끊겼습니다"는 같은 말이라 두지 않는다. */
+  hideEnd: boolean
+  onOpenDocument: (id: string) => void
+  onOpenAddress: (address: string) => void
+}
+
+/** 말 하나가 그리는 데 쓰는 값이 같으면 다시 그리지 않는다(App 이 그릴 때마다 말 목록을 새로 만들어도). */
+function sameMessage(a: MessageItemProps, b: MessageItemProps) {
+  const x = a.message
+  const y = b.message
+  return a.always === b.always && a.hideEnd === b.hideEnd && a.onOpenDocument === b.onOpenDocument && a.onOpenAddress === b.onOpenAddress
+    && x.id === y.id && x.role === y.role && x.text === y.text && x.provider === y.provider && x.modelLabel === y.modelLabel
+    && x.notHandedOver === y.notHandedOver && x.skill === y.skill && x.endReason === y.endReason && x.createdAt === y.createdAt
+}
+
+/** 대화의 말 하나: 넘기지 못한 말 알림, 내 말(말풍선) 또는 AI 의 답, 끊긴 답의 까닭 한 줄. */
+const MessageItem = memo(function MessageItem({ message, always, hideEnd, onOpenDocument, onOpenAddress }: MessageItemProps) {
+  return (
+    <>
+      {Boolean(message.notHandedOver) && message.provider && (
+        <p className="message-notice" role="note">{W.assistantPanel.text2(PROVIDER_NAME[message.provider], message.notHandedOver ?? 0)}</p>
+      )}
+      {message.role === 'user' ? (
+        // 내 말: 이름표 없이 말풍선만(두 앱처럼 오른쪽에).
+        <div className="message user">
+          {message.skill && (
+            <span className="message-skill" aria-label={W.skills.usedLabel(message.skill)}>
+              <Wand2 size={12} aria-hidden />{message.skill}
+            </span>
+          )}
+          {message.text && <p>{message.text}</p>}
+          {message.text && <MessageActions text={message.text} at={message.createdAt} side="user" />}
+        </div>
+      ) : (
+        // AI 의 답: 말풍선 없이 바탕 위에 글. 답한 회사를 알면 머리에 그 회사 로고를 작게(올리면 모델 이름).
+        <div className="message assistant" data-provider={message.provider ?? undefined}>
+          {/* 가져온 대화의 답은 provider 가 세 회사가 아닌 값(예: 'chatgpt')으로 온다(2026-11-17 실제 앱). 모르는 값이면 로고를 그리지 않는다(화면 전체가 깨지지 않게). */}
+          {message.provider && MARK[message.provider] && (
+            <span className="message-by" title={answeredBy(message.provider, message.modelLabel)}>
+              <ProviderMark provider={MARK[message.provider]} className="message-by-mark" />
+              <span className="sr-only">{answeredBy(message.provider, message.modelLabel)}</span>
+            </span>
+          )}
+          <ZetMarkdown text={message.text} onOpenZet={onOpenDocument} onOpenAddress={onOpenAddress} />
+          {message.text && (
+            <MessageActions text={message.text} at={message.createdAt} side="assistant" always={always} />
+          )}
+        </div>
+      )}
+      {/* 끊긴 답에만 그 아래 한 줄. 까닭은 답에 저장돼 앱을 다시 켜도 남는다. 모르는 값이면 적지 않는다. */}
+      {/* 답이 오지 않은 까닭 줄(failure)이 보이면 마지막 답의 "문제가 생겨 끊겼습니다"는 같은 말이라 두지 않는다. */}
+      {message.role === 'assistant' && message.endReason && W.assistantPanel.endReason[message.endReason]
+        && !hideEnd && (
+        <p className="message-notice message-end" role="note">{W.assistantPanel.endReason[message.endReason]}</p>
+      )}
+    </>
+  )
+}, sameMessage)
 
 const timeOfDay = new Intl.DateTimeFormat('ko-KR', { hour: 'numeric', minute: '2-digit' })
 const monthDay = new Intl.DateTimeFormat('ko-KR', { month: 'long', day: 'numeric' })

@@ -423,6 +423,8 @@ button:disabled {
   background: var(--surface);
 }
 
+.assistant-browser { display: inline-flex; flex: none; align-items: center; gap: 4px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+
 .message-stream {
   min-height: 0;
   overflow-y: auto;
@@ -1171,6 +1173,9 @@ button:disabled {
 .archived-date { color: var(--faint); font-size: 11px; }
 .archived-actions { display: flex; flex: none; gap: 6px; opacity: 0; transition: opacity 120ms ease; }
 .archived-row:hover .archived-actions, .archived-actions:focus-within { opacity: 1; }
+/* 작업 내역 탭 머리의 ⋯ 메뉴(2026-11-17, 첨부파일 줄의 메뉴와 같은 단추). 머리에는 늘 보인다. */
+.receipt-head-title { position: relative; padding-right: 32px; }
+.receipt-head-title .chat-more { opacity: 1; }
 .archived-remove { padding-inline: 9px; }
 @media (prefers-reduced-motion: reduce) { .archived-actions { transition: none; } }
 .skills-empty { display: grid; justify-items: start; gap: 8px; padding: 22px 0; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
@@ -1181,6 +1186,7 @@ button:disabled {
 .skills-row-main:hover { background: rgba(40, 43, 42, 0.035); }
 .skills-row-title { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--ink); font-size: 13px; font-weight: 600; }
 .skills-row-description { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.skills-row-unavailable { color: var(--coral); font-size: 12px; line-height: 1.5; }
 .skills-row-name { color: var(--faint); font-size: 11px; }
 .skills-tag { padding: 1px 6px; border-radius: 999px; background: var(--surface-muted); color: var(--muted); font-size: 10.5px; font-weight: 600; }
 .skills-tag.is-warn { color: #c26a1d; }
@@ -1221,6 +1227,9 @@ button:disabled {
 .provider-key-form input { flex: 1; min-width: 0; height: 30px; padding: 0 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); font: inherit; font-size: 12.5px; }
 .provider-key-form input:disabled { background: var(--surface-soft); }
 .provider-error { margin: 0; color: var(--coral); font-size: 12px; }
+.provider-key-problem { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+/* GitHub 에서 처음 받아 오는 동안의 한 줄과 막대(2026-11-17). */
+.backup-receive { display: grid; gap: 6px; color: var(--ink-soft); font-size: 12px; }
 /* 다른 AI 의 대화 가져오기: AI 연결의 회사 줄과 같은 꼴을 쓴다. */
 /* 바로 위 회사 줄이 선으로 끝나므로 이 묶음의 윗선은 두지 않는다(선 두 줄과 빈 곳이 겹치지 않게). */
 .chat-import { border-top: 0; padding-top: 12px; }
@@ -1291,4 +1300,36 @@ button:disabled {
 .term-mine { padding: 1px 7px; border-radius: 999px; background: var(--surface-muted); color: var(--ink-soft); font-size: 11px; }
 .term-meaning { margin: 0; color: var(--ink-soft); font-size: 12.5px; line-height: 1.55; word-break: keep-all; }
 .term-spellings { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0 0; }
-.term-spelling { padding: 1px 7px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink-soft); font-size: 11.5px; }
+.term-spelling { display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink-soft); font-size: 11.5px; }
+.term-tabs { display: flex; gap: 4px; margin: 0 0 10px; }
+.term-tabs button { height: 28px; padding: 0 12px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font: inherit; font-size: 12.5px; cursor: pointer; }
+.term-tabs button:hover { color: var(--ink); }
+.term-tabs button.is-active { background: var(--surface-muted); color: var(--ink); font-weight: 650; }
+.term-note.is-alert { color: var(--coral); }
+.term-row-main { display: grid; gap: 4px; width: 100%; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.term-row-main .term-meaning { display: block; }
+.term-row.is-off .term-head strong, .term-row.is-off .term-meaning { color: var(--faint); }
+.term-editor { display: grid; gap: 8px; margin-top: 6px; padding: 10px 0 2px; }
+.term-spelling-remove { display: inline-grid; place-items: center; width: 15px; height: 15px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; }
+.term-spelling-remove:hover:not(:disabled) { background: var(--surface-muted); color: var(--ink); }
+.term-inline { display: flex; gap: 6px; }
+.term-inline input { flex: 1; min-width: 0; height: 30px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12.5px; }
+.term-inline .secondary-button { flex: none; }
+.term-use { display: flex; align-items: center; justify-content: space-between; color: var(--ink-soft); font-size: 12.5px; }
+.term-form { display: grid; gap: 10px; margin: 0 0 14px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.term-row .term-form { margin: 0; border-bottom: 0; }
+.term-form-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.term-person { grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; }
+.term-person-main { display: grid; gap: 4px; min-width: 0; }
+.term-person-actions { display: flex; gap: 6px; }
+/* 사람 이름 칸: 용어 칸처럼 갈래 머리가 없어 수 줄과 목록 사이를 띄운다. */
+.term-count + .term-rows { margin-top: 8px; }
+
+/* 설정에서 읽지 못했을 때의 한 줄과 다시 시도(2026-11-17, 첫 실행의 같은 글 꼴). */
+.settings-problem { display: flex; align-items: center; gap: 10px; margin-top: 8px; color: var(--coral); font-size: 12.5px; }
+.settings-problem p { margin: 0; }
+/* 2026-11-17 기다릴 때의 한 줄(설정)과 알림·백업 줄 안의 다시 시도. */
+.settings-checking { display: flex; align-items: center; gap: 6px; margin: 8px 0 0; color: var(--muted); font-size: 12.5px; }
+.workbench-toast-action { margin-left: 10px; }
+.backup-inline-retry { margin-left: 8px; }
+.empty-queue .secondary-button { margin-top: 8px; }

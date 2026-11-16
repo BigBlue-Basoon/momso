@@ -11,8 +11,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:bundle": "node scripts/prepare-mingit.mjs && node scripts/prepare-node.mjs && npm run build",
-    "test:mingit": "node --test scripts/prepare-mingit.test.mjs",
+    "build:bundle": "node scripts/prepare-node.mjs && npm run build",
     "test": "tsx --test tests/source-import.test.ts tests/feedback-removal.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"

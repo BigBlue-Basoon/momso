@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import { Check } from 'lucide-react'
 import { findZetId, readZet } from '../archive'
 import { PROVIDER_NAME, type AiProvider } from '../ai-models'
-import { CHOICE_DONE, CHOICE_LABEL, approvalChange, orderedChoices, type ApprovalChange, type ApprovalChoice, type ApprovalRequest, type SetupAction } from '../approvals'
+import { CHOICE_DONE, CHOICE_LABEL, approvalChange, isBrowserApproval, orderedChoices, type ApprovalChange, type ApprovalChoice, type ApprovalRequest, type SetupAction } from '../approvals'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 import './ApprovalCard.css'
 
@@ -145,6 +145,65 @@ function SetupApprovalCard({ item, setup, onAnswer }: { item: ApprovalItem; setu
 }
 
 /**
+ * 몸소 브라우저의 물음(browser.ts). 머리 글, 하려는 일(뒤쪽이 적어 준 글 그대로: 스킬·작업·버튼 이름, 입력이면 입력할 값),
+ * 사이트, 누르면 생기는 일(효과 값을 쉬운 말로, 모르는 값이면 적지 않음). 읽기만에서 바꾸는 일로 넘어가는 물음에는
+ * "허락해도 누를 때마다 다시 묻는다"는 한 줄. 단추는 "이번만 허락"과 "거절"(orderedChoices).
+ * reason 은 AI 의 까닭 글이 아니라 값이라(scope, publish …) 까닭 줄로 보이지 않는다.
+ */
+function BrowserApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer: (choice: ApprovalChoice) => void }) {
+  const { request } = item
+  const words = W.approvalCard.browser
+  const who = providerName(request.provider)
+  const scope = request.kind === 'browser_action_scope'
+  const site = request.targets?.[0]?.path?.trim() || null
+  const effect = !scope && request.reason ? (words.effect as Record<string, string>)[request.reason] ?? null : null
+  const subject = request.description.trim()
+
+  if (item.status === 'answered' && item.choice) {
+    return (
+      <p className="approval-done">
+        <Check size={13} aria-hidden />
+        <span>{CHOICE_DONE[item.choice]}</span>
+        {subject && <span className="approval-done-subject">{subject}</span>}
+      </p>
+    )
+  }
+
+  const choices = orderedChoices(request.options, request)
+  const mark = MARK[request.provider as AiProvider]
+  return (
+    <section className="approval-card is-setup is-browser" role="group" aria-label={W.approvalCard.aria1} aria-busy={item.status === 'sending'}>
+      <div className="approval-head">
+        {mark && <ProviderMark provider={mark} className="approval-mark" />}
+        <strong>{scope ? words.scopeHead(who) : words.actionHead(who)}</strong>
+      </div>
+      {subject && <p className="approval-subject is-plain">{subject}</p>}
+      {(site || effect) && (
+        <dl className="approval-facts">
+          {site && <div><dt>{words.site}</dt><dd>{site}</dd></div>}
+          {effect && <div><dt>{words.result}</dt><dd>{effect}</dd></div>}
+        </dl>
+      )}
+      {scope && <p className="approval-reason">{words.scopeNote}</p>}
+      {item.error && <p className="approval-error" role="alert">{item.error}</p>}
+      <div className="approval-actions">
+        {choices.map((choice) => (
+          <button
+            key={choice}
+            className={choice === 'allow_once' ? 'approval-button is-primary' : 'approval-button'}
+            type="button"
+            disabled={item.status === 'sending'}
+            onClick={() => onAnswer(choice)}
+          >
+            {CHOICE_LABEL[choice]}
+          </button>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+/**
  * 대화 안에서 허락을 묻는 물음. Claude 앱의 대화 안 물음 상자처럼 대화 흐름 끝에 둥근 상자로 뜨고,
  * 무엇을 하려는지와 답 단추(그 AI 가 받는 것만)를 보인다. 답하면 고른 것을 적은 한 줄로 줄어 대화에 남는다.
  */
@@ -165,6 +224,7 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
     : request.kind === 'command' ? command : request.description
 
   if (request.kind === 'setup_change' && request.setup) return <SetupApprovalCard item={item} setup={request.setup} onAnswer={onAnswer} />
+  if (isBrowserApproval(request)) return <BrowserApprovalCard item={item} onAnswer={onAnswer} />
 
   if (item.status === 'answered' && item.choice) {
     return (

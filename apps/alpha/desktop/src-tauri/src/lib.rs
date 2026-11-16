@@ -10,7 +10,18 @@ mod archive_zet;
 mod backup;
 mod backup_profile;
 mod backup_remote;
+mod browser_driver;
+mod browser_gateway;
+#[cfg(test)]
+mod browser_policy;
+mod browser_runtime;
 mod chat;
+mod chat_archive_merge;
+mod chat_archive_redact;
+mod chat_archive_snapshot;
+mod chat_archive_status;
+mod chat_archive_store;
+mod chat_archive_tracking;
 mod chat_claude;
 mod chat_claude_items;
 mod chat_codex;
@@ -25,6 +36,9 @@ mod chat_group;
 mod chat_handoff;
 mod chat_items;
 mod chat_recovery;
+mod chat_search_index;
+#[cfg(test)]
+mod command_entry_tests;
 mod connections;
 mod credentials;
 #[allow(dead_code)] // The terminology dictionary is retained for its future interface.
@@ -33,14 +47,18 @@ mod gemini_access;
 mod git_tool;
 #[cfg(test)]
 mod instagram_preview_contract_tests;
+mod install_staging;
 mod media;
 mod momso_mcp;
+#[cfg(test)]
+mod scale_benchmark;
 mod yoga_dictionary;
 
 pub fn serve_mcp_stdio(pipe: Option<String>) -> std::io::Result<()> {
     momso_mcp::serve(pipe.as_deref())
 }
 mod object_store;
+mod object_store_lock;
 mod object_store_restore;
 mod object_store_state;
 mod object_store_transfer;
@@ -48,6 +66,7 @@ mod permission_modes;
 mod process;
 mod provider_auth;
 mod provider_install;
+mod r2_oauth;
 mod records;
 mod runtime;
 #[cfg(windows)]
@@ -61,6 +80,8 @@ mod setup_secret;
 mod skills;
 mod skills_write;
 mod source_assets;
+mod source_delete;
+mod source_integrity;
 mod source_search;
 mod storage;
 mod usage_status;
@@ -80,6 +101,7 @@ struct AppState {
     usage_monitor: Arc<std::sync::atomic::AtomicBool>,
     usage_cache: Arc<usage_status::UsageCache>,
     chat_active: chat_codex::Active,
+    browser: Arc<browser_runtime::BrowserManager>,
 }
 
 #[derive(Serialize)]
@@ -134,6 +156,36 @@ async fn zet_restore_version(
     })
     .await
     .map_err(|_| "이전 글을 복원하지 못했습니다".to_string())?
+}
+
+#[tauri::command]
+async fn source_integrity_list(
+    state: State<'_, AppState>,
+    chat_id: Option<String>,
+    before_id: Option<i64>,
+) -> Result<Vec<source_integrity::IntegrityEvent>, String> {
+    let database = state.paths.database_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        source_integrity::list(&database, chat_id.as_deref(), before_id)
+    })
+    .await
+    .map_err(|_| "storage_error".to_owned())?
+}
+
+#[tauri::command]
+async fn chat_recovery_history(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<String>, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    let resources = app
+        .path()
+        .resource_dir()
+        .map_err(|_| "recovery_unavailable".to_owned())?;
+    tauri::async_runtime::spawn_blocking(move || chat_recovery::history(&root, &resources, &id))
+        .await
+        .map_err(|_| "recovery_unavailable".to_owned())?
 }
 
 #[tauri::command]
@@ -203,16 +255,27 @@ async fn user_profile_set(
 }
 
 #[tauri::command]
-async fn archive_save(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn archive_save<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let root = state.paths.archive.current.clone().read_owned().await;
     let database = state.paths.database_path.clone();
+    let paths = state.paths.clone();
     let resources = app
         .path()
         .resource_dir()
         .map_err(|_| "몸소 폴더 경로를 확인하지 못했습니다".to_string())?;
-    tauri::async_runtime::spawn_blocking(move || archive::save(&root, &resources, &database))
-        .await
-        .map_err(|_| "저장을 완료하지 못했습니다".to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = chat_archive_store::write_all(&root, &paths);
+        if let Err(error) = result {
+            report_chat_archive(&app, None, Err(error));
+            return Err(error.to_owned());
+        }
+        archive::save(&root, &resources, &database)
+    })
+    .await
+    .map_err(|_| "저장을 완료하지 못했습니다".to_string())?
 }
 
 #[tauri::command]
@@ -344,6 +407,83 @@ async fn yoga_terms_list(
 }
 
 #[tauri::command]
+async fn yoga_term_edit(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    input: yoga_dictionary::TermEdit,
+) -> Result<String, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    let id = tauri::async_runtime::spawn_blocking(move || yoga_dictionary::edit_term(&root, input))
+        .await
+        .map_err(|_| "unavailable".to_string())??;
+    let _ = app.emit(
+        "yoga-dictionary-updated",
+        serde_json::json!({"source":"terms"}),
+    );
+    Ok(id)
+}
+
+#[tauri::command]
+async fn yoga_person_edit(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    input: yoga_dictionary::PersonEdit,
+) -> Result<String, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    let id =
+        tauri::async_runtime::spawn_blocking(move || yoga_dictionary::edit_person(&root, input))
+            .await
+            .map_err(|_| "unavailable".to_string())??;
+    let _ = app.emit(
+        "yoga-dictionary-updated",
+        serde_json::json!({"source":"people"}),
+    );
+    Ok(id)
+}
+
+#[tauri::command]
+async fn yoga_term_delete(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: String,
+) -> Result<&'static str, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        yoga_dictionary::delete_term(&root, &id, &expected_revision)
+    })
+    .await
+    .map_err(|_| "unavailable".to_string())??;
+    if result == "deleted" {
+        let _ = app.emit(
+            "yoga-dictionary-updated",
+            serde_json::json!({"source":"terms"}),
+        );
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn yoga_person_delete(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    expected_revision: String,
+) -> Result<(), String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        yoga_dictionary::delete_person(&root, &id, &expected_revision)
+    })
+    .await
+    .map_err(|_| "unavailable".to_string())??;
+    let _ = app.emit(
+        "yoga-dictionary-updated",
+        serde_json::json!({"source":"people"}),
+    );
+    Ok(())
+}
+
+#[tauri::command]
 async fn chat_items(
     state: State<'_, AppState>,
     chat_id: String,
@@ -371,6 +511,28 @@ async fn attachment_text_read(
 }
 
 #[tauri::command]
+async fn source_asset_open(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    asset_id: String,
+    cursor: Option<u64>,
+) -> Result<chat_items::SourceOpen, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    let database = state.paths.database_path.clone();
+    let opened = tauri::async_runtime::spawn_blocking(move || {
+        chat_items::open_source(&root, &database, &asset_id, cursor.unwrap_or(0))
+    })
+    .await
+    .map_err(|_| "unavailable".to_string())??;
+    if let Some(path) = &opened.path {
+        app.asset_protocol_scope()
+            .allow_file(path)
+            .map_err(|_| "unavailable".to_string())?;
+    }
+    Ok(opened)
+}
+
+#[tauri::command]
 async fn receipt_create(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -387,6 +549,26 @@ async fn receipt_create(
     if let Some(chat_id) = chat_id {
         let _ = app.emit("chat-items-updated", serde_json::json!({"chatId":chat_id}));
     }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn receipt_delete(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<archive_receipt::ReceiptDeleteResult, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    let database = state.paths.database_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        archive_receipt::delete(&root, &database, &id)
+    })
+    .await
+    .map_err(|_| "unavailable".to_string())??;
+    let _ = app.emit(
+        "chat-items-updated",
+        serde_json::json!({"chatId":result.chat_id}),
+    );
     Ok(result)
 }
 
@@ -547,16 +729,19 @@ async fn load_local_ai_conversations(
 }
 
 #[tauri::command]
-async fn chat_import_export(
+async fn chat_import_export<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     path: String,
     provider: String,
 ) -> Result<chat_export_import::ResultCounts, String> {
     let db = state.paths.database_path.clone();
     let lease = state.paths.archive.current.clone().read_owned().await;
+    let paths = state.paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _lease = lease;
-        chat_export_import::import(&db, std::path::Path::new(&path), &provider)
+        let result = chat_export_import::import(&db, std::path::Path::new(&path), &provider)?;
+        report_chat_archive(&app, None, chat_archive_store::write_all(&lease, &paths));
+        Ok(result)
     })
     .await
     .map_err(|_| "unavailable".to_string())?
@@ -579,8 +764,8 @@ async fn chat_import_export_preview(
 }
 
 #[tauri::command]
-async fn chat_import_export_progress(
-    app: tauri::AppHandle,
+async fn chat_import_export_progress<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     request_id: String,
     path: String,
@@ -589,10 +774,10 @@ async fn chat_import_export_progress(
     let db = state.paths.database_path.clone();
     let (guard, token) = chat_export_import::reserve(&request_id)?;
     let lease = state.paths.archive.current.clone().read_owned().await;
+    let paths = state.paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
-        let _lease = lease;
-        chat_export_import::import_controlled(
+        let result = chat_export_import::import_controlled(
             &db,
             std::path::Path::new(&path),
             &provider,
@@ -603,10 +788,155 @@ async fn chat_import_export_progress(
                     serde_json::json!({"requestId":request_id,"processed":processed}),
                 );
             },
-        )
+        )?;
+        report_chat_archive(&app, None, chat_archive_store::write_all(&lease, &paths));
+        Ok(result)
     })
     .await
     .map_err(|_| "unavailable".to_string())?
+}
+
+fn report_chat_archive<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    chat_id: Option<&str>,
+    result: Result<(), &'static str>,
+) {
+    let payload = chat_archive_event(chat_id, &result);
+    if let Err(error) = result {
+        chat_archive_store::record_failure(error);
+    }
+    let _ = app.emit("chat-archive-changed", payload);
+}
+
+fn chat_archive_event(
+    chat_id: Option<&str>,
+    result: &Result<(), &'static str>,
+) -> serde_json::Value {
+    let reason = result
+        .as_ref()
+        .err()
+        .map(|error| chat_archive_store::failure_details(error).0);
+    serde_json::json!({"chatId":chat_id,"state":if result.is_ok() {"saved"} else {"unavailable"},"reason":reason})
+}
+
+#[cfg(test)]
+mod chat_archive_command_tests {
+    use super::*;
+
+    #[test]
+    fn archive_event_exposes_only_safe_reason_even_with_diagnostics_off() {
+        let event = chat_archive_event(None, &Err("credentials_unavailable"));
+        assert_eq!(event["state"], "unavailable");
+        assert_eq!(event["reason"], "credentialStoreUnavailable");
+        assert!(event["chatId"].is_null());
+        let conflict = chat_archive_event(Some("chat_fixture"), &Err("chat_deletion_conflict"));
+        assert_eq!(conflict["state"], "unavailable");
+        assert_eq!(conflict["reason"], "deletionConflict");
+        assert_eq!(conflict["chatId"], "chat_fixture");
+        let saved = chat_archive_event(None, &Ok(()));
+        assert!(saved["reason"].is_null());
+    }
+
+    #[test]
+    fn import_ipc_succeeds_without_github_and_reports_snapshot_failure_separately() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let db = root.join("momso.db");
+        storage::initialize(&db, &root.join("backups"), "test").unwrap();
+        let location = archive_location::ArchiveLocation::load(db.clone(), root, vec![]).unwrap();
+        let archive = root.join("momso");
+        std::fs::create_dir_all(&archive).unwrap();
+        let paths = RuntimePaths {
+            data_root: root.to_owned(),
+            database_path: db.clone(),
+            objects_path: archive.join("objects"),
+            exports_path: root.join("exports"),
+            backups_path: root.join("backups"),
+            logs_path: root.join("logs"),
+            archive: location,
+            archive_lease: None,
+        };
+        let app = tauri::test::mock_builder()
+            .manage(AppState {
+                paths,
+                approvals: Default::default(),
+                setup_secrets: Default::default(),
+                usage_monitor: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                usage_cache: Default::default(),
+                chat_active: Default::default(),
+                browser: Default::default(),
+            })
+            .invoke_handler(tauri::generate_handler![
+                chat_import_export,
+                chat_import_export_progress
+            ])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let file = root.join("conversations.json");
+        let fixture = |id: &str| serde_json::json!({"uuid":id,"created_at":"2020-01-01T00:00:00Z","chat_messages":[{"sender":"human","text":"fixture"}]});
+        std::fs::write(
+            &file,
+            serde_json::json!([fixture("one"), fixture("two"), fixture("three")]).to_string(),
+        )
+        .unwrap();
+        let invoke = |command: &str| {
+            tauri::test::get_ipc_response(
+                &webview,
+                tauri::webview::InvokeRequest {
+                    cmd: command.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(
+                        serde_json::json!({"path":file.to_str().unwrap(),"provider":"claude","requestId":"fixture-import"}),
+                    ),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            )
+        };
+        let response = invoke("chat_import_export_progress")
+            .unwrap()
+            .deserialize::<serde_json::Value>()
+            .unwrap();
+        assert_eq!(response["imported"], 3);
+        assert_eq!(std::fs::read_dir(archive.join("chats")).unwrap().count(), 3);
+        assert!(!archive.join(".git").exists());
+        std::fs::remove_dir_all(archive.join("chats")).unwrap();
+        std::fs::write(archive.join("chats"), "fixture blocker").unwrap();
+        std::fs::write(&file, serde_json::json!([fixture("four")]).to_string()).unwrap();
+        let response = invoke("chat_import_export")
+            .unwrap()
+            .deserialize::<serde_json::Value>()
+            .unwrap();
+        assert_eq!(response["imported"], 1);
+        assert_eq!(chat::list(&db).unwrap().len(), 4);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM app_runtime_meta WHERE key='chat_archive_write:all'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+        drop(conn);
+        std::fs::remove_file(archive.join("chats")).unwrap();
+        chat_archive_store::write_all(&archive, &app.state::<AppState>().paths).unwrap();
+        assert_eq!(std::fs::read_dir(archive.join("chats")).unwrap().count(), 4);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM app_runtime_meta WHERE key GLOB 'chat_archive_write:*'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
 }
 
 #[tauri::command]
@@ -643,6 +973,15 @@ async fn runtime_info(
         database_health: storage_status.health,
         wom_adapter_status: "waiting_for_stable_contract",
     })
+}
+
+#[tauri::command]
+async fn check_ai_api_connection(
+    provider: String,
+) -> Result<connections::AiApiConnectionCheck, String> {
+    connections::check_ai_api_connection(&provider)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -823,19 +1162,33 @@ async fn chat_send(
         return Ok(serde_json::json!({"status":"special_unavailable"}));
     }
     if !chat_codex::supported(&provider) && provider != "claude" && provider != "gemini" {
-        return Ok(serde_json::json!({"status":"unavailable"}));
+        return Ok(serde_json::json!({"status":"unavailable", "reason":"unsupported_provider"}));
     }
     let claude_status = if provider == "claude" {
-        Some(provider_auth::read_status("claude").await)
+        Some(provider_auth::read_status_for_chat("claude").await)
     } else {
         None
     };
     let codex_status = if provider == "codex" {
-        Some(provider_auth::read_status("codex").await)
+        Some(provider_auth::read_status_for_chat("codex").await)
     } else {
         None
     };
-    let status = claude_status.as_ref().or(codex_status.as_ref());
+    let gemini_status = if provider == "gemini" {
+        Some(provider_auth::read_status_for_chat("gemini").await)
+    } else {
+        None
+    };
+    let status = claude_status
+        .as_ref()
+        .or(codex_status.as_ref())
+        .or(gemini_status.as_ref());
+    if let Some(status) = status {
+        provider_auth::ensure_key_retry(&app, status);
+        if status.api_key_saved {
+            provider_auth::notify(&app, &provider, status.key_verification);
+        }
+    }
     let installed = status
         .map(|s| s.installed)
         .unwrap_or_else(|| gemini_access::executable().is_some());
@@ -845,12 +1198,30 @@ async fn chat_send(
             "__momso_tool_missing",
         ));
     }
+    if status.is_some_and(|s| !s.runnable) {
+        return Ok(serde_json::json!({"status":"unavailable", "reason":"tool_not_runnable"}));
+    }
+    let gemini_key = if provider == "gemini" {
+        match credentials::get_secret(
+            credentials::ai_key_name("gemini").map_err(|_| "AI 연결을 확인하지 못했습니다")?,
+        ) {
+            Ok(Some(key)) if !key.trim().is_empty() => Some(key),
+            Ok(_) => None,
+            Err(_) => {
+                return Ok(
+                    serde_json::json!({"status":"unavailable", "reason":"credential_unavailable"}),
+                )
+            }
+        }
+    } else {
+        None
+    };
     let method = match provider_auth::chat_auth_method(
         &provider,
         installed,
         status.map_or("signedOut", |s| s.state),
         status.and_then(|s| s.active),
-        status.is_some_and(|s| s.api_key_saved),
+        status.is_some_and(|s| provider_auth::key_can_be_used(s.api_key_saved, s.key_verification)),
         auth_method.as_deref(),
     ) {
         Ok(method) => method,
@@ -873,7 +1244,11 @@ async fn chat_send(
         ) {
             Ok(Some(key)) if !key.trim().is_empty() => Some(key),
             Ok(_) => return Ok(serde_json::json!({"status":"not_connected"})),
-            Err(_) => return Ok(serde_json::json!({"status":"unavailable"})),
+            Err(_) => {
+                return Ok(
+                    serde_json::json!({"status":"unavailable", "reason":"credential_unavailable"}),
+                )
+            }
         }
     } else {
         None
@@ -884,22 +1259,27 @@ async fn chat_send(
         ) {
             Ok(Some(key)) if !key.trim().is_empty() => Some(key),
             Ok(_) => return Ok(serde_json::json!({"status":"not_connected"})),
-            Err(_) => return Ok(serde_json::json!({"status":"unavailable"})),
+            Err(_) => {
+                return Ok(
+                    serde_json::json!({"status":"unavailable", "reason":"credential_unavailable"}),
+                )
+            }
         }
     } else {
         None
     };
-    let gemini_key = if provider == "gemini" {
-        match credentials::get_secret(
-            credentials::ai_key_name("gemini").map_err(|_| "AI 연결을 확인하지 못했습니다")?,
+    if method == "apiKey" {
+        let selected = codex_key
+            .as_deref()
+            .or(claude_key.as_deref())
+            .or(gemini_key.as_deref());
+        if !provider_auth::key_matches_checked(
+            status.and_then(|s| s.checked_key_fingerprint),
+            selected,
         ) {
-            Ok(Some(key)) if !key.trim().is_empty() => Some(key),
-            Ok(_) => return Ok(serde_json::json!({"status":"not_connected"})),
-            Err(_) => return Ok(serde_json::json!({"status":"unavailable"})),
+            return Ok(serde_json::json!({"status":"not_connected"}));
         }
-    } else {
-        None
-    };
+    }
     if provider == "gemini" && fast == Some(true) {
         return Ok(serde_json::json!({"status":"fast_unavailable"}));
     }
@@ -907,7 +1287,9 @@ async fn chat_send(
     if provider == "claude"
         && !chat_claude::authentication_selected(&archive, claude_key.as_deref()).await
     {
-        return Ok(serde_json::json!({"status":"unavailable"}));
+        return Ok(
+            serde_json::json!({"status":"unavailable", "reason":"authentication_selection_unavailable"}),
+        );
     }
     let db = state.paths.database_path.clone();
     let (text, skill) = if let Some(id) = retry_message_id.as_deref() {
@@ -919,14 +1301,22 @@ async fn chat_send(
         (text, skill.filter(|name| !name.is_empty()))
     };
     if let Some(name) = skill.as_deref() {
-        match skills::callable(&archive, name) {
-            Ok(true) => (),
-            Ok(false) | Err("not_found") => {
-                return Ok(serde_json::json!({"status":"skill_unavailable"}))
+        match skills::call_unavailable_reason(&archive, name) {
+            Ok(None) => (),
+            Ok(Some(reason)) => {
+                return Ok(serde_json::json!({"status":"skill_unavailable", "reason":reason}))
+            }
+            Err("not_found") => {
+                return Ok(serde_json::json!({"status":"skill_unavailable", "reason":"not_found"}))
             }
             Err(error) => return Err(error.into()),
         }
     }
+    #[cfg(windows)]
+    let browser_policy = match skill.as_deref() {
+        Some(name) => browser_gateway::Policy::from_skill(&archive, name),
+        None => Ok(None),
+    };
     let permission_mode = permission_modes::get(
         &db,
         if provider == "claude" {
@@ -1021,6 +1411,10 @@ async fn chat_send(
         chat::append_for_send(&db, &chat_id, &text, skill.clone())?.id
     };
     let started_user_message_id = user_message_id.clone();
+    let initial_archive = chat_archive_store::write(&archive, &state.paths, &chat_id);
+    if initial_archive.is_err() {
+        report_chat_archive(&app, Some(&chat_id), initial_archive);
+    }
     if old_title.is_empty() {
         let title = chat::title(&db, &chat_id)?;
         if let Some(payload) = chat::automatic_title_event(&chat_id, &old_title, &title) {
@@ -1049,7 +1443,58 @@ async fn chat_send(
         let setup_chat = chat_id.clone();
         let setup_provider = provider.clone();
         let setup_cancel = cancel.clone();
+        let browser = state.browser.clone();
+        let browser_skill = skill.clone();
+        let browser_root = state.paths.data_root.clone();
+        let browser_broker = state.approvals.clone();
         let handler: setup_bridge::Handler = Arc::new(move |input| {
+            if input
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|m| m.starts_with("browser_"))
+            {
+                let browser = browser.clone();
+                let skill = browser_skill.clone();
+                let root = browser_root.clone();
+                let policy = browser_policy.clone();
+                let app = setup_app.clone();
+                let chat = setup_chat.clone();
+                let provider = setup_provider.clone();
+                let cancel = setup_cancel.clone();
+                let broker = browser_broker.clone();
+                return Box::pin(async move {
+                    let event_app = app.clone();
+                    let notify: browser_runtime::Notify = Arc::new(move |name, payload| {
+                        let _ = event_app.emit(name, payload);
+                    });
+                    let ask: browser_runtime::Ask = Arc::new(move |request, token| {
+                        let app = app.clone();
+                        let broker = broker.clone();
+                        Box::pin(async move {
+                            matches!(
+                                broker.request(&app, request, token).await,
+                                Ok(approval::ApprovalChoice::AllowOnce)
+                            )
+                        })
+                    });
+                    browser
+                        .dispatch(
+                            browser_runtime::RequestContext {
+                                chat_id: &chat,
+                                provider: &provider,
+                                skill: skill.as_deref(),
+                                selected: &policy,
+                                root,
+                                visible: true,
+                                cancel,
+                                notify,
+                                ask,
+                            },
+                            input,
+                        )
+                        .await
+                });
+            }
             Box::pin(setup_actions::dispatch(
                 setup_app.clone(),
                 setup_chat.clone(),
@@ -1069,6 +1514,7 @@ async fn chat_send(
     let approval_broker = state.approvals.clone();
     let stopped_by_approval = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let approval_stop = stopped_by_approval.clone();
+    let archive_paths = state.paths.clone();
     let approvals: chat_codex::ApprovalChannel = Box::new(move |request, cancel| {
         let app = approval_app.clone();
         let broker = approval_broker.clone();
@@ -1081,6 +1527,15 @@ async fn chat_send(
             result
         })
     });
+    let sent_key_fingerprint = if method == "apiKey" {
+        codex_key
+            .as_deref()
+            .or(claude_key.as_deref())
+            .or(gemini_key.as_deref())
+            .map(provider_auth::key_fingerprint)
+    } else {
+        None
+    };
     tauri::async_runtime::spawn(async move {
         #[cfg(windows)]
         let _setup_guard = setup_guard;
@@ -1213,16 +1668,29 @@ async fn chat_send(
         })
         .await;
         if let Ok(Ok(after)) = after {
-            let source_changes: Vec<_> = chat_file_changes::source_changes(&before, &after)
-                .into_iter()
-                .map(|(id, action)| serde_json::json!({"id":id,"action":action}))
-                .collect();
+            let source_changes = chat_file_changes::source_change_details(&before, &after);
+            let saved = if source_changes.is_empty() {
+                None
+            } else {
+                Some(source_integrity::record(
+                    &db,
+                    &chat_id,
+                    &provider,
+                    "changed",
+                    &source_changes,
+                ))
+            };
+            if saved.as_ref().is_some_and(Result::is_err) {
+                log::warn!("Could not save source integrity alert");
+            }
             let _ = app.emit(
                 "chat-source-integrity",
                 serde_json::json!({
                     "chatId": chat_id,
                     "state": if source_changes.is_empty() { "unchanged" } else { "changed" },
                     "changes": source_changes,
+                    "recorded": saved.as_ref().map(Result::is_ok),
+                    "eventId": saved.and_then(Result::ok),
                 }),
             );
             let completed_model = done
@@ -1270,9 +1738,10 @@ async fn chat_send(
             }
         } else {
             log::warn!("Could not compare file changes");
+            let saved = source_integrity::record(&db, &chat_id, &provider, "unavailable", &[]);
             let _ = app.emit(
                 "chat-source-integrity",
-                serde_json::json!({"chatId":chat_id,"state":"unavailable"}),
+                serde_json::json!({"chatId":chat_id,"state":"unavailable","recorded":saved.is_ok(),"eventId":saved.ok()}),
             );
         }
         let omitted = if used_fallback {
@@ -1377,6 +1846,9 @@ async fn chat_send(
                 if payload["error"]["kind"] == "authentication" && method == "apiKey" {
                     payload["error"]["actions"] =
                         serde_json::json!(["checkApiKey", "switchProvider"]);
+                    if let Some(fingerprint) = sent_key_fingerprint {
+                        provider_auth::reject_unverified_key(&app, &provider, fingerprint);
+                    }
                 }
                 if let Ok(Some(message_id)) = saved_partial {
                     payload["messageId"] = serde_json::json!(message_id);
@@ -1391,6 +1863,11 @@ async fn chat_send(
                 let _ = app.emit("chat-error", payload);
             }
         }
+        report_chat_archive(
+            &app,
+            Some(&chat_id),
+            chat_archive_store::write(&archive, &archive_paths, &chat_id),
+        );
     });
     Ok(
         serde_json::json!({"status":"started","handoffLimit":started_limit,"userMessageId":started_user_message_id}),
@@ -1398,11 +1875,29 @@ async fn chat_send(
 }
 
 #[tauri::command]
-async fn chat_cancel(state: State<'_, AppState>, chat_id: String) -> Result<(), String> {
-    if let Some(token) = state.chat_active.lock().await.get(&chat_id) {
+async fn chat_cancel(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<(), String> {
+    let token = state.chat_active.lock().await.get(&chat_id).cloned();
+    if let Some(token) = token {
         token.cancel();
     }
+    let notify: browser_runtime::Notify = Arc::new(move |name, payload| {
+        let _ = app.emit(name, payload);
+    });
+    state.browser.close(&chat_id, &notify).await;
     Ok(())
+}
+
+#[tauri::command]
+async fn browser_session_status(
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<serde_json::Value, String> {
+    let open = state.browser.is_open(&chat_id).await;
+    Ok(serde_json::json!({"chatId":chat_id,"open":open}))
 }
 
 #[tauri::command]
@@ -1423,6 +1918,16 @@ async fn chat_delete(
         .as_deref()
         == Some("deleted")
     {
+        let event_app = app.clone();
+        let notify: browser_runtime::Notify = Arc::new(move |name, payload| {
+            let _ = event_app.emit(name, payload);
+        });
+        state.browser.close(&chat_id, &notify).await;
+        report_chat_archive(
+            &app,
+            Some(&chat_id),
+            chat_archive_store::remove(&_lease, &path, &chat_id),
+        );
         let _ = app.emit("chat-list-updated", serde_json::json!({"chatId": chat_id}));
     }
     Ok(result)
@@ -1438,6 +1943,11 @@ async fn chat_pin(
     let _lease = state.paths.archive.current.clone().read_owned().await;
     let result = chat::set_pinned(&state.paths.database_path, &chat_id, pinned);
     if result.state == "ok" {
+        report_chat_archive(
+            &app,
+            Some(&chat_id),
+            chat_archive_store::write(&_lease, &state.paths, &chat_id),
+        );
         let _ = app.emit("chat-list-updated", serde_json::json!({"chatId": chat_id}));
     }
     Ok(result)
@@ -1453,6 +1963,16 @@ async fn chat_archive(
     let result =
         chat::archive_if_idle(&state.paths.database_path, &state.chat_active, &chat_id).await;
     if result.state == "ok" {
+        let event_app = app.clone();
+        let notify: browser_runtime::Notify = Arc::new(move |name, payload| {
+            let _ = event_app.emit(name, payload);
+        });
+        state.browser.close(&chat_id, &notify).await;
+        report_chat_archive(
+            &app,
+            Some(&chat_id),
+            chat_archive_store::write(&_lease, &state.paths, &chat_id),
+        );
         let _ = app.emit("chat-list-updated", serde_json::json!({"chatId": chat_id}));
     }
     Ok(result)
@@ -1467,6 +1987,11 @@ async fn chat_restore(
     let _lease = state.paths.archive.current.clone().read_owned().await;
     let result = chat::set_archived(&state.paths.database_path, &chat_id, false);
     if result.state == "ok" {
+        report_chat_archive(
+            &app,
+            Some(&chat_id),
+            chat_archive_store::write(&_lease, &state.paths, &chat_id),
+        );
         let _ = app.emit("chat-list-updated", serde_json::json!({"chatId": chat_id}));
     }
     Ok(result)
@@ -1511,16 +2036,19 @@ async fn chat_group_create(
     .map_err(|_| "프로젝트를 만들지 못했습니다".to_string())?
 }
 #[tauri::command]
-async fn chat_group_rename(
+async fn chat_group_rename<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     id: String,
     name: String,
 ) -> Result<(), String> {
     let path = state.paths.database_path.clone();
     let lease = state.paths.archive.current.clone().read_owned().await;
+    let paths = state.paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _lease = lease;
-        chat_group::rename(&path, &id, &name)
+        chat_group::rename(&path, &id, &name)?;
+        report_chat_archive(&app, None, chat_archive_store::write_all(&lease, &paths));
+        Ok(())
     })
     .await
     .map_err(|_| "프로젝트 이름을 바꾸지 못했습니다".to_string())?
@@ -1538,27 +2066,40 @@ async fn chat_group_reorder(state: State<'_, AppState>, ids: Vec<String>) -> Res
 }
 /// 묶음만 없애고 그 안의 채팅방은 묶이지 않은 상태로 남긴다.
 #[tauri::command]
-async fn chat_group_remove(state: State<'_, AppState>, id: String) -> Result<(), String> {
+async fn chat_group_remove<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
     let path = state.paths.database_path.clone();
     let lease = state.paths.archive.current.clone().read_owned().await;
+    let paths = state.paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _lease = lease;
-        chat_group::remove(&path, &id)
+        chat_group::remove(&path, &id)?;
+        report_chat_archive(&app, None, chat_archive_store::write_all(&lease, &paths));
+        Ok(())
     })
     .await
     .map_err(|_| "프로젝트를 없애지 못했습니다".to_string())?
 }
 #[tauri::command]
-async fn chat_set_group(
+async fn chat_set_group<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     chat_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
     let path = state.paths.database_path.clone();
     let lease = state.paths.archive.current.clone().read_owned().await;
+    let paths = state.paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _lease = lease;
-        chat_group::set_group(&path, &chat_id, group_id)
+        chat_group::set_group(&path, &chat_id, group_id)?;
+        report_chat_archive(
+            &app,
+            Some(&chat_id),
+            chat_archive_store::write(&lease, &paths, &chat_id),
+        );
+        Ok(())
     })
     .await
     .map_err(|_| "프로젝트를 바꾸지 못했습니다".to_string())?
@@ -1581,12 +2122,26 @@ async fn chat_list(state: State<'_, AppState>) -> Result<Vec<chat::ChatSummary>,
         .map_err(|_| "채팅방 목록을 읽지 못했습니다".to_string())?
 }
 #[tauri::command]
-async fn chat_create(state: State<'_, AppState>) -> Result<chat::ChatSummary, String> {
+async fn chat_create<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<chat::ChatSummary, String> {
     let path = state.paths.database_path.clone();
     let lease = state.paths.archive.current.clone().read_owned().await;
+    let paths = state.paths.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _lease = lease;
-        chat::create(&path)
+        let room = chat::create(&path)?;
+        let value = serde_json::to_value(&room).map_err(|_| "unavailable".to_string())?;
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("unavailable")?;
+        report_chat_archive(
+            &app,
+            Some(id),
+            chat_archive_store::write(&lease, &paths, id),
+        );
+        Ok(room)
     })
     .await
     .map_err(|_| "채팅방을 만들지 못했습니다".to_string())?
@@ -1599,12 +2154,22 @@ async fn chat_read(state: State<'_, AppState>, id: String) -> Result<chat::ChatD
         .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?
 }
 #[tauri::command]
-async fn chat_rename(state: State<'_, AppState>, id: String, title: String) -> Result<(), String> {
+async fn chat_rename<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
     let path = state.paths.database_path.clone();
     let lease = state.paths.archive.current.clone().read_owned().await;
+    let paths = state.paths.clone();
     let (thread_id, name) = tauri::async_runtime::spawn_blocking(move || {
-        let _lease = lease;
         chat::rename(&path, &id, &title)?;
+        report_chat_archive(
+            &app,
+            Some(&id),
+            chat_archive_store::write(&lease, &paths, &id),
+        );
         Ok::<_, String>((chat::codex_thread(&path, &id)?, title))
     })
     .await
@@ -1623,6 +2188,20 @@ async fn chat_search(
     tauri::async_runtime::spawn_blocking(move || chat::search(&path, &query))
         .await
         .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?
+}
+
+#[tauri::command]
+async fn chat_search_page(
+    state: State<'_, AppState>,
+    query: String,
+    offset: Option<u32>,
+) -> Result<chat::ChatSearchPage, String> {
+    let path = state.paths.database_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        chat::search_page(&path, &query, offset.unwrap_or(0))
+    })
+    .await
+    .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?
 }
 
 #[tauri::command]
@@ -1796,10 +2375,46 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                static CLOSING: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let app = window.app_handle().clone();
+                let Some(state) = app.try_state::<AppState>() else {
+                    return;
+                };
+                let Ok(resources) = app.path().resource_dir() else {
+                    return;
+                };
+                api.prevent_close();
+                if CLOSING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let paths = state.paths.clone();
+                let window = window.clone();
+                tauri::async_runtime::spawn(async move {
+                    let root = paths.archive.current.clone().read_owned().await;
+                    let result = tauri::async_runtime::spawn_blocking(move || {
+                        chat_archive_store::save_pending(&root, &resources, &paths)
+                    })
+                    .await;
+                    if let Err(error) = result.unwrap_or(Err("unavailable")) {
+                        report_chat_archive(&app, None, Err(error));
+                    }
+                    let _ = window.destroy();
+                    CLOSING.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        })
         .setup(|app| {
             let (paths, status) = RuntimePaths::prepare(app.handle())?;
+            chat_search_index::start(paths.database_path.clone());
             git_tool::configure(paths.data_root.clone());
             let resources = app.path().resource_dir()?;
+            r2_oauth::configure_resources(&resources);
             process::set_local_ai_tools(paths.data_root.join("ai-tools"));
             let archive_root = paths
                 .archive
@@ -1834,6 +2449,7 @@ pub fn run() {
             );
             app.manage(app_updates::UpdateState::default());
             app_updates::start_monitor(app.handle().clone());
+            provider_auth::start_initial_key_rechecks(app.handle().clone());
             app.manage(AppState {
                 paths,
                 approvals: approval::ApprovalBroker::default(),
@@ -1841,12 +2457,15 @@ pub fn run() {
                 usage_monitor: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 usage_cache: Arc::new(usage_status::UsageCache::default()),
                 chat_active: Default::default(),
+                browser: Default::default(),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             chat_recovery_list,
+            chat_recovery_history,
             chat_recovery_restore,
+            source_integrity_list,
             git_tool::git_install_status,
             git_tool::git_install,
             voice_typing::voice_typing_status,
@@ -1863,6 +2482,8 @@ pub fn run() {
             archive_remote::archive_remote_create,
             archive_remote::archive_remote_connect,
             archive_remote::archive_remote_push,
+            chat_archive_status::chat_archive_redaction_count,
+            chat_archive_status::chat_archive_sync_status,
             archive_remote::archive_remote_pull,
             archive_remote::archive_remote_disconnect,
             archive_location::archive_location_get,
@@ -1876,10 +2497,16 @@ pub fn run() {
             zet_linked,
             receipt_read,
             receipt_create,
+            receipt_delete,
             chat_attach_asset,
             chat_items,
             yoga_terms_list,
+            yoga_term_edit,
+            yoga_term_delete,
+            yoga_person_edit,
+            yoga_person_delete,
             attachment_text_read,
+            source_asset_open,
             archive_reindex,
             archive_check,
             user_profile_get,
@@ -1891,13 +2518,16 @@ pub fn run() {
             runtime_info,
             discover_local_ai_conversations,
             load_local_ai_conversations,
+            check_ai_api_connection,
             provider_auth::provider_auth_status,
+            provider_auth::provider_first_run_eligible,
             provider_install::install_external_provider,
             provider_install::connect_external_provider,
             provider_auth::provider_login_start,
             provider_auth::provider_login_cancel,
             provider_auth::provider_logout,
             provider_auth::provider_api_key_set,
+            provider_auth::provider_api_key_verify,
             provider_auth::provider_api_key_clear,
             list_transcription_terms,
             create_transcription_term,
@@ -1919,6 +2549,7 @@ pub fn run() {
             skills_write::skill_set_enabled,
             skills_write::skill_remove,
             chat_cancel,
+            browser_session_status,
             chat_delete,
             chat_pin,
             chat_archive,
@@ -1936,6 +2567,7 @@ pub fn run() {
             chat_read,
             chat_rename,
             chat_search,
+            chat_search_page,
             agent_approval_respond,
             setup_secret_submit,
             agent_setup_secret_cancel,
@@ -1954,6 +2586,12 @@ pub fn run() {
             object_store::object_store_disconnect,
             object_store_transfer::object_store_backup,
             object_store_restore::object_store_restore,
+            source_delete::source_asset_delete_preview,
+            source_delete::source_asset_deleted_list,
+            source_delete::source_asset_trash,
+            source_delete::source_asset_restore_trashed,
+            source_delete::source_asset_purge,
+            object_store_restore::object_store_recover_original_copy,
             object_store_restore::object_store_verify,
             object_store_state::app_state_backup,
             object_store_state::app_state_restore,
@@ -2006,7 +2644,6 @@ mod feedback_retention_tests {
             [],
         ).expect("insert old feedback");
         drop(connection);
-
         storage::initialize(&database, &backups, "new").expect("migrate database");
         storage::initialize(&database, &backups, "new").expect("restart database");
         let connection = Connection::open(&database).expect("reopen database");

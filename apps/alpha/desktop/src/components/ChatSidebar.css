@@ -429,3 +429,6 @@
 .chat-sidebar .chat-group-rows {
   padding: 0 0 4px 10px;
 }
+
+/* 받은 채팅 사본을 되살리는 동안 목록 맨 위의 한 줄과 막대(2026-11-17). 막대는 업데이트·백업과 같은 꼴(.app-update-progress). */
+.chat-restore { display: grid; gap: 6px; padding: 8px 10px 10px; color: var(--ink-soft); font-size: 12px; }

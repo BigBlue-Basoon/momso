@@ -4,5 +4,8 @@ apps/alpha/desktop/src-tauri/target/
 apps/alpha/desktop/src-tauri/gen/
 apps/alpha/desktop/src-tauri/generated/*
 !apps/alpha/desktop/src-tauri/generated/.gitkeep
+!apps/alpha/desktop/src-tauri/generated/node/
+apps/alpha/desktop/src-tauri/generated/node/*
+!apps/alpha/desktop/src-tauri/generated/node/.gitkeep
 .env
 .env.*

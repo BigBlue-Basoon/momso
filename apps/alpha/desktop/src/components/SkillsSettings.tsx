@@ -7,6 +7,7 @@ import {
   removeSkill,
   setSkillEnabled,
   skillErrorCode,
+  skillUnavailableText,
   updateSkill,
   type SkillDocument,
   type SkillEntry,
@@ -53,15 +54,20 @@ export function SkillsSettings({ skills, onChanged }: { skills: SkillEntry[]; on
         </div>
       ) : (
         <ul className="skills-list">
-          {skills.map((item) => (
+          {skills.map((item) => {
+            const unavailable = skillUnavailableText(item)
+            return (
             <li key={item.name} className="skills-row">
               <button className="skills-row-main" type="button" onClick={() => setEditing({ name: item.name })}>
                 <span className="skills-row-title">
                   {item.title}
                   <span className="skills-tag">{item.builtin ? W.skills.builtin : W.skills.mine}</span>
                   {item.syncState === 'conflict' && <span className="skills-tag is-warn">{W.skills.conflict}</span>}
+                  {unavailable && <span className="skills-tag is-warn">{W.skills.unavailableTag}</span>}
                 </span>
                 {item.description && <span className="skills-row-description">{item.description}</span>}
+                {/* 까닭 줄: 다른 곳에서 수정한 것은 위 표시가 이미 까닭을 말한다. */}
+                {unavailable && item.unavailableReason !== 'skill_conflict' && <span className="skills-row-unavailable">{unavailable}</span>}
                 <span className="skills-row-name">/{item.name}</span>
               </button>
               <button
@@ -73,7 +79,8 @@ export function SkillsSettings({ skills, onChanged }: { skills: SkillEntry[]; on
                 onClick={() => void toggle(item, !item.enabled)}
               />
             </li>
-          ))}
+            )
+          })}
         </ul>
       )}
     </div>

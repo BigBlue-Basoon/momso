@@ -92,11 +92,32 @@ pub(crate) fn resolve() -> Option<(PathBuf, bool)> {
 }
 
 fn managed_git(root: &Path) -> Option<PathBuf> {
-    let dir = managed_path(root);
+    if let Some(path) = usable_managed_git(&managed_path(root)) {
+        return Some(path);
+    }
+    let parent = root.join("git-tools");
+    std::fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let id = name.strip_prefix(".momso-git-")?;
+            if uuid::Uuid::parse_str(id).is_err() {
+                return None;
+            }
+            usable_managed_git(&entry.path())
+        })
+}
+
+fn usable_managed_git(dir: &Path) -> Option<PathBuf> {
+    let metadata = fs::symlink_metadata(dir).ok()?;
+    if !metadata.is_dir() || crate::archive_location::is_link_or_reparse(&metadata) {
+        return None;
+    }
     let marker_path = dir.join(".momso-sha256");
     let metadata = fs::symlink_metadata(&marker_path).ok()?;
     if !metadata.is_file()
-        || metadata.file_type().is_symlink()
+        || crate::archive_location::is_link_or_reparse(&metadata)
         || metadata.len() != SHA256.len() as u64
     {
         return None;
@@ -271,7 +292,15 @@ async fn fetch(mut progress: impl FnMut(u64, Option<u64>)) -> Result<Vec<u8>, &'
         }))
         .build()
         .map_err(|_| "networkFailed")?;
-    let mut response = client.get(URL).send().await.map_err(|_| "networkFailed")?;
+    fetch_from(&client, URL, &mut progress).await
+}
+
+async fn fetch_from(
+    client: &reqwest::Client,
+    url: &str,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, &'static str> {
+    let mut response = client.get(url).send().await.map_err(|_| "networkFailed")?;
     if !response.status().is_success() {
         return Err("networkFailed");
     }
@@ -300,13 +329,12 @@ fn install_verified(root: &Path, bytes: &[u8], expected: &str) -> Result<(), &'s
     if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
         return Err("filesystemFailed");
     }
-    let destination = managed_path(root);
+    let mut destination = managed_path(root);
     if destination.exists() {
-        return Err("destinationExists");
+        // Preserve any existing directory, including an incomplete or user-owned one.
+        destination = parent.join(format!(".momso-git-{}", uuid::Uuid::new_v4()));
     }
-    let temporary = tempfile::Builder::new()
-        .prefix(".mingit-stage-")
-        .tempdir_in(&parent)
+    let temporary = crate::install_staging::OwnedStage::new(&parent, ".mingit-stage-")
         .map_err(|_| "filesystemFailed")?;
     let tree = temporary.path().join("mingit");
     fs::create_dir(&tree).map_err(|_| "filesystemFailed")?;
@@ -390,6 +418,48 @@ mod tests {
     use super::*;
     use zip::write::SimpleFileOptions;
 
+    #[tokio::test]
+    async fn fake_download_disconnect_and_wrong_digest_do_not_install() {
+        use std::net::TcpListener;
+        use std::thread;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            for truncated in [true, false] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut input = [0u8; 4096];
+                let _ = stream.read(&mut input);
+                if truncated {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nx",
+                        )
+                        .unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://{address}/fake-git.zip");
+        assert_eq!(
+            fetch_from(&client, &url, |_, _| {}).await,
+            Err("networkFailed")
+        );
+        let bytes = fetch_from(&client, &url, |_, _| {}).await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            install_verified(temp.path(), &bytes, SHA256),
+            Err("checksumMismatch")
+        );
+        assert!(!managed_path(temp.path()).exists());
+        worker.join().unwrap();
+    }
+
     fn fixture(name: &str) -> Vec<u8> {
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         zip.start_file(name, SimpleFileOptions::default()).unwrap();
@@ -452,10 +522,25 @@ mod tests {
             fs::read(managed_path(root.path()).join("cmd/git.exe")).unwrap(),
             b"fixture"
         );
+        fs::write(managed_path(root.path()).join("user-file"), b"keep").unwrap();
+        assert_eq!(install_verified(root.path(), &bytes, &hash), Ok(()));
         assert_eq!(
-            install_verified(root.path(), &bytes, &hash),
-            Err("destinationExists")
+            fs::read(managed_path(root.path()).join("cmd/git.exe")).unwrap(),
+            b"fixture"
         );
+        assert_eq!(
+            fs::read(managed_path(root.path()).join("user-file")).unwrap(),
+            b"keep"
+        );
+        assert!(fs::read_dir(root.path().join("git-tools"))
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".momso-git-")
+            }));
     }
 
     #[test]

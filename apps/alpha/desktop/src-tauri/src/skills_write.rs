@@ -302,6 +302,16 @@ fn state(root: &Path, name: &str, fallback_hash: &str) -> Result<State, &'static
     }
 }
 
+pub(crate) fn validate_repository(root: &Path, resources: &Path) -> Result<(), &'static str> {
+    let tool = crate::archive::storage_tool(resources)
+        .map_err(|_| "save_failed")?
+        .0;
+    if git(&tool, root, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+        return Err("save_failed");
+    }
+    Ok(())
+}
+
 pub(crate) fn install_builtin(
     root: &Path,
     resources: &Path,
@@ -367,6 +377,35 @@ pub(crate) fn install_builtin(
         before: builtin_before,
         after: Some(serde_json::to_vec(&builtins).map_err(|_| "io_error")?),
     });
+    if edits.iter().all(|change| change.before == change.after) {
+        let tool = crate::archive::storage_tool(resources)
+            .map_err(|_| "save_failed")?
+            .0;
+        let paths: Vec<String> = ["skills", ".agents/skills", ".claude/skills"]
+            .into_iter()
+            .map(|folder| format!("{folder}/{name}/SKILL.md"))
+            .filter(|path| root.join(path).is_file())
+            .collect();
+        let mut args = vec!["ls-tree", "-r", "--name-only", "HEAD", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        match git(&tool, root, &args) {
+            Ok(tracked)
+                if paths
+                    .iter()
+                    .all(|path| tracked.lines().any(|line| line == path)) =>
+            {
+                let mut diff = vec!["diff", "--quiet", "HEAD", "--"];
+                diff.extend(paths.iter().map(String::as_str));
+                if git(&tool, root, &diff).is_ok() {
+                    return Ok(());
+                }
+            }
+            Err(_) if git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_err() => {
+                return Ok(())
+            }
+            _ => {}
+        }
+    }
     // A freshly initialized archive must remain unborn until the first remote
     // receive. Otherwise default skills create an unrelated local history.
     let tool = crate::archive::storage_tool(resources)

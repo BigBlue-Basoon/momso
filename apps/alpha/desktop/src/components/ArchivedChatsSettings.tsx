@@ -50,6 +50,7 @@ export function ArchivedChatsSettings({ onChanged }: { onChanged: () => void }) 
         <p>{K.settingsIntro}</p>
       </header>
       {error && <p className="archived-error" role="alert">{error}</p>}
+      {items === null && !error && <p className="archived-empty" role="status">{K.loading}</p>}
       {items && items.length === 0 && !error && <p className="archived-empty">{K.empty}</p>}
       {items && items.length > 0 && (
         <ul className="archived-list">

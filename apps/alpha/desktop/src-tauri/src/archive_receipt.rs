@@ -28,12 +28,30 @@ pub(crate) fn valid_id(id: &str) -> bool {
             .all(u8::is_ascii_digit)
         && chrono::NaiveDateTime::parse_from_str(&id[4..], "%Y%m%d_%H%M%S").is_ok()
 }
-fn valid_chat_id(id: &str) -> bool {
+pub(crate) fn valid_chat_id(id: &str) -> bool {
     let Some(suffix) = id.strip_prefix("chat_") else {
         return false;
     };
+    if uuid::Uuid::parse_str(suffix).is_ok_and(|value| value.hyphenated().to_string() == suffix) {
+        return true;
+    }
     let candidate = format!("rec_{suffix}");
     valid_id(&candidate)
+}
+
+#[cfg(test)]
+mod chat_id_tests {
+    use super::valid_chat_id;
+
+    #[test]
+    fn accepts_existing_and_uuid_chat_ids_without_accepting_paths() {
+        assert!(valid_chat_id("chat_20261115_120000"));
+        assert!(valid_chat_id(&format!("chat_{}", uuid::Uuid::new_v4())));
+        assert!(!valid_chat_id("chat_../../credentials"));
+        assert!(!valid_chat_id(
+            "chat_00000000-0000-0000-0000-000000000000/secret"
+        ));
+    }
 }
 pub(crate) fn parse(text: &str) -> Result<(ReceiptHead, &str), String> {
     let (rest, delimiter) = if let Some(s) = text.strip_prefix("---\r\n") {
@@ -95,20 +113,19 @@ pub(crate) fn parse(text: &str) -> Result<(ReceiptHead, &str), String> {
     {
         return Err("작업 기록의 내용 구간이 빠졌습니다".into());
     }
-    if head
-        .read
-        .iter()
-        .any(|id| !crate::archive_zet::valid_asset_id(id) && !crate::archive_zet::valid_zet_id(id))
-        || head.wrote.iter().any(|id| {
-            !crate::archive_zet::valid_zet_id(id) && !crate::archive_zet::valid_asset_id(id)
-        })
-        || head.write_actions.iter().any(|(id, action)| {
-            !head.wrote.contains(id) || !["created", "edited", "deleted"].contains(&action.as_str())
-        })
-        || head.evidence.iter().any(|(id, evidence)| {
-            !head.wrote.contains(id) || !["tool", "diff"].contains(&evidence.as_str())
-        })
-        || head.unknown_actor.iter().any(|id| !head.wrote.contains(id))
+    if head.read.iter().any(|id| {
+        !crate::archive_zet::valid_asset_id(id)
+            && !crate::archive_zet::valid_zet_id(id)
+            && !crate::chat_recovery::valid_document_reference(id)
+    }) || head.wrote.iter().any(|id| {
+        !crate::archive_zet::valid_zet_id(id)
+            && !crate::archive_zet::valid_asset_id(id)
+            && !crate::chat_recovery::valid_document_reference(id)
+    }) || head.write_actions.iter().any(|(id, action)| {
+        !head.wrote.contains(id) || !["created", "edited", "deleted"].contains(&action.as_str())
+    }) || head.evidence.iter().any(|(id, evidence)| {
+        !head.wrote.contains(id) || !["tool", "diff"].contains(&evidence.as_str())
+    }) || head.unknown_actor.iter().any(|id| !head.wrote.contains(id))
     {
         return Err("작업 기록의 참조 번호가 올바르지 않습니다".into());
     }
@@ -130,6 +147,13 @@ pub(crate) enum ReceiptReference {
         id: String,
         #[serde(rename = "originalFileName")]
         original_file_name: Option<String>,
+        deleted: bool,
+    },
+    File {
+        id: String,
+        #[serde(rename = "relativePath")]
+        relative_path: String,
+        missing: bool,
     },
 }
 
@@ -177,6 +201,7 @@ pub(crate) fn chats_for_reference(
     use rusqlite::OptionalExtension;
     if !crate::archive_zet::valid_asset_id(reference)
         && !crate::archive_zet::valid_zet_id(reference)
+        && !crate::chat_recovery::valid_document_reference(reference)
     {
         return Err("문서 또는 원자료 번호가 올바르지 않습니다".into());
     }
@@ -280,9 +305,20 @@ pub(crate) fn read(
                     "SELECT original_file_name FROM momso_source_assets WHERE content_sha256=?1",
                     [&reference[7..]], |row| row.get::<_, String>(0),
                 ).optional().map_err(|_| "작업 기록의 참조를 읽지 못했습니다".to_string())?;
+                    let deleted: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE a.content_sha256=?1)", [&reference[7..]], |row| row.get(0)).map_err(|_| "작업 기록의 참조를 읽지 못했습니다".to_string())?;
                     Ok(ReceiptReference::Asset {
                         id: reference.clone(),
                         original_file_name,
+                        deleted,
+                    })
+                } else if crate::chat_recovery::valid_document_reference(reference) {
+                    Ok(ReceiptReference::File {
+                        id: reference.clone(),
+                        relative_path: reference
+                            .strip_prefix("document-path:")
+                            .unwrap_or_default()
+                            .to_owned(),
+                        missing: !crate::chat_recovery::document_exists(root, reference),
                     })
                 } else {
                     let metadata: Option<(String, String, String)> = conn
@@ -348,6 +384,9 @@ pub(crate) fn attach_asset(
     asset_id: &str,
 ) -> Result<String, String> {
     use rusqlite::OptionalExtension;
+    // Keep attachment validation and recording in the same app-write critical
+    // section as source deletion, so a pending deletion cannot be reattached.
+    let _guard = crate::chat_file_changes::lock_app_write();
     let conn = crate::storage::open_writable_connection(database)
         .map_err(|_| "원자료를 연결하지 못했습니다".to_string())?;
     let chat_exists: bool = conn
@@ -362,7 +401,7 @@ pub(crate) fn attach_asset(
     }
     let hash: Option<String> = conn
         .query_row(
-            "SELECT content_sha256 FROM momso_source_assets WHERE id=?1",
+            "SELECT a.content_sha256 FROM momso_source_assets a WHERE a.id=?1 AND a.integrity_state='active' AND NOT EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=a.id)",
             [asset_id],
             |row| row.get(0),
         )
@@ -373,12 +412,23 @@ pub(crate) fn attach_asset(
     if !crate::archive_zet::valid_asset_id(&reference) {
         return Err("원자료 번호가 올바르지 않습니다".into());
     }
-    if !root
+    let archive = root
+        .canonicalize()
+        .map_err(|_| "원자료 파일을 찾을 수 없습니다")?;
+    let objects = root
         .join("objects")
-        .join("sha256")
-        .join(&hash[..2])
-        .join(&hash)
-        .is_file()
+        .canonicalize()
+        .map_err(|_| "원자료 파일을 찾을 수 없습니다")?;
+    let path = objects.join("sha256").join(&hash[..2]).join(&hash);
+    let metadata =
+        std::fs::symlink_metadata(&path).map_err(|_| "원자료 파일을 찾을 수 없습니다")?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "원자료 파일을 찾을 수 없습니다")?;
+    if !objects.starts_with(&archive)
+        || !canonical.starts_with(&objects)
+        || !metadata.is_file()
+        || crate::archive_location::is_link_or_reparse(&metadata)
     {
         return Err("원자료 파일을 찾을 수 없습니다".into());
     }
@@ -445,25 +495,46 @@ pub(crate) fn create_with_evidence(
     if input.chat.as_deref().is_some_and(|id| !valid_chat_id(id)) {
         return Err("채팅방 번호가 올바르지 않습니다".into());
     }
-    if input
-        .read
+    if input.read.iter().any(|id| {
+        !crate::archive_zet::valid_asset_id(id)
+            && !crate::archive_zet::valid_zet_id(id)
+            && !crate::chat_recovery::valid_document_reference(id)
+    }) || input.wrote.iter().any(|id| {
+        !crate::archive_zet::valid_zet_id(id)
+            && !crate::archive_zet::valid_asset_id(id)
+            && !crate::chat_recovery::valid_document_reference(id)
+    }) || write_actions.iter().any(|(id, action)| {
+        !input.wrote.contains(id) || !["created", "edited", "deleted"].contains(&action.as_str())
+    }) || evidence
         .iter()
-        .any(|id| !crate::archive_zet::valid_asset_id(id) && !crate::archive_zet::valid_zet_id(id))
-        || input.wrote.iter().any(|id| {
-            !crate::archive_zet::valid_zet_id(id) && !crate::archive_zet::valid_asset_id(id)
-        })
-        || write_actions.iter().any(|(id, action)| {
-            !input.wrote.contains(id)
-                || !["created", "edited", "deleted"].contains(&action.as_str())
-        })
-        || evidence.iter().any(|(id, value)| {
-            !input.wrote.contains(id) || !["tool", "diff"].contains(&value.as_str())
-        })
+        .any(|(id, value)| !input.wrote.contains(id) || !["tool", "diff"].contains(&value.as_str()))
         || unknown_actor.iter().any(|id| !input.wrote.contains(id))
     {
         return Err("작업 기록의 참조 번호가 올바르지 않습니다".into());
     }
-    let (id, created_at, mut file) = crate::archive::allocate_file(&root.join("receipts"), "rec")?;
+    let _guard = crate::archive_zet::WRITE_LOCK
+        .lock()
+        .map_err(|_| "작업 기록을 저장하지 못했습니다".to_string())?;
+    let (id, created_at, mut file) = loop {
+        let (id, created_at, file) = crate::archive::allocate_file(&root.join("receipts"), "rec")?;
+        let saved = root
+            .join(".git/momso-deleted-receipts")
+            .join(format!("{id}.md"));
+        match std::fs::symlink_metadata(saved) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                break (id, created_at, file)
+            }
+            result => {
+                drop(file);
+                std::fs::remove_file(root.join("receipts").join(format!("{id}.md")))
+                    .map_err(|_| "unavailable")?;
+                if result.is_err() {
+                    return Err("unavailable".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    };
     let head = ReceiptHead {
         id: id.clone(),
         created_at,
@@ -522,9 +593,160 @@ pub(crate) fn create_with_evidence(
     Ok(id)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReceiptDeleteResult {
+    state: &'static str,
+    id: String,
+    pub(crate) chat_id: Option<String>,
+}
+
+pub(crate) fn delete(
+    root: &std::path::Path,
+    database: &std::path::Path,
+    id: &str,
+) -> Result<ReceiptDeleteResult, String> {
+    if !valid_id(id) {
+        return Err("invalid_id".into());
+    }
+    let _write = crate::chat_file_changes::lock_app_write();
+    let _index = crate::archive_zet::WRITE_LOCK
+        .lock()
+        .map_err(|_| "unavailable")?;
+    let receipts = root.join("receipts");
+    let git = root.join(".git");
+    for directory in [&receipts, &git] {
+        let meta = std::fs::symlink_metadata(directory).map_err(|_| "unavailable")?;
+        if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+            return Err("unsafe_path".into());
+        }
+    }
+    let path = receipts.join(format!("{id}.md"));
+    let meta = std::fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "not_found"
+        } else {
+            "unavailable"
+        }
+    })?;
+    if !meta.is_file() || crate::archive_location::is_link_or_reparse(&meta) {
+        return Err("unsafe_path".into());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|_| "unavailable")?;
+    let (head, _) = parse(&text).map_err(|_| "invalid_receipt")?;
+    if head.id != id {
+        return Err("invalid_receipt".into());
+    }
+    let trash = git.join("momso-deleted-receipts");
+    match std::fs::create_dir(&trash) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(_) => return Err("unavailable".into()),
+    }
+    let meta = std::fs::symlink_metadata(&trash).map_err(|_| "unavailable")?;
+    if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+        return Err("unsafe_path".into());
+    }
+    let saved = trash.join(format!("{id}.md"));
+    crate::source_delete::move_without_replacement(&path, &saved).map_err(|_| "unavailable")?;
+    let update = (|| -> Result<(), String> {
+        let mut conn =
+            crate::storage::open_writable_connection(database).map_err(|_| "unavailable")?;
+        let tx = conn.transaction().map_err(|_| "unavailable")?;
+        for table in ["archive_receipts_read", "archive_receipts_wrote"] {
+            tx.execute(&format!("DELETE FROM {table} WHERE receipt_id=?1"), [id])
+                .map_err(|_| "unavailable")?;
+        }
+        tx.execute("DELETE FROM archive_receipts WHERE id=?1", [id])
+            .map_err(|_| "unavailable")?;
+        tx.execute(
+            "DELETE FROM chat_attachments WHERE receipt_id=?1 AND message_id IS NULL",
+            [id],
+        )
+        .map_err(|_| "unavailable")?;
+        tx.commit().map_err(|_| "unavailable")?;
+        Ok(())
+    })();
+    if let Err(error) = update {
+        if crate::source_delete::move_without_replacement(&saved, &path).is_err() {
+            return Err("rollback_failed".into());
+        }
+        return Err(error);
+    }
+    Ok(ReceiptDeleteResult {
+        state: "deleted",
+        id: id.to_owned(),
+        chat_id: head.chat,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deleting_receipt_preserves_source_and_sent_attachment_and_rolls_back_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        for folder in ["receipts", "objects", ".git"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let db = temp.path().join("state.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let bytes = b"source bytes";
+        let hash = crate::object_store::digest(bytes);
+        let object = root.join("objects/sha256").join(&hash[..2]).join(&hash);
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(&object, bytes).unwrap();
+        let conn = crate::storage::open_writable_connection(&db).unwrap();
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset','other',?1,?2,?3,'source.txt','test','2026-01-01T00:00:00Z')", rusqlite::params![hash,bytes.len() as i64,format!("sha256/{}/{hash}",&hash[..2])]).unwrap();
+        drop(conn);
+        let receipt = attach_asset(&root, &db, &chat, "asset").unwrap();
+        let message = crate::chat::append_for_send(&db, &chat, "message", None).unwrap();
+        let path = root.join("receipts").join(format!("{receipt}.md"));
+        let original = std::fs::read(&path).unwrap();
+        assert!(delete(&root, &temp.path().join("missing.db"), &receipt).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let result = delete(&root, &db, &receipt).unwrap();
+        assert_eq!(result.state, "deleted");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&object).unwrap(), bytes);
+        assert_eq!(
+            crate::chat::message_attachment_paths(&db, &root, &chat, &message.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let copies = std::fs::read_dir(root.join(".git/momso-deleted-receipts"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read(copies[0].path()).unwrap(), original);
+        assert!(matches!(delete(&root, &db, "../../outside"), Err(error) if error == "invalid_id"));
+        let pending = attach_asset(&root, &db, &chat, "asset").unwrap();
+        assert_ne!(pending, receipt);
+        delete(&root, &db, &pending).unwrap();
+        let conn = crate::storage::open_writable_connection(&db).unwrap();
+        let pending_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_attachments WHERE chat_id=?1 AND message_id IS NULL",
+                [&chat],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 0);
+        assert_eq!(
+            crate::chat::message_attachment_paths(&db, &root, &chat, &message.id)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn attachment_records_an_existing_asset_in_the_requested_chat() {
         use sha2::{Digest, Sha256};
@@ -548,6 +770,25 @@ mod tests {
         conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES ('asset-1','other',?1,?2,?3,'요가.png','person','2026-11-15T12:00:00+09:00')", rusqlite::params![hash,i64::try_from(bytes.len()).unwrap(),format!("sha256/{}/{}", &hash[..2],hash)]).unwrap();
         assert!(attach_asset(&root, &db, "chat_20261115_120001", "asset-1").is_err());
         assert!(attach_asset(&root, &db, chat, "missing").is_err());
+        conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('asset-1','pending-operation','pending','x','x')", []).unwrap();
+        assert!(attach_asset(&root, &db, chat, "asset-1").is_err());
+        assert_eq!(std::fs::read_dir(root.join("receipts")).unwrap().count(), 0);
+        conn.execute(
+            "DELETE FROM source_asset_deletions WHERE asset_id='asset-1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE momso_source_assets SET integrity_state='quarantined',integrity_issue='test',quarantined_at='x',quarantined_by='test' WHERE id='asset-1'",
+            [],
+        )
+        .unwrap();
+        assert!(attach_asset(&root, &db, chat, "asset-1").is_err());
+        conn.execute(
+            "UPDATE momso_source_assets SET integrity_state='active',integrity_issue=NULL,quarantined_at=NULL,quarantined_by=NULL WHERE id='asset-1'",
+            [],
+        )
+        .unwrap();
         let receipt = attach_asset(&root, &db, chat, "asset-1").unwrap();
         let text =
             std::fs::read_to_string(root.join("receipts").join(format!("{receipt}.md"))).unwrap();
@@ -567,6 +808,21 @@ mod tests {
         attach_asset(&root, &db, other, "asset-1").unwrap();
         let message =
             crate::chat::append_for_send(&db, chat, "이 파일을 읽어 주세요", None).unwrap();
+        conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('asset-1','interrupted-operation','pending','2026-11-16T00:00:00Z','x')", []).unwrap();
+        assert!(crate::chat::message_attachment_paths(&db, &root, chat, &message.id).is_err());
+        let pending_items =
+            serde_json::to_value(crate::chat_items::list(&root, &db, chat).unwrap()).unwrap();
+        assert!(pending_items["files"].as_array().unwrap().is_empty());
+        assert!(pending_items["deleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == format!("sha256:{hash}")));
+        conn.execute(
+            "DELETE FROM source_asset_deletions WHERE asset_id='asset-1'",
+            [],
+        )
+        .unwrap();
         let paths = crate::chat::message_attachment_paths(&db, &root, chat, &message.id).unwrap();
         let encoded = serde_json::to_value(paths).unwrap();
         assert_eq!(

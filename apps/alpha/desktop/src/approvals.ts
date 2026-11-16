@@ -11,7 +11,12 @@ import type { AiProvider } from './ai-models'
 import { isDesktopRuntime } from './runtime'
 
 export type ApprovalChoice = 'allow_once' | 'allow_session' | 'deny' | 'cancel'
-export type ApprovalKind = 'command' | 'file_change' | 'setup_change' | 'other'
+export type ApprovalKind = 'command' | 'file_change' | 'setup_change' | 'browser_action_scope' | 'browser_action' | 'other'
+
+/** 몸소 브라우저의 물음(browser.ts 의 계약). 누르기·입력 한 번마다 묻는 일이라 "이번만 허락"과 "거절"만 둔다. */
+export function isBrowserApproval(request?: ApprovalRequest) {
+  return request?.kind === 'browser_action_scope' || request?.kind === 'browser_action'
+}
 
 /**
  * 스킬("GitHub 연결", "원자료 저장소 연결")로 AI 가 몸소의 도구를 불러 무언가를 만들고 연결하려 할 때의 물음.
@@ -81,8 +86,9 @@ export const CHOICE_DONE: Record<ApprovalChoice, string> = {
 const CHOICE_ORDER: ApprovalChoice[] = ['allow_once', 'allow_session', 'deny', 'cancel']
 
 export function orderedChoices(options: ApprovalChoice[], request?: ApprovalRequest) {
-  const setup = request?.kind === 'setup_change'
-  return CHOICE_ORDER.filter((choice) => options.includes(choice) && !(setup && (choice === 'allow_session' || choice === 'cancel')))
+  // 설정 승인과 브라우저 승인은 한 번 한 번 묻는 일이다: "이 채팅방에서 항상 허락"과 "그만두기"는 와도 두지 않는다.
+  const once = request?.kind === 'setup_change' || isBrowserApproval(request)
+  return CHOICE_ORDER.filter((choice) => options.includes(choice) && !(once && (choice === 'allow_session' || choice === 'cancel')))
 }
 
 export async function respondApproval(requestId: string, choice: ApprovalChoice) {

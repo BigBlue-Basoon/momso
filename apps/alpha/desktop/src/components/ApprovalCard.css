@@ -289,3 +289,8 @@
   .approval-card,
   .approval-done { animation: none; }
 }
+
+/* 브라우저 카드의 이름표는 "사이트", "누르면" 두 낱말뿐이라 좁게. 좁은 창(960, 오른쪽 패널 열림)에서 사이트 주소가 중간에서 끊기지 않게. */
+.approval-card.is-browser .approval-facts > div {
+  grid-template-columns: 52px minmax(0, 1fr);
+}

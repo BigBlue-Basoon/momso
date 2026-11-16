@@ -484,7 +484,7 @@ pub(crate) async fn run_command<F: FnMut(&str, Value) + Send>(
                 let context_model = actual_model.clone();
                 let reason = match stop_reason { "max_tokens" => chat::FinishReason::LengthLimit, "max_turn_requests" => chat::FinishReason::TurnLimit, "refusal" => chat::FinishReason::Refusal, _ => chat::FinishReason::Completed };
                 let msg = chat::append_finished(db,id,&answer,"gemini".into(),actual_model,actual_effort,reason)?;
-                let mut done = json!({"chatId":id,"messageId":msg.id,"actualEffort":null,"fastState":null,"stopReason":null,"finishReason":reason});
+                let mut done = json!({"chatId":id,"messageId":msg.id,"actualEffort":null,"actualSpecialEffort":null,"fastState":null,"stopReason":null,"finishReason":reason});
                 if stop_reason != "end_turn" { done["stopReason"] = json!(stop_reason); }
                 emit("chat-done",done);
                 if let Some(old) = chat_claude::initial_title(db,id) {

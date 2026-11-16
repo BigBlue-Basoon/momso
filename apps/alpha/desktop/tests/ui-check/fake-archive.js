@@ -328,6 +328,42 @@
     })
   }
 
+  // ---- ?big=1: 많이 쌓였을 때(2026-11-17 화면 재기). 채팅방 500개(묶음 20개에 나눔, 고정 10개) + 보관 200개,
+  //      말 500개인 채팅방 하나(긴 답·코드·표), 문서 1,000개, 미디어 300개, 용어 1,000개, 사람 이름 300개. ----
+  const bigMode = new URLSearchParams(location.search).has('big')
+  if (bigMode) {
+    const NL = String.fromCharCode(10)
+    const groups = Array.from({ length: 20 }, (_, i) => addGroup(`${i + 1}번 묶음 수련생들`))
+    for (let i = 1; i <= 500; i += 1) {
+      seedChat(`${i}번째 채팅방, 수업과 수련생 이야기`, 1)
+    }
+    const all = Object.values(chats).filter((c) => /번째 채팅방/.test(c.title))
+    all.forEach((c, i) => { if (i % 3 !== 0) c.groupId = groups[i % 20].id; if (i >= all.length - 10) { c.pinned = true; c.pinnedOrder = i } })
+    for (let i = 1; i <= 200; i += 1) {
+      seedChat(`${i}번째 보관한 채팅방`, 1)
+      const made = Object.values(chats).find((c) => c.title === `${i}번째 보관한 채팅방`)
+      made.archived = true; made.archivedAt = nextStamp()
+    }
+    // 말 500개인 채팅방: 긴 답, 코드, 표.
+    const createdAt = nextStamp()
+    const id = chatIdFor(createdAt)
+    const messages = []
+    for (let i = 1; i <= 250; i += 1) {
+      messages.push({ id: `${id}-u${i}`, role: 'user', text: `${i}번째 물음: 다음 수업 순서를 표로 정리하고, 기록용 코드도 보여 줘.`, createdAt: nextStamp() })
+      const long = Array.from({ length: 6 }, (_, k) => `${k + 1}. 호흡을 길게 내쉬며 골반의 무게를 내려놓고, 어깨는 귀에서 멀어지게 둡니다. 서두르지 않고 다음 자세로 넘어갑니다.`).join(NL)
+      const table = ['| 순서 | 자세 | 시간 |', '| --- | --- | --- |', '| 1 | 앉은 호흡 | 5분 |', '| 2 | 고양이 소 | 3분 |', '| 3 | 낮은 런지 | 4분 |'].join(NL)
+      const code = ['```js', 'const flow = ["호흡", "고양이 소", "런지"]', 'for (const pose of flow) console.log(pose)', '```'].join(NL)
+      messages.push({ id: `${id}-a${i}`, role: 'assistant', text: [`**${i}번째 답**입니다.`, long, table, code].join(NL + NL), createdAt: nextStamp(), provider: ['codex', 'claude', 'gemini'][i % 3], model: null })
+    }
+    chats[id] = { id, title: '말이 500개인 채팅방', createdAt, updatedAt: messages[messages.length - 1].createdAt, messages }
+    // 문서 1,000개.
+    for (let i = 1; i <= 1000; i += 1) {
+      const zid = `zet_2026${pad(1 + (i % 11))}${pad(1 + (i % 27))}_${String(100000 + i).slice(1)}`
+      const at = new Date(Date.parse('2026-11-15T12:00:00+09:00') - i * 3600000).toISOString()
+      zets[zid] = { head: { id: zid, title: `${i}번째 문서, 수업 기록`, summary: `${i}번째 수업에서 호흡과 어깨를 살폈다.`, kind: ['summary', 'note', 'transcript'][i % 3], status: 'draft', created_at: at, updated_at: at, assets: [], edges: [] }, body: `# ${i}번째 문서` + NL + NL + '호흡을 길게 내쉬었다.' }
+    }
+  }
+
   // ---- 사용량(본부가 전한 계약대로 흉내 낸다). 주소에 ?usage=mixed(기본) / all-ok / none / low / fail 를 붙일 수 있다. ----
   const usageMode = new URLSearchParams(location.search).get('usage') || 'mixed'
   function soon(hours) {
@@ -496,7 +532,7 @@
   window.__emit = emit
   window.__emitCompacted = (chatId) => emit('chat-compacted', { chatId })
   const running = {}
-  function chatSend({ chatId, text, provider, model, effort, fast, skill }) {
+  function chatSend({ chatId, text, provider, model, effort, fast, skill, retryMessageId }) {
     if (sendMode === 'old') throw 'Command chat_send not found'
     const chat = chats[chatId]
     if (!chat) throw '대화를 찾지 못했습니다'
@@ -506,9 +542,14 @@
     // ?fast=refuse: 보낸 뒤 실패(말은 저장되고 다시 보내기 표시, chat-error). 같은 글을 다시 보내면 그 말을 다시 쓴다.
     if (provider === 'claude' && fast && query.get('fast') === 'refusenow') return { status: 'fast_unavailable' }
     const last = chat.messages[chat.messages.length - 1]
-    const reuse = last && last.role === 'user' && last.retryableFast && last.text === text
-    const userMessage = reuse ? last : { id: `${chatId}-m${chat.messages.length + 1}`, role: 'user', text, createdAt: nextStamp(), skill: skill ?? null }
-    if (reuse) { delete last.retryableFast; last.skill = skill ?? null } else chat.messages.push(userMessage)
+    // retryMessageId(T52·T55): 답을 받지 못한 내 말을 그대로 다시 쓴다(새 말을 더하지 않음). 그런 말이 아니거나 ?retryfail 이면 retry_unavailable.
+    const retried = retryMessageId ? chat.messages.find((m) => m.id === retryMessageId && m.role === 'user' && m.failed) : null
+    if (retryMessageId && (!retried || query.has('retryfail'))) return { status: 'retry_unavailable' }
+    window.__retryCalls = (window.__retryCalls || []).concat(retryMessageId ? [retryMessageId] : [])
+    const reuse = Boolean(retried) || (last && last.role === 'user' && last.retryableFast && last.text === text)
+    const userMessage = retried || (reuse ? last : { id: `${chatId}-m${chat.messages.length + 1}`, role: 'user', text, createdAt: nextStamp(), skill: skill ?? null })
+    if (retried) { delete retried.failed; if (query.get('chaterror') && window.__retryOk) window.__failOff = true }
+    else if (reuse) { delete last.retryableFast; last.skill = skill ?? null } else chat.messages.push(userMessage)
     chat.updatedAt = userMessage.createdAt
     if (!chat.title) chat.title = text.trim().slice(0, 40)
     if (provider === 'claude' && fast && query.get('fast') === 'refuse') {
@@ -521,7 +562,7 @@
     const pieces = ['받은 말: "', text, '"' + String.fromCharCode(10) + String.fromCharCode(10), '**굵은 ', '글씨**와 목록:' + String.fromCharCode(10), '- 하나' + String.fromCharCode(10) + '- ', '둘' + String.fromCharCode(10) + String.fromCharCode(10), '```' + String.fromCharCode(10) + '코드 ', '조각' + String.fromCharCode(10) + '```']
     let at = 0
     // ?chaterror=usageLimit 처럼: 답이 조금 오다가 G18 chat-error 로 끊긴다(그때까지 온 글은 답으로 저장). retryAt 은 ?retryin=분.
-    const failKind = query.get('chaterror')
+    const failKind = window.__failOff ? null : query.get('chaterror')
     const FAIL_ACTIONS = { usageLimit: ['wait', 'switchProvider'], rateLimited: ['wait', 'retry', 'switchProvider'], authentication: ['signIn', 'switchProvider'], billing: ['checkBilling', 'switchProvider'], modelUnavailable: ['switchModel', 'switchProvider'], connectionClosed: ['retry', 'switchProvider'], timeout: ['retry', 'switchProvider'], toolMissing: ['install', 'switchProvider'], serviceUnavailable: ['retry', 'wait', 'switchProvider'], contextTooLong: ['shorten', 'switchProvider'], unknown: [] }
     const timer = setInterval(() => {
       if (failKind && at >= 3) {
@@ -530,7 +571,8 @@
         const partial = { id: `${chatId}-m${chat.messages.length + 1}`, role: 'assistant', text: pieces.slice(0, at).join(''), createdAt: nextStamp(), provider, model, effort, finishReason: 'error' }
         chat.messages.push(partial)
         const retryAt = query.get('retryin') ? Math.round(Date.now() / 1000) + Number(query.get('retryin')) * 60 : null
-        emit('chat-error', { chatId, messageId: partial.id, reason: '', ...(failKind === 'authentication' ? { status: 'auth_failed' } : {}), error: { kind: failKind, retryAt, actions: FAIL_ACTIONS[failKind] || [], providerCode: null } })
+        userMessage.failed = true
+        emit('chat-error', { chatId, messageId: partial.id, userMessageId: userMessage.id, reason: '', ...(failKind === 'authentication' ? { status: 'auth_failed' } : {}), error: { kind: failKind, retryAt, actions: FAIL_ACTIONS[failKind] || [], providerCode: null } })
         return
       }
       if (at < pieces.length) {
@@ -550,7 +592,7 @@
       emit('chat-done', { chatId, messageId: message.id, notHandedOver: omitted, ...(fastState ? { fastState } : {}) })
     }, 250)
     running[chatId] = timer
-    return null
+    return { status: 'started', userMessageId: userMessage.id, handoffLimit: null }
   }
 
   // ---- 허락을 구하는 물음(화면 확인용 가짜). window.__approve('command'|'file_change'|'other', ['allow_once', ...]) 로 띄운다. ----
@@ -673,8 +715,54 @@
   function mediaList() {
     if (mediaMode === 'none') throw 'Command media_list not found'
     const list = chatList()
-    const count = mediaMode === 'many' ? 120 : 14
-    return Array.from({ length: count }, (_, i) => mediaItem(i, (n) => list[n % Math.max(1, list.length)] || null))
+    const count = bigMode ? 300 : mediaMode === 'many' ? 120 : mediaMode === 'empty' ? 0 : 14
+    return Array.from({ length: count }, (_, i) => mediaItem(i, (n) => list[n % Math.max(1, list.length)] || null)).filter((item) => !trashedSources.has(item.id))
+  }
+  // ---- 원자료 열기와 지우기(가짜, T59). 지운 원자료는 미디어 목록과 채팅방에서 다룬 것에서 빠진다. ----
+  const trashedSources = new Set()
+  const purgedSources = new Set()
+  window.__sourceCalls = []
+  if (query.get('copyfail')) setTimeout(() => emit('chat-archive-changed', { chatId: null, state: 'unavailable', reason: query.get('copyfail') }), 2500)
+  function sourceCommand(command, args) {
+    window.__sourceCalls.push([command, args])
+    const id = args.assetId
+    if (trashedSources.has(id) && command !== 'source_asset_restore_trashed') {
+      if (command === 'source_asset_open') return { state: 'not_found', kind: null, path: null, content: null, nextCursor: null, totalBytes: null }
+    }
+    const files = chatItems(chatList()[0]?.id).files
+    const fileTitle = Object.fromEntries(files.map((f) => [f.id, f.title]))[id]
+    switch (command) {
+      case 'source_asset_open':
+        if (id === asset) return { state: 'ok', kind: 'audio', path: 'C:/fake/a.m4a', content: null, nextCursor: null, totalBytes: null }
+        if (fileTitle) return /[.](txt|md)$/.test(fileTitle) ? { state: 'ok', kind: 'text', path: null, content: '...', nextCursor: null, totalBytes: 3 } : { state: 'not_text', kind: null, path: null, content: null, nextCursor: null, totalBytes: null }
+        return { state: 'ok', kind: 'image', path: 'C:/fake/p.jpg', content: null, nextCursor: null, totalBytes: null }
+      case 'source_asset_delete_preview': {
+        // ?sourceused=none 이면 쓰는 곳 없음. 기본은 문서 둘·작업 내역 하나·채팅방 하나.
+        if (query.get('sourcefail') === 'preview') throw 'references_unavailable'
+        const none = query.get('sourceused') === 'none'
+        const docIds = Object.keys(zets).slice(0, 2)
+        return { assetId: id, sha256: 'x', originalFileName: fileTitle || null, state: 'active', documents: none ? [] : docIds, receipts: none ? [] : ['rcpt_1'], chats: none ? [] : [chatList()[0]?.id].filter(Boolean), recordVersions: [], localRemaining: null, remoteRemaining: null, planDigest: 'fake-digest' }
+      }
+      case 'source_asset_trash':
+        if (query.get('sourcefail') === 'busy') throw 'chat_active'
+        trashedSources.add(id); return { state: 'trashed', assetId: id, retainUntil: new Date(Date.now() + 30 * 864e5).toISOString() }
+      case 'source_asset_restore_trashed':
+        trashedSources.delete(id); return { state: 'active', assetId: id, retainUntil: null }
+      case 'source_asset_deleted_list': {
+        // ?deleted=many 면 미리 지운 것 45개(쪽 나눔 확인), 기본은 이 창에서 지운 것만.
+        if (query.get('deleted') === 'many' && !window.__deletedSeeded) { window.__deletedSeeded = true; for (let i = 0; i < 45; i++) trashedSources.add('sha256:seed' + String(i).padStart(4, '0')) }
+        const all = [...trashedSources].map((id, i) => ({ id, originalFileName: id.startsWith('sha256:seed') ? `수업 녹음 ${id.slice(-4)}.m4a` : (Object.fromEntries(files.map((f) => [f.id, f.title]))[id] || '수업 사진.jpg'), deletedAt: new Date(Date.now() - i * 3600e3).toISOString(), deletionState: purgedSources.has(id) ? 'purge_pending' : 'trashed', canRestore: !purgedSources.has(id), canPurge: true, referenceCount: i % 3 }))
+        const start = args.before ? all.findIndex((x) => x.id === args.before.assetId) + 1 : 0
+        const items = all.slice(start, start + 40)
+        const more = start + items.length < all.length
+        return { items, hasMore: more, nextCursor: more ? { deletedAt: items[items.length - 1].deletedAt, assetId: items[items.length - 1].id } : null }
+      }
+      case 'source_asset_purge':
+        if (!args.confirmed) throw 'confirmation_required'
+        trashedSources.delete(id); purgedSources.add(id)
+        return { state: 'partial', assetId: id, localRemaining: ['database_backups_may_contain_metadata'], remoteRemaining: ['object_versions_unverified', 'other_stores_unverified'], removedRemoteKeys: [] }
+    }
+    return undefined
   }
   // ?items=ok(기본) / none(명령 없음) · 첫 채팅방은 문서 셋과 미디어 여섯, 둘째는 문서 하나, 셋째는 아무것도 없음.
   const extraItems = {}
@@ -697,7 +785,8 @@
       documents = [pick(docs[0], 'edited', { kind: 'user' }, 120)]
     }
     const extra = extraItems[chatId] || []
-    return { documents: [...extra, ...documents], media: [...(attachedMedia[chatId] || []), ...media], files: [...(attachedFiles[chatId] || []), ...files] }
+    const kept = (item) => !(typeof trashedSources !== 'undefined' && trashedSources.has(item.id))
+    return { documents: [...extra, ...documents], media: [...(attachedMedia[chatId] || []), ...media].filter(kept), files: [...(attachedFiles[chatId] || []), ...files].filter(kept) }
   }
   // ---- 클립으로 붙이기(가짜): plan/apply_source_asset_import → chat_attach_asset. 소리 파일은 미디어로 "붙임"(실제처럼). ----
   const attachedMedia = {}
@@ -746,7 +835,14 @@
     { name: 'skill-two', title: '보기 스킬 둘', description: '보기 설명: 내가 만든 스킬.', enabled: true, builtin: false, body: '보기 내용 둘.' + String.fromCharCode(10) + '둘째 줄.', syncState: 'ok' },
     { name: 'skill-three', title: '보기 스킬 셋', description: '보기 설명: 꺼 둔 스킬.', enabled: false, builtin: false, body: '보기 내용 셋.', syncState: 'disabled' },
     { name: 'skill-four', title: '보기 스킬 넷', description: '보기 설명: 다른 곳에서 고친 내용과 다른 스킬.', enabled: true, builtin: true, body: '보기 내용 넷.', syncState: 'conflict' },
-  ].map((item) => ({ ...item, updatedAt: '2026-11-16T01:00:00+09:00', providers: ['codex', 'claude'], hash: 'h1' }))
+    // 쓸 수 있는지(available·unavailableReason): 브라우저 스킬 둘
+    { name: 'skill-five', title: '보기 스킬 다섯', description: '보기 설명: 브라우저 스킬, 기본 규칙을 고침.', enabled: true, builtin: true, body: '보기 내용 다섯.', syncState: 'ok', available: false, unavailableReason: 'policy_modified' },
+    { name: 'skill-six', title: '보기 스킬 여섯', description: '보기 설명: 브라우저 스킬, 브라우저 없음.', enabled: true, builtin: true, body: '보기 내용 여섯.', syncState: 'ok', available: false, unavailableReason: 'browser_unavailable' },
+  ].map((item) => ({
+    available: item.syncState === 'conflict' || !item.enabled ? false : true,
+    unavailableReason: item.syncState === 'conflict' ? 'skill_conflict' : !item.enabled ? 'disabled' : null,
+    ...item, updatedAt: '2026-11-16T01:00:00+09:00', providers: ['codex', 'claude'], hash: 'h1',
+  }))
   window.__skillCalls = []
   function skillCommand(command, args) {
     if ((query.get('skills') || 'ok') === 'none') throw `Command ${command} not found`
@@ -813,8 +909,20 @@
       provider, installed, state, methods: gem ? ['apiKey'] : ['account', 'apiKey'],
       accountLabel: state === 'account' ? 'teacher@example.com' : null, planLabel: state === 'account' ? (provider === 'codex' ? 'Plus' : 'Pro') : null,
       apiKeySaved: state === 'apiKey', active: state === 'signedOut' ? null : state,
+      // 2026-11-17 키 확인(desktop-screen-backend-contract.md "AI 연결 확인"). ?key=verifying|rejected|unavailable|notSupported 로 저장된 키의 확인 결과를 바꾼다(기본 verified).
+      runnable: installed, keyVerification: state === 'apiKey' ? (query.get('key') || 'verified') : 'notConfigured',
     }
   })
+  // 뒤쪽 first_run_allowed 와 같은 규칙(provider_auth.rs): 도구가 실행되고, 계정이 있거나 저장된 키가 verified·unavailable·notSupported.
+  function firstRunAllowed() {
+    return Object.values(authState).some((x) => x.runnable && (x.state === 'account' || (x.apiKeySaved && ['verified', 'unavailable', 'notSupported'].includes(x.keyVerification))))
+  }
+  // 키를 저장하거나 다시 확인하면 verifying 을 알리고, 잠시 뒤 결과(?keyresult=rejected|unavailable|verified, 기본 verified)를 알린다.
+  function checkKey(item, provider) {
+    item.keyVerification = 'verifying'
+    emit('provider-auth-changed', { provider, state: 'verifying' })
+    setTimeout(() => { item.keyVerification = query.get('keyresult') || 'verified'; emit('provider-auth-changed', { provider, state: item.keyVerification }) }, Number(query.get('keydelay') || 800))
+  }
   window.__authCalls = []
   function authCommand(command, args) {
     if (!authMode) throw `Command ${command} not found`
@@ -831,8 +939,11 @@
         const total = 40 * 1024 * 1024
         const delay = Number(query.get('installdelay') || 1200)
         if (query.get('installbytes') === '1') [0.25, 0.5, 0.75].forEach((part, i) => setTimeout(() => progress('installing', { receivedBytes: total * part, totalBytes: total }), (delay / 4) * (i + 1)))
+        // 뒤쪽처럼 끝나기 전에 설치한 도구를 실행해 보는 단계(verifying, 실패 아님). ?installfail=once 면 처음 한 번만 실패(반쯤 깔린 뒤 다시 시도).
+        setTimeout(() => progress('verifying'), delay * 0.8)
+        window.__installTries = (window.__installTries || 0) + 1
         return new Promise((done) => setTimeout(() => {
-          if (query.get('installfail') === '1') {
+          if (query.get('installfail') === '1' || (query.get('installfail') === 'once' && window.__installTries === 1)) {
             progress('failed', { reason: query.get('installreason') || 'installFailed' })
             done('installFailed'); return
           }
@@ -852,10 +963,14 @@
       case 'provider_api_key_set':
         if (!item.methods.includes('apiKey')) return 'unavailable'
         if (!args.apiKey || /\s/.test(args.apiKey) || args.apiKey.length < 8) return 'invalidKey'
-        item.apiKeySaved = true; if (item.state === 'signedOut') item.state = 'apiKey'
-        emit('provider-auth-changed', { provider: args.provider, state: 'keySaved' }); return 'keySaved'
+        item.apiKeySaved = true; if (item.state === 'signedOut' || item.state === 'unavailable') item.state = 'apiKey'
+        checkKey(item, args.provider); return 'verifying'
+      case 'provider_api_key_verify':
+        if (!item || !item.apiKeySaved) return 'notConfigured'
+        checkKey(item, args.provider); return 'verifying'
+      case 'provider_first_run_eligible': return firstRunAllowed()
       case 'provider_api_key_clear':
-        item.apiKeySaved = false; if (item.state === 'apiKey') item.state = 'signedOut'
+        item.apiKeySaved = false; item.keyVerification = 'notConfigured'; if (item.state === 'apiKey') item.state = 'signedOut'
         emit('provider-auth-changed', { provider: args.provider, state: 'keyCleared' }); return 'keyCleared'
     }
     return undefined
@@ -879,11 +994,40 @@
       }
       // ?git=missing: 이 PC 에 Git 이 없어 GitHub 쪽이 막힘(reason git_missing). 설치가 끝나면(gitInstalled) 풀린다.
       if (command === 'archive_remote_status' && query.get('git') === 'missing' && !window.__gitInstalled) return { ...remote, state: 'unavailable', reason: 'git_missing' }
+      // 다시 읽은 상태에도 conflictPaths(2026-11-17). ?statusdiverged=3 이면 그 수만큼, =null 이면 수 없이.
+      if (command === 'archive_remote_status' && query.get('statusdiverged')) return { ...remote, reason: 'diverged', conflictPaths: query.get('statusdiverged') === 'null' ? null : Array.from({ length: Number(query.get('statusdiverged')) }, (_, i) => `zettels/${i}.md`) }
       // ?history=profile / rules / other: 올리기가 이력 때문에 막힘(T34·T35). reason 은 unsafe_history, historyReason 은 그 까닭(그 밖은 null).
       const held = { profile: 'profile_in_history', rules: 'profile_in_rules_history', other: null }
       if (command === 'archive_remote_push' && query.get('history') in held) return { ...remote, reason: 'unsafe_history', historyReason: held[query.get('history')] }
-      if (command === 'archive_remote_push') { Object.assign(remote, { ahead: 0, lastPushedAt: new Date().toISOString() }); return { ...remote } }
-      if (command === 'archive_remote_pull') return { ...remote, reason: query.get('pull') === 'unsaved' ? 'unsaved_changes' : null }
+      // 2026-11-17 합치기 결과와 못 올린 까닭. ?merge=auto|preserved|preserved2|conflicts|conflictsnull, ?pushreason=connection_failed 등.
+      // ?firstreceive=1 이면 받기 동안 archive-first-receive-progress(세 단계)와 chat-archive-restore-progress 를 흉내 낸다.
+      const merged = () => {
+        const m = query.get('merge')
+        const ids = Object.keys(zets)
+        if (m === 'auto') return { autoMerged: true, preservedDocuments: [], conflictPaths: [] }
+        if (m === 'preserved') return { autoMerged: true, preservedDocuments: [ids[0]], conflictPaths: [] }
+        if (m === 'preserved2') return { autoMerged: true, preservedDocuments: ids.slice(0, 2), conflictPaths: [] }
+        if (m === 'conflicts') return { autoMerged: false, preservedDocuments: [], conflictPaths: ['zettels/a.md', 'zettels/b.md', 'chats/c.json'], reason: 'diverged' }
+        if (m === 'conflictsnull') return { autoMerged: false, preservedDocuments: [], conflictPaths: null, reason: 'diverged' }
+        return { autoMerged: false, preservedDocuments: [], conflictPaths: [] }
+      }
+      if (command === 'archive_remote_push') {
+        if (query.get('pushreason')) return { ...remote, reason: query.get('pushreason'), ...merged() }
+        Object.assign(remote, { ahead: 0, lastPushedAt: new Date().toISOString() }); return { ...remote, ...merged() }
+      }
+      if (command === 'archive_remote_pull') {
+        const done = () => ({ ...remote, reason: query.get('pull') === 'unsaved' ? 'unsaved_changes' : null, ...merged() })
+        if (query.get('firstreceive') !== '1') return done()
+        const steps = [['receiving', 0], ['indexing', 1], ['restoring', 2]]
+        const gap = Number(query.get('receivegap') || 1500)
+        steps.forEach(([state, completed], i) => setTimeout(() => emit('archive-first-receive-progress', { completed, total: 3, state, available: false }), gap * i))
+        ;[0, 1, 2, 3, 4].forEach((n) => setTimeout(() => emit('chat-archive-restore-progress', { completed: n * 3, total: 12, state: 'restoring', available: false }), gap * 2 + n * (gap / 5)))
+        return new Promise((resolve) => setTimeout(() => {
+          emit('chat-archive-restore-progress', { completed: 12, total: 12, state: 'complete', available: true })
+          emit('archive-first-receive-progress', { completed: 3, total: 3, state: 'complete', available: true })
+          resolve(done())
+        }, gap * 3 + 200))
+      }
       if (command === 'archive_remote_disconnect') { Object.assign(remote, { state: 'not_connected', repo: null, ahead: null, behind: null }); return { ...remote } }
       // T37 저장소 만들기(가짜). ?create=created(기본) / exists_empty / exists_public / signed_out 등.
       if (command === 'archive_remote_create') {
@@ -901,6 +1045,8 @@
       if (command === 'object_store_connect') {
         if (args.provider === 'ncp') throw 'write_safety_unverified'
         if (args.secretAccessKey === 'wrong') throw 'invalid_credentials'
+        // ?storefail=bucket_create_unknown|created_not_connected 처럼 연결 실패 값을 흉내 낸다(2026-11-17).
+        if (query.get('storefail')) throw query.get('storefail')
         // 버킷을 비우면 momso-<username> 을 만들어 연결(자동 버킷 계약). ?bucketauto=taken 이면 bucket_name_taken.
         let bucket = args.bucket
         if (!bucket || !bucket.trim() || bucket === 'auto') {
@@ -918,6 +1064,8 @@
         return new Promise((done) => { let n = 0; const t = setInterval(() => { n += 1; emit('object-store-progress', { completedCount: n, completedBytes: total * n / 4, totalCount: 4, totalBytes: total }); if (n >= 4) { clearInterval(t); emit('object-store-done', { completedCount: 4, completedBytes: total, totalCount: 4, totalBytes: total }); Object.assign(store, { pendingCount: 0, pendingBytes: 0, lastBackupAt: new Date().toISOString() }); done({ completedCount: 4, completedBytes: total, totalCount: 4, totalBytes: total }) } }, 300) })
       }
       if (command === 'app_state_backup') return { state: 'complete', createdAt: new Date().toISOString(), size: 2048 }
+      // ?restorefail=restore_failed|restore_rollback_failed 면 그 값으로 실패한다(뒤쪽은 오류 글로 준다).
+      if (command === 'app_state_restore' && query.get('restorefail')) throw query.get('restorefail')
       if (command === 'app_state_restore') return { state: 'restored', snapshotAt: store.lastBackupAt, safetyBackupCreated: true }
       if (command === 'object_store_restore') return { restoredCount: 2, skippedCount: 10 }
     }
@@ -1048,6 +1196,7 @@
         if (args && args.options && args.options.multiple) return [['D:', '수업', '2026-11-15 저녁 하타 수업.m4a'].join(String.fromCharCode(92)), ['D:', '수업', '저녁 하타 전사.txt'].join(String.fromCharCode(92))]
         return ['D:', 'momso-folder'].join(String.fromCharCode(92))
       case 'provider_auth_status': case 'provider_login_start': case 'provider_login_cancel': case 'provider_logout': case 'provider_api_key_set': case 'provider_api_key_clear': case 'install_external_provider':
+      case 'provider_api_key_verify': case 'provider_first_run_eligible':
         return authCommand(command, args)
       case 'momso_username_get': case 'momso_username_set':
         return usernameCommand(command, args)
@@ -1064,8 +1213,13 @@
         return backupCommand(command, args)
       case 'skill_list': case 'skill_read': case 'skill_create': case 'skill_update': case 'skill_set_enabled': case 'skill_remove':
         return skillCommand(command, args)
+      // 채팅방 사본 쓰기 형편(CHAT-ARCHIVE-RETRY.md). ?copyfail=<까닭> 이면 대기 2개, 앱을 켠 뒤 그 까닭으로 chat-archive-changed 를 한 번 보낸다.
+      case 'chat_archive_sync_status':
+        return query.get('copyfail') || query.get('copypending') ? { state: 'pending', pendingWrites: 2, pendingDeletions: 0 } : { state: 'saved', pendingWrites: 0, pendingDeletions: 0 }
       case 'media_list':
         return mediaList()
+      case 'source_asset_open': case 'source_asset_delete_preview': case 'source_asset_trash': case 'source_asset_restore_trashed': case 'source_asset_purge': case 'source_asset_deleted_list':
+        return sourceCommand(command, args)
       case 'chat_items':
         return chatItems(args.chatId)
       // ---- Git 설치(가짜, B12). ?git=missing 이면 approvalRequired, ?gitfail=networkFailed 처럼 실패를 흉내 낸다. ----
@@ -1103,6 +1257,46 @@
         if (query.get('importfail')) throw query.get('importfail')
         return new Promise((done) => setTimeout(() => done({ imported: 2, duplicate: 1, skipped: 0, omittedNonTextMessages: 0, omittedAttachments: 0, updated: 0, addedMessages: 0, conflicts: 0 }), 900))
       }
+      case 'yoga_terms_list': {
+        // 용어 사전(가짜). ?big=1 이면 용어 1,000개·사람 이름 300개, 아니면 용어 몇 개. ?dict=fail 이면 읽기 실패, ?dict=slow 면 3초 뒤.
+        if (query.get('dict') === 'fail') throw 'dictionary_unavailable'
+        const n = bigMode ? 1000 : 6
+        const cats = ['자세', '호흡·정화', '반다·무드라', '철학·수련', '유파·수업', '시리즈', '빈야사 구령', '차크라', '나디·구나', '도구', '만트라·수업 말', '변형 자세']
+        const terms = Array.from({ length: n }, (_, i) => ({ id: `yoga-${i + 1}`, enabled: true, sanskrit: `Asana${i + 1}`, roman: `Āsana ${i + 1}`, korean: [`아사나${i + 1}`], koreanNames: [`${i + 1}번 자세`], meaning: `${i + 1}번째 용어의 뜻입니다.`, category: cats[i % cats.length], variants: [{ text: `아사나 ${i + 1}`, origin: 'observed', recognitionOnly: false }], searchOnly: [{ text: `아 사나${i + 1}`, recognitionOnly: true }], origin: i % 50 === 0 ? 'user' : 'default' }))
+        const people = query.get('dict') === 'empty' ? [] : Array.from({ length: bigMode ? 300 : 3 }, (_, i) => ({ id: `person-${i + 1}`, name: `수련생${i + 1}`, aliases: [`${i + 1}번 회원`], confirmed: i % 4 !== 0, origin: 'user' }))
+        const value = { bundleVersion: 3, reviewStatus: '사람 검수 전', baseStatus: 'ok', baseConflicts: [], terms: query.get('dict') === 'empty' ? [] : terms, fragments: [], people, peopleStatus: 'ok', userRevision: 'r1', peopleRevision: 'p1' }
+        return query.get('dict') === 'slow' ? new Promise((done) => setTimeout(() => done(value), 3000)) : value
+      }
+      case 'chat_archive_redaction_count':
+        // 채팅방 GitHub 사본에서 가린 수. ?redacted=3 이면 3, 없으면 null(사본 없음).
+        return query.get('redacted') ? Number(query.get('redacted')) : null
+      case 'chat_import_export_preview': {
+        // 계약: { conversations, alreadyImported, unreadable, oldest, newest }. ?importpreview=empty 이면 0개.
+        if (args.provider === 'gemini') throw 'unsupported_format'
+        if (query.get('importfail')) throw query.get('importfail')
+        const empty = query.get('importpreview') === 'empty'
+        return new Promise((done) => setTimeout(() => done(empty
+          ? { conversations: 0, alreadyImported: 0, unreadable: 0, oldest: null, newest: null }
+          : { conversations: 40, alreadyImported: 3, unreadable: 1, oldest: '2024-03-02T09:00:00+00:00', newest: '2026-11-10T12:00:00+00:00' }), 400))
+      }
+      case 'chat_import_export_progress': {
+        // 대화 하나마다 chat-import-progress { requestId, processed }. 그만두면 'cancelled'. ?importslow 이면 천천히(사진용).
+        window.__importCalls = (window.__importCalls || []).concat([[args.provider, args.path, args.requestId]])
+        const step = query.has('importslow') ? 400 : 40
+        return new Promise((done, fail) => {
+          let processed = 0
+          window.__importCancel = window.__importCancel || {}
+          const timer = setInterval(() => {
+            if (window.__importCancel[args.requestId]) { clearInterval(timer); fail('cancelled'); return }
+            processed += 1
+            emit('chat-import-progress', { requestId: args.requestId, processed })
+            if (processed >= 40) { clearInterval(timer); done({ imported: 36, duplicate: 3, skipped: 1, omittedNonTextMessages: 0, omittedAttachments: 0, updated: 2, addedMessages: 5, conflicts: 0 }) }
+          }, step)
+        })
+      }
+      case 'chat_import_export_cancel':
+        window.__importCancel = { ...(window.__importCancel || {}), [args.requestId]: true }
+        return null
       case 'attachment_text_read': {
         // 계약(T46·T48): { state, content, nextCursor, totalBytes }. 가짜는 2000자씩 잘라 이어 받기를 흉내 낸다.
         window.__textCalls = (window.__textCalls || []).concat([[args.assetId, args.cursor ?? null]])
@@ -1180,6 +1374,16 @@
         if (!chat) throw '대화를 찾지 못했습니다'
         chat.title = args.title
         return null
+      }
+      // 쪽 나눔(G33). ?searchpage=1 일 때만 있다(없으면 화면이 옛 chat_search 로 돌아가는지 본다). 한 쪽 80개.
+      case 'chat_search_page': {
+        if (query.get('searchpage') !== '1') throw 'Command chat_search_page not found'
+        window.__pageCalls = (window.__pageCalls || []).concat([args.offset ?? 0])
+        const all = archive('chat_search', { query: args.query })
+        const start = Number(args.offset || 0)
+        const items = all.slice(start, start + 80)
+        const next = start + items.length
+        return { items, hasMore: next < all.length, nextOffset: next < all.length ? next : null }
       }
       case 'chat_search': {
         const q = String(args.query || '').trim().toLowerCase()
@@ -1286,6 +1490,12 @@
         history[args.id].unshift({ revision: 'c'.repeat(40), time: zet.head.updated_at, title: zet.head.title, otherZets: 0 })
         return null
       }
+      // 작업 내역 지우기(2026-11-17). ?receiptfail=1 이면 실패.
+      case 'receipt_delete':
+        if (query.get('receiptfail') === '1') throw 'unavailable'
+        if (!receipts[args.id]) throw 'not_found'
+        delete receipts[args.id]
+        return { state: 'deleted', id: args.id, chatId: null }
       case 'receipt_read': {
         const receipt = receipts[args.id]
         if (!receipt) throw '작업 기록을 읽지 못했습니다'
@@ -1364,15 +1574,21 @@
       return callbackId
     },
     invoke(command, args) {
+      // 2026-11-17 화면 품질 점검: ?failcmd=명령1,명령2(또는 all) 이면 그 명령이 영어 상태 값 'storage_error' 로 실패,
+      // ?slowcmd=명령1,명령2(또는 all) 이면 그 명령이 10초 뒤에 답한다(기다리는 동안의 화면 보기). 창·이벤트 명령은 빼고.
+      const pick = (name) => { const v = query.get(name); if (!v || command.startsWith('plugin:')) return false; return (v === 'all' && command !== 'runtime_info') || v.split(',').includes(command) }
+      const failNow = pick('failcmd')
+      const delay = pick('slowcmd') ? 10000 : 120
       return new Promise((resolve, reject) => {
         window.setTimeout(() => {
           try {
+            if (failNow) throw 'storage_error'
             const result = archive(command, args || {})
             resolve(result === undefined ? app(command, args || {}) : result)
           } catch (error) {
             reject(error)
           }
-        }, 120)
+        }, delay)
       })
     },
   }

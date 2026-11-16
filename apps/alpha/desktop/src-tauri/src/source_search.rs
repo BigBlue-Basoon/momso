@@ -14,7 +14,7 @@ pub(crate) struct SearchResult {
     linked_document_ids: Vec<String>,
 }
 
-fn search(conn: &Connection, query: &str) -> rusqlite::Result<Vec<SearchResult>> {
+pub(crate) fn search(conn: &Connection, query: &str) -> rusqlite::Result<Vec<SearchResult>> {
     let needle = query.trim().to_lowercase();
     let mut stmt = conn.prepare("SELECT id, original_file_name, media_type, byte_length, created_at, content_sha256 FROM momso_source_assets WHERE integrity_state = 'active' ORDER BY created_at DESC, id")?;
     let mut rows = stmt.query([])?;

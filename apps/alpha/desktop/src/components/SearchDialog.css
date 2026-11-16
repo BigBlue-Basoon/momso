@@ -236,3 +236,6 @@
 
 /* 아직 열 수 없는 원자료(이어진 문서가 없고 사진·소리·영상도 아닌 것): 흐리게, 눌리지 않게. */
 .search-item[aria-disabled='true'] { cursor: default; opacity: 0.55; }
+
+/* 찾는 동안·없을 때·실패했을 때의 한 줄(2026-11-17). */
+.search-state { display: flex; align-items: center; gap: 10px; margin: 0; padding: 14px 12px; color: var(--muted); font-size: 12.5px; }

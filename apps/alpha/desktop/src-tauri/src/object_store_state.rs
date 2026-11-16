@@ -115,7 +115,36 @@ fn preserve_recovery_identity_with(
     }
 }
 
+#[cfg(test)]
 fn apply_snapshot(snapshot: &Path, paths: &RuntimePaths) -> Result<PathBuf, &'static str> {
+    apply_snapshot_with_progress(snapshot, paths, None)
+}
+
+fn apply_snapshot_with_progress(
+    snapshot: &Path,
+    paths: &RuntimePaths,
+    app: Option<&tauri::AppHandle>,
+) -> Result<PathBuf, &'static str> {
+    let result = apply_snapshot_with_callback(snapshot, paths, |progress| {
+        use tauri::Emitter;
+        if let Some(app) = app {
+            let _ = app.emit("chat-archive-restore-progress", progress);
+        }
+    });
+    if result.is_ok() && app.is_some() {
+        crate::chat_search_index::start(paths.database_path.clone());
+    }
+    result
+}
+
+fn apply_snapshot_with_callback(
+    snapshot: &Path,
+    paths: &RuntimePaths,
+    mut emit: impl FnMut(crate::chat_archive_store::RestoreProgress),
+) -> Result<PathBuf, &'static str> {
+    let restore_guard = crate::chat_search_index::RESTORE_LOCK
+        .lock()
+        .map_err(|_| "restore_failed")?;
     storage::validate_snapshot_file(snapshot).map_err(|_| "invalid_snapshot")?;
     let root = paths.objects_path.parent().ok_or("invalid_snapshot")?;
     let path = root.to_str().ok_or("invalid_snapshot")?;
@@ -123,12 +152,37 @@ fn apply_snapshot(snapshot: &Path, paths: &RuntimePaths) -> Result<PathBuf, &'st
     db.execute("INSERT INTO archive_location_settings(id,path,initialized) VALUES(1,?1,1) ON CONFLICT(id) DO UPDATE SET path=excluded.path,initialized=1", [path]).map_err(|_| "invalid_snapshot")?;
     drop(db);
     crate::archive::reindex(root, snapshot).map_err(|_| "invalid_snapshot")?;
-    storage::restore_snapshot_file(snapshot, &paths.database_path, &paths.backups_path).map_err(
-        |error| match error {
-            storage::StorageError::RestoreRollbackFailed => "restore_rollback_failed",
-            _ => "restore_failed",
+    let mut last_progress = None;
+    let result = storage::restore_snapshot_file_with_hook(
+        snapshot,
+        &paths.database_path,
+        &paths.backups_path,
+        || {
+            crate::chat_archive_store::restore_with_progress(
+                root,
+                &paths.database_path,
+                |mut progress| {
+                    if progress.state != "restoring" {
+                        progress.state = "restoring";
+                        progress.available = false;
+                    }
+                    emit(progress.clone());
+                    last_progress = Some(progress);
+                },
+            )
+            .map_err(|error| storage::StorageError::Integrity(error.to_owned()))
         },
-    )
+    );
+    if let Some(mut progress) = last_progress {
+        progress.state = if result.is_ok() { "complete" } else { "failed" };
+        progress.available = result.is_ok();
+        emit(progress);
+    }
+    drop(restore_guard);
+    result.map_err(|error| match error {
+        storage::StorageError::RestoreRollbackFailed => "restore_rollback_failed",
+        _ => "restore_failed",
+    })
 }
 
 #[tauri::command]
@@ -150,6 +204,7 @@ pub(crate) async fn app_state_backup(
 
 #[tauri::command]
 pub(crate) async fn app_state_restore(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AppStateRestoreResult, &'static str> {
     let location = state.paths.archive.current.clone().write_owned().await;
@@ -161,7 +216,11 @@ pub(crate) async fn app_state_restore(
     let identity = transfer::identity(&paths.database_path)?;
     let (snapshot, manifest) = download_latest_snapshot(&config, &keys, &identity, &paths).await?;
     preserve_recovery_identity(snapshot.path(), &identity)?;
-    apply_snapshot(snapshot.path(), &paths)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_snapshot_with_progress(snapshot.path(), &paths, Some(&app))
+    })
+    .await
+    .map_err(|_| "restore_failed")??;
     Ok(AppStateRestoreResult {
         state: "restored",
         snapshot_at: manifest.created_at,
@@ -205,11 +264,163 @@ mod tests {
         fs,
         io::{Read, Write},
         net::TcpListener,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
     };
 
+    #[tokio::test]
+    async fn old_app_snapshot_preserves_a_deleted_chat_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let database_path = root.join("momso.db");
+        let backups_path = root.join("backups");
+        fs::create_dir_all(&backups_path).unwrap();
+        storage::initialize(&database_path, &backups_path, "test").unwrap();
+        let archive_root = root.join("momso");
+        let archive =
+            crate::archive_location::ArchiveLocation::load(database_path.clone(), root, vec![])
+                .unwrap();
+        crate::archive::initialize(&archive_root, root).unwrap();
+        let paths = RuntimePaths {
+            data_root: root.to_path_buf(),
+            database_path: database_path.clone(),
+            objects_path: archive_root.join("objects"),
+            exports_path: root.join("exports"),
+            backups_path,
+            logs_path: root.join("logs"),
+            archive,
+            archive_lease: None,
+        };
+        let room = crate::chat::create(&database_path).unwrap();
+        let id = serde_json::to_value(room).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        crate::chat::append(
+            &database_path,
+            &id,
+            crate::chat::Role::User,
+            "fixture",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::chat_archive_store::write(&archive_root, &paths, &id).unwrap();
+        let snapshot = root.join("old-snapshot.db");
+        storage::create_snapshot_file(&database_path, &snapshot).unwrap();
+        let survivor = serde_json::to_value(crate::chat::create(&database_path).unwrap()).unwrap()
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let document = archive_root.join("zettels").join("fixture.txt");
+        let original = archive_root.join("objects").join("fixture.bin");
+        fs::write(&document, b"user document").unwrap();
+        fs::write(&original, b"user original").unwrap();
+        let active = crate::chat_codex::Active::default();
+        let result =
+            crate::chat::delete_with(&database_path, &active, &id, |_| async { Ok(()) }).await;
+        assert_eq!(serde_json::to_value(result).unwrap()["state"], "deleted");
+        crate::chat_archive_store::remove(&archive_root, &database_path, &id).unwrap();
+        assert!(crate::chat::read(&database_path, &id).is_err());
+        let marker: serde_json::Value = serde_json::from_slice(
+            &fs::read(archive_root.join("chats").join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["deleted"], true);
+        // Even before a Git copy is present, the local database deletion must win.
+        fs::remove_file(archive_root.join("chats").join(format!("{id}.json"))).unwrap();
+        let safety = apply_snapshot(&snapshot, &paths).unwrap();
+        assert!(
+            crate::chat::read(&database_path, &id).is_err(),
+            "the old snapshot must not resurrect the deleted chat"
+        );
+        assert!(
+            crate::chat::read(&safety, &survivor).is_ok(),
+            "pre-restore chat remains in the safety copy"
+        );
+        assert_eq!(fs::read(document).unwrap(), b"user document");
+        assert_eq!(fs::read(original).unwrap(), b"user original");
+    }
+
+    #[test]
+    fn failed_chat_import_restores_pre_restore_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let database_path = root.join("momso.db");
+        let backups_path = root.join("backups");
+        fs::create_dir_all(&backups_path).unwrap();
+        storage::initialize(&database_path, &backups_path, "test").unwrap();
+        let archive_root = root.join("momso");
+        let archive =
+            crate::archive_location::ArchiveLocation::load(database_path.clone(), root, vec![])
+                .unwrap();
+        crate::archive::initialize(&archive_root, root).unwrap();
+        let paths = RuntimePaths {
+            data_root: root.to_path_buf(),
+            database_path: database_path.clone(),
+            objects_path: archive_root.join("objects"),
+            exports_path: root.join("exports"),
+            backups_path,
+            logs_path: root.join("logs"),
+            archive,
+            archive_lease: None,
+        };
+        let id = "chat_00000000-0000-4000-8000-000000000000";
+        let db = storage::open_writable_connection(&database_path).unwrap();
+        db.execute(
+            "INSERT INTO chats(id,title,created_at,updated_at) VALUES(?1,'fixture','x','x')",
+            [id],
+        )
+        .unwrap();
+        drop(db);
+        let snapshot = root.join("snapshot.db");
+        storage::create_snapshot_file(&database_path, &snapshot).unwrap();
+        crate::chat::append(
+            &database_path,
+            id,
+            crate::chat::Role::User,
+            "pre-restore message",
+            None,
+            None,
+        )
+        .unwrap();
+        fs::create_dir_all(archive_root.join("chats")).unwrap();
+        let marker = serde_json::json!({"version":1,"room":{"id":id},"deleted":true,"deletedAt":"2026-11-17T00:00:00Z"});
+        fs::write(
+            archive_root.join("chats").join(format!("{id}.json")),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            archive_root
+                .join("chats")
+                .join("chat_ffffffff-ffff-4fff-8fff-ffffffffffff.json"),
+            b"invalid json",
+        )
+        .unwrap();
+        let mut failed_after_rollback = false;
+        let result = apply_snapshot_with_callback(&snapshot, &paths, |event| {
+            if event.state == "failed" {
+                let detail =
+                    serde_json::to_value(crate::chat::read(&database_path, id).unwrap()).unwrap();
+                assert_eq!(detail["messages"][0]["text"], "pre-restore message");
+                assert!(!event.available);
+                failed_after_rollback = true;
+            }
+        });
+        assert_eq!(result, Err("restore_failed"));
+        assert!(failed_after_rollback);
+        let preserved =
+            serde_json::to_value(crate::chat::read(&database_path, id).unwrap()).unwrap();
+        assert_eq!(preserved["messages"][0]["text"], "pre-restore message");
+    }
+
     async fn fake_skill_connection(chat_id: &str, cancel_first: bool) -> Option<String> {
-        let action = serde_json::json!({"method":"object_store_r2_connect", "account":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"});
+        let action =
+            serde_json::json!({"method":"object_store_gcp_connect", "account":"fixture-project"});
         let (service, account, region) =
             crate::setup_actions::storage_account(&action).expect("stage 5: skill action");
         let events = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -256,7 +467,7 @@ mod tests {
                                                 crate::setup_secret::SecretInput {
                                                     access_key_id: "fixture-id".into(),
                                                     secret_access_key: "fixture-secret".into(),
-                                                    gcp_oauth_token: None,
+                                                    gcp_oauth_token: Some("fixture-oauth".into()),
                                                 },
                                             )
                                             .await
@@ -332,6 +543,69 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_snapshot_round_trip_preserves_current_state_before_restore() {
+        exercise_new_pc_round_trip(false).await;
+    }
+
+    #[tokio::test]
+    async fn oauth_r2_new_pc_recovers_documents_sources_and_chat_state() {
+        exercise_new_pc_round_trip(true).await;
+    }
+
+    #[test]
+    fn restoring_older_state_preserves_local_source_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        let backups = temp.path().join("backups");
+        storage::initialize(&database, &backups, "test").unwrap();
+        let old_hash = "b".repeat(64);
+        let conn = storage::open_writable_connection(&database).unwrap();
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('older-asset','other',?1,1,?2,'old-private-name','tester','old')", rusqlite::params![old_hash,format!("sha256/bb/{old_hash}")]).unwrap();
+        drop(conn);
+        let older = temp.path().join("older.db");
+        storage::create_snapshot_file(&database, &older).unwrap();
+        let conn = storage::open_writable_connection(&database).unwrap();
+        let hash = "a".repeat(64);
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset','other',?1,1,?2,'deleted','redacted','now')", rusqlite::params![hash,format!("sha256/aa/{hash}")]).unwrap();
+        conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('asset',?1,'purge_pending','now','later')", [uuid::Uuid::new_v4().to_string()]).unwrap();
+        conn.execute("UPDATE momso_source_assets SET original_file_name='deleted',captured_by='redacted' WHERE id='older-asset'", []).unwrap();
+        conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('older-asset',?1,'purge_pending','now','later')", [uuid::Uuid::new_v4().to_string()]).unwrap();
+        drop(conn);
+        let failure = storage::restore_snapshot_file_with_hook(&older, &database, &backups, || {
+            Err(storage::StorageError::Integrity("injected".into()))
+        });
+        assert!(failure.is_err());
+        let conn = storage::open_writable_connection(&database).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM source_asset_deletions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(conn);
+        storage::restore_snapshot_file(&older, &database, &backups).unwrap();
+        let conn = storage::open_writable_connection(&database).unwrap();
+        let preserved: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE a.content_sha256=?1 AND d.state='purge_pending')", [&hash], |r| r.get(0)).unwrap();
+        assert!(
+            preserved,
+            "restoring an older snapshot must retain the local purge marker"
+        );
+        let name: String = conn
+            .query_row(
+                "SELECT original_file_name FROM momso_source_assets WHERE content_sha256=?1",
+                [&old_hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "deleted");
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM source_asset_deletions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    async fn exercise_new_pc_round_trip(oauth: bool) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let database_path = root.join("momso.db");
@@ -409,6 +683,22 @@ mod tests {
             None,
         )
         .expect("stage 2: chat message");
+        crate::chat::append_finished(
+            &paths.database_path,
+            &chat_id,
+            "partial",
+            "codex".into(),
+            None,
+            None,
+            crate::chat::FinishReason::Error,
+        )
+        .expect("stage 2: failed answer");
+        let (retry_text, retry_skill) =
+            crate::chat::retry_input(&paths.database_path, &chat_id, &sent.id)
+                .expect("stage 2: read failed message")
+                .expect("stage 2: failed message is retryable");
+        assert_eq!(retry_text, "hello", "stage 2: retry original text");
+        assert!(retry_skill.is_none());
         let script = root.join("fake-codex.ps1");
         fs::write(&script, r#"
 $null = [Console]::ReadLine()
@@ -446,7 +736,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             &paths.database_path,
             &archive_root,
             &chat_id,
-            "hello",
+            &retry_text,
             None,
             None,
             None,
@@ -461,6 +751,25 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         )
         .await
         .expect("stage 2: fake CLI reply");
+        let messages =
+            serde_json::to_value(crate::chat::read(&paths.database_path, &chat_id).unwrap())
+                .unwrap();
+        assert_eq!(
+            messages["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .count(),
+            1,
+            "stage 2: retry does not duplicate the user message"
+        );
+        assert!(
+            crate::chat::retry_input(&paths.database_path, &chat_id, &sent.id)
+                .unwrap()
+                .is_none(),
+            "stage 2: completed retry closes retry eligibility"
+        );
         assert!(
             fs::read_to_string(
                 archive_root
@@ -629,6 +938,30 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         let selected_bucket = fake_skill_connection(&chat_id, false)
             .await
             .expect("stage 5: selected fake bucket");
+        let group = serde_json::to_value(
+            crate::chat_group::create(&paths.database_path, "fixture group").unwrap(),
+        )
+        .unwrap();
+        let group_id = group["id"].as_str().unwrap();
+        crate::chat_group::set_group(&paths.database_path, &chat_id, Some(group_id.to_owned()))
+            .unwrap();
+        crate::chat::rename(&paths.database_path, &chat_id, "fixture room").unwrap();
+        assert_eq!(
+            crate::chat::set_pinned(&paths.database_path, &chat_id, true).state,
+            "ok"
+        );
+        let secret = format!("sk-proj-{}", "Z".repeat(30));
+        crate::chat::append(
+            &paths.database_path,
+            &chat_id,
+            crate::chat::Role::User,
+            &secret,
+            None,
+            None,
+        )
+        .unwrap();
+        crate::chat_archive_store::write(&archive_root, &paths, &chat_id).unwrap();
+        crate::archive::save(&archive_root, root, &paths.database_path).unwrap();
         crate::archive_remote::transfer(
             &tool,
             &archive_root,
@@ -654,13 +987,20 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         drop(db);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let objects = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
         let remote = Arc::clone(&objects);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let server_stopped = stopped.clone();
         let server_bucket = selected_bucket.clone();
         let server = std::thread::spawn(move || {
-            for _ in 0..16 {
-                let (mut stream, _) = listener.accept().unwrap();
+            while !server_stopped.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(15)))
                     .unwrap();
@@ -678,8 +1018,24 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                 let mut line = head.lines().next().unwrap().split_whitespace();
                 let method = line.next().unwrap();
                 let path = line.next().unwrap();
-                let prefix = format!("/{server_bucket}/");
-                let key = path.trim_start_matches(prefix.as_str());
+                let oauth_path = format!(
+                    "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects",
+                    "a".repeat(32)
+                );
+                if oauth {
+                    assert!(
+                        path == oauth_path
+                            || path.starts_with(&format!("{oauth_path}/"))
+                            || path.starts_with(&format!("{oauth_path}?"))
+                    );
+                }
+                let oauth_prefix = format!("{oauth_path}/");
+                let s3_prefix = format!("/{server_bucket}/");
+                let key = path
+                    .trim_start_matches(if oauth { &oauth_prefix } else { &s3_prefix })
+                    .split('?')
+                    .next()
+                    .unwrap();
                 let length = head
                     .lines()
                     .find_map(|line| {
@@ -694,16 +1050,31 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                     received.extend_from_slice(&buffer[..n]);
                 }
                 let (status, body) = if method == "GET"
-                    && path.starts_with(&format!("/{server_bucket}?"))
+                    && ((oauth && path.starts_with(&format!("{oauth_path}?")))
+                        || (!oauth && path.starts_with(&format!("/{server_bucket}?"))))
                 {
-                    let entries = remote
-                        .lock()
-                        .unwrap()
-                        .keys()
-                        .filter(|key| key.contains("/manifests/"))
-                        .map(|key| format!("<Contents><Key>{key}</Key></Contents>"))
-                        .collect::<String>();
-                    ("200 OK", format!("<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>").into_bytes())
+                    if oauth {
+                        let data_list = path.contains("data%2F");
+                        let entries: Vec<_> = remote
+                            .lock()
+                            .unwrap()
+                            .keys()
+                            .filter(|key| {
+                                key.contains(if data_list { "/data/" } else { "/manifests/" })
+                            })
+                            .map(|key| serde_json::json!({"key":key}))
+                            .collect();
+                        ("200 OK", serde_json::to_vec(&serde_json::json!({"success":true,"result":entries,"result_info":{"is_truncated":false}})).unwrap())
+                    } else {
+                        let entries = remote
+                            .lock()
+                            .unwrap()
+                            .keys()
+                            .filter(|key| key.contains("/manifests/"))
+                            .map(|key| format!("<Contents><Key>{key}</Key></Contents>"))
+                            .collect::<String>();
+                        ("200 OK", format!("<ListBucketResult><IsTruncated>false</IsTruncated>{entries}</ListBucketResult>").into_bytes())
+                    }
                 } else if method == "PUT" {
                     let mut data = remote.lock().unwrap();
                     assert!(!data.contains_key(key));
@@ -724,13 +1095,21 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             }
         });
         let config = object_store::Config {
-            provider: "s3_compatible".into(),
+            provider: if oauth { "cloudflare" } else { "s3_compatible" }.into(),
             endpoint: format!("http://{address}"),
-            region: "auto".into(),
-            bucket: selected_bucket,
+            region: if oauth { "wrangleroauth" } else { "auto" }.into(),
+            bucket: if oauth {
+                "momso-fixture".into()
+            } else {
+                selected_bucket
+            },
             credential_id: "test".into(),
             last_backup_at: None,
-            write_safety: Some(object_store::WriteSafety::Conditional),
+            write_safety: Some(if oauth {
+                object_store::WriteSafety::CheckThenWrite
+            } else {
+                object_store::WriteSafety::Conditional
+            }),
         };
         let keys = object_store::Keys {
             access_key_id: "TEST".into(),
@@ -754,6 +1133,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         let _manifest = backup_snapshot(&config, &keys, &identity, &paths)
             .await
             .unwrap();
+        let source_archive_root = archive_root.clone();
         let new_pc = root.join("new-pc");
         fs::create_dir_all(&new_pc).unwrap();
         let database_path = new_pc.join("momso.db");
@@ -803,9 +1183,82 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             github_profile["name"], "Teacher",
             "stage 6: profile from Git"
         );
+        let restored_chat =
+            serde_json::to_value(crate::chat::read(&database_path, &chat_id).unwrap()).unwrap();
+        assert_eq!(
+            restored_chat["title"], "fixture room",
+            "stage 6: chat from Git"
+        );
         assert!(
-            crate::chat::read(&database_path, &chat_id).is_err(),
-            "stage 6: Git alone does not restore chats"
+            !restored_chat.to_string().contains(&secret),
+            "stage 6: redacted copy"
+        );
+        let summaries = serde_json::to_value(crate::chat::list(&database_path).unwrap()).unwrap();
+        assert_eq!(summaries[0]["pinned"], true);
+        assert_eq!(summaries[0]["groupId"], group_id);
+        let before = restored_chat["messages"].as_array().unwrap().len();
+        crate::chat_archive_store::restore(&archive_root, &database_path).unwrap();
+        let repeated =
+            serde_json::to_value(crate::chat::read(&database_path, &chat_id).unwrap()).unwrap();
+        assert_eq!(repeated["messages"].as_array().unwrap().len(), before);
+        let active = crate::chat_codex::Active::default();
+        let deleted =
+            crate::chat::delete_with(&paths.database_path, &active, &chat_id, |_| async {
+                Ok(())
+            })
+            .await;
+        assert_eq!(serde_json::to_value(deleted).unwrap()["state"], "deleted");
+        crate::chat_archive_store::remove(&source_archive_root, &paths.database_path, &chat_id)
+            .unwrap();
+        crate::archive::save(&source_archive_root, root, &paths.database_path).unwrap();
+        crate::archive_remote::transfer(
+            &tool,
+            &source_archive_root,
+            bare.to_str().unwrap(),
+            "main",
+            "push",
+        )
+        .unwrap();
+        let third = root.join("third-pc");
+        fs::create_dir_all(&third).unwrap();
+        let third_db = third.join("momso.db");
+        storage::initialize(&third_db, &third.join("backups"), "test").unwrap();
+        let third_archive_location =
+            crate::archive_location::ArchiveLocation::load(third_db.clone(), &third, vec![])
+                .unwrap();
+        let third_archive = third.join("momso");
+        crate::archive::initialize(&third_archive, &third).unwrap();
+        crate::archive_remote::connect_local(&tool, &third_archive, bare.to_str().unwrap())
+            .unwrap();
+        crate::archive_remote::receive_connected(
+            &tool,
+            &third_archive,
+            &third_db,
+            bare.to_str().unwrap(),
+            "main",
+        )
+        .unwrap();
+        assert!(
+            crate::chat::read(&third_db, &chat_id).is_err(),
+            "stage 6: deleted chat stays deleted"
+        );
+        let third_paths = RuntimePaths {
+            data_root: third.clone(),
+            database_path: third_db.clone(),
+            objects_path: third_archive.join("objects"),
+            exports_path: third.join("exports"),
+            backups_path: third.join("backups"),
+            logs_path: third.join("logs"),
+            archive: third_archive_location,
+            archive_lease: None,
+        };
+        let (old_snapshot, _) = download_latest_snapshot(&config, &keys, &identity, &third_paths)
+            .await
+            .unwrap();
+        apply_snapshot(old_snapshot.path(), &third_paths).unwrap();
+        assert!(
+            crate::chat::read(&third_db, &chat_id).is_err(),
+            "old app backup must not resurrect chat after Git received its deletion"
         );
         assert!(
             !archive_root.join("objects").join(&object_relative).exists(),
@@ -932,6 +1385,11 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             fs::read(paths.objects_path.join(&object_relative)).unwrap(),
             b"original bytes"
         );
+        #[cfg(windows)]
+        {
+            let restored = paths.objects_path.join(&object_relative);
+            crate::source_assets::clear_readonly_attribute(&restored).unwrap();
+        }
         assert_eq!(
             crate::chat::set_archived(&paths.database_path, &chat_id, false).state,
             "ok",
@@ -1019,6 +1477,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             .unwrap()
             .values()
             .all(|bytes| !bytes.windows(b"before".len()).any(|part| part == b"before")));
+        stopped.store(true, Ordering::Relaxed);
         server.join().unwrap();
     }
 }

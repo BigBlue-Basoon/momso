@@ -20,6 +20,23 @@ use std::{
 use uuid::Uuid;
 
 const MAX_ENTRY: u64 = 8 * 1024 * 1024 * 1024;
+fn file_open_error(error: std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "file_not_found",
+        std::io::ErrorKind::PermissionDenied => "file_permission_denied",
+        _ => "file_error",
+    }
+}
+fn import_storage_error(error: rusqlite::Error) -> &'static str {
+    use rusqlite::ErrorCode;
+    match error.sqlite_error_code() {
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => "storage_busy",
+        Some(ErrorCode::ReadOnly | ErrorCode::PermissionDenied) => "storage_permission_denied",
+        Some(ErrorCode::DiskFull) => "storage_full",
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => "storage_corrupt",
+        _ => "storage_error",
+    }
+}
 const MAX_ENTRIES: usize = 100_000;
 static RUNNING: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 fn running() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
@@ -242,7 +259,7 @@ fn record_source(
     message_id: &str,
     message: &ImportedMessage,
 ) -> Result<(), String> {
-    tx.execute("INSERT INTO chat_import_message_state(chat_id,ordinal,message_id,source_message_id,fingerprint) VALUES(?1,?2,?3,?4,?5)", params![chat, ordinal as i64, message_id, message.source_id, message.fingerprint]).map_err(|_| "storage_error")?;
+    tx.execute("INSERT INTO chat_import_message_state(chat_id,ordinal,message_id,source_message_id,fingerprint) VALUES(?1,?2,?3,?4,?5)", params![chat, ordinal as i64, message_id, message.source_id, message.fingerprint]).map_err(import_storage_error)?;
     Ok(())
 }
 
@@ -254,8 +271,31 @@ fn insert_message(
     message: &ImportedMessage,
 ) -> Result<(), String> {
     let id = Uuid::new_v4().to_string();
-    tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,provider,model) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![id, chat, message.role, message.text, message.time, if message.role == "assistant" { Some(provider) } else { None }, message.model]).map_err(|_| "storage_error")?;
+    tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,provider,model) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![id, chat, message.role, message.text, message.time, if message.role == "assistant" { Some(provider) } else { None }, message.model]).map_err(import_storage_error)?;
     record_source(tx, chat, ordinal, &id, message)
+}
+
+fn matches_redacted_message(saved: &str, incoming: &str) -> bool {
+    let markers = [
+        "[비밀값으로 보여 가림: 개인 키]",
+        "[비밀값으로 보여 가림: API 키]",
+        "[비밀값으로 보여 가림: 토큰]",
+        "[비밀값으로 보여 가림: 저장된 값]",
+    ];
+    let mut matches = markers
+        .iter()
+        .flat_map(|marker| saved.match_indices(marker).map(move |(i, _)| (i, *marker)));
+    let Some((offset, marker)) = matches.next() else {
+        return false;
+    };
+    if matches.next().is_some() {
+        return false;
+    }
+    let prefix = &saved[..offset];
+    let suffix = &saved[offset + marker.len()..];
+    incoming.len() >= prefix.len() + suffix.len()
+        && incoming.starts_with(prefix)
+        && incoming.ends_with(suffix)
 }
 
 fn update_existing(
@@ -265,18 +305,26 @@ fn update_existing(
     messages: &[ImportedMessage],
     counts: &mut ResultCounts,
 ) -> Result<(), String> {
-    let mut query = tx.prepare("SELECT ordinal,source_message_id,fingerprint FROM chat_import_message_state WHERE chat_id=?1 ORDER BY ordinal").map_err(|_| "storage_error")?;
-    let saved: Vec<(i64, Option<String>, String)> = query
-        .query_map([chat], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-        .map_err(|_| "storage_error")?
+    let mut query = tx.prepare("SELECT s.ordinal,s.source_message_id,s.fingerprint,m.role,m.text FROM chat_import_message_state s JOIN chat_messages m ON m.id=s.message_id WHERE s.chat_id=?1 ORDER BY s.ordinal").map_err(import_storage_error)?;
+    let saved: Vec<(i64, Option<String>, String, String, String)> = query
+        .query_map([chat], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .map_err(import_storage_error)?
         .collect::<Result<_, _>>()
-        .map_err(|_| "storage_error")?;
+        .map_err(import_storage_error)?;
     drop(query);
     let mut legacy = Vec::new();
     let baseline = if saved.is_empty() {
         let mut query = tx
             .prepare("SELECT id,role,text FROM chat_messages WHERE chat_id=?1 ORDER BY rowid")
-            .map_err(|_| "storage_error")?;
+            .map_err(import_storage_error)?;
         legacy = query
             .query_map([chat], |r| {
                 Ok((
@@ -285,9 +333,9 @@ fn update_existing(
                     r.get::<_, String>(2)?,
                 ))
             })
-            .map_err(|_| "storage_error")?
+            .map_err(import_storage_error)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "storage_error")?;
+            .map_err(import_storage_error)?;
         for ((_, role, text), incoming) in legacy.iter().zip(messages) {
             if fingerprint(role, text) != incoming.fingerprint {
                 counts.conflicts += 1;
@@ -300,13 +348,27 @@ fn update_existing(
         }
         legacy.len()
     } else {
-        for (index, (ordinal, source_id, hash)) in saved.iter().enumerate() {
+        for (index, (ordinal, source_id, hash, role, text)) in saved.iter().enumerate() {
             if *ordinal != index as i64 {
                 counts.conflicts += 1;
                 return Ok(());
             }
             if let Some(incoming) = messages.get(index) {
-                if hash != &incoming.fingerprint
+                let same = if hash == "redacted-v1" {
+                    source_id.is_some()
+                        && source_id == &incoming.source_id
+                        && saved.iter().filter(|row| &row.1 == source_id).count() == 1
+                        && messages
+                            .iter()
+                            .filter(|row| &row.source_id == source_id)
+                            .count()
+                            == 1
+                        && role == &incoming.role
+                        && matches_redacted_message(text, &incoming.text)
+                } else {
+                    hash == &incoming.fingerprint
+                };
+                if !same
                     || (source_id.is_some()
                         && incoming.source_id.is_some()
                         && source_id != &incoming.source_id)
@@ -365,7 +427,7 @@ fn import_one(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| "storage_error")?;
+        .map_err(import_storage_error)?;
     let mut messages: Vec<(&Value, &str, Option<&str>)> = Vec::new();
     if provider == "chatgpt" {
         let mapping = obj
@@ -510,12 +572,12 @@ fn import_one(
         "INSERT INTO chats(id,title,created_at,updated_at) VALUES(?1,?2,?3,?4)",
         params![id, title, created, updated],
     )
-    .map_err(|_| "storage_error")?;
+    .map_err(import_storage_error)?;
     tx.execute(
         "INSERT INTO chat_imports(chat_id,source_provider,source_id) VALUES(?1,?2,?3)",
         params![id, provider, source],
     )
-    .map_err(|_| "storage_error")?;
+    .map_err(import_storage_error)?;
     for (ordinal, message) in messages.iter().enumerate() {
         insert_message(tx, &id, provider, ordinal, message)?;
     }
@@ -530,6 +592,7 @@ struct ArraySeed<'a, 'b> {
     cancelled: &'a AtomicBool,
     progress: &'a dyn Fn(u64),
     processed: &'a mut u64,
+    operation_error: &'a mut Option<String>,
 }
 impl<'de> DeserializeSeed<'de> for ArraySeed<'_, '_> {
     type Value = ();
@@ -547,7 +610,10 @@ impl<'de> Visitor<'de> for ArraySeed<'_, '_> {
             if self.cancelled.load(Ordering::SeqCst) {
                 return Err(A::Error::custom("cancelled"));
             }
-            import_one(self.tx, self.provider, v, self.counts).map_err(A::Error::custom)?;
+            if let Err(error) = import_one(self.tx, self.provider, v, self.counts) {
+                *self.operation_error = Some(error);
+                return Err(A::Error::custom("import operation failed"));
+            }
             *self.processed += 1;
             (self.progress)(*self.processed);
         }
@@ -565,6 +631,7 @@ fn parse<R: Read>(
     processed: &mut u64,
 ) -> Result<(), String> {
     let mut de = serde_json::Deserializer::from_reader(BufReader::new(reader));
+    let mut operation_error = None;
     ArraySeed {
         tx,
         provider,
@@ -572,15 +639,15 @@ fn parse<R: Read>(
         cancelled,
         progress,
         processed,
+        operation_error: &mut operation_error,
     }
     .deserialize(&mut de)
     .map_err(|_| {
         if cancelled.load(Ordering::SeqCst) {
-            "cancelled"
+            "cancelled".to_owned()
         } else {
-            "invalid_format"
+            operation_error.unwrap_or_else(|| "invalid_format".to_owned())
         }
-        .to_owned()
     })?;
     de.end().map_err(|_| "invalid_format".to_owned())
 }
@@ -602,14 +669,14 @@ pub(crate) fn import_controlled(
     if !matches!(provider, "chatgpt" | "claude") {
         return Err("unsupported_provider".into());
     }
-    let mut db = Connection::open(db).map_err(|_| "storage_error")?;
+    let mut db = Connection::open(db).map_err(import_storage_error)?;
     db.execute_batch("PRAGMA foreign_keys=ON")
-        .map_err(|_| "storage_error")?;
-    let tx = db.transaction().map_err(|_| "storage_error")?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS chat_import_message_state (chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, message_id TEXT NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE, source_message_id TEXT, fingerprint TEXT NOT NULL, PRIMARY KEY(chat_id,ordinal))").map_err(|_| "storage_error")?;
+        .map_err(import_storage_error)?;
+    let tx = db.transaction().map_err(import_storage_error)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS chat_import_message_state (chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, message_id TEXT NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE, source_message_id TEXT, fingerprint TEXT NOT NULL, PRIMARY KEY(chat_id,ordinal))").map_err(import_storage_error)?;
     let mut counts = ResultCounts::default();
     let mut processed = 0;
-    let f = File::open(file).map_err(|_| "file_error")?;
+    let f = File::open(file).map_err(file_open_error)?;
     if file
         .extension()
         .and_then(|s| s.to_str())
@@ -665,7 +732,7 @@ pub(crate) fn import_controlled(
     if cancelled.load(Ordering::SeqCst) {
         return Err("cancelled".into());
     }
-    tx.commit().map_err(|_| "storage_error")?;
+    tx.commit().map_err(import_storage_error)?;
     Ok(counts)
 }
 
@@ -683,6 +750,7 @@ struct PreviewSeed<'a> {
     db: &'a Connection,
     provider: &'a str,
     result: &'a mut Preview,
+    operation_error: &'a mut Option<String>,
 }
 fn readable_conversation(v: &Value, provider: &str) -> bool {
     if provider == "claude" {
@@ -760,7 +828,13 @@ impl<'de> Visitor<'de> for PreviewSeed<'_> {
                 self.result.unreadable += 1;
                 continue;
             };
-            let exists: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM chat_imports WHERE source_provider=?1 AND source_id=?2)", params![self.provider, source], |r| r.get(0)).map_err(A::Error::custom)?;
+            let exists: bool = match self.db.query_row("SELECT EXISTS(SELECT 1 FROM chat_imports WHERE source_provider=?1 AND source_id=?2)", params![self.provider, source], |r| r.get(0)) {
+                Ok(exists) => exists,
+                Err(error) => {
+                    *self.operation_error = Some(import_storage_error(error).to_owned());
+                    return Err(A::Error::custom("preview operation failed"));
+                }
+            };
             if exists {
                 self.result.already_imported += 1;
             }
@@ -792,13 +866,15 @@ fn preview_parse<R: Read>(
     result: &mut Preview,
 ) -> Result<(), String> {
     let mut de = serde_json::Deserializer::from_reader(BufReader::new(reader));
+    let mut operation_error = None;
     PreviewSeed {
         db,
         provider,
         result,
+        operation_error: &mut operation_error,
     }
     .deserialize(&mut de)
-    .map_err(|_| "invalid_format".to_string())?;
+    .map_err(|_| operation_error.unwrap_or_else(|| "invalid_format".to_string()))?;
     de.end().map_err(|_| "invalid_format".to_string())
 }
 pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview, String> {
@@ -809,8 +885,8 @@ pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview,
         return Err("unsupported_provider".into());
     }
     let db = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| "storage_error")?;
-    let f = File::open(file).map_err(|_| "file_error")?;
+        .map_err(import_storage_error)?;
+    let f = File::open(file).map_err(file_open_error)?;
     let mut result = Preview::default();
     if file
         .extension()
@@ -853,8 +929,89 @@ pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn masked_import_comparison_rejects_changed_context_or_ambiguous_markers() {
+        let masked = "앞 [비밀값으로 보여 가림: 저장된 값] 뒤";
+        assert!(super::matches_redacted_message(
+            masked,
+            "앞 fake-example 뒤"
+        ));
+        assert!(!super::matches_redacted_message(
+            masked,
+            "변경 fake-example 뒤"
+        ));
+        assert!(!super::matches_redacted_message(
+            "[비밀값으로 보여 가림: API 키] [비밀값으로 보여 가림: 토큰]",
+            "one two"
+        ));
+    }
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn import_storage_errors_distinguish_actionable_failures() {
+        let error = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+        assert_eq!(
+            import_storage_error(error(rusqlite::ffi::SQLITE_BUSY)),
+            "storage_busy"
+        );
+        assert_eq!(
+            import_storage_error(error(rusqlite::ffi::SQLITE_READONLY)),
+            "storage_permission_denied"
+        );
+        assert_eq!(
+            import_storage_error(error(rusqlite::ffi::SQLITE_FULL)),
+            "storage_full"
+        );
+        assert_eq!(
+            import_storage_error(error(rusqlite::ffi::SQLITE_CORRUPT)),
+            "storage_corrupt"
+        );
+        assert_eq!(
+            import_storage_error(error(rusqlite::ffi::SQLITE_ERROR)),
+            "storage_error"
+        );
+    }
+
+    #[test]
+    fn import_and_preview_keep_database_failures_distinct_from_bad_json() {
+        let mut db = Connection::open_in_memory().unwrap();
+        let data = br#"[{"uuid":"test","chat_messages":[{"sender":"human","text":"hello"}]}]"#;
+        let tx = db.transaction().unwrap();
+        let mut counts = ResultCounts::default();
+        let mut processed = 0;
+        assert_eq!(
+            parse(
+                &data[..],
+                &tx,
+                "claude",
+                &mut counts,
+                &AtomicBool::new(false),
+                &|_| {},
+                &mut processed
+            ),
+            Err("storage_error".into())
+        );
+        drop(tx);
+        assert_eq!(
+            preview_parse(&data[..], &db, "claude", &mut Preview::default()),
+            Err("storage_error".into())
+        );
+    }
+
+    #[test]
+    fn import_file_errors_distinguish_missing_and_permission() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            file_open_error(Error::from(ErrorKind::NotFound)),
+            "file_not_found"
+        );
+        assert_eq!(
+            file_open_error(Error::from(ErrorKind::PermissionDenied)),
+            "file_permission_denied"
+        );
+        assert_eq!(file_open_error(Error::from(ErrorKind::Other)), "file_error");
+    }
 
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();

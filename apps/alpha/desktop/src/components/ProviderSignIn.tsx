@@ -6,14 +6,18 @@ import {
   clearProviderApiKey,
   getProviderAuth,
   installProvider,
+  keyConnected,
+  keyProblem,
   listenInstallProgress,
   listenProviderAuth,
   logoutProvider,
   setProviderApiKey,
   startProviderLogin,
+  verifyProviderApiKey,
   type ProviderAuth,
 } from '../provider-auth'
 import { W } from '../words'
+import { isMissingCommand } from '../ai-models'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 import { QuestionDialog } from './ZetPanel'
 
@@ -22,8 +26,10 @@ const MARK: Record<AiProvider, ProviderMarkId> = { codex: 'chatgpt', claude: 'cl
 /** provider_auth_status 가 있는지 알아본다. 있으면 그 목록, 없으면 null(예전 연결 칸을 그대로 보인다). */
 export function useProviderAuth() {
   const [list, setList] = useState<ProviderAuth[] | null | undefined>(undefined)
+  // 명령은 있는데 읽지 못했으면(명령이 없는 것과 다르게) 설정 "AI 연결"에서 알리고 다시 시도하게 한다(2026-11-17 틀렸을 때 점검).
+  const [failed, setFailed] = useState(false)
   const refresh = useCallback(() => {
-    getProviderAuth().then(setList).catch(() => setList(null))
+    getProviderAuth().then((value) => { setList(value); setFailed(false) }).catch((error) => { setList(null); setFailed(!isMissingCommand(error)) })
   }, [])
   useEffect(() => {
     refresh()
@@ -32,7 +38,7 @@ export function useProviderAuth() {
     void listenProviderAuth(() => refresh()).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
   }, [refresh])
-  return { list, refresh }
+  return { list, refresh, failed }
 }
 
 /**
@@ -92,6 +98,10 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
         setInstall('working')
         setInstallBytes(typeof progress.receivedBytes === 'number' && typeof progress.totalBytes === 'number' && progress.totalBytes > 0
           ? { received: progress.receivedBytes, total: progress.totalBytes } : null)
+      } else if (progress.phase === 'verifying') {
+        // 설치한 도구가 실행되는지 확인하는 중(실패가 아니다). 지금 있는 "설치하고 있습니다" 꼴 그대로 기다린다.
+        setInstall('working')
+        setInstallBytes(null)
       } else if (progress.phase === 'completed') {
         setInstallBytes(null)
         changedRef.current()
@@ -154,9 +164,18 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
     setError(null)
     try {
       const state = await setProviderApiKey(item.provider, value)
+      // 새 뒤쪽은 저장한 뒤 확인을 시작하며 'verifying' 을 준다(예전 뒤쪽은 'keySaved'). 확인 결과는 provider-auth-changed 로 온다.
       if (state === 'invalidKey') setError(W.signIn.invalidKey)
-      else if (state !== 'keySaved') setError(W.signIn.keySaveFailed)
+      else if (state !== 'verifying' && state !== 'keySaved') setError(W.signIn.keySaveFailed)
     } catch { setError(W.signIn.keySaveFailed) }
+    onChanged()
+  }
+  async function verifyKey() {
+    setError(null)
+    try {
+      const state = await verifyProviderApiKey(item.provider)
+      if (state !== 'verifying') setError(W.signIn.keyCheckFailed)
+    } catch { setError(W.signIn.keyCheckFailed) }
     onChanged()
   }
   async function clearKey() {
@@ -171,7 +190,13 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
 
   const installed = item.installed
   // 제미나이는 키가 없을 때 state 가 unavailable 로 오지만 API 키는 넣을 수 있다(methods ['apiKey'], 2026-11-16 실제 앱 값). 그때는 "연결 안 됨"으로 본다.
-  const shownState = item.state === 'unavailable' && (canAccount || canKey) ? 'signedOut' : item.state
+  // 저장된 키가 아직 맞는지 모르거나(확인하는 중) 틀렸거나 확인하지 못했으면 "API 키로 연결됨"이라 하지 않는다(2026-11-17 계약 "AI 연결 확인").
+  const problem = keyProblem(item)
+  const keyState = item.state === 'apiKey' || item.apiKeySaved
+    ? (keyConnected(item) ? 'apiKey' : problem === 'verifying' ? 'verifying' : 'signedOut')
+    : null
+  const baseState = item.state === 'unavailable' && (canAccount || canKey) ? 'signedOut' : item.state
+  const shownState = item.state === 'account' ? 'account' : keyState ?? (baseState === 'apiKey' ? 'signedOut' : baseState)
   const stateText = !installed ? W.signIn.state.notInstalled : shownState === 'unavailable' ? null : W.signIn.state[shownState]
   const account = [item.accountLabel, item.planLabel].filter(Boolean).join(' · ')
   return (
@@ -223,7 +248,7 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
 
         <div className="provider-key">
           <span className="provider-key-label">{W.signIn.apiKey}</span>
-          {item.apiKeySaved ? (
+          {item.apiKeySaved && problem !== 'rejected' ? (
             <>
               <span className="provider-key-saved">{W.signIn.keySaved}</span>
               <button className="secondary-button" type="button" disabled={!canKey} onClick={() => setAsking('clear')}>{W.signIn.keyClear}</button>
@@ -245,6 +270,19 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
             </form>
           )}
         </div>
+        {/* 틀린 키: 저장은 됐지만 연결되지 않았다. 위 칸에 새 키를 넣으면 바뀐다. 확인하지 못함(인터넷 등)은 틀렸다고 하지 않고 다시 확인하게 한다. */}
+        {installed && problem === 'rejected' && (
+          <div className="provider-key-problem" role="alert">
+            <p className="provider-error">{W.signIn.keyRejected}</p>
+            <button className="secondary-button" type="button" disabled={!canKey} onClick={() => setAsking('clear')}>{W.signIn.keyClear}</button>
+          </div>
+        )}
+        {installed && problem === 'unavailable' && (
+          <div className="provider-key-problem" role="alert">
+            <p className="provider-error">{W.signIn.keyUnchecked}</p>
+            <button className="secondary-button" type="button" disabled={!canKey} onClick={() => void verifyKey()}>{W.signIn.keyRetry}</button>
+          </div>
+        )}
         {W.signIn.apiCost[item.provider] && <p className="provider-hint">{W.signIn.apiCost[item.provider]}</p>}
         {error && <p className="provider-error" role="alert">{error}</p>}
         </>}

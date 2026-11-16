@@ -4,6 +4,7 @@ import { AudioLines, ChevronLeft, ChevronRight, Play, X } from 'lucide-react'
 import { mediaChat, mediaSrc, type MediaItem } from '../media'
 import { PROVIDER_NAME } from '../ai-models'
 import { W } from '../words'
+import { SourceDeleteDialog, type SourceNotice } from './SourceDelete'
 import { ModelName } from './ModelName'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 import './MediaGallery.css'
@@ -71,13 +72,19 @@ export function MediaBy({ item, small = false }: { item: MediaItem; small?: bool
  * 사진·동영상·소리 갤러리. 미디어 화면(날짜별 묶음)과 오른쪽 패널(작은 칸)이 같이 쓴다.
  * 칸 위에 올리면 어느 채팅방에서, 언제, 누가 만들었는지가 사진을 가리지 않게 아래에 드러나고, 누르면 크게 본다.
  */
-export function MediaGallery({ items, rowHeight, groupByDay, onOpenChat }: {
+export function MediaGallery({ items, rowHeight, groupByDay, onOpenChat, onNotice, onChanged }: {
   items: MediaItem[]
   rowHeight: number
   groupByDay: boolean
   onOpenChat?: (chatId: string) => void
+  /** 있으면 크게 보기의 아랫줄에 "삭제"를 둔다(잘못 첨부한 원자료 지우기). */
+  onNotice?: SourceNotice
+  /** 지우거나 되살린 뒤 목록을 다시 읽는다. */
+  onChanged?: () => void
 }) {
   const [openIndex, setOpenIndex] = useState<number | null>(null)
+  // 지울 원자료. 묻는 창은 크게 보기 밖에 두어(창 안을 눌러도 크게 보기가 닫히지 않게) 크게 보기 위에 뜬다.
+  const [deleting, setDeleting] = useState<MediaItem | null>(null)
   const [width, setWidth] = useState(0)
   const box = useRef<HTMLDivElement>(null)
   const gap = rowHeight < 140 ? 3 : 4
@@ -122,6 +129,17 @@ export function MediaGallery({ items, rowHeight, groupByDay, onOpenChat }: {
           onIndex={setOpenIndex}
           onClose={() => setOpenIndex(null)}
           onOpenChat={onOpenChat ? (id) => { setOpenIndex(null); onOpenChat(id) } : undefined}
+          onDelete={onNotice ? (item) => setDeleting(item) : undefined}
+          paused={deleting !== null}
+        />
+      )}
+      {deleting && onNotice && (
+        <SourceDeleteDialog
+          assetId={deleting.id}
+          name={deleting.title ?? mediaLabel(deleting)}
+          onClose={() => setDeleting(null)}
+          onNotice={onNotice}
+          onChanged={() => { setOpenIndex(null); onChanged?.() }}
         />
       )}
     </div>
@@ -160,12 +178,15 @@ function MediaTile({ item, width, onOpen }: { item: MediaItem; width: number; on
   )
 }
 
-function MediaLightbox({ items, index, onIndex, onClose, onOpenChat }: {
+function MediaLightbox({ items, index, onIndex, onClose, onOpenChat, onDelete, paused = false }: {
   items: MediaItem[]
   index: number
   onIndex: (index: number) => void
   onClose: () => void
   onOpenChat?: (chatId: string) => void
+  onDelete?: (item: MediaItem) => void
+  /** 위에 묻는 창이 떠 있으면 Esc·화살표를 받지 않는다. */
+  paused?: boolean
 }) {
   const item = items[index]
   const chat = mediaChat(item)
@@ -173,13 +194,14 @@ function MediaLightbox({ items, index, onIndex, onClose, onOpenChat }: {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (paused) return
       if (event.key === 'Escape') { event.stopPropagation(); onClose() }
       if (event.key === 'ArrowLeft' && !event.altKey) go(-1)
       if (event.key === 'ArrowRight' && !event.altKey) go(1)
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [go, onClose])
+  }, [go, onClose, paused])
 
   return createPortal(
     <div className="media-lightbox" role="dialog" aria-modal="true" aria-label={item.title ?? W.mediaView.aria4} onClick={onClose}>
@@ -204,6 +226,7 @@ function MediaLightbox({ items, index, onIndex, onClose, onOpenChat }: {
             ) : chat.title && <span>{chat.title}</span>)}
             <MediaBy item={item} />
             <time dateTime={item.at ?? item.createdAt}>{timeFormat.format(new Date(item.at ?? item.createdAt))}</time>
+            {onDelete && <button className="media-lightbox-delete" type="button" onClick={() => onDelete(item)}>{W.sourceDelete.trash}</button>}
           </span>
         </figcaption>
       </figure>
@@ -223,4 +246,9 @@ function MediaLightbox({ items, index, onIndex, onClose, onOpenChat }: {
     </div>,
     document.body,
   )
+}
+
+/** 이름이 없는 미디어의 이름(칸의 화면 읽기 이름과 같은 말). */
+function mediaLabel(item: MediaItem) {
+  return item.kind === 'video' ? W.mediaView.aria2 : item.kind === 'audio' ? W.gallery.audio : W.mediaView.aria3
 }

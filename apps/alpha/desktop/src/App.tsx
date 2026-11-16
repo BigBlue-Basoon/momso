@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { ActivityRail, type AppScreen } from './components/ActivityRail'
 import { MediaView } from './components/MediaView'
 import { SearchDialog, type SearchAction } from './components/SearchDialog'
@@ -12,6 +12,7 @@ import { listMedia } from './media'
 import { AssistantPanel, type ChatViewMessage } from './components/AssistantPanel'
 import type { ApprovalItem } from './components/ApprovalCard'
 import { listenApprovals, respondApproval, type ApprovalChoice } from './approvals'
+import { browserSessionStatus, listenBrowser } from './browser'
 import type { SecretItem } from './components/SecretRequestCard'
 import { cancelSecret, listenSecretRequests, submitSecret } from './setup-secrets'
 import { ChatSidebar } from './components/ChatSidebar'
@@ -20,6 +21,10 @@ import { SettingsView, type SettingsSection } from './components/SettingsView'
 import { WindowTitlebar } from './components/WindowTitlebar'
 import { ZetPanel, ZetPanelToggle, useZetPanelFrame } from './components/ZetPanel'
 import { FirstRun } from './components/FirstRun'
+import { useProviderAuth } from './components/ProviderSignIn'
+import { isConnected } from './provider-auth'
+import { listenChatRestoreProgress, watchFirstReceive, type RestoreProgress } from './restore-progress'
+import { watchChatArchive } from './chat-archive-status'
 import { effortKorean } from './permission-labels'
 import { checkFirstRun, type FirstRunCheck } from './first-run'
 import './App.css'
@@ -35,6 +40,8 @@ import { archiveErrorMessage } from './archive'
 import { GROUP_WORD, W } from './words'
 import {
   cancelChatMessage,
+  chatRedactionCount,
+  listenChatArchiveChanged,
   createChat,
   probeSendableProviders,
   createChatGroup,
@@ -158,6 +165,8 @@ function App() {
   // 대화. selectedChatId 가 null 이면 새 대화를 쓰는 중이다(첫 말을 보낼 때 만들어진다).
   const [chats, setChats] = useState<ChatEntry[]>([])
   const [chatsError, setChatsError] = useState<string | null>(null)
+  // 채팅방 목록을 한 번이라도 읽었는지(읽는 동안 왼쪽 목록에 "불러오는 중", 2026-11-17).
+  const [chatsLoaded, setChatsLoaded] = useState(false)
   // 채팅방 묶음. null 이면 묶음 백엔드가 없다(묶음 만들기가 눌리지 않는다).
   const [groups, setGroups] = useState<ChatGroup[] | null>(null)
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null)
@@ -166,6 +175,8 @@ function App() {
   const [pendingMessage, setPendingMessage] = useState<ChatViewMessage | null>(null)
   // 채팅방 고정·보관 명령이 있는지(앱을 열 때 알아본다).
   const [chatKeep, setChatKeep] = useState(false)
+  // 보관 명령이 있는지 아직 모르면(읽는 중) 설정의 "보관된 채팅방" 칸을 숨기지 않는다(늦게 나타나지 않게, 2026-11-17).
+  const [chatKeepKnown, setChatKeepKnown] = useState(false)
   const stopChatListUpdated = useRef<(() => void) | null>(null)
   useEffect(() => () => stopChatListUpdated.current?.(), [])
   const [generatingChatId, setGeneratingChatId] = useState<string | null>(null)
@@ -178,14 +189,27 @@ function App() {
   // 마지막으로 보낸 곳(chat-error 의 fast_unavailable 이 어느 모델의 것인지 알려고).
   const lastSendRef = useRef<{ chatId: string; provider: AiProvider; model: string | null } | null>(null)
   // 답이 오지 않은 채팅방마다 그 까닭(G18 chat-error 의 error)과 보냈던 글. 그 채팅방에서 다시 보내면 지운다.
-  const [chatFailures, setChatFailures] = useState<Record<string, { kind: string; retryAt: number | string | null; actions: string[]; provider: AiProvider; text: string }>>({})
-  const lastSentTextRef = useRef<{ chatId: string; text: string } | null>(null)
+  const [chatFailures, setChatFailures] = useState<Record<string, { kind: string; retryAt: number | string | null; actions: string[]; provider: AiProvider; text: string; userMessageId: string | null }>>({})
+  // userMessageId: 보내기가 시작되면 chat_send 가 주는 내 말의 id(다시 보내기에 쓴다).
+  const lastSentTextRef = useRef<{ chatId: string; text: string; userMessageId?: string | null } | null>(null)
   // 설정을 열 때 처음 보일 쪽(알림 줄의 "AI 연결 열기"면 'ai').
   const [settingsStart, setSettingsStart] = useState<SettingsSection>('profile')
   const [models, setModels] = useState<ProviderModels[] | null>(null)
+  // 모델 목록: 읽는 중 / 읽음(명령이 없을 때도) / 읽지 못함. 입력창의 모델·추론 수준 자리에 한 줄로 알린다(2026-11-17).
+  const [modelsState, setModelsState] = useState<'loading' | 'ok' | 'failed'>(desktopRuntime ? 'loading' : 'ok')
+  const refreshModels = useCallback(() => {
+    setModelsState('loading')
+    return listAiModels()
+      .then((list) => { setModels(list); setModelsState('ok') })
+      .catch((error) => { setModels(null); setModelsState(isMissingCommand(error) ? 'ok' : 'failed') })
+  }, [])
   // 모델 목록과 보낼 수 있는 곳을 읽었는지(앱을 연 직후 잠깐). 개발용 화면(데스크톱 밖)은 처음부터 됨.
   const [modelsReady, setModelsReady] = useState({ models: !desktopRuntime, sendable: !desktopRuntime })
-  const sendReady = modelsReady.models && modelsReady.sendable
+  // 받은 채팅 사본을 되살리는 동안(chat-archive-restore-progress, available false)은 채팅방을 바꾸는 요청을 보내지 않는다(RESTORE-PROGRESS.md).
+  const [chatRestore, setChatRestore] = useState<RestoreProgress | null>(null)
+  const chatRestoreRef = useRef<RestoreProgress | null>(null)
+  chatRestoreRef.current = chatRestore
+  const sendReady = modelsReady.models && modelsReady.sendable && chatRestore === null
   // 대화마다 고른 모델과 추론 수준(새 대화는 마지막에 쓴 것으로 시작한다).
   const [chatModels, setChatModels] = useState(loadChatModels)
   const [permission, setPermission] = useState<PermissionState | null>(null)
@@ -197,10 +221,26 @@ function App() {
   // 대화마다 적다 만 말. 다른 대화로 갔다 와도 남아 있다.
   const drafts = useRef(new Map<string, string>())
   // 지금 보낼 수 있는 곳(chat_send 에 물어 안다). 알기 전에는 Codex·Claude.
-  const [sendableProviders, setSendableProviders] = useState<AiProvider[]>(FALLBACK_PROVIDERS)
+  const [probedProviders, setSendableProviders] = useState<AiProvider[]>(FALLBACK_PROVIDERS)
+  // AI 연결 상태(provider_auth_status). 저장만 됐거나 틀렸거나 확인하지 못한 API 키는 연결로 치지 않는다(2026-11-17 계약 "AI 연결 확인").
+  // 입력창의 회사 고르기·기본 회사와 왼쪽 띠 사용량이 같은 조건(isConnected)을 쓴다. 상태를 읽지 못하면 chat_send 에 물은 것만 쓴다.
+  const providerAuth = useProviderAuth()
+  const sendableProviders = useMemo(() => {
+    const list = providerAuth.list
+    if (!Array.isArray(list)) return probedProviders
+    return probedProviders.filter((provider) => {
+      const item = list.find((entry) => entry.provider === provider)
+      return !item || isConnected(item)
+    })
+  }, [probedProviders, providerAuth.list])
   const generatingRef = useRef<{ chatId: string } | null>(null)
   // 채팅방이 길어져 앞의 내용을 줄여 담은 때(chat-compacted). 그 자리에 한 줄로 남는다(앱을 닫으면 사라짐).
   const [compactions, setCompactions] = useState<Array<{ id: string; chatId: string; at: number }>>([])
+  // 몸소 브라우저: 선생님이 직접 해야 할 일(browser-human-required, 채팅방마다 하나)과 브라우저가 열려 있는 채팅방.
+  const [browserHuman, setBrowserHuman] = useState<Record<string, { reason: string; at: number }>>({})
+  const [browserOpen, setBrowserOpen] = useState<Record<string, boolean>>({})
+  // 채팅방 GitHub 사본에서 가린 수(채팅방마다). 0 보다 크면 그 채팅방 끝에 한 줄.
+  const [redactions, setRedactions] = useState<Record<string, number>>({})
   // AI 가 허락을 구한 물음들. 대화마다 둔다(다른 대화로 갔다 와도 그대로 있다). 앱을 닫으면 사라진다.
   const [approvals, setApprovals] = useState<ApprovalItem[]>([])
   const [secretRequests, setSecretRequests] = useState<SecretItem[]>([])
@@ -208,23 +248,43 @@ function App() {
   const shownCountRef = useRef(0)
 
   const [toast, setToast] = useState<string | null>(null)
+  // 알림 줄의 단추 하나(원자료 삭제의 되돌리기처럼). 알림이 사라지면 함께 사라진다.
+  const [toastAction, setToastAction] = useState<{ label: string; run: () => void } | null>(null)
   const [zetPanelOpen, setZetPanelOpen] = useState(false)
   // 스킬. null = 스킬 명령이 없음(입력 칸의 / 목록과 설정의 "스킬" 쪽을 그리지 않는다).
   const [skills, setSkills] = useState<SkillEntry[] | null>(null)
+  // 스킬 명령은 있는데 목록을 읽지 못했다(명령이 없는 것과 다르다): 설정의 "스킬" 쪽에서 알린다.
+  const [skillsFailed, setSkillsFailed] = useState(false)
+  // 스킬 목록을 한 번이라도 읽었는지(읽는 동안 설정의 "스킬" 칸을 숨기지 않고 "불러오는 중").
+  const [skillsLoaded, setSkillsLoaded] = useState(false)
   const [chosenSkill, setChosenSkill] = useState<SkillEntry | null>(null)
   const refreshSkills = useCallback(() => {
     if (!isDesktopRuntime()) return
     listSkills().then((list) => {
       setSkills(list)
+      setSkillsFailed(false)
+      setSkillsLoaded(true)
       // 입력 칸에 골라 둔 스킬이 설정에서 꺼졌거나 없어졌으면 그 조각도 뺀다(보내면 skill_unavailable 이 된다).
       setChosenSkill((current) => (current && list.some((item) => item.name === current.name && item.enabled) ? current : null))
-    }).catch(() => setSkills(null))
+    }).catch((error) => { setSkills(null); setSkillsFailed(!isMissingCommand(error)); setSkillsLoaded(true) })
   }, [])
   const zetPanelOpenRef = useRef(zetPanelOpen)
+  // 패널 단추는 열면 패널 머리로, 닫으면 채팅방 머리로 옮겨 다시 그려진다. 키보드로 누른 뒤 초점이 화면 밖으로 빠지지 않게 그 단추로 옮긴다(2026-11-17).
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      const active = document.activeElement
+      if (!active || active === document.body) document.querySelector<HTMLElement>('.zet-panel-toggle')?.focus()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [zetPanelOpen])
   zetPanelOpenRef.current = zetPanelOpen
   // 지금 연 채팅방에서 다룬 문서와 미디어(오른쪽 패널). undefined = 명령이 없음(예전처럼 문서 전체), null = 읽는 중.
   const [chatItems, setChatItems] = useState<ChatItems | null | undefined>(undefined)
+  // 이 채팅방에서 다룬 것을 읽지 못했다(명령은 있음). 앞 채팅방의 것이 남거나 전체 문서 목록으로 말없이 바뀌지 않게 패널에서 알린다(2026-11-17).
+  const [chatItemsFailed, setChatItemsFailed] = useState(false)
   const chatItemsSupported = useRef<boolean | null>(null)
+  // 지금 패널에 있는 "이 채팅방" 것이 어느 채팅방의 것인지. 채팅방이 바뀌면 읽는 동안 앞 채팅방 것이나 전체 문서 목록을 보이지 않는다(2026-11-17).
+  const itemsChatRef = useRef<string | null>(null)
   // 패널을 닫아 둔 동안 채팅방에 새로 생긴 것이 있으면 패널 단추에 점(채팅방마다).
   const [freshInPanel, setFreshInPanel] = useState<Record<string, boolean>>({})
   // 검색 창(Ctrl+K).
@@ -245,10 +305,17 @@ function App() {
   // 그 채팅방에서 다룬 것을 다시 읽는다. 답이 끝났거나 백엔드가 바뀌었다고 알리면(fromEvent) 패널이 닫혀 있을 때 새로 생긴 것을 표시한다.
   const refreshChatItems = useCallback((chatId: string | null, fromEvent = false) => {
     if (!desktopRuntime || chatItemsSupported.current === false) return
-    if (!chatId) { if (chatItemsSupported.current) setChatItems(EMPTY_CHAT_ITEMS); return }
+    if (!chatId) { itemsChatRef.current = null; if (chatItemsSupported.current) setChatItems(EMPTY_CHAT_ITEMS); return }
+    if (!fromEvent && itemsChatRef.current !== chatId) {
+      // 읽는 동안: 패널은 "불러오는 중"(null). 명령이 없다고 알게 되면 아래에서 undefined(예전 문서 목록)로 돌린다.
+      setChatItems(null)
+      setChatItemsFailed(false)
+    }
     getChatItems(chatId).then((next) => {
       chatItemsSupported.current = true
       if (chatId !== selectedChatRef.current) return
+      itemsChatRef.current = chatId
+      setChatItemsFailed(false)
       setChatItems((previous) => {
         if (fromEvent && !zetPanelOpenRef.current && previous && chatItemCount(next) > chatItemCount(previous)) {
           setFreshInPanel((current) => ({ ...current, [chatId]: true }))
@@ -256,15 +323,22 @@ function App() {
         return next
       })
     }).catch((error) => {
-      if (isMissingCommand(error)) { chatItemsSupported.current = false; setChatItems(undefined) }
+      if (isMissingCommand(error)) { chatItemsSupported.current = false; setChatItems(undefined); return }
+      if (chatId !== selectedChatRef.current) return
+      chatItemsSupported.current = true
+      itemsChatRef.current = chatId
+      setChatItems(null)
+      setChatItemsFailed(true)
     })
   }, [desktopRuntime])
   selectedChatRef.current = selectedChatId
 
-  function showToast(message: string) {
+  function showToast(message: string, action?: { label: string; run: () => void }) {
     setToast(message)
+    setToastAction(action ?? null)
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
-    toastTimer.current = window.setTimeout(() => setToast(null), 2600)
+    // 단추가 있으면 누를 틈을 더 둔다.
+    toastTimer.current = window.setTimeout(() => { setToast(null); setToastAction(null) }, action ? 8000 : 2600)
   }
 
   const refreshChats = useCallback(async () => {
@@ -274,9 +348,11 @@ function App() {
       const next = await listChats()
       setChats(next)
       setChatsError(null)
+      setChatsLoaded(true)
       return next
     } catch (error) {
       setChatsError(archiveErrorMessage(error, W.app.text1))
+      setChatsLoaded(true)
       return null
     }
   }, [])
@@ -289,8 +365,16 @@ function App() {
     }
   }, [])
 
+  // 되살리는 중이면 채팅방을 바꾸지 않고 그 까닭 한 줄만 알린다.
+  function restoreBlocks() {
+    if (!chatRestoreRef.current) return false
+    showToast(W.restoreProgress.chatBusy)
+    return true
+  }
+
   // 채팅방 고정·풀기. 실패하면 알리고, 어쨌든 목록을 다시 읽는다.
   async function pinChat(chatId: string, pinned: boolean) {
+    if (restoreBlocks()) return
     try {
       await setChatPinned(chatId, pinned)
     } catch (error) {
@@ -301,6 +385,7 @@ function App() {
 
   // 채팅방 보관: 왼쪽 목록에서 빠진다(설정의 보관된 채팅방에서 되돌리거나 영구 삭제). 보고 있던 채팅방이면 새 채팅방으로.
   async function keepChatAway(chatId: string) {
+    if (restoreBlocks()) return
     try {
       await archiveChat(chatId)
       if (selectedChatRef.current === chatId) startNewChat()
@@ -312,6 +397,7 @@ function App() {
 
   // 묶음을 바꾼 뒤: 묶음과 채팅방 목록(groupId)을 다시 읽는다. 실패하면 알린다.
   const changeGroups = useCallback(async (work: () => Promise<unknown>, fallback: string) => {
+    if (chatRestoreRef.current) { showToast(W.restoreProgress.chatBusy); return }
     try {
       await work()
     } catch (error) {
@@ -347,10 +433,10 @@ function App() {
       void openChat(listed[0].id)
     }
     // 모델 목록과 보낼 수 있는 곳을 다 읽기 전에는 보내기가 눌리지 않는다(고른 것과 다른 모델이 답하지 않게).
-    void listAiModels().then(setModels).catch(() => setModels(null)).finally(() => setModelsReady((current) => ({ ...current, models: true })))
+    void refreshModels().finally(() => setModelsReady((current) => ({ ...current, models: true })))
     void refreshGroups()
     // 채팅방 고정·보관 명령이 있는지(보관된 목록을 읽어 본다. 아무것도 바뀌지 않는다). 없으면 고정·보관 단추와 설정 쪽을 그리지 않는다.
-    void listArchivedChats().then(() => setChatKeep(true)).catch((error) => setChatKeep(!isMissingCommand(error)))
+    void listArchivedChats().then(() => setChatKeep(true)).catch((error) => setChatKeep(!isMissingCommand(error))).finally(() => setChatKeepKnown(true))
     // 고정·보관·되돌리기·삭제가 되면(다른 곳에서 바뀐 것도) 목록을 다시 읽는다.
     if (!stopChatListUpdated.current) {
       stopChatListUpdated.current = () => {}
@@ -417,6 +503,7 @@ function App() {
   }
 
   function startNewChat() {
+    if (restoreBlocks()) return
     showPlace('new')
   }
 
@@ -644,7 +731,7 @@ function App() {
         setCompactions((current) => [...current, { id: `${chatId}-${Date.now()}`, chatId, at }])
         refreshContext(chatId)
       },
-      onError: ({ chatId, reason, message, status, error }) => {
+      onError: ({ chatId, reason, message, status, error, userMessageId }) => {
         if (generatingRef.current?.chatId !== chatId) return
         if (status === 'fast_unavailable') {
           // 보낸 뒤 고속 모드를 쓸 수 없다고 왔다(보낸 말은 채팅방에 남고, 같은 글을 다시 보내면 백엔드가 그 말을 다시 쓴다).
@@ -668,6 +755,7 @@ function App() {
             actions: Array.isArray(error?.actions) ? error.actions : status === 'auth_failed' ? ['signIn', 'switchProvider'] : [],
             provider: (sent?.chatId === chatId ? sent.provider : null) ?? 'codex',
             text: sentText,
+            userMessageId: userMessageId ?? (lastSentTextRef.current?.chatId === chatId ? lastSentTextRef.current.userMessageId ?? null : null),
           },
         }))
         // 오다가 끊긴 답은 뒤쪽이 저장해 두므로(messageId) finishGenerating 이 채팅방을 다시 읽어 그때까지 온 글을 보인다.
@@ -712,6 +800,70 @@ function App() {
       stop?.()
     }
   }, [desktopRuntime])
+
+  // 몸소 브라우저 알림(browser.ts). 사람이 해야 할 일은 그 채팅방 끝에 한 줄로 두고, 그 채팅방에서 말을 보내거나 브라우저가 닫히면 거둔다.
+  useEffect(() => {
+    if (!desktopRuntime) return
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenBrowser({
+      onHumanRequired: (chatId, reason) => {
+        const at = chatId === selectedChatRef.current ? shownCountRef.current : Number.MAX_SAFE_INTEGER
+        setBrowserHuman((current) => ({ ...current, [chatId]: { reason, at } }))
+      },
+      onSession: (chatId, open) => {
+        setBrowserOpen((current) => ({ ...current, [chatId]: open }))
+        if (!open) setBrowserHuman((current) => { if (!current[chatId]) return current; const next = { ...current }; delete next[chatId]; return next })
+      },
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [desktopRuntime])
+
+  // 채팅방 사본에서 가린 수: 채팅방을 고를 때와 사본을 새로 쓸 때(chat-archive-changed saved) 읽는다.
+  useEffect(() => {
+    if (!desktopRuntime) return
+    const read = (chatId: string) => {
+      chatRedactionCount(chatId)
+        .then((count) => setRedactions((current) => (current[chatId] === (count ?? 0) ? current : { ...current, [chatId]: count ?? 0 })))
+        .catch(() => {})
+    }
+    if (selectedChatId) read(selectedChatId)
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenChatArchiveChanged((chatId, state) => { if (chatId && state === 'saved' && chatId === selectedChatRef.current) read(chatId) })
+      .then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [desktopRuntime, selectedChatId])
+
+  // 사본 쓰기 실패와 처음 받아 오기를 앱을 켤 때부터 듣는다(설정 화면을 열기 전에 온 것도 알리고, 받는 동안 문서 고치기를 막는다).
+  useEffect(() => {
+    if (!desktopRuntime) return
+    watchChatArchive()
+    watchFirstReceive()
+  }, [desktopRuntime])
+
+  // 받은 채팅 사본을 되살리는 진행. 끝나면 목록을 다시 읽고(새로 받은 채팅방이 생김), 실패하면 이 PC 에 있던 채팅방은 그대로라고 알린다.
+  useEffect(() => {
+    if (!desktopRuntime) return
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenChatRestoreProgress((value) => {
+      if (value.state === 'restoring' && !value.available) { setChatRestore(value); return }
+      setChatRestore(null)
+      if (value.state === 'complete') void refreshChats()
+      else if (value.state === 'failed') showToast(W.restoreProgress.chatFailed)
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [desktopRuntime, refreshChats])
+
+  // 채팅방을 고를 때 브라우저가 열려 있는지 다시 확인한다(사람이 창을 직접 닫았을 수 있다).
+  useEffect(() => {
+    if (!desktopRuntime || !selectedChatId) return
+    let current = true
+    const chatId = selectedChatId
+    browserSessionStatus(chatId).then((open) => { if (current) setBrowserOpen((value) => (value[chatId] === open ? value : { ...value, [chatId]: open })) }).catch(() => {})
+    return () => { current = false }
+  }, [desktopRuntime, selectedChatId])
 
   // 스킬로 하는 연결에서 키를 넣어 달라는 물음(agent-setup-secret-request)과 거두기. 채팅방 번호가 없으면 답을 쓰는 중인 대화에 둔다.
   useEffect(() => {
@@ -775,8 +927,9 @@ function App() {
   }
 
   // 말 보내기: 대화가 없으면 만들고 chat_send 로 보낸다(답은 이벤트로 온다).
-  async function sendPrompt(again?: string) {
-    // again: 알림 줄의 "다시 보내기"로 보낸 글을 그대로 다시 보낸다(입력창에 적던 글은 건드리지 않는다).
+  async function sendPrompt(again?: string, retryMessageId?: string) {
+    // again: 알림 줄의 "다시 보내기"로 보낸 글(입력창에 적던 글은 건드리지 않는다).
+    // retryMessageId: 답을 받지 못한 그 말의 id. 뒤쪽이 저장된 그 말로 다시 보내고 같은 말을 새로 남기지 않는다.
     const text = again ?? prompt.trim()
     const skill = again ? null : chosenSkill
     if ((!text && !skill) || generatingChatId || !sendReady) return
@@ -788,7 +941,7 @@ function App() {
     }
     // 답을 받지 못한 마지막 말과 같은 글을 다시 보내면 백엔드가 그 말을 다시 쓸 수 있다(고속 모드 실패 뒤). 그때는 같은 말을 한 번 더 그리지 않는다.
     const last = chat && chat.id === selectedChatId ? chat.messages[chat.messages.length - 1] : undefined
-    const resending = last?.role === 'user' && last.text === text
+    const resending = Boolean(retryMessageId) || (last?.role === 'user' && last.text === text)
     setPendingMessage(resending ? null : { id: `pending-${Date.now()}`, role: 'user', text, skill: skill?.title ?? null, createdAt: new Date().toISOString() })
     const giveBack = (error: unknown, fallback: string) => {
       setPendingMessage(null)
@@ -815,6 +968,13 @@ function App() {
     }
     const targetId = chatId
     lastSentTextRef.current = { chatId: targetId, text }
+    // 브라우저에서 직접 한 뒤 채팅으로 알린 것이므로 "직접 해 주세요" 줄을 거둔다.
+    setBrowserHuman((current) => {
+      if (!current[targetId]) return current
+      const next = { ...current }
+      delete next[targetId]
+      return next
+    })
     setChatFailures((current) => {
       if (!current[targetId]) return current
       const next = { ...current }
@@ -830,7 +990,19 @@ function App() {
       const targetModel = models?.find((list) => list.provider === target.provider)?.models.find((model) => model.id === target.model)
       const refused = Boolean(fastRefused[`${target.provider}:${target.model ?? ''}`])
       lastSendRef.current = { chatId: targetId, provider: target.provider, model: target.model }
-      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null)
+      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null, retryMessageId ?? null)
+      if (result?.status === 'started' && lastSentTextRef.current?.chatId === targetId) {
+        lastSentTextRef.current = { ...lastSentTextRef.current, userMessageId: result.userMessageId ?? null }
+      }
+      if (result?.status === 'retry_unavailable') {
+        // 그 말은 다시 보낼 수 없다(이미 답을 받았거나 예전 실패). 아무것도 보내지 않았다. 글을 입력창에 넣어 새로 보낼 수 있게 한다.
+        generatingRef.current = null
+        setGeneratingChatId(null)
+        setPendingMessage(null)
+        setPrompt(text)
+        showToast(W.app.retryUnavailable)
+        return
+      }
       if (result?.status === 'skill_unavailable') {
         // 고른 스킬이 그사이 꺼졌거나 없어졌다(말은 저장되지 않았다). 적은 말은 돌려놓고, 쓸 수 없는 스킬 조각은 빼고, 목록을 새로 읽는다.
         generatingRef.current = null
@@ -892,6 +1064,7 @@ function App() {
   }
 
   async function renameCurrentChat(title: string) {
+    if (restoreBlocks()) return
     const id = selectedChatId
     if (!id) return
     try {
@@ -1030,7 +1203,8 @@ function App() {
     const text = when && (failure.kind === 'usageLimit' || failure.kind === 'rateLimited') ? `${base} ${W.app.retryAt(when)}` : base
     const actions: Array<{ id: string; label: string; run: () => void }> = []
     const has = (...ids: string[]) => ids.some((id) => failure.actions.includes(id))
-    if (has('retry') && failure.text) actions.push({ id: 'retry', label: W.app.failureAction.retry, run: () => void sendPrompt(failure.text) })
+    // 다시 보내기는 그 말의 id 를 알 때만(같은 말을 새로 남기지 않는다).
+    if (has('retry') && failure.userMessageId) actions.push({ id: 'retry', label: W.app.failureAction.retry, run: () => void sendPrompt(failure.text, failure.userMessageId ?? undefined) })
     if (has('signIn', 'checkApiKey', 'checkBilling', 'install')) actions.push({ id: 'settings', label: W.app.failureAction.settings, run: () => openSettingsAt('ai') })
     if (has('switchModel')) actions.push({ id: 'switchModel', label: W.app.failureAction.switchModel, run: () => window.dispatchEvent(new CustomEvent('momso:open-picker', { detail: 'model' })) })
     if (has('shorten')) actions.push({ id: 'shorten', label: W.app.failureAction.shorten, run: () => startNewChat() })
@@ -1112,10 +1286,11 @@ function App() {
           onNavigate={(next) => showPlace(next === 'home' ? chatPlace : next)}
           update={update}
           onRestart={requestRestart}
+          providerAuth={providerAuth.list}
         />
 
         {screen === 'documents' ? null : screen === 'media' ? (
-          <MediaView onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }} />
+          <MediaView onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }} onNotice={showToast} />
         ) : settingsOpen ? (
           <SettingsView
             key={settingsStart}
@@ -1126,7 +1301,9 @@ function App() {
             update={update}
             skills={skills}
             onSkillsChanged={refreshSkills}
-            archivedChats={chatKeep}
+            skillsFailed={skillsFailed}
+            skillsLoading={desktopRuntime && !skillsLoaded}
+            archivedChats={chatKeep || (desktopRuntime && !chatKeepKnown)}
             onChatsChanged={() => void refreshChats()}
           />
         ) : (
@@ -1136,6 +1313,9 @@ function App() {
               waitingChatIds={waitingChatIds}
               selectedChatId={selectedChatId}
               error={chatsError}
+              loading={desktopRuntime && !chatsLoaded && session.mode !== 'error'}
+              onRetry={() => void refreshChats()}
+              restoring={chatRestore}
               onNewChat={startNewChat}
               onSelectChat={selectChat}
               groups={groups}
@@ -1174,7 +1354,16 @@ function App() {
               streamText={streamText}
               onRename={(title) => void renameCurrentChat(title)}
               approvals={chatApprovals}
-              notices={compactions.filter((item) => item.chatId === selectedChatId).map((item) => ({ id: item.id, at: item.at, text: W.app.text22 }))}
+              notices={[
+                ...compactions.filter((item) => item.chatId === selectedChatId).map((item) => ({ id: item.id, at: item.at, text: W.app.text22 })),
+                ...(selectedChatId && (redactions[selectedChatId] ?? 0) > 0
+                  ? [{ id: `redacted-${selectedChatId}`, at: Number.MAX_SAFE_INTEGER, text: W.app.chatRedacted(redactions[selectedChatId]) }]
+                  : []),
+                ...(selectedChatId && browserHuman[selectedChatId]
+                  ? [{ id: `browser-${selectedChatId}`, at: browserHuman[selectedChatId].at, text: `${W.app.browserHuman[browserHuman[selectedChatId].reason] ?? W.app.browserHuman.verification} ${W.app.browserHumanAfter}` }]
+                  : []),
+              ]}
+              browserOpen={Boolean(selectedChatId && browserOpen[selectedChatId])}
               onAnswerApproval={(requestId, choice) => void answerApproval(requestId, choice)}
               secretRequests={chatSecrets}
               onSubmitSecret={(requestId, values) => void answerSecret(requestId, values)}
@@ -1197,6 +1386,8 @@ function App() {
                   onStop={stopResponse}
                   onAttach={() => void pickAndAttach()}
                   models={models}
+                  modelsState={modelsState}
+                  onRetryModels={() => void refreshModels()}
                   fallbackProviders={FALLBACK_PROVIDERS}
                   sendableProviders={sendableProviders}
                   chosen={chosen}
@@ -1228,7 +1419,10 @@ function App() {
           onNotice={showToast}
           chatId={selectedChatId}
           chatItems={chatItems}
+          chatItemsFailed={chatItemsFailed}
+          onRetryChatItems={() => refreshChatItems(selectedChatRef.current)}
           onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }}
+          onOpenMedia={() => showPlace('media')}
         />
       )}
       </div>
@@ -1259,7 +1453,14 @@ function App() {
 
       {(toast || session.error) && (
         <div className="workbench-toast" role="status">
-          {toast ?? session.error}
+          {/* 앱 시작(runtime_info)이 실패하면 뒤쪽 글을 그대로 보이지 않는다: 한글 글이면 그대로, 영어·코드 값이면 일반 글과 다시 시도(2026-11-17). */}
+          {toast ?? archiveErrorMessage(session.error, W.app.runtimeFailed)}
+          {toast && toastAction && (
+            <button className="secondary-button workbench-toast-action" type="button" onClick={() => { const run = toastAction.run; setToast(null); setToastAction(null); run() }}>{toastAction.label}</button>
+          )}
+          {!toast && session.error && (
+            <button className="secondary-button workbench-toast-action" type="button" onClick={() => void refreshRuntime()}>{W.firstRun.retry}</button>
+          )}
         </div>
       )}
     </div>

@@ -2,7 +2,7 @@ import { Fragment, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, use
 import { createPortal } from 'react-dom'
 import { FileArchive, FileText, FolderOpen, MessageSquare, Search, Settings, SquarePen, X } from 'lucide-react'
 import { listZets, searchSources, type SourceSearchResult, type ZetListEntry } from '../archive'
-import { searchChats, type ChatEntry, type ChatGroup, type ChatSearchResult } from '../chats'
+import { searchChatsPage, type ChatEntry, type ChatGroup, type ChatSearchResult } from '../chats'
 import { W } from '../words'
 import './SearchDialog.css'
 
@@ -35,6 +35,9 @@ function shortDate(value: string) {
   return Number.isNaN(date.getTime()) ? null : dateFormat.format(date)
 }
 
+/** 찾은 것을 한 번에 그리는 수(아래로 내리면 이만큼씩 더). */
+const SEARCH_PAGE = 80
+
 /**
  * 검색 창: 채팅방(이름과 말), 문서(제목과 요약), 원자료(파일 이름, source_search), 할 일을 한 창에서 찾는다. Claude 앱의 검색 창 틀(제목과 닫기,
  * 위에 종류 탭, 아래에 키 안내)을 따랐다. 찾는 말이 없으면 최근 것. 키보드만으로 쓸 수 있다
@@ -62,9 +65,16 @@ export function SearchDialog({
   const [tab, setTab] = useState<Tab>('all')
   const [active, setActive] = useState(0)
   const [chatResults, setChatResults] = useState<ChatSearchResult[] | null>(null)
+  // 채팅방 찾기의 다음 쪽(chat_search_page). 새 단추 없이 목록 끝까지 내리면 이어 받는다.
+  const [chatNext, setChatNext] = useState<number | null>(null)
+  const chatLoadingMore = useRef(false)
+  const chatQuery = useRef('')
   const [documents, setDocuments] = useState<ZetListEntry[] | null>(null)
   const [sourceResults, setSourceResults] = useState<SourceSearchResult[] | null>(null)
   const [leaving, setLeaving] = useState(false)
+  // 뒤쪽 찾기(채팅방·원자료)가 실패했는지와 다시 시도(2026-11-17: 조용히 실패하지 않게).
+  const [searchFailed, setSearchFailed] = useState(false)
+  const [retry, setRetry] = useState(0)
   const input = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const text = query.trim()
@@ -78,22 +88,50 @@ export function SearchDialog({
   }, [])
 
   // 채팅방은 백엔드에서 찾는다(이름과 말). 적는 동안 매번 묻지 않게 잠깐 기다린다.
+  // 찾는 말이나 채팅방 목록(chats)이 바뀌면 처음부터 다시 찾는다(쪽을 이어 받는 동안 결과가 바뀌면 겹치거나 빠질 수 있어서).
   useEffect(() => {
-    if (!text) { setChatResults(null); return }
+    setChatResults(null)
+    setChatNext(null)
+    setSearchFailed(false)
+    chatQuery.current = text
+    chatLoadingMore.current = false
+    if (!text) return
     const timer = window.setTimeout(() => {
-      searchChats(text).then(setChatResults).catch(() => setChatResults([]))
+      searchChatsPage(text).then((page) => {
+        if (chatQuery.current !== text) return
+        setChatResults(page.items)
+        setChatNext(page.hasMore ? page.nextOffset : null)
+      }).catch(() => { setChatResults([]); setSearchFailed(true) })
     }, 180)
     return () => window.clearTimeout(timer)
-  }, [text])
+  }, [text, retry, chats])
+
+  // 다음 쪽을 받아 붙인다(이미 받은 채팅방은 빼고). 찾는 말이 그사이 바뀌었으면 버린다.
+  const loadMoreChats = () => {
+    if (chatNext === null || chatLoadingMore.current || !text) return
+    chatLoadingMore.current = true
+    const asked = text
+    searchChatsPage(asked, chatNext).then((page) => {
+      if (chatQuery.current !== asked) return
+      setChatResults((current) => {
+        const seen = new Set((current ?? []).map((item) => item.id))
+        return [...(current ?? []), ...page.items.filter((item) => !seen.has(item.id))]
+      })
+      setChatNext(page.hasMore ? page.nextOffset : null)
+      // 받은 만큼 그릴 수도 늘린다(끝에 서 있으면 스크롤이 다시 일어나지 않으므로).
+      setBudget((current) => current + page.items.length)
+    }).catch(() => setChatNext(null)).finally(() => { if (chatQuery.current === asked) chatLoadingMore.current = false })
+  }
 
   // 원자료도 뒤쪽에서 찾는다(파일 이름). 찾는 말이 있을 때만(빈 말이면 최근 원자료를 늘어놓지 않는다).
   useEffect(() => {
-    if (!text) { setSourceResults(null); return }
+    setSourceResults(null)
+    if (!text) return
     const timer = window.setTimeout(() => {
-      searchSources(text).then(setSourceResults).catch(() => setSourceResults([]))
+      searchSources(text).then(setSourceResults).catch(() => { setSourceResults([]); setSearchFailed(true) })
     }, 180)
     return () => window.clearTimeout(timer)
-  }, [text])
+  }, [text, retry])
 
   const groupName = (id: string | null | undefined) => groups?.find((group) => group.id === id)?.name ?? null
 
@@ -132,7 +170,23 @@ export function SearchDialog({
     return all.filter((section) => (tab === 'all' || tab === section.key) && section.items.length > 0)
   }, [text, chatResults, sourceResults, chats, documents, actions, tab, groups])
 
-  const flat = sections.flatMap((section) => section.items)
+  // 찾은 것이 많으면(채팅방 500개·문서 1,000개에서 한 글자) 위에서부터 SEARCH_PAGE 개씩만 그리고, 아래로 내리거나 화살표로 끝에 닿으면
+  // 이어서 그린다. 찾은 것과 그 차례는 같다(2026-11-17 많이 쌓였을 때 재기: 글자 하나에 0.58초).
+  const [budget, setBudget] = useState(SEARCH_PAGE)
+  useEffect(() => { setBudget(SEARCH_PAGE) }, [text, tab])
+  const total = sections.reduce((sum, section) => sum + section.items.length, 0)
+  const shownSections = useMemo(() => {
+    let left = budget
+    return sections.map((section) => {
+      const items = section.items.slice(0, Math.max(0, left))
+      left -= items.length
+      return { ...section, items }
+    }).filter((section) => section.items.length > 0)
+  }, [sections, budget])
+  const flat = shownSections.flatMap((section) => section.items)
+  const more = flat.length < total
+  // 그린 것이 끝에 닿으면 더 그리고, 다 그렸는데 뒤쪽에 채팅방이 더 있으면 다음 쪽을 받는다.
+  const showMore = () => { if (more) setBudget((current) => current + SEARCH_PAGE); else if (tab === 'all' || tab === 'chats') loadMoreChats() }
 
   useEffect(() => { setActive(0) }, [text, tab])
   useEffect(() => {
@@ -164,7 +218,7 @@ export function SearchDialog({
       close()
       return
     }
-    if (event.key === 'ArrowDown') { event.preventDefault(); setActive((i) => Math.min(flat.length - 1, i + 1)) }
+    if (event.key === 'ArrowDown') { event.preventDefault(); if (active >= flat.length - 2) showMore(); setActive((i) => Math.min(flat.length - 1, i + 1)) }
     if (event.key === 'ArrowUp') { event.preventDefault(); setActive((i) => Math.max(0, i - 1)) }
     if (event.key === 'Enter') { event.preventDefault(); choose(flat[active]) }
     if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && !event.altKey && !event.shiftKey) {
@@ -202,8 +256,27 @@ export function SearchDialog({
             onChange={(event) => setQuery(event.target.value)}
           />
         </label>
-        <div ref={listRef} className="search-results" role="listbox" aria-label={W.searchDialog.aria3}>
-          {sections.map((section) => (
+        <div
+          ref={listRef}
+          className="search-results"
+          role="listbox"
+          aria-label={W.searchDialog.aria3}
+          onScroll={(event) => { const el = event.currentTarget; if (el.scrollTop + el.clientHeight >= el.scrollHeight - 240) showMore() }}
+        >
+          {/* 찾는 말이 있을 때: 실패하면 그 줄과 다시 시도, 아직 찾는 중이고 보일 것이 없으면 "검색하는 중", 다 찾았는데 없으면 "찾은 것이 없습니다". */}
+          {text && searchFailed && (
+            <div className="search-state" role="alert">
+              <span>{W.searchDialog.failed}</span>
+              <button className="secondary-button" type="button" onClick={() => setRetry((n) => n + 1)}>{W.firstRun.retry}</button>
+            </div>
+          )}
+          {text && !searchFailed && shownSections.length === 0 && (chatResults === null || sourceResults === null) && (
+            <p className="search-state" role="status">{W.searchDialog.searching}</p>
+          )}
+          {text && !searchFailed && shownSections.length === 0 && chatResults !== null && sourceResults !== null && (
+            <p className="search-state" role="status">{W.searchDialog.empty}</p>
+          )}
+          {shownSections.map((section) => (
             <section key={section.key} className="search-section" aria-label={section.title}>
               <h3>{section.title}</h3>
               {section.items.map((item) => {

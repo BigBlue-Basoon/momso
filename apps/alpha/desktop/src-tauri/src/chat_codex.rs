@@ -504,7 +504,7 @@ where
                     }
                     if answer.is_empty() { return Err("AI의 답을 읽지 못했습니다".into()); }
                     let message=chat::append_finished(db, chat_id, &answer, "codex".into(), actual_model, actual_effort, chat::FinishReason::Completed)?;
-                    let done = json!({"chatId":chat_id,"messageId":message.id,"actualEffort":null,"fastState":null,"stopReason":null,"finishReason":"completed"});
+                    let done = json!({"chatId":chat_id,"messageId":message.id,"actualEffort":null,"actualSpecialEffort":null,"fastState":null,"stopReason":null,"finishReason":"completed"});
                     emit("chat-done", done);
                     return Ok(());
                 }
@@ -949,15 +949,15 @@ switch ($env:MOMSO_FAKE_RESULT) {
         std::fs::write(archive.join("AGENTS.md"), "이 보관함에서 일합니다.").unwrap();
         let db = dir.path().join("test.db");
         let c = rusqlite::Connection::open(&db).unwrap();
-        c.execute_batch(include_str!("../migrations/0009_chats.sql"))
+        c.execute_batch(include_str!("../migrations/0010_chats.sql"))
             .unwrap();
-        c.execute_batch(include_str!("../migrations/0010_chat_codex.sql"))
+        c.execute_batch(include_str!("../migrations/0011_chat_codex.sql"))
             .unwrap();
-        c.execute_batch(include_str!("../migrations/0011_chat_effort.sql"))
+        c.execute_batch(include_str!("../migrations/0012_chat_effort.sql"))
             .unwrap();
-        c.execute_batch(include_str!("../migrations/0012_chat_groups.sql"))
+        c.execute_batch(include_str!("../migrations/0013_chat_groups.sql"))
             .unwrap();
-        c.execute_batch(include_str!("../migrations/0013_chat_context.sql"))
+        c.execute_batch(include_str!("../migrations/0014_chat_context.sql"))
             .unwrap();
         c.execute_batch(include_str!("../migrations/0070_chat_skill.sql"))
             .unwrap();
