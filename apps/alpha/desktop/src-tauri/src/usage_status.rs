@@ -56,13 +56,17 @@ fn unavailable_without_reason(provider: &'static str) -> UsageStatus {
     unavailable(provider, "unavailable", "checking")
 }
 fn auth_unavailable(provider: &'static str, installed: bool, state: &str) -> Option<UsageStatus> {
-    let reason = if !installed { "not_installed" } else { match state {
-        "account" => return None,
-        "apiKey" if provider == "gemini" => "no_quota_api",
-        "apiKey" => "api_key",
-        "signedOut" => "not_connected",
-        _ => "fetch_failed",
-    }};
+    let reason = if !installed {
+        "not_installed"
+    } else {
+        match state {
+            "account" => return None,
+            "apiKey" if provider == "gemini" => "no_quota_api",
+            "apiKey" => "api_key",
+            "signedOut" => "not_connected",
+            _ => "fetch_failed",
+        }
+    };
     Some(unavailable(provider, "unavailable", reason))
 }
 async fn fetch_gemini() -> UsageStatus {
@@ -182,7 +186,9 @@ fn request(method: &'static str, params: serde_json::Value) -> process::JsonRpcR
 }
 pub(crate) async fn fetch_codex() -> UsageStatus {
     let status = provider_auth::read_status("codex").await;
-    if let Some(result) = auth_unavailable("codex", status.installed, status.state) { return result; }
+    if let Some(result) = auth_unavailable("codex", status.installed, status.state) {
+        return result;
+    }
     if process::resolve_interactive_tool("codex").is_none() {
         return unavailable("codex", "unavailable", "not_installed");
     }
@@ -204,7 +210,11 @@ pub(crate) async fn fetch_codex() -> UsageStatus {
     };
     if account.get("type").and_then(|v| v.as_str()) != Some("chatgpt") {
         return unavailable_with_plan(
-            if account.get("type").and_then(|v| v.as_str()) == Some("apiKey") { "api_key" } else { "fetch_failed" },
+            if account.get("type").and_then(|v| v.as_str()) == Some("apiKey") {
+                "api_key"
+            } else {
+                "fetch_failed"
+            },
             account_plan(account),
         );
     }
@@ -287,7 +297,9 @@ fn parse_claude_report(output: &str) -> UsageStatus {
 
 pub(crate) async fn fetch_claude(working_directory: &std::path::Path) -> UsageStatus {
     let status = provider_auth::read_status("claude").await;
-    if let Some(result) = auth_unavailable("claude", status.installed, status.state) { return result; }
+    if let Some(result) = auth_unavailable("claude", status.installed, status.state) {
+        return result;
+    }
     if process::resolve_tool("claude").is_none() {
         return unavailable("claude", "unavailable", "not_installed");
     }
@@ -533,13 +545,37 @@ mod tests {
             assert_eq!(value["provider"], provider);
             assert_eq!(value["state"], "unavailable");
             assert_eq!(value["reason"], "checking");
-            assert_eq!(auth_unavailable(provider, false, "unavailable").unwrap().reason, Some("not_installed"));
-            assert_eq!(auth_unavailable(provider, true, "signedOut").unwrap().reason, Some("not_connected"));
-            assert_eq!(auth_unavailable(provider, true, "unavailable").unwrap().reason, Some("fetch_failed"));
+            assert_eq!(
+                auth_unavailable(provider, false, "unavailable")
+                    .unwrap()
+                    .reason,
+                Some("not_installed")
+            );
+            assert_eq!(
+                auth_unavailable(provider, true, "signedOut")
+                    .unwrap()
+                    .reason,
+                Some("not_connected")
+            );
+            assert_eq!(
+                auth_unavailable(provider, true, "unavailable")
+                    .unwrap()
+                    .reason,
+                Some("fetch_failed")
+            );
         }
-        assert_eq!(auth_unavailable("codex", true, "apiKey").unwrap().reason, Some("api_key"));
-        assert_eq!(auth_unavailable("claude", true, "apiKey").unwrap().reason, Some("api_key"));
-        assert_eq!(auth_unavailable("gemini", true, "apiKey").unwrap().reason, Some("no_quota_api"));
+        assert_eq!(
+            auth_unavailable("codex", true, "apiKey").unwrap().reason,
+            Some("api_key")
+        );
+        assert_eq!(
+            auth_unavailable("claude", true, "apiKey").unwrap().reason,
+            Some("api_key")
+        );
+        assert_eq!(
+            auth_unavailable("gemini", true, "apiKey").unwrap().reason,
+            Some("no_quota_api")
+        );
         assert!(auth_unavailable("codex", true, "account").is_none());
     }
     #[test]

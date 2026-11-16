@@ -926,6 +926,21 @@ mod tests {
     use crate::records;
     use tempfile::TempDir;
 
+    #[cfg(windows)]
+    fn clear_readonly(path: &Path) -> std::io::Result<()> {
+        use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+        };
+        let attributes = fs::metadata(path)?.file_attributes() & !FILE_ATTRIBUTE_READONLY;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe { SetFileAttributesW(wide.as_ptr(), attributes) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     struct TestStore {
         _temp: TempDir,
         database_path: PathBuf,
@@ -941,11 +956,7 @@ mod tests {
                 .flatten()
             {
                 if entry.file_type().is_file() {
-                    if let Ok(metadata) = entry.metadata() {
-                        let mut permissions = metadata.permissions();
-                        permissions.set_readonly(false);
-                        let _ = fs::set_permissions(entry.path(), permissions);
-                    }
+                    let _ = clear_readonly(entry.path());
                 }
             }
         }
@@ -1035,9 +1046,7 @@ mod tests {
             .status().unwrap();
         assert!(!status.success());
         assert_eq!(fs::read(&stored).unwrap(), b"original source");
-        let mut permissions = fs::metadata(&stored).unwrap().permissions();
-        permissions.set_readonly(false);
-        fs::set_permissions(&stored, permissions).unwrap();
+        clear_readonly(&stored).unwrap();
         fs::write(&stored, b"bypass").unwrap();
         let after = crate::chat_file_changes::capture(root).unwrap();
         assert_eq!(

@@ -7,6 +7,9 @@ use serde::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{
     collections::HashSet,
     fmt,
@@ -15,26 +18,54 @@ use std::{
     path::Path,
 };
 use uuid::Uuid;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::collections::HashMap;
 
 const MAX_ENTRY: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100_000;
 static RUNNING: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-fn running() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> { RUNNING.get_or_init(|| Mutex::new(HashMap::new())) }
+fn running() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    RUNNING.get_or_init(|| Mutex::new(HashMap::new()))
+}
 pub(crate) struct ImportGuard(String);
-impl Drop for ImportGuard { fn drop(&mut self) { if let Ok(mut map) = running().lock() { map.remove(&self.0); } } }
+impl Drop for ImportGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = running().lock() {
+            map.remove(&self.0);
+        }
+    }
+}
 pub(crate) fn cancel(id: &str) {
-    if let Ok(map) = running().lock() { if let Some(token) = map.get(id) { token.store(true, Ordering::SeqCst); } }
+    if let Ok(map) = running().lock() {
+        if let Some(token) = map.get(id) {
+            token.store(true, Ordering::SeqCst);
+        }
+    }
 }
 pub(crate) fn reserve(id: &str) -> Result<(ImportGuard, Arc<AtomicBool>), String> {
-    if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') { return Err("invalid_request_id".into()); }
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid_request_id".into());
+    }
     let token = Arc::new(AtomicBool::new(false));
-    { let mut map = running().lock().map_err(|_| "unavailable")?; if map.contains_key(id) { return Err("request_busy".into()); } map.insert(id.to_owned(), token.clone()); }
+    {
+        let mut map = running().lock().map_err(|_| "unavailable")?;
+        if map.contains_key(id) {
+            return Err("request_busy".into());
+        }
+        map.insert(id.to_owned(), token.clone());
+    }
     Ok((ImportGuard(id.to_owned()), token))
 }
-pub(crate) fn import_with_id(db: &Path, file: &Path, provider: &str, id: &str, progress: &dyn Fn(u64)) -> Result<ResultCounts, String> {
+pub(crate) fn import_with_id(
+    db: &Path,
+    file: &Path,
+    provider: &str,
+    id: &str,
+    progress: &dyn Fn(u64),
+) -> Result<ResultCounts, String> {
     let (_guard, token) = reserve(id)?;
     import_controlled(db, file, provider, &token, progress)
 }
@@ -513,7 +544,9 @@ impl<'de> Visitor<'de> for ArraySeed<'_, '_> {
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
         while let Some(v) = seq.next_element::<Value>()? {
-            if self.cancelled.load(Ordering::SeqCst) { return Err(A::Error::custom("cancelled")); }
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(A::Error::custom("cancelled"));
+            }
             import_one(self.tx, self.provider, v, self.counts).map_err(A::Error::custom)?;
             *self.processed += 1;
             (self.progress)(*self.processed);
@@ -541,7 +574,14 @@ fn parse<R: Read>(
         processed,
     }
     .deserialize(&mut de)
-    .map_err(|_| if cancelled.load(Ordering::SeqCst) { "cancelled" } else { "invalid_format" }.to_owned())?;
+    .map_err(|_| {
+        if cancelled.load(Ordering::SeqCst) {
+            "cancelled"
+        } else {
+            "invalid_format"
+        }
+        .to_owned()
+    })?;
     de.end().map_err(|_| "invalid_format".to_owned())
 }
 
@@ -549,7 +589,13 @@ pub(crate) fn import(db: &Path, file: &Path, provider: &str) -> Result<ResultCou
     import_controlled(db, file, provider, &AtomicBool::new(false), &|_| {})
 }
 
-pub(crate) fn import_controlled(db: &Path, file: &Path, provider: &str, cancelled: &AtomicBool, progress: &dyn Fn(u64)) -> Result<ResultCounts, String> {
+pub(crate) fn import_controlled(
+    db: &Path,
+    file: &Path,
+    provider: &str,
+    cancelled: &AtomicBool,
+    progress: &dyn Fn(u64),
+) -> Result<ResultCounts, String> {
     if provider == "gemini" {
         return Err("unsupported_format".into());
     }
@@ -592,15 +638,33 @@ pub(crate) fn import_controlled(db: &Path, file: &Path, provider: &str, cancelle
                 return Err("archive_limit".into());
             }
             matched = true;
-            parse(entry, &tx, provider, &mut counts, cancelled, progress, &mut processed)?;
+            parse(
+                entry,
+                &tx,
+                provider,
+                &mut counts,
+                cancelled,
+                progress,
+                &mut processed,
+            )?;
         }
         if !matched {
             return Err("unsupported_format".into());
         }
     } else {
-        parse(f, &tx, provider, &mut counts, cancelled, progress, &mut processed)?;
+        parse(
+            f,
+            &tx,
+            provider,
+            &mut counts,
+            cancelled,
+            progress,
+            &mut processed,
+        )?;
     }
-    if cancelled.load(Ordering::SeqCst) { return Err("cancelled".into()); }
+    if cancelled.load(Ordering::SeqCst) {
+        return Err("cancelled".into());
+    }
     tx.commit().map_err(|_| "storage_error")?;
     Ok(counts)
 }
@@ -622,19 +686,49 @@ struct PreviewSeed<'a> {
 }
 fn readable_conversation(v: &Value, provider: &str) -> bool {
     if provider == "claude" {
-        return v.get("chat_messages").and_then(Value::as_array).is_some_and(|items| items.iter().any(|m| {
-            matches!(m.get("sender").and_then(Value::as_str), Some("human" | "assistant")) && m.get("content").or_else(|| m.get("text")).and_then(text_parts).or_else(|| m.get("text").and_then(Value::as_str).map(str::to_owned)).is_some_and(|t| !t.is_empty())
-        }));
+        return v
+            .get("chat_messages")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|m| {
+                    matches!(
+                        m.get("sender").and_then(Value::as_str),
+                        Some("human" | "assistant")
+                    ) && m
+                        .get("content")
+                        .or_else(|| m.get("text"))
+                        .and_then(text_parts)
+                        .or_else(|| m.get("text").and_then(Value::as_str).map(str::to_owned))
+                        .is_some_and(|t| !t.is_empty())
+                })
+            });
     }
-    let Some(mapping) = v.get("mapping").and_then(Value::as_object) else { return false; };
+    let Some(mapping) = v.get("mapping").and_then(Value::as_object) else {
+        return false;
+    };
     let mut current = v.get("current_node").and_then(Value::as_str);
     let mut seen = HashSet::new();
     let mut has_text = false;
     while let Some(id) = current {
-        if !seen.insert(id) { return false; }
-        let Some(node) = mapping.get(id) else { return false; };
+        if !seen.insert(id) {
+            return false;
+        }
+        let Some(node) = mapping.get(id) else {
+            return false;
+        };
         if let Some(m) = node.get("message") {
-            if matches!(m.pointer("/author/role").and_then(Value::as_str), Some("user" | "assistant")) && m.get("content").or_else(|| m.get("text")).and_then(text_parts).or_else(|| m.get("text").and_then(Value::as_str).map(str::to_owned)).is_some_and(|t| !t.is_empty()) { has_text = true; }
+            if matches!(
+                m.pointer("/author/role").and_then(Value::as_str),
+                Some("user" | "assistant")
+            ) && m
+                .get("content")
+                .or_else(|| m.get("text"))
+                .and_then(text_parts)
+                .or_else(|| m.get("text").and_then(Value::as_str).map(str::to_owned))
+                .is_some_and(|t| !t.is_empty())
+            {
+                has_text = true;
+            }
         }
         current = node.get("parent").and_then(Value::as_str);
     }
@@ -642,54 +736,118 @@ fn readable_conversation(v: &Value, provider: &str) -> bool {
 }
 impl<'de> DeserializeSeed<'de> for PreviewSeed<'_> {
     type Value = ();
-    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> { d.deserialize_seq(self) }
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_seq(self)
+    }
 }
 impl<'de> Visitor<'de> for PreviewSeed<'_> {
     type Value = ();
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result { f.write_str("conversation array") }
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("conversation array")
+    }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
         while let Some(v) = seq.next_element::<Value>()? {
             self.result.conversations += 1;
-            let source = if self.provider == "chatgpt" { v.get("conversation_id").or_else(|| v.get("id")) } else { v.get("uuid").or_else(|| v.get("id")) }.and_then(Value::as_str).filter(|s| !s.is_empty());
+            let source = if self.provider == "chatgpt" {
+                v.get("conversation_id").or_else(|| v.get("id"))
+            } else {
+                v.get("uuid").or_else(|| v.get("id"))
+            }
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
             let valid = readable_conversation(&v, self.provider);
-            let Some(source) = source.filter(|_| valid) else { self.result.unreadable += 1; continue; };
+            let Some(source) = source.filter(|_| valid) else {
+                self.result.unreadable += 1;
+                continue;
+            };
             let exists: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM chat_imports WHERE source_provider=?1 AND source_id=?2)", params![self.provider, source], |r| r.get(0)).map_err(A::Error::custom)?;
-            if exists { self.result.already_imported += 1; }
-            let date = timestamp(v.get(if self.provider == "chatgpt" { "create_time" } else { "created_at" }).unwrap_or(&Value::Null));
+            if exists {
+                self.result.already_imported += 1;
+            }
+            let date = timestamp(
+                v.get(if self.provider == "chatgpt" {
+                    "create_time"
+                } else {
+                    "created_at"
+                })
+                .unwrap_or(&Value::Null),
+            );
             if let Ok(parsed) = DateTime::parse_from_rfc3339(&date) {
                 let normalized = parsed.with_timezone(&Utc).to_rfc3339();
-                if self.result.oldest.as_ref().is_none_or(|d| normalized < *d) { self.result.oldest = Some(normalized.clone()); }
-                if self.result.newest.as_ref().is_none_or(|d| normalized > *d) { self.result.newest = Some(normalized); }
+                if self.result.oldest.as_ref().is_none_or(|d| normalized < *d) {
+                    self.result.oldest = Some(normalized.clone());
+                }
+                if self.result.newest.as_ref().is_none_or(|d| normalized > *d) {
+                    self.result.newest = Some(normalized);
+                }
             }
         }
         Ok(())
     }
 }
-fn preview_parse<R: Read>(reader: R, db: &Connection, provider: &str, result: &mut Preview) -> Result<(), String> {
+fn preview_parse<R: Read>(
+    reader: R,
+    db: &Connection,
+    provider: &str,
+    result: &mut Preview,
+) -> Result<(), String> {
     let mut de = serde_json::Deserializer::from_reader(BufReader::new(reader));
-    PreviewSeed { db, provider, result }.deserialize(&mut de).map_err(|_| "invalid_format".to_string())?;
+    PreviewSeed {
+        db,
+        provider,
+        result,
+    }
+    .deserialize(&mut de)
+    .map_err(|_| "invalid_format".to_string())?;
     de.end().map_err(|_| "invalid_format".to_string())
 }
 pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview, String> {
-    if provider == "gemini" { return Err("unsupported_format".into()); }
-    if !matches!(provider, "chatgpt" | "claude") { return Err("unsupported_provider".into()); }
-    let db = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| "storage_error")?;
+    if provider == "gemini" {
+        return Err("unsupported_format".into());
+    }
+    if !matches!(provider, "chatgpt" | "claude") {
+        return Err("unsupported_provider".into());
+    }
+    let db = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "storage_error")?;
     let f = File::open(file).map_err(|_| "file_error")?;
     let mut result = Preview::default();
-    if file.extension().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case("zip")) {
+    if file
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("zip"))
+    {
         let mut zip = zip::ZipArchive::new(f).map_err(|_| "invalid_format")?;
-        if zip.len() > MAX_ENTRIES { return Err("archive_limit".into()); }
+        if zip.len() > MAX_ENTRIES {
+            return Err("archive_limit".into());
+        }
         let mut matched = false;
         for i in 0..zip.len() {
             let entry = zip.by_index(i).map_err(|_| "invalid_format")?;
-            let name = entry.name().rsplit('/').next().unwrap_or("").to_ascii_lowercase();
-            if !(name == "conversations.json" || (name.starts_with("conversations-") && name.ends_with(".json")) || (name.starts_with("conversations_") && name.ends_with(".json"))) { continue; }
-            if entry.size() > MAX_ENTRY { return Err("archive_limit".into()); }
+            let name = entry
+                .name()
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !(name == "conversations.json"
+                || (name.starts_with("conversations-") && name.ends_with(".json"))
+                || (name.starts_with("conversations_") && name.ends_with(".json")))
+            {
+                continue;
+            }
+            if entry.size() > MAX_ENTRY {
+                return Err("archive_limit".into());
+            }
             matched = true;
             preview_parse(entry, &db, provider, &mut result)?;
         }
-        if !matched { return Err("unsupported_format".into()); }
-    } else { preview_parse(f, &db, provider, &mut result)?; }
+        if !matched {
+            return Err("unsupported_format".into());
+        }
+    } else {
+        preview_parse(f, &db, provider, &mut result)?;
+    }
     Ok(result)
 }
 
@@ -710,17 +868,33 @@ mod tests {
         let (dir, db) = fixture();
         let file = dir.path().join("conversations.json");
         let item = |id: &str, date: &str| serde_json::json!({"uuid":id,"created_at":date,"chat_messages":[{"sender":"human","text":"private contents"}]});
-        std::fs::write(&file, serde_json::json!([item("a","2020-01-01T00:00:00Z")]).to_string()).unwrap();
+        std::fs::write(
+            &file,
+            serde_json::json!([item("a", "2020-01-01T00:00:00Z")]).to_string(),
+        )
+        .unwrap();
         import(&db, &file, "claude").unwrap();
         std::fs::write(&file, serde_json::json!([item("a","2020-01-01T00:00:00Z"),item("b","2024-01-01T00:00:00Z"),{"uuid":"broken"}]).to_string()).unwrap();
         let p = preview(&db, &file, "claude").unwrap();
-        assert_eq!((p.conversations,p.already_imported,p.unreadable), (3,1,1));
+        assert_eq!(
+            (p.conversations, p.already_imported, p.unreadable),
+            (3, 1, 1)
+        );
         assert!(p.oldest.unwrap().starts_with("2020-01-01"));
         assert!(p.newest.unwrap().starts_with("2024-01-01"));
-        let count = || Connection::open(&db).unwrap().query_row("SELECT count(*) FROM chats", [], |r| r.get::<_, i64>(0)).unwrap();
+        let count = || {
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT count(*) FROM chats", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        };
         assert_eq!(count(), 1);
         let cancelled = AtomicBool::new(false);
-        let result = import_controlled(&db, &file, "claude", &cancelled, &|n| { if n == 1 { cancelled.store(true, Ordering::SeqCst); } });
+        let result = import_controlled(&db, &file, "claude", &cancelled, &|n| {
+            if n == 1 {
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        });
         assert!(matches!(result, Err(e) if e == "cancelled"));
         assert_eq!(count(), 1);
         assert!(matches!(preview(&db, &file, "gemini"), Err(e) if e == "unsupported_format"));
@@ -730,14 +904,29 @@ mod tests {
     fn progress_request_cancels_without_saving_and_cleans_registry() {
         let (dir, db) = fixture();
         let file = dir.path().join("conversations.json");
-        std::fs::write(&file, serde_json::json!([
-            {"uuid":"one","chat_messages":[{"sender":"human","text":"one"}]},
-            {"uuid":"two","chat_messages":[{"sender":"human","text":"two"}]}
-        ]).to_string()).unwrap();
+        std::fs::write(
+            &file,
+            serde_json::json!([
+                {"uuid":"one","chat_messages":[{"sender":"human","text":"one"}]},
+                {"uuid":"two","chat_messages":[{"sender":"human","text":"two"}]}
+            ])
+            .to_string(),
+        )
+        .unwrap();
         let id = format!("test-{}", Uuid::new_v4());
-        let result = import_with_id(&db, &file, "claude", &id, &|n| if n == 1 { cancel(&id); });
+        let result = import_with_id(&db, &file, "claude", &id, &|n| {
+            if n == 1 {
+                cancel(&id);
+            }
+        });
         assert!(matches!(result, Err(e) if e == "cancelled"));
-        assert_eq!(Connection::open(&db).unwrap().query_row("SELECT count(*) FROM chats", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT count(*) FROM chats", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         assert!(!running().lock().unwrap().contains_key(&id));
     }
 

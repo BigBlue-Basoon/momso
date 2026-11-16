@@ -91,7 +91,9 @@ impl BridgeClient {
                 .ok_or(io::ErrorKind::InvalidData)?;
             let mut safe = json!({"status":status});
             for key in ["imported", "duplicate", "skipped"] {
-                if let Some(n) = value.get(key).and_then(Value::as_u64) { safe[key] = json!(n); }
+                if let Some(n) = value.get(key).and_then(Value::as_u64) {
+                    safe[key] = json!(n);
+                }
             }
             Ok(safe)
         })();
@@ -159,12 +161,27 @@ fn response_with_bridge(
             json!({"tools":tools})
         }
         "tools/call"
-            if *initialized && v.pointer("/params/name").and_then(Value::as_str) == Some(IMPORT) && bridge.is_some() =>
+            if *initialized
+                && v.pointer("/params/name").and_then(Value::as_str) == Some(IMPORT)
+                && bridge.is_some() =>
         {
-            let args = v.pointer("/params/arguments").and_then(Value::as_object).filter(|v| v.len() == 1);
-            let provider = args.and_then(|v| v.get("provider")).and_then(Value::as_str).filter(|v| matches!(*v, "chatgpt" | "claude" | "gemini"));
-            let Some(provider) = provider else { return Some(json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Invalid parameters"}})); };
-            let result = bridge.as_mut().unwrap().call(&json!({"method":"import_conversations","provider":provider}));
+            let args = v
+                .pointer("/params/arguments")
+                .and_then(Value::as_object)
+                .filter(|v| v.len() == 1);
+            let provider = args
+                .and_then(|v| v.get("provider"))
+                .and_then(Value::as_str)
+                .filter(|v| matches!(*v, "chatgpt" | "claude" | "gemini"));
+            let Some(provider) = provider else {
+                return Some(
+                    json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Invalid parameters"}}),
+                );
+            };
+            let result = bridge
+                .as_mut()
+                .unwrap()
+                .call(&json!({"method":"import_conversations","provider":provider}));
             json!({"content":[{"type":"text","text":result.to_string()}]})
         }
         "tools/call"

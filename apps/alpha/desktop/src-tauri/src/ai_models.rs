@@ -150,7 +150,10 @@ fn codex_model(v: &Value) -> Option<Model> {
                 .filter_map(|x| {
                     x.get("reasoningEffort")
                         .and_then(Value::as_str)
-                        .filter(|id| !id.eq_ignore_ascii_case("ultracode") && !id.eq_ignore_ascii_case("ultra"))
+                        .filter(|id| {
+                            !id.eq_ignore_ascii_case("ultracode")
+                                && !id.eq_ignore_ascii_case("ultra")
+                        })
                         .map(|id| {
                             effort(
                                 id,

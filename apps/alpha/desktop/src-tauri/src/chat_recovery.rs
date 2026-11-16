@@ -228,7 +228,7 @@ fn restore_bytes(root: &Path, id: &str, bytes: &[u8]) -> Result<(), String> {
     }
     let mut temp = tempfile::NamedTempFile::new_in(root.join("zettels"))
         .map_err(|_| "recovery_unavailable")?;
-    temp.write_all(&bytes).map_err(|_| "recovery_unavailable")?;
+    temp.write_all(bytes).map_err(|_| "recovery_unavailable")?;
     temp.as_file()
         .sync_all()
         .map_err(|_| "recovery_unavailable")?;

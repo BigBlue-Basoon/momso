@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Archive, Cloud, HardDrive, Info, Sparkles, UserRound, Wand2, X } from 'lucide-react'
+import { Archive, BookOpen, Cloud, HardDrive, Info, Sparkles, UserRound, Wand2, X } from 'lucide-react'
 import { UserProfileSettings } from './UserProfileSettings'
 import { AppFolderSetting, AppInfoSettings } from './AppSettingsParts'
 import { SkillsSettings } from './SkillsSettings'
@@ -7,6 +7,7 @@ import { ArchivedChatsSettings } from './ArchivedChatsSettings'
 import { BackupSettings } from './BackupSettings'
 import { ProviderSignIn, useProviderAuth } from './ProviderSignIn'
 import { ChatImportSettings } from './ChatImportSettings'
+import { TermDictionarySettings } from './TermDictionarySettings'
 import type { SkillEntry } from '../skills'
 import type { AppUpdateState } from './AppUpdate'
 import { W } from '../words'
@@ -14,7 +15,7 @@ import { W } from '../words'
 // 2026-11-16 김성균 개발자의 지시("방향을 바꾸기 전 옛화면에 남아있는거 그런거는 이제 필요 없는거잖아")로
 // 꺼 두었던 옛 칸(작업공간, 참여자 표기, 채팅방 이력 보관, 응답 밀도, 개인정보 경계, 이전 채팅방 가져오기, 예전 백업 화면,
 // 예전 경로·앱 정보 칸)과 예전 AI 연결 칸, 저장공간의 수동 백업, 옛 "새 기록" 창에 딸린 "기록" 쪽(원자료 보관, 녹음 동의 확인)을 없앴다.
-export type SettingsSection = 'profile' | 'ai' | 'skills' | 'archived' | 'backup' | 'storage' | 'about'
+export type SettingsSection = 'profile' | 'ai' | 'skills' | 'dictionary' | 'archived' | 'backup' | 'storage' | 'about'
 
 type SettingsViewProps = {
   /** 처음 열 쪽(채팅의 알림 줄에서 "AI 연결 열기"를 누르면 'ai'). */
@@ -38,6 +39,8 @@ const SECTIONS: Array<{ id: SettingsSection; label: string; icon: typeof Info }>
   { id: 'ai', label: W.settingsView.text4, icon: Sparkles },
   // 스킬: 스킬 명령이 있을 때만 보인다.
   { id: 'skills', label: W.skills.word, icon: Wand2 },
+  // 용어 사전(2026-11-16, 보기만): 용어가 수백 개라 다른 쪽에 넣지 않고 따로 둔다. AI 가 알아듣는 데 쓰는 것이라 스킬 다음.
+  { id: 'dictionary', label: W.termDictionary.title, icon: BookOpen },
   // 보관된 채팅방: 보관 명령이 있을 때만 보인다.
   { id: 'archived', label: W.chatKeep.settingsTitle, icon: Archive },
   { id: 'backup', label: W.settingsView.text5, icon: Cloud },
@@ -143,6 +146,8 @@ export function SettingsView({
           )}
 
           {section === 'skills' && skills && <SkillsSettings skills={skills} onChanged={() => onSkillsChanged?.()} />}
+
+          {section === 'dictionary' && <TermDictionarySettings />}
 
           {section === 'archived' && archivedChats && <ArchivedChatsSettings onChanged={() => onChatsChanged?.()} />}
 

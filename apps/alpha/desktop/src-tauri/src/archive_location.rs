@@ -625,13 +625,23 @@ mod tests {
     }
     #[test]
     fn onedrive_check_respects_component_boundaries() {
-        let roots = vec![PathBuf::from(r"C:\").join("Users").join("person").join("OneDrive")];
+        let roots = vec![PathBuf::from(r"C:\")
+            .join("Users")
+            .join("person")
+            .join("OneDrive")];
         assert!(in_onedrive(
-            &PathBuf::from(r"c:\").join("users").join("PERSON").join("onedrive").join("folder"),
+            &PathBuf::from(r"c:\")
+                .join("users")
+                .join("PERSON")
+                .join("onedrive")
+                .join("folder"),
             &roots
         ));
         assert!(!in_onedrive(
-            &PathBuf::from(r"c:\").join("users").join("person").join("OneDrive-other"),
+            &PathBuf::from(r"c:\")
+                .join("users")
+                .join("person")
+                .join("OneDrive-other"),
             &roots
         ));
     }

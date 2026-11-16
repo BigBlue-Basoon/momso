@@ -29,13 +29,13 @@ mod connections;
 mod credentials;
 #[allow(dead_code)] // The terminology dictionary is retained for its future interface.
 mod dictionary;
-mod yoga_dictionary;
-#[cfg(test)]
-mod instagram_preview_contract_tests;
 mod gemini_access;
 mod git_tool;
+#[cfg(test)]
+mod instagram_preview_contract_tests;
 mod media;
 mod momso_mcp;
+mod yoga_dictionary;
 
 pub fn serve_mcp_stdio(pipe: Option<String>) -> std::io::Result<()> {
     momso_mcp::serve(pipe.as_deref())
@@ -334,7 +334,9 @@ async fn chat_attach_asset(
 }
 
 #[tauri::command]
-async fn yoga_terms_list(state: State<'_, AppState>) -> Result<yoga_dictionary::DictionaryList, String> {
+async fn yoga_terms_list(
+    state: State<'_, AppState>,
+) -> Result<yoga_dictionary::DictionaryList, String> {
     let root = state.paths.archive.current.clone().read_owned().await;
     tauri::async_runtime::spawn_blocking(move || yoga_dictionary::list(&root))
         .await
@@ -561,26 +563,56 @@ async fn chat_import_export(
 }
 
 #[tauri::command]
-async fn chat_import_export_preview(state: State<'_, AppState>, path: String, provider: String) -> Result<chat_export_import::Preview, String> {
+async fn chat_import_export_preview(
+    state: State<'_, AppState>,
+    path: String,
+    provider: String,
+) -> Result<chat_export_import::Preview, String> {
     let db = state.paths.database_path.clone();
     let lease = state.paths.archive.current.clone().read_owned().await;
-    tauri::async_runtime::spawn_blocking(move || { let _lease = lease; chat_export_import::preview(&db, std::path::Path::new(&path), &provider) }).await.map_err(|_| "unavailable".to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lease = lease;
+        chat_export_import::preview(&db, std::path::Path::new(&path), &provider)
+    })
+    .await
+    .map_err(|_| "unavailable".to_string())?
 }
 
 #[tauri::command]
-async fn chat_import_export_progress(app: tauri::AppHandle, state: State<'_, AppState>, request_id: String, path: String, provider: String) -> Result<chat_export_import::ResultCounts, String> {
+async fn chat_import_export_progress(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request_id: String,
+    path: String,
+    provider: String,
+) -> Result<chat_export_import::ResultCounts, String> {
     let db = state.paths.database_path.clone();
     let (guard, token) = chat_export_import::reserve(&request_id)?;
     let lease = state.paths.archive.current.clone().read_owned().await;
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         let _lease = lease;
-        chat_export_import::import_controlled(&db, std::path::Path::new(&path), &provider, &token, &|processed| { let _ = app.emit("chat-import-progress", serde_json::json!({"requestId":request_id,"processed":processed})); })
-    }).await.map_err(|_| "unavailable".to_string())?
+        chat_export_import::import_controlled(
+            &db,
+            std::path::Path::new(&path),
+            &provider,
+            &token,
+            &|processed| {
+                let _ = app.emit(
+                    "chat-import-progress",
+                    serde_json::json!({"requestId":request_id,"processed":processed}),
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|_| "unavailable".to_string())?
 }
 
 #[tauri::command]
-fn chat_import_export_cancel(request_id: String) { chat_export_import::cancel(&request_id); }
+fn chat_import_export_cancel(request_id: String) {
+    chat_export_import::cancel(&request_id);
+}
 
 #[tauri::command]
 async fn runtime_info(

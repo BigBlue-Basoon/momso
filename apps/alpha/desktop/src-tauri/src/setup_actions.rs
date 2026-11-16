@@ -1,6 +1,6 @@
 //! App-owned setup actions. Inputs and responses never contain credentials.
 use serde_json::{json, Value};
-use tauri::{Manager, Emitter};
+use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tokio_util::sync::CancellationToken;
 
@@ -56,14 +56,24 @@ pub(crate) async fn dispatch(
     cancel: CancellationToken,
     input: Value,
 ) -> Value {
-    if input.as_object().is_some_and(|o| o.len() == 2) && input.get("method").and_then(Value::as_str) == Some("import_conversations") {
+    if input.as_object().is_some_and(|o| o.len() == 2)
+        && input.get("method").and_then(Value::as_str) == Some("import_conversations")
+    {
         let provider = match input.get("provider").and_then(Value::as_str) {
-            Some("chatgpt") => "chatgpt", Some("claude") => "claude",
+            Some("chatgpt") => "chatgpt",
+            Some("claude") => "claude",
             Some("gemini") => return json!({"status":"unsupported_format"}),
             _ => return json!({"status":"unavailable"}),
         };
         let db = app.state::<crate::AppState>().paths.database_path.clone();
-        let lease = app.state::<crate::AppState>().paths.archive.current.clone().read_owned().await;
+        let lease = app
+            .state::<crate::AppState>()
+            .paths
+            .archive
+            .current
+            .clone()
+            .read_owned()
+            .await;
         return tauri::async_runtime::spawn_blocking(move || {
             let _lease = lease;
             if cancel.is_cancelled() { return json!({"status":"cancelled"}); }

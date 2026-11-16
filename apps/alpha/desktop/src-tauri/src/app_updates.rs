@@ -355,11 +355,20 @@ mod tests {
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0u8; 4096];
-                        let _ = stream.read(&mut request);
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            let count = stream.read(&mut chunk).unwrap();
+                            assert!(count > 0 && request.len() + count <= 16384);
+                            request.extend_from_slice(&chunk[..count]);
+                        }
                         let body = std::fs::read(path).unwrap();
-                        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
-                        stream.write_all(&body).unwrap();
+                        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+                        response.extend_from_slice(&body);
+                        stream.write_all(&response).unwrap();
                         return;
                     }
                     Err(e)

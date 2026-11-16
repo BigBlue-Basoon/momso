@@ -172,7 +172,11 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
     std::fs::create_dir_all(dir.path().join("zettels")).unwrap();
     std::fs::create_dir_all(dir.path().join("receipts")).unwrap();
     std::fs::create_dir_all(dir.path().join("dictionary")).unwrap();
-    std::fs::write(dir.path().join("dictionary/yoga.json"), "C15_PRIVATE_DICTIONARY_MARKER").unwrap();
+    std::fs::write(
+        dir.path().join("dictionary/yoga.json"),
+        "C15_PRIVATE_DICTIONARY_MARKER",
+    )
+    .unwrap();
     std::fs::write(object_dir.join(&hash), "fake file").unwrap();
     let connection = rusqlite::Connection::open(&db).unwrap();
     connection.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,media_type,captured_by,created_at) VALUES('fixture','other',?1,9,?2,'attachment-marker.txt','text/plain','test','test')", rusqlite::params![hash,format!("sha256/{}/{hash}", &hash[..2])]).unwrap();

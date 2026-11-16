@@ -589,6 +589,20 @@ const ko = {
     /** 누른 뒤 잠깐(그림이 체크로 바뀌는 동안) 풍선·화면 읽기 이름. */
     copied: '복사했습니다',
   },
+  // ---- components/TermDictionarySettings.tsx: 설정 › 용어 사전(보기만). 이름 "용어 사전"은 그가 정함. 나머지는 2026-11-16 새로 씀(그가 보고 고친다). ----
+  termDictionary: {
+    title: '용어 사전',
+    intro: 'AI가 수업 녹음과 글을 알아들을 때 참고하는 요가 용어입니다. 같은 말을 적는 여러 표기를 함께 적어 둡니다.',
+    searchHint: '용어 찾기(한글, 산스크리트, 우리말 이름)',
+    loading: '용어 사전을 여는 중',
+    failed: '용어 사전을 읽지 못했습니다',
+    total: (n: number) => `용어 ${n}개`,
+    found: (n: number) => `찾은 용어 ${n}개`,
+    empty: '찾는 용어가 없습니다.',
+    otherCategory: '그 밖',
+    mine: '내가 더함',
+    spellings: '다른 표기',
+  },
   // ---- components/ChatImportSettings.tsx: 다른 AI 에서 내보낸 대화 가져오기. 2026-11-16 새로 씀(그가 보고 고친다, 낱말 목록에 올림). ----
   chatImport: {
     title: '다른 AI의 대화 가져오기',

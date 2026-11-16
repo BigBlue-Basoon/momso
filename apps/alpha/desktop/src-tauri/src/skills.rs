@@ -3,13 +3,34 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub(crate) const BUNDLED_SKILLS: &[(&str, &str)] = &[
-    ("naver-smartplace", include_str!("../bundled-skills/naver-smartplace/SKILL.md")),
-    ("onstudio-operations", include_str!("../bundled-skills/onstudio-operations/SKILL.md")),
-    ("studiomate-operations", include_str!("../bundled-skills/studiomate-operations/SKILL.md")),
-    ("soomgo-operations", include_str!("../bundled-skills/soomgo-operations/SKILL.md")),
-    ("frip-host-operations", include_str!("../bundled-skills/frip-host-operations/SKILL.md")),
-    ("sssd-host-operations", include_str!("../bundled-skills/sssd-host-operations/SKILL.md")),
-    ("conversation-import", include_str!("../bundled-skills/conversation-import/SKILL.md")),
+    (
+        "naver-smartplace",
+        include_str!("../bundled-skills/naver-smartplace/SKILL.md"),
+    ),
+    (
+        "onstudio-operations",
+        include_str!("../bundled-skills/onstudio-operations/SKILL.md"),
+    ),
+    (
+        "studiomate-operations",
+        include_str!("../bundled-skills/studiomate-operations/SKILL.md"),
+    ),
+    (
+        "soomgo-operations",
+        include_str!("../bundled-skills/soomgo-operations/SKILL.md"),
+    ),
+    (
+        "frip-host-operations",
+        include_str!("../bundled-skills/frip-host-operations/SKILL.md"),
+    ),
+    (
+        "sssd-host-operations",
+        include_str!("../bundled-skills/sssd-host-operations/SKILL.md"),
+    ),
+    (
+        "conversation-import",
+        include_str!("../bundled-skills/conversation-import/SKILL.md"),
+    ),
     (
         "github-connect",
         include_str!("../bundled-skills/github-connect/SKILL.md"),

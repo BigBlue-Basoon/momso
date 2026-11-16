@@ -195,7 +195,10 @@ mod tests {
                         serde_json::json!({"status":"cancelled"})
                     }
                     Some("import_conversations") => {
-                        assert_eq!(value, serde_json::json!({"method":"import_conversations","provider":"claude"}));
+                        assert_eq!(
+                            value,
+                            serde_json::json!({"method":"import_conversations","provider":"claude"})
+                        );
                         serde_json::json!({"status":"success","imported":2,"duplicate":1,"contents":"private conversation","path":"private path"})
                     }
                     _ => panic!("unexpected setup request"),

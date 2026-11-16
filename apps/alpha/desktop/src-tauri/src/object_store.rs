@@ -858,8 +858,14 @@ mod tests {
         assert!(!r2_test_connect("cloudflare", true, "momso-other"));
         assert!(!r2_test_connect("aws", true, "momso-basoon"));
         assert!(r2_test_target("cloudflare", "momso-basoon"));
-        assert!(!r2_test_target("cloudflare", "someone-elses-private-bucket"));
-        assert!(!r2_test_target("cloudflare", "someone-elses-archive-bucket"));
+        assert!(!r2_test_target(
+            "cloudflare",
+            "someone-elses-private-bucket"
+        ));
+        assert!(!r2_test_target(
+            "cloudflare",
+            "someone-elses-archive-bucket"
+        ));
     }
     use chrono::TimeZone;
     use std::io::{Read, Write};
