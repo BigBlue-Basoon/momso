@@ -70,6 +70,7 @@ fn declined_approval(chat_id: &str, method: &str, params: &Value) -> Option<Appr
             .and_then(Value::as_str)
             .map(str::to_owned),
         options: vec![ApprovalChoice::Deny],
+        setup: None,
     })
 }
 fn emit_declined_request<F: FnMut(&str, Value)>(
@@ -157,6 +158,18 @@ fn is_compaction_event(method: &str, event: &Value, thread: Option<&str>) -> boo
         && thread
             .is_some_and(|id| Some(id) == event.pointer("/params/threadId").and_then(Value::as_str))
 }
+fn is_context_limit(event: &Value) -> bool {
+    event
+        .pointer("/params/turn/error/codexErrorInfo")
+        .and_then(Value::as_str)
+        == Some("contextWindowExceeded")
+}
+fn is_unauthorized(event: &Value) -> bool {
+    event
+        .pointer("/params/turn/error/codexErrorInfo")
+        .and_then(Value::as_str)
+        == Some("unauthorized")
+}
 fn approval_wire(choice: ApprovalChoice) -> &'static str {
     match choice {
         ApprovalChoice::AllowOnce => "accept",
@@ -189,6 +202,28 @@ pub(crate) async fn rename_thread(thread_id: &str, title: &str) -> Result<(), St
     .map_err(|_| "Codex 채팅방 이름을 바꾸지 못했습니다".to_string())?;
     Ok(())
 }
+
+fn archive_request(thread_id: &str) -> process::JsonRpcRequest<'static> {
+    process::JsonRpcRequest {
+        initialize_params: json!({"clientInfo":{"name":"momso","title":"momso","version":env!("CARGO_PKG_VERSION")}}),
+        method: "thread/archive",
+        params: json!({"threadId":thread_id}),
+    }
+}
+
+pub(crate) async fn archive_thread(thread_id: &str) -> Result<(), ()> {
+    process::run_json_rpc_tool(
+        "codex",
+        &["app-server"],
+        None,
+        &process::empty_environment(),
+        archive_request(thread_id),
+        Duration::from_secs(30),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|_| ())
+}
 fn thread_params(archive: &Path, settings: &CodexSettings, now: &str) -> Value {
     json!({"cwd":archive,"sandbox":settings.sandbox,"approvalPolicy":settings.approval_policy,
            "config":{"approvals_reviewer":settings.reviewer},
@@ -217,13 +252,14 @@ pub(crate) async fn run<F>(
 where
     F: FnMut(&str, Value) + Send,
 {
-    run_with_skill(
-        db, archive, chat_id, text, model, effort, None, None, None, settings, approvals, cancel,
-        emit,
+    run_with_skill_auth(
+        db, archive, chat_id, text, model, effort, None, None, None, None, settings, approvals,
+        cancel, emit,
     )
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_skill<F>(
     db: &Path,
@@ -235,6 +271,45 @@ pub(crate) async fn run_with_skill<F>(
     skill: Option<&str>,
     fast: Option<bool>,
     fallback_prompt: Option<&str>,
+    settings: &CodexSettings,
+    approvals: Option<ApprovalChannel>,
+    cancel: CancellationToken,
+    emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, Value) + Send,
+{
+    run_with_skill_auth(
+        db,
+        archive,
+        chat_id,
+        text,
+        model,
+        effort,
+        skill,
+        fast,
+        fallback_prompt,
+        None,
+        settings,
+        approvals,
+        cancel,
+        emit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_skill_auth<F>(
+    db: &Path,
+    archive: &Path,
+    chat_id: &str,
+    text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    skill: Option<&str>,
+    fast: Option<bool>,
+    fallback_prompt: Option<&str>,
+    api_key: Option<&str>,
     settings: &CodexSettings,
     approvals: Option<ApprovalChannel>,
     cancel: CancellationToken,
@@ -254,6 +329,13 @@ where
         .map_err(|_| "몸소 폴더 규칙을 읽지 못했습니다".to_string())?;
     let previous = chat::codex_thread(db, chat_id)?;
     let mut command = Command::new(exe);
+    for option in crate::momso_mcp::codex_config(&crate::momso_mcp::executable()?, chat_id)? {
+        command.arg("-c").arg(option);
+    }
+    if api_key.is_some() {
+        command.arg("-c").arg("model_providers.momso_api={name='momso_api',base_url='https://api.openai.com/v1',env_key='MOMSO_CODEX_API_KEY',wire_api='responses',requires_openai_auth=false}");
+    }
+    apply_api_key_environment(&mut command, api_key);
     command
         .arg("app-server")
         .current_dir(archive)
@@ -265,9 +347,79 @@ where
         .env_remove("CODEX_API_KEY");
     #[cfg(windows)]
     command.creation_flags(0x08000000);
+    run_command(
+        command,
+        db,
+        archive,
+        chat_id,
+        text,
+        model,
+        effort,
+        skill,
+        fast,
+        fallback_prompt,
+        settings,
+        approvals,
+        cancel,
+        previous,
+        Some(if api_key.is_some() {
+            "momso_api"
+        } else {
+            "openai"
+        }),
+        &mut emit,
+    )
+    .await?;
+    // The reply and momso title have already been saved and chat-done emitted.
+    // Synchronizing the provider's thread title is best effort: a second CLI
+    // failure must not turn a successfully saved reply into a chat error.
+    if let (Ok(Some(thread_id)), Ok(title)) =
+        (chat::codex_thread(db, chat_id), chat::title(db, chat_id))
+    {
+        if !title.is_empty() {
+            let _ = rename_thread(&thread_id, &title).await;
+        }
+    }
+    Ok(())
+}
+
+fn apply_api_key_environment(command: &mut Command, api_key: Option<&str>) {
+    command
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .env_remove("MOMSO_CODEX_API_KEY");
+    if let Some(key) = api_key {
+        command.env("MOMSO_CODEX_API_KEY", key);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_command<F>(
+    mut command: Command,
+    db: &Path,
+    archive: &Path,
+    chat_id: &str,
+    text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    skill: Option<&str>,
+    fast: Option<bool>,
+    fallback_prompt: Option<&str>,
+    settings: &CodexSettings,
+    approvals: Option<ApprovalChannel>,
+    cancel: CancellationToken,
+    previous: Option<String>,
+    expected_provider: Option<&str>,
+    mut emit: F,
+) -> Result<(), String>
+where
+    F: FnMut(&str, Value) + Send,
+{
     let mut child = command
         .spawn()
         .map_err(|_| "Codex를 시작하지 못했습니다".to_string())?;
+    #[cfg(windows)]
+    crate::setup_bridge::bind(chat_id, child.id());
     let result = async {
         let mut input = child.stdin.take().ok_or("AI에 요청을 보내지 못했습니다")?;
         let output = child.stdout.take().ok_or("AI의 답을 읽지 못했습니다")?;
@@ -344,11 +496,15 @@ where
                         answer.push_str(delta); emit("chat-stream", json!({"chatId":chat_id,"delta":delta}));
                     }
                 } else if method == "turn/completed" {
-                    if v.pointer("/params/turn/status").and_then(Value::as_str) != Some("completed") { return Err("AI가 응답을 완료하지 못했습니다".into()); }
+                    if v.pointer("/params/turn/status").and_then(Value::as_str) != Some("completed") {
+                        if let Some(info) = v.pointer("/params/turn/error/codexErrorInfo").and_then(crate::chat_finish::codex_error) { emit("momso-internal-provider-error", info); }
+                        if is_unauthorized(&v) { return Err("__momso_auth_failed".into()); }
+                        if is_context_limit(&v) { emit("momso-internal-finish-reason", json!("length_limit")); }
+                        return Err("AI가 응답을 완료하지 못했습니다".into());
+                    }
                     if answer.is_empty() { return Err("AI의 답을 읽지 못했습니다".into()); }
-                    let message=chat::append_with_effort(db, chat_id, chat::Role::Assistant, &answer, Some("codex".into()), actual_model, actual_effort)?;
-                    let mut done = json!({"chatId":chat_id,"messageId":message.id});
-                    if fast == Some(true) { done["fastState"] = json!("unavailable"); }
+                    let message=chat::append_finished(db, chat_id, &answer, "codex".into(), actual_model, actual_effort, chat::FinishReason::Completed)?;
+                    let done = json!({"chatId":chat_id,"messageId":message.id,"actualEffort":null,"fastState":null,"stopReason":null,"finishReason":"completed"});
                     emit("chat-done", done);
                     return Ok(());
                 }
@@ -359,6 +515,7 @@ where
                 if let Some(fallback) = fallback_prompt.filter(|_| phase == 2 && resuming && previous.as_deref().is_some_and(|id| missing_thread_error(error, id))) {
                     if cancel.is_cancelled() { return Err("요청을 중단했습니다".into()); }
                     let mut params = thread_params(archive, settings, &Local::now().to_rfc3339());
+                    if let Some(provider) = expected_provider { params["modelProvider"] = json!(provider); }
                     if let Some(m) = model.filter(|x| !x.trim().is_empty()) { params["model"] = json!(m); }
                     active_thread = None;
                     resuming = false;
@@ -374,15 +531,19 @@ where
                 1 => {
                     send(&mut input,json!({"method":"initialized","params":{}})).await?;
                     let mut params=thread_params(archive, settings, &Local::now().to_rfc3339());
+                    if let Some(provider) = expected_provider { params["modelProvider"] = json!(provider); }
                     if let Some(m)=model.filter(|x| !x.trim().is_empty()) { params["model"]=json!(m); }
                     let method=if let Some(id)=previous.as_ref() { params["threadId"]=json!(id); "thread/resume" } else { "thread/start" };
                     send(&mut input,json!({"id":2,"method":method,"params":params})).await?; phase=2;
                 }
                 2 => {
                     if !effective_settings_match(result, settings) { return Err("선택한 권한 설정을 적용하지 못했습니다".into()); }
+                    if expected_provider.is_some_and(|provider| result.get("modelProvider").and_then(Value::as_str) != Some(provider)) { return Err("unavailable".into()); }
                     let id=result.pointer("/thread/id").and_then(Value::as_str).ok_or("채팅방을 열지 못했습니다")?;
                     actual_model=result.get("model").and_then(Value::as_str).map(str::to_owned);
                     actual_effort=effort.filter(|e| !e.trim().is_empty()).map(str::to_owned).or_else(|| result.get("reasoningEffort").and_then(Value::as_str).map(str::to_owned));
+                    if let Some(model) = &actual_model { emit("momso-internal-observed-model", json!(model)); }
+                    if let Some(effort) = &actual_effort { emit("momso-internal-observed-effort", json!(effort)); }
                     chat::set_codex_thread(db, chat_id, id)?;
                     active_thread=Some(id.to_owned());
                     let selected=skill.map(|name| format!("${name} ")).unwrap_or_default();
@@ -399,14 +560,7 @@ where
         }
     }.await;
     terminate(&mut child).await;
-    result?;
-    if let Some(thread_id) = chat::codex_thread(db, chat_id)? {
-        let title = chat::title(db, chat_id)?;
-        if !title.is_empty() {
-            rename_thread(&thread_id, &title).await?;
-        }
-    }
-    Ok(())
+    result
 }
 
 fn service_tier_for_turn(fast: Option<bool>) -> Option<&'static str> {
@@ -460,6 +614,136 @@ pub(crate) fn valid_model(model: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_request_targets_the_stored_thread() {
+        let request = archive_request("thread-test");
+        assert_eq!(request.method, "thread/archive");
+        assert_eq!(request.params, json!({"threadId":"thread-test"}));
+    }
+    #[test]
+    fn context_limit_uses_only_the_structured_error() {
+        assert!(is_context_limit(
+            &json!({"params":{"turn":{"error":{"codexErrorInfo":"contextWindowExceeded"}}}})
+        ));
+        assert!(!is_context_limit(
+            &json!({"params":{"turn":{"error":{"message":"contextWindowExceeded"}}}})
+        ));
+    }
+    #[test]
+    fn unauthorized_uses_only_the_structured_error() {
+        assert!(is_unauthorized(
+            &json!({"params":{"turn":{"error":{"codexErrorInfo":"unauthorized"}}}})
+        ));
+        assert!(!is_unauthorized(
+            &json!({"params":{"turn":{"error":{"message":"unauthorized"}}}})
+        ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fake_cli_records_stop_error_limit_and_completion() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("db.sqlite");
+        crate::storage::initialize(&db, &d.path().join("backups"), "test").unwrap();
+        let id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let script = d.path().join("fake-codex.ps1");
+        std::fs::write(&script, r#"
+if (-not $env:MOMSO_CODEX_API_KEY -or $env:OPENAI_API_KEY -or $env:CODEX_API_KEY) { exit 7 }
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"id":1,"result":{}}')
+$null = [Console]::In.ReadLine()
+$request = [Console]::In.ReadLine() | ConvertFrom-Json
+if ($request.params.modelProvider -ne 'momso_api') { exit 8 }
+[Console]::WriteLine('{"id":2,"result":{"thread":{"id":"fixture-thread"},"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"},"modelProvider":"momso_api","model":"fixture-model","reasoningEffort":"low"}}')
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"partial"}}')
+switch ($env:MOMSO_FAKE_RESULT) {
+ 'stop' { [Threading.Thread]::Sleep(30000) }
+ 'error' { [Console]::WriteLine('{"method":"turn/completed","params":{"turn":{"status":"failed","error":{"codexErrorInfo":"other"}}}}') }
+ 'limit' { [Console]::WriteLine('{"method":"turn/completed","params":{"turn":{"status":"failed","error":{"codexErrorInfo":"contextWindowExceeded"}}}}') }
+ 'completed' { [Console]::WriteLine('{"method":"turn/completed","params":{"turn":{"status":"completed"}}}') }
+}
+"#).unwrap();
+        for mode in ["stop", "error", "limit", "completed"] {
+            chat::append(&db, &id, chat::Role::User, "question", None, None).unwrap();
+            let mut cmd = Command::new("powershell.exe");
+            cmd.args(["-NoProfile", "-File"])
+                .arg(&script)
+                .env("MOMSO_FAKE_RESULT", mode)
+                .current_dir(d.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            apply_api_key_environment(&mut cmd, Some("momso-fake-codex-key-b84f39c7"));
+            let cancel = CancellationToken::new();
+            let trigger = cancel.clone();
+            let mut capture = crate::chat_finish::Capture::default();
+            let previous = chat::codex_thread(&db, &id).unwrap();
+            let result = run_command(
+                cmd,
+                &db,
+                d.path(),
+                &id,
+                "question",
+                None,
+                None,
+                None,
+                None,
+                None,
+                &crate::permission_modes::codex_settings("Ask for approval").unwrap(),
+                None,
+                cancel,
+                previous,
+                Some("momso_api"),
+                |name, value| {
+                    capture.observe(name, &value);
+                    if mode == "stop" && name == "chat-stream" {
+                        trigger.cancel();
+                    }
+                },
+            )
+            .await;
+            if mode == "completed" {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.is_err());
+                capture
+                    .persist_partial(&db, &id, "codex", mode == "stop", 0)
+                    .unwrap();
+            }
+        }
+        let detail = serde_json::to_value(chat::read(&db, &id).unwrap()).unwrap();
+        let replies: Vec<_> = detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["role"] == "assistant")
+            .collect();
+        assert_eq!(replies.len(), 4);
+        for (reply, expected) in
+            replies
+                .iter()
+                .zip(["cancelled", "error", "length_limit", "completed"])
+        {
+            assert_eq!(reply["finishReason"], expected);
+            assert_eq!(reply["text"], "partial");
+            assert_eq!(reply["provider"], "codex");
+            assert_eq!(reply["model"], "fixture-model");
+        }
+        let fake_key = b"momso-fake-codex-key-b84f39c7";
+        for entry in walkdir::WalkDir::new(d.path()) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_file() {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                assert!(!bytes.windows(fake_key.len()).any(|part| part == fake_key));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn active_chat_is_released_only_after_delivery_persistence() {
@@ -678,6 +962,22 @@ mod tests {
         c.execute_batch(include_str!("../migrations/0070_chat_skill.sql"))
             .unwrap();
         c.execute_batch(include_str!("../migrations/0072_chat_delivery.sql"))
+            .unwrap();
+        c.execute_batch(include_str!("../migrations/0073_chat_visibility.sql"))
+            .unwrap();
+        c.execute_batch(include_str!("../migrations/0075_chat_actual_effort.sql"))
+            .unwrap();
+        c.execute_batch(include_str!("../migrations/0080_chat_finish_reason.sql"))
+            .unwrap();
+        c.execute_batch(include_str!("../migrations/0081_chat_import.sql"))
+            .unwrap();
+        c.execute_batch(include_str!(
+            "../migrations/0083_reconcile_context_import.sql"
+        ))
+        .unwrap();
+        c.execute_batch(include_str!("../migrations/0084_chat_auth_method.sql"))
+            .unwrap();
+        c.execute_batch(include_str!("../migrations/0085_chat_fast_state.sql"))
             .unwrap();
         c.execute(
             "INSERT INTO chats(id,title,created_at,updated_at) VALUES ('test','','a','a')",

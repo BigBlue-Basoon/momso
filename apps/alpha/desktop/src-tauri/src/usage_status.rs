@@ -1,4 +1,4 @@
-use crate::process;
+use crate::{process, provider_auth};
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use std::{
@@ -32,6 +32,7 @@ pub(crate) struct UsageStatus {
     state: &'static str,
     reason: Option<&'static str>,
     windows: Vec<UsageWindow>,
+    remaining: Option<f64>,
     plan: Option<String>,
     plan_label: Option<&'static str>,
     checked_at: String,
@@ -45,21 +46,29 @@ fn unavailable(provider: &'static str, state: &'static str, reason: &'static str
         state,
         reason: Some(reason),
         windows: Vec::new(),
+        remaining: None,
         plan: None,
         plan_label: None,
         checked_at: now(),
     }
 }
 fn unavailable_without_reason(provider: &'static str) -> UsageStatus {
-    UsageStatus {
-        provider,
-        state: "unavailable",
-        reason: None,
-        windows: Vec::new(),
-        plan: None,
-        plan_label: None,
-        checked_at: now(),
-    }
+    unavailable(provider, "unavailable", "checking")
+}
+fn auth_unavailable(provider: &'static str, installed: bool, state: &str) -> Option<UsageStatus> {
+    let reason = if !installed { "not_installed" } else { match state {
+        "account" => return None,
+        "apiKey" if provider == "gemini" => "no_quota_api",
+        "apiKey" => "api_key",
+        "signedOut" => "not_connected",
+        _ => "fetch_failed",
+    }};
+    Some(unavailable(provider, "unavailable", reason))
+}
+async fn fetch_gemini() -> UsageStatus {
+    let status = provider_auth::read_status("gemini").await;
+    auth_unavailable("gemini", status.installed, status.state)
+        .unwrap_or_else(|| unavailable("gemini", "unavailable", "no_quota_api"))
 }
 fn kind(minutes: Option<u64>, fallback: &str) -> String {
     match minutes {
@@ -151,13 +160,14 @@ fn parse_limits(value: &serde_json::Value, account: &serde_json::Value) -> Usage
         add_bucket(None, limit);
     }
     if windows.is_empty() {
-        return unavailable_with_plan("Codex가 사용량을 제공하지 않았습니다", plan);
+        return unavailable_with_plan("fetch_failed", plan);
     }
     UsageStatus {
         provider: "codex",
         state: "ok",
         reason: None,
         windows,
+        remaining: None,
         plan_label: plan.as_deref().and_then(|p| plan_label("codex", p)),
         plan,
         checked_at: now(),
@@ -171,8 +181,10 @@ fn request(method: &'static str, params: serde_json::Value) -> process::JsonRpcR
     }
 }
 pub(crate) async fn fetch_codex() -> UsageStatus {
+    let status = provider_auth::read_status("codex").await;
+    if let Some(result) = auth_unavailable("codex", status.installed, status.state) { return result; }
     if process::resolve_interactive_tool("codex").is_none() {
-        return unavailable("codex", "not_connected", "Codex가 설치되지 않았습니다");
+        return unavailable("codex", "unavailable", "not_installed");
     }
     let account = match process::run_json_rpc_tool(
         "codex",
@@ -185,14 +197,14 @@ pub(crate) async fn fetch_codex() -> UsageStatus {
     .await
     {
         Ok(value) => value,
-        Err(_) => return unavailable("codex", "unavailable", "Codex 연결 상태를 읽지 못했습니다"),
+        Err(_) => return unavailable("codex", "unavailable", "fetch_failed"),
     };
     let Some(account) = account.get("account").filter(|a| a.is_object()) else {
-        return unavailable("codex", "not_connected", "Codex에 로그인되어 있지 않습니다");
+        return unavailable("codex", "unavailable", "not_connected");
     };
     if account.get("type").and_then(|v| v.as_str()) != Some("chatgpt") {
         return unavailable_with_plan(
-            "이 연결에서는 Codex 구독 사용량을 읽지 못합니다",
+            if account.get("type").and_then(|v| v.as_str()) == Some("apiKey") { "api_key" } else { "fetch_failed" },
             account_plan(account),
         );
     }
@@ -207,7 +219,7 @@ pub(crate) async fn fetch_codex() -> UsageStatus {
     .await
     {
         Ok(value) => parse_limits(&value, account),
-        Err(_) => unavailable_with_plan("Codex 사용량을 읽지 못했습니다", account_plan(account)),
+        Err(_) => unavailable_with_plan("fetch_failed", account_plan(account)),
     }
 }
 fn parse_claude_report(output: &str) -> UsageStatus {
@@ -259,13 +271,14 @@ fn parse_claude_report(output: &str) -> UsageStatus {
         }
     }
     if windows.is_empty() {
-        return unavailable_without_reason("claude");
+        return unavailable("claude", "unavailable", "fetch_failed");
     }
     UsageStatus {
         provider: "claude",
         state: "ok",
         reason: None,
         windows,
+        remaining: None,
         plan: None,
         plan_label: None,
         checked_at: now(),
@@ -273,10 +286,10 @@ fn parse_claude_report(output: &str) -> UsageStatus {
 }
 
 pub(crate) async fn fetch_claude(working_directory: &std::path::Path) -> UsageStatus {
+    let status = provider_auth::read_status("claude").await;
+    if let Some(result) = auth_unavailable("claude", status.installed, status.state) { return result; }
     if process::resolve_tool("claude").is_none() {
-        let mut status = unavailable_without_reason("claude");
-        status.state = "not_connected";
-        return status;
+        return unavailable("claude", "unavailable", "not_installed");
     }
     let auth = match process::run_tool(
         "claude",
@@ -297,12 +310,10 @@ pub(crate) async fn fetch_claude(working_directory: &std::path::Path) -> UsageSt
         .and_then(|v| v.as_bool())
     {
         Some(false) => {
-            let mut status = unavailable_without_reason("claude");
-            status.state = "not_connected";
-            return status;
+            return unavailable("claude", "unavailable", "not_connected");
         }
         Some(true) => {}
-        None => return unavailable_without_reason("claude"),
+        None => return unavailable("claude", "unavailable", "fetch_failed"),
     }
     let plan = auth
         .as_ref()
@@ -337,7 +348,7 @@ pub(crate) async fn fetch_claude(working_directory: &std::path::Path) -> UsageSt
             status
         }
         _ => {
-            let mut status = unavailable_without_reason("claude");
+            let mut status = unavailable("claude", "unavailable", "fetch_failed");
             status.plan = plan;
             status
         }
@@ -347,7 +358,7 @@ pub(crate) async fn fetch_claude(working_directory: &std::path::Path) -> UsageSt
 #[cfg(test)]
 pub(crate) async fn all(working_directory: &std::path::Path) -> Vec<UsageStatus> {
     let (codex, claude) = tokio::join!(fetch_codex(), fetch_claude(working_directory));
-    vec![codex, claude, unavailable_without_reason("gemini")]
+    vec![codex, claude, fetch_gemini().await]
 }
 // Cached results are returned immediately; each provider has its own refresh clock.
 #[derive(Default)]
@@ -403,7 +414,7 @@ pub(crate) fn cached(
                         "claude" => fetch_claude(&working_directory).await,
                         _ => {
                             log::debug!("Gemini quota CLI output is not verified");
-                            unavailable_without_reason("gemini")
+                            fetch_gemini().await
                         }
                     };
                     if result.state == "unavailable" && provider == "claude" {
@@ -516,13 +527,20 @@ mod tests {
         assert!(cache.get_or_start("codex", false).1);
     }
     #[test]
-    fn unavailable_providers_keep_reason_field_empty() {
-        for provider in ["claude", "gemini"] {
+    fn unavailable_providers_report_reason_codes() {
+        for provider in ["codex", "claude", "gemini"] {
             let value = serde_json::to_value(unavailable_without_reason(provider)).unwrap();
             assert_eq!(value["provider"], provider);
             assert_eq!(value["state"], "unavailable");
-            assert!(value.get("reason").unwrap().is_null());
+            assert_eq!(value["reason"], "checking");
+            assert_eq!(auth_unavailable(provider, false, "unavailable").unwrap().reason, Some("not_installed"));
+            assert_eq!(auth_unavailable(provider, true, "signedOut").unwrap().reason, Some("not_connected"));
+            assert_eq!(auth_unavailable(provider, true, "unavailable").unwrap().reason, Some("fetch_failed"));
         }
+        assert_eq!(auth_unavailable("codex", true, "apiKey").unwrap().reason, Some("api_key"));
+        assert_eq!(auth_unavailable("claude", true, "apiKey").unwrap().reason, Some("api_key"));
+        assert_eq!(auth_unavailable("gemini", true, "apiKey").unwrap().reason, Some("no_quota_api"));
+        assert!(auth_unavailable("codex", true, "account").is_none());
     }
     #[test]
     fn plan_labels_use_only_confirmed_values() {
@@ -634,7 +652,7 @@ mod tests {
             let status = parse_claude_report(text);
             assert_eq!(status.state, "unavailable");
             assert!(status.windows.is_empty());
-            assert!(status.reason.is_none());
+            assert_eq!(status.reason, Some("fetch_failed"));
         }
     }
     #[tokio::test]

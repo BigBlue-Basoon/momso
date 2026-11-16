@@ -7,9 +7,20 @@ use std::{fs, io::Write, path::Path};
 use tauri::State;
 use uuid::Uuid;
 
+#[path = "object_store_bucket.rs"]
+pub(crate) mod bucket;
+
 type HmacSha256 = Hmac<Sha256>;
 pub(crate) const PREFIX: &str = "momso/object-store/v1";
 pub(crate) static CONNECTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn r2_test_target(provider: &str, bucket: &str) -> bool {
+    provider == "cloudflare" && bucket == "momso-basoon"
+}
+
+fn r2_test_connect(provider: &str, automatic: bool, bucket: &str) -> bool {
+    automatic && r2_test_target(provider, bucket)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +92,11 @@ pub(crate) fn load_config(root: &Path) -> Result<Option<Config>, &'static str> {
     match fs::read(config_path(root)) {
         Ok(data) => {
             let config: Config = serde_json::from_slice(&data).map_err(|_| "unavailable")?;
+            if crate::runtime::r2_test_enabled()
+                && !r2_test_target(&config.provider, &config.bucket)
+            {
+                return Err("invalid_bucket");
+            }
             let id = Uuid::parse_str(&config.credential_id).map_err(|_| "unavailable")?;
             if id.to_string() != config.credential_id {
                 return Err("unavailable");
@@ -147,12 +163,16 @@ fn validate(input: &ConnectInput) -> Result<Config, &'static str> {
     {
         return Err("invalid_region");
     }
-    if input.bucket.len() < 3
-        || input.bucket.len() > 63
-        || !input
-            .bucket
-            .bytes()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.')
+    if input.provider == "gcp" && !bucket::valid_name("gcp", &input.bucket) {
+        return Err("invalid_bucket");
+    }
+    if input.provider != "gcp"
+        && (input.bucket.len() < 3
+            || input.bucket.len() > 63
+            || !input
+                .bucket
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.'))
     {
         return Err("invalid_bucket");
     }
@@ -277,6 +297,8 @@ fn sign(
         format!("{method}\n{path}\n{query}\n{headers}\n{signed_headers}\n{payload_hash}");
     let (algorithm, key_prefix, service, terminator) = if google {
         ("GOOG4-HMAC-SHA256", "GOOG4", "storage", "goog4_request")
+    } else if config.provider == "aws-sts" {
+        ("AWS4-HMAC-SHA256", "AWS4", "sts", "aws4_request")
     } else {
         ("AWS4-HMAC-SHA256", "AWS4", "s3", "aws4_request")
     };
@@ -315,6 +337,59 @@ fn sign(
     })
 }
 
+#[cfg(windows)]
+async fn verify_aws_account(
+    keys: &Keys,
+    expected: &str,
+    endpoint: &str,
+) -> Result<(), &'static str> {
+    // AWS GetCallerIdentity returns the account associated with these credentials.
+    // https://docs.aws.amazon.com/STS/latest/APIReference/API_GetCallerIdentity.html
+    let config = Config {
+        provider: "aws-sts".into(),
+        endpoint: endpoint.into(),
+        region: "us-east-1".into(),
+        bucket: String::new(),
+        credential_id: String::new(),
+        last_backup_at: None,
+        write_safety: None,
+    };
+    let response = request(
+        &config,
+        keys,
+        reqwest::Method::GET,
+        "",
+        &[("Action", "GetCallerIdentity"), ("Version", "2011-06-15")],
+        vec![],
+    )
+    .await
+    .map_err(|_| "account_unverified")?;
+    if !response.status().is_success() {
+        let body = response.text().await.unwrap_or_default();
+        if body.contains("InvalidClientTokenId") || body.contains("SignatureDoesNotMatch") {
+            return Err("credentials_rejected_before_create");
+        }
+        return Err("account_unverified");
+    }
+    #[derive(Deserialize)]
+    struct CallerIdentity {
+        #[serde(rename = "GetCallerIdentityResult")]
+        result: CallerIdentityResult,
+    }
+    #[derive(Deserialize)]
+    struct CallerIdentityResult {
+        #[serde(rename = "Account")]
+        account: String,
+    }
+    let body = response.text().await.map_err(|_| "account_unverified")?;
+    let identity: CallerIdentity =
+        quick_xml::de::from_str(&body).map_err(|_| "account_unverified")?;
+    if identity.result.account != expected {
+        return Err("account_unverified");
+    }
+    Ok(())
+}
+
 pub(crate) async fn request(
     config: &Config,
     keys: &Keys,
@@ -323,6 +398,9 @@ pub(crate) async fn request(
     query: &[(&str, &str)],
     body: Vec<u8>,
 ) -> Result<reqwest::Response, &'static str> {
+    if config.provider == "cloudflare" && config.bucket.is_empty() {
+        return Err("invalid_bucket");
+    }
     if method == reqwest::Method::PUT && config.write_safety.is_none() {
         return Err("write_safety_unverified");
     }
@@ -485,17 +563,32 @@ pub(crate) async fn probe_connection(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn object_store_connect(
     state: State<'_, AppState>,
     provider: String,
     endpoint: String,
     region: String,
-    bucket: String,
+    bucket: Option<String>,
     access_key_id: String,
     secret_access_key: String,
+    gcp_project_id: Option<String>,
+    gcp_oauth_token: Option<String>,
 ) -> Result<StoreStatus, &'static str> {
     let paths = state.paths.scoped().await;
     let _guard = CONNECTION_LOCK.lock().await;
+    let requested_bucket = bucket.unwrap_or_default();
+    let automatic = requested_bucket.trim().is_empty()
+        || requested_bucket.trim().eq_ignore_ascii_case("auto")
+        || requested_bucket.trim() == "\u{c790}\u{b3d9}";
+    let bucket = if automatic {
+        stored_automatic_name(&paths.database_path, &provider)?
+    } else {
+        requested_bucket
+    };
+    if crate::runtime::r2_test_enabled() && !r2_test_connect(&provider, automatic, &bucket) {
+        return Err("invalid_bucket");
+    }
     let input = ConnectInput {
         provider,
         endpoint,
@@ -509,6 +602,15 @@ pub(crate) async fn object_store_connect(
         access_key_id: input.access_key_id,
         secret_access_key: input.secret_access_key,
     };
+    if automatic {
+        bucket::ensure(
+            &config,
+            &keys,
+            gcp_project_id.as_deref(),
+            gcp_oauth_token.as_deref(),
+        )
+        .await?;
+    }
     config.write_safety = Some(probe_connection(&config, &keys).await?);
     let prior = load_config(&paths.data_root)?;
     let stored = serde_json::to_string(&keys).map_err(|_| "unavailable")?;
@@ -521,6 +623,115 @@ pub(crate) async fn object_store_connect(
         let _ = credentials::delete_secret(&key_name(&old));
     }
     Ok(status("connected", Some(config)))
+}
+
+fn stored_automatic_name(path: &std::path::Path, provider: &str) -> Result<String, &'static str> {
+    let username = crate::archive_remote::username_get_db(path).map_err(|_| "unavailable")?;
+    bucket::automatic_name(provider, username.as_deref())
+}
+
+/// The skill path can only create a new bucket for the approved account.
+#[cfg(windows)]
+pub(crate) async fn connect_approved(
+    state: State<'_, AppState>,
+    chat_id: &str,
+    permit: crate::setup_approval::SetupPermit,
+    secret: crate::setup_secret::SecretLease,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<(), &'static str> {
+    let details = permit.consume(chat_id)?;
+    let valid_account = match details.service.as_str() {
+        "cloudflare" => {
+            details.account.len() == 32 && details.account.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        "gcp" => {
+            (6..=30).contains(&details.account.len())
+                && details
+                    .account
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        }
+        "aws" => details.account.len() == 12 && details.account.bytes().all(|b| b.is_ascii_digit()),
+        _ => false,
+    };
+    let region = details.region.as_deref().ok_or("invalid_region")?;
+    let valid_region = match details.service.as_str() {
+        "aws" => {
+            region != "us-east-1"
+                && region.len() <= 32
+                && region
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        }
+        _ => region == "auto",
+    };
+    if !valid_account || !valid_region || cancel.is_cancelled() {
+        return Err("unavailable");
+    }
+    let paths = state.paths.scoped().await;
+    let _guard = CONNECTION_LOCK.lock().await;
+    if load_config(&paths.data_root)?.is_some() {
+        return Err("already_connected");
+    }
+    if stored_automatic_name(&paths.database_path, &details.service)? != details.resource_name {
+        return Err("approval_stale");
+    }
+    let secret = secret.take()?;
+    let input = ConnectInput {
+        provider: details.service.clone(),
+        endpoint: match details.service.as_str() {
+            "gcp" => "https://storage.googleapis.com".into(),
+            "aws" => format!("https://s3.{region}.amazonaws.com"),
+            _ => format!("https://{}.r2.cloudflarestorage.com", details.account),
+        },
+        region: region.into(),
+        bucket: details.resource_name,
+        access_key_id: secret.access_key_id,
+        secret_access_key: secret.secret_access_key,
+    };
+    let mut config = validate(&input)?;
+    let keys = Keys {
+        access_key_id: input.access_key_id,
+        secret_access_key: input.secret_access_key,
+    };
+    if cancel.is_cancelled() {
+        return Err("cancelled");
+    }
+    if config.provider == "aws" {
+        verify_aws_account(&keys, &details.account, "https://sts.amazonaws.com").await?;
+        if cancel.is_cancelled() {
+            return Err("cancelled");
+        }
+    }
+    bucket::ensure_new(
+        &config,
+        &keys,
+        Some(&details.account),
+        secret.gcp_oauth_token.as_deref(),
+    )
+    .await
+    .map_err(|error| match error {
+        "invalid_credentials" | "gcp_oauth_invalid" => "credentials_rejected_before_create",
+        _ => error,
+    })?;
+    if cancel.is_cancelled() {
+        return Err("created_not_connected");
+    }
+    config.write_safety = Some(
+        probe_connection(&config, &keys)
+            .await
+            .map_err(|_| "created_not_connected")?,
+    );
+    if cancel.is_cancelled() {
+        return Err("created_not_connected");
+    }
+    let stored = serde_json::to_string(&keys).map_err(|_| "unavailable")?;
+    credentials::set_secret(&key_name(&config), &stored).map_err(|_| "unavailable")?;
+    if let Err(error) = save_config(&paths.data_root, &config) {
+        let _ = credentials::delete_secret(&key_name(&config));
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -592,8 +803,83 @@ pub(crate) async fn object_store_disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn aws_account_check_uses_fake_sts_and_rejects_wrong_account() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let fake = std::thread::spawn(move || {
+            for index in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0u8; 8192];
+                let size = socket.read(&mut request).unwrap();
+                let text = std::str::from_utf8(&request[..size]).unwrap();
+                assert!(text.contains("Action=GetCallerIdentity"));
+                assert!(text.contains("/sts/aws4_request"));
+                let (status, body) = if index == 2 {
+                    ("403 Forbidden", "<ErrorResponse><Error><Code>InvalidClientTokenId</Code></Error></ErrorResponse>")
+                } else {
+                    ("200 OK", "<GetCallerIdentityResponse><GetCallerIdentityResult><Account>123456789012</Account></GetCallerIdentityResult></GetCallerIdentityResponse>")
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let keys = Keys {
+            access_key_id: "fake-id".into(),
+            secret_access_key: "fake-secret".into(),
+        };
+        assert!(verify_aws_account(&keys, "123456789012", &endpoint)
+            .await
+            .is_ok());
+        assert_eq!(
+            verify_aws_account(&keys, "999999999999", &endpoint).await,
+            Err("account_unverified")
+        );
+        assert_eq!(
+            verify_aws_account(&keys, "123456789012", &endpoint).await,
+            Err("credentials_rejected_before_create")
+        );
+        fake.join().unwrap();
+    }
+
+    #[test]
+    fn live_test_only_allows_the_automatic_basoon_bucket() {
+        assert!(r2_test_connect("cloudflare", true, "momso-basoon"));
+        assert!(!r2_test_connect("cloudflare", false, "momso-basoon"));
+        assert!(!r2_test_connect("cloudflare", true, "momso-other"));
+        assert!(!r2_test_connect("aws", true, "momso-basoon"));
+        assert!(r2_test_target("cloudflare", "momso-basoon"));
+        assert!(!r2_test_target("cloudflare", "someone-elses-private-bucket"));
+        assert!(!r2_test_target("cloudflare", "someone-elses-archive-bucket"));
+    }
     use chrono::TimeZone;
     use std::io::{Read, Write};
+
+    #[test]
+    fn automatic_bucket_uses_the_saved_username() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("app.db");
+        crate::storage::initialize(&db, &dir.path().join("backups"), "test").unwrap();
+        assert_eq!(
+            stored_automatic_name(&db, "cloudflare"),
+            Err("username_required")
+        );
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        connection.execute("INSERT INTO app_runtime_meta(key, value, updated_at) VALUES('momso_username', 'basoon', 'now')", []).unwrap();
+        assert_eq!(
+            stored_automatic_name(&db, "cloudflare").unwrap(),
+            "momso-basoon"
+        );
+    }
 
     #[test]
     fn provider_endpoints_and_signatures_are_deterministic() {

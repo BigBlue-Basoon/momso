@@ -1,7 +1,4 @@
-use crate::{
-    storage::{self, StorageError},
-    text_paging,
-};
+use crate::storage::{self, StorageError};
 use rusqlite::{params, types::Type, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,11 +6,7 @@ use std::{io, path::Path};
 use thiserror::Error;
 use uuid::Uuid;
 
-const MAX_TITLE_CHARS: usize = 200;
-const MAX_SUMMARY_CHARS: usize = 4_000;
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTOR_CHARS: usize = 120;
-const MAX_RECORD_KIND_CHARS: usize = 64;
 
 #[derive(Debug, Error)]
 pub(crate) enum RecordError {
@@ -39,12 +32,6 @@ pub(crate) enum RecordError {
     NoChanges,
     #[error("Local record integrity check failed: {0}")]
     Integrity(String),
-    #[error("A continuation read requires the complete body hash returned by the first page")]
-    ContinuationHashRequired,
-    #[error("The record body changed after the first page was read")]
-    ContentChanged,
-    #[error(transparent)]
-    Paging(#[from] text_paging::TextPagingError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,40 +75,6 @@ pub(crate) enum SummaryState {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CreateRecordDraftInput {
-    record_kind: String,
-    title: String,
-    body: String,
-    summary: Option<String>,
-    actor: String,
-    #[serde(default)]
-    initial_status: Option<RecordStatus>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RecordChangeProposal {
-    record_id: String,
-    expected_version: i64,
-    record_kind: String,
-    title: String,
-    body: String,
-    summary: Option<String>,
-    target_status: RecordStatus,
-    actor: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ApplyRecordChangeInput {
-    proposal: RecordChangeProposal,
-    plan_digest: String,
-    reviewer: String,
-    review_confirmed: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct RecordRestoreProposal {
     record_id: String,
     expected_version: i64,
@@ -136,28 +89,6 @@ pub(crate) struct ApplyRecordRestoreInput {
     plan_digest: String,
     reviewer: String,
     review_confirmed: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RecordSummary {
-    id: String,
-    record_kind: String,
-    title: String,
-    status: RecordStatus,
-    current_version: i64,
-    summary: Option<String>,
-    summary_state: SummaryState,
-    body_bytes: i64,
-    updated_at: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RecordReadinessReport {
-    records: Vec<RecordSummary>,
-    metadata_read_count: usize,
-    body_read_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,32 +110,6 @@ pub(crate) struct RecordDetail {
     reviewed_at: Option<String>,
     created_at: String,
     updated_at: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RecordBodyPage {
-    record_id: String,
-    version: i64,
-    body_sha256: String,
-    body_bytes: i64,
-    cursor: u64,
-    next_cursor: Option<u64>,
-    content: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RecordChangePlan {
-    record_id: String,
-    current_version: i64,
-    next_version: i64,
-    changed_fields: Vec<String>,
-    target_status: RecordStatus,
-    summary_state_after: SummaryState,
-    body_bytes_after: i64,
-    requires_confirmation: bool,
-    plan_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,215 +234,12 @@ struct ContentState {
 }
 
 #[derive(Debug)]
-struct PreparedChange {
-    current: CurrentRecord,
-    state: ContentState,
-    actor: String,
-    plan: RecordChangePlan,
-}
-
-#[derive(Debug)]
 struct PreparedRestore {
     current: CurrentRecord,
     state: ContentState,
     actor: String,
     source_version: i64,
     plan: RecordRestorePlan,
-}
-
-pub(crate) fn create_draft(
-    database_path: &Path,
-    input: CreateRecordDraftInput,
-) -> Result<RecordDetail, RecordError> {
-    let record_kind = validate_record_kind(&input.record_kind)?;
-    let title = validate_title(&input.title)?;
-    validate_body(&input.body)?;
-    let summary = normalize_summary(input.summary)?;
-    let actor = validate_person("actor", &input.actor)?;
-    let status = input.initial_status.unwrap_or(RecordStatus::Draft);
-    if status == RecordStatus::Reviewed {
-        return Err(RecordError::Validation(
-            "a new record cannot begin in the reviewed state".to_owned(),
-        ));
-    }
-    let body_sha256 = hash_text(&input.body);
-    let body_bytes = usize_to_i64(input.body.len(), "body size")?;
-    let summary_sha256 = summary.as_deref().map(hash_text);
-    let record_id = Uuid::new_v4().to_string();
-    let mut connection = storage::open_writable_connection(database_path)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let timestamp = current_timestamp(&transaction)?;
-    transaction.execute(
-        "INSERT INTO momso_records (
-           id, record_kind, title, status, current_version,
-           summary, summary_sha256, summary_basis_body_sha256,
-           body_sha256, body_bytes,
-           created_by, updated_by, reviewed_by, reviewed_at,
-           created_at, updated_at
-         ) VALUES (
-           ?1, ?2, ?3, ?4, 1,
-           ?5, ?6, NULL,
-           ?7, ?8,
-           ?9, ?9, NULL, NULL,
-           ?10, ?10
-         )",
-        params![
-            record_id,
-            record_kind,
-            title,
-            status.as_db(),
-            summary,
-            summary_sha256,
-            body_sha256,
-            body_bytes,
-            actor,
-            timestamp,
-        ],
-    )?;
-    transaction.execute(
-        "INSERT INTO momso_record_versions (
-           record_id, version, record_kind, title, status,
-           summary, summary_sha256, summary_basis_body_sha256,
-           body_sha256, body_bytes, change_kind, source_version,
-           actor, confirmed_by, reviewed_by, reviewed_at, plan_digest, created_at
-         ) VALUES (
-           ?1, 1, ?2, ?3, ?4,
-           ?5, ?6, NULL,
-           ?7, ?8, 'create', NULL,
-           ?9, NULL, NULL, NULL, NULL, ?10
-         )",
-        params![
-            record_id,
-            record_kind,
-            title,
-            status.as_db(),
-            summary,
-            summary_sha256,
-            body_sha256,
-            body_bytes,
-            actor,
-            timestamp,
-        ],
-    )?;
-    transaction.execute(
-        "INSERT INTO momso_record_bodies (
-           record_id, version, body, body_sha256, body_bytes
-         ) VALUES (?1, 1, ?2, ?3, ?4)",
-        params![record_id, input.body, body_sha256, body_bytes],
-    )?;
-    transaction.commit()?;
-
-    get_record(database_path, &record_id)
-}
-
-pub(crate) fn list_summaries(database_path: &Path) -> Result<RecordReadinessReport, RecordError> {
-    let connection = storage::open_writable_connection(database_path)?;
-    let records = load_all_current_records(&connection)?;
-    let summaries = records
-        .into_iter()
-        .map(|record| RecordSummary {
-            id: record.id,
-            record_kind: record.record_kind,
-            title: record.title,
-            status: record.status,
-            current_version: record.current_version,
-            summary_state: summary_state(
-                record.summary.as_deref(),
-                record.summary_basis_body_sha256.as_deref(),
-                &record.body_sha256,
-            ),
-            summary: record.summary,
-            body_bytes: record.body_bytes,
-            updated_at: record.updated_at,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(RecordReadinessReport {
-        metadata_read_count: summaries.len(),
-        body_read_count: 0,
-        records: summaries,
-    })
-}
-
-pub(crate) fn read_body_page(
-    database_path: &Path,
-    record_id: &str,
-    version: Option<i64>,
-    cursor: u64,
-    expected_body_sha256: Option<&str>,
-    max_bytes: u64,
-) -> Result<RecordBodyPage, RecordError> {
-    if cursor > 0 && expected_body_sha256.is_none() {
-        return Err(RecordError::ContinuationHashRequired);
-    }
-    let connection = storage::open_writable_connection(database_path)?;
-    let selected_version = match version {
-        Some(version) if version >= 1 => version,
-        Some(_) => {
-            return Err(RecordError::Validation(
-                "record version must be positive".to_owned(),
-            ))
-        }
-        None => connection
-            .query_row(
-                "SELECT current_version FROM momso_records WHERE id = ?1",
-                [record_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| RecordError::NotFound(record_id.to_owned()))?,
-    };
-    let (body, body_sha256, body_bytes, version_sha256, version_bytes): (
-        String,
-        String,
-        i64,
-        String,
-        i64,
-    ) = connection
-        .query_row(
-            "SELECT b.body, b.body_sha256, b.body_bytes,
-                    v.body_sha256, v.body_bytes
-             FROM momso_record_bodies b
-             JOIN momso_record_versions v
-               ON v.record_id = b.record_id AND v.version = b.version
-             WHERE b.record_id = ?1 AND b.version = ?2",
-            params![record_id, selected_version],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| RecordError::NotFound(format!("{record_id} version {selected_version}")))?;
-    let actual_sha256 = hash_text(&body);
-    let actual_bytes = usize_to_i64(body.len(), "body size")?;
-    if actual_sha256 != body_sha256
-        || actual_bytes != body_bytes
-        || actual_sha256 != version_sha256
-        || actual_bytes != version_bytes
-    {
-        return Err(RecordError::Integrity(format!(
-            "body and version ledger differ for {record_id} version {selected_version}"
-        )));
-    }
-    if expected_body_sha256.is_some_and(|expected| expected != actual_sha256) {
-        return Err(RecordError::ContentChanged);
-    }
-    let page = text_paging::page(&body, cursor, max_bytes)?;
-    Ok(RecordBodyPage {
-        record_id: record_id.to_owned(),
-        version: selected_version,
-        body_sha256: actual_sha256,
-        body_bytes: actual_bytes,
-        cursor,
-        next_cursor: page.next_cursor,
-        content: page.content,
-    })
 }
 
 pub(crate) fn get_record(
@@ -558,62 +260,22 @@ pub(crate) fn get_record(
     Ok(detail_from_parts(record, body))
 }
 
-pub(crate) fn plan_change(
+#[cfg(test)]
+pub(crate) fn fixture_record(
     database_path: &Path,
-    proposal: RecordChangeProposal,
-) -> Result<RecordChangePlan, RecordError> {
-    let connection = storage::open_writable_connection(database_path)?;
-    Ok(prepare_change(&connection, proposal)?.plan)
-}
-
-pub(crate) fn apply_change(
-    database_path: &Path,
-    input: ApplyRecordChangeInput,
+    title: &str,
+    body: &str,
+    summary: Option<&str>,
 ) -> Result<RecordDetail, RecordError> {
-    let reviewer = require_review(&input.reviewer, input.review_confirmed)?;
-    let mut connection = storage::open_writable_connection(database_path)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let prepared = prepare_change(&transaction, input.proposal)?;
-    if prepared.plan.plan_digest != input.plan_digest {
-        return Err(RecordError::PlanMismatch);
-    }
-
-    let timestamp = current_timestamp(&transaction)?;
-    let next_version = prepared.plan.next_version;
-    let (reviewed_by, reviewed_at) = if prepared.state.status == RecordStatus::Reviewed {
-        (Some(reviewer.as_str()), Some(timestamp.as_str()))
-    } else {
-        (None, None)
-    };
-
-    insert_version(
-        &transaction,
-        &prepared.current.id,
-        next_version,
-        &prepared.state,
-        "update",
-        None,
-        &prepared.actor,
-        Some(&reviewer),
-        reviewed_by,
-        reviewed_at,
-        Some(&prepared.plan.plan_digest),
-        &timestamp,
-    )?;
-    update_current_record(
-        &transaction,
-        &prepared.current.id,
-        prepared.current.current_version,
-        next_version,
-        &prepared.state,
-        &prepared.actor,
-        reviewed_by,
-        reviewed_at,
-        &timestamp,
-    )?;
-    transaction.commit()?;
-
-    get_record(database_path, &prepared.current.id)
+    let id = Uuid::new_v4().to_string();
+    let body_hash = hash_text(body);
+    let summary_hash = summary.map(hash_text);
+    let bytes = usize_to_i64(body.len(), "body size")?;
+    let c = storage::open_writable_connection(database_path)?;
+    c.execute("INSERT INTO momso_records(id,record_kind,title,status,current_version,summary,summary_sha256,body_sha256,body_bytes,created_by,updated_by,created_at,updated_at) VALUES(?1,'session_note',?2,'draft',1,?3,?4,?5,?6,'tester','tester','now','now')", params![id,title,summary,summary_hash,body_hash,bytes])?;
+    c.execute("INSERT INTO momso_record_versions(record_id,version,record_kind,title,status,summary,summary_sha256,body_sha256,body_bytes,change_kind,actor,created_at) VALUES(?1,1,'session_note',?2,'draft',?3,?4,?5,?6,'create','tester','now')", params![id,title,summary,summary_hash,body_hash,bytes])?;
+    c.execute("INSERT INTO momso_record_bodies(record_id,version,body,body_sha256,body_bytes) VALUES(?1,1,?2,?3,?4)", params![id,body,body_hash,bytes])?;
+    get_record(database_path, &id)
 }
 
 pub(crate) fn list_history(
@@ -823,81 +485,6 @@ pub(crate) fn audit_summary_freshness(
         metadata_read_count,
         body_read_count,
         integrity_issue_count,
-    })
-}
-
-fn prepare_change(
-    connection: &Connection,
-    proposal: RecordChangeProposal,
-) -> Result<PreparedChange, RecordError> {
-    let record_id = validate_record_id(&proposal.record_id)?;
-    validate_version("expectedVersion", proposal.expected_version)?;
-    let current = load_current_record(connection, &record_id)?;
-    ensure_expected_version(&current, proposal.expected_version)?;
-
-    let record_kind = validate_record_kind(&proposal.record_kind)?;
-    let title = validate_title(&proposal.title)?;
-    validate_body(&proposal.body)?;
-    let summary = normalize_summary(proposal.summary)?;
-    let actor = validate_person("actor", &proposal.actor)?;
-    if proposal.target_status == RecordStatus::Reviewed && summary.is_none() {
-        return Err(RecordError::Validation(
-            "a reviewed record must have a non-empty summary".to_string(),
-        ));
-    }
-
-    let body_sha256 = hash_text(&proposal.body);
-    let body_bytes = usize_to_i64(proposal.body.len(), "body size")?;
-    let summary_sha256 = summary.as_deref().map(hash_text);
-    let summary_basis_body_sha256 = if summary.is_none() {
-        None
-    } else if proposal.target_status == RecordStatus::Reviewed {
-        Some(body_sha256.clone())
-    } else if summary_sha256 == current.summary_sha256 {
-        current.summary_basis_body_sha256.clone()
-    } else {
-        None
-    };
-
-    let state = ContentState {
-        record_kind,
-        title,
-        status: proposal.target_status,
-        summary,
-        summary_sha256,
-        summary_basis_body_sha256,
-        body: proposal.body,
-        body_sha256,
-        body_bytes,
-    };
-    let changed_fields = changed_fields(&current, &state);
-    if changed_fields.is_empty() {
-        return Err(RecordError::NoChanges);
-    }
-
-    let next_version = current.current_version + 1;
-    let plan_digest = change_plan_digest(&current.id, &state, &actor, current.current_version);
-    let plan = RecordChangePlan {
-        record_id: current.id.clone(),
-        current_version: current.current_version,
-        next_version,
-        changed_fields,
-        target_status: state.status,
-        summary_state_after: summary_state(
-            state.summary.as_deref(),
-            state.summary_basis_body_sha256.as_deref(),
-            &state.body_sha256,
-        ),
-        body_bytes_after: state.body_bytes,
-        requires_confirmation: true,
-        plan_digest,
-    };
-
-    Ok(PreparedChange {
-        current,
-        state,
-        actor,
-        plan,
     })
 }
 
@@ -1289,26 +876,6 @@ fn summary_state(
     }
 }
 
-fn change_plan_digest(
-    record_id: &str,
-    state: &ContentState,
-    actor: &str,
-    current_version: i64,
-) -> String {
-    let mut digest = DigestBuilder::new("momso.record-change.v1");
-    digest.push(record_id);
-    digest.push(&current_version.to_string());
-    digest.push(&state.record_kind);
-    digest.push(&state.title);
-    digest.push(state.status.as_db());
-    digest.push_optional(state.summary_sha256.as_deref());
-    digest.push_optional(state.summary_basis_body_sha256.as_deref());
-    digest.push(&state.body_sha256);
-    digest.push(&state.body_bytes.to_string());
-    digest.push(actor);
-    digest.finish()
-}
-
 fn restore_plan_digest(
     record_id: &str,
     state: &ContentState,
@@ -1371,66 +938,6 @@ fn validate_record_id(value: &str) -> Result<String, RecordError> {
     Uuid::parse_str(value.trim())
         .map(|id| id.to_string())
         .map_err(|_| RecordError::Validation("recordId must be a UUID".to_string()))
-}
-
-fn validate_record_kind(value: &str) -> Result<String, RecordError> {
-    let value = value.trim();
-    if value.is_empty() || value.chars().count() > MAX_RECORD_KIND_CHARS {
-        return Err(RecordError::Validation(format!(
-            "recordKind must be 1 to {MAX_RECORD_KIND_CHARS} characters"
-        )));
-    }
-    if !value.chars().all(|character| {
-        character.is_ascii_lowercase()
-            || character.is_ascii_digit()
-            || character == '_'
-            || character == '-'
-    }) {
-        return Err(RecordError::Validation(
-            "recordKind may contain lowercase ASCII letters, numbers, underscores, and hyphens"
-                .to_string(),
-        ));
-    }
-    Ok(value.to_string())
-}
-
-fn validate_title(value: &str) -> Result<String, RecordError> {
-    let value = value.trim();
-    if value.is_empty() || value.chars().count() > MAX_TITLE_CHARS {
-        return Err(RecordError::Validation(format!(
-            "title must be 1 to {MAX_TITLE_CHARS} characters"
-        )));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(RecordError::Validation(
-            "title may not contain control characters".to_string(),
-        ));
-    }
-    Ok(value.to_string())
-}
-
-fn normalize_summary(value: Option<String>) -> Result<Option<String>, RecordError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if value.trim().is_empty() {
-        return Ok(None);
-    }
-    if value.chars().count() > MAX_SUMMARY_CHARS {
-        return Err(RecordError::Validation(format!(
-            "summary may contain at most {MAX_SUMMARY_CHARS} characters"
-        )));
-    }
-    Ok(Some(value))
-}
-
-fn validate_body(value: &str) -> Result<(), RecordError> {
-    if value.len() > MAX_BODY_BYTES {
-        return Err(RecordError::Validation(format!(
-            "body may contain at most {MAX_BODY_BYTES} UTF-8 bytes"
-        )));
-    }
-    Ok(())
 }
 
 fn validate_person(field: &str, value: &str) -> Result<String, RecordError> {
@@ -1512,88 +1019,8 @@ mod tests {
         }
 
         fn create(&self, title: &str, body: &str, summary: Option<&str>) -> RecordDetail {
-            create_draft(
-                &self.database_path,
-                CreateRecordDraftInput {
-                    record_kind: "session_note".to_string(),
-                    title: title.to_string(),
-                    body: body.to_string(),
-                    summary: summary.map(str::to_string),
-                    actor: "AI draft".to_string(),
-                    initial_status: None,
-                },
-            )
-            .expect("draft is created")
+            fixture_record(&self.database_path, title, body, summary).expect("draft is created")
         }
-    }
-
-    fn change_proposal(
-        record: &RecordDetail,
-        title: &str,
-        body: &str,
-        summary: Option<&str>,
-        target_status: RecordStatus,
-    ) -> RecordChangeProposal {
-        RecordChangeProposal {
-            record_id: record.id.clone(),
-            expected_version: record.current_version,
-            record_kind: record.record_kind.clone(),
-            title: title.to_string(),
-            body: body.to_string(),
-            summary: summary.map(str::to_string),
-            target_status,
-            actor: "AI draft".to_string(),
-        }
-    }
-
-    #[test]
-    fn imported_record_can_begin_needs_review_but_never_reviewed() {
-        let store = TestStore::new();
-        let needs_review = create_draft(
-            &store.database_path,
-            CreateRecordDraftInput {
-                record_kind: "session_note".to_string(),
-                title: "Imported note".to_string(),
-                body: "Exact imported body".to_string(),
-                summary: Some("Human must still review this".to_string()),
-                actor: "momso-desktop".to_string(),
-                initial_status: Some(RecordStatus::NeedsReview),
-            },
-        )
-        .expect("an imported record can enter the review queue");
-        assert_eq!(needs_review.status, RecordStatus::NeedsReview);
-
-        let reviewed = create_draft(
-            &store.database_path,
-            CreateRecordDraftInput {
-                record_kind: "session_note".to_string(),
-                title: "Invalid imported note".to_string(),
-                body: "Body".to_string(),
-                summary: Some("Summary".to_string()),
-                actor: "momso-desktop".to_string(),
-                initial_status: Some(RecordStatus::Reviewed),
-            },
-        );
-        assert!(matches!(reviewed, Err(RecordError::Validation(_))));
-    }
-
-    #[test]
-    fn summary_listing_never_requires_body_rows() {
-        let store = TestStore::new();
-        let record = store.create("첫 기록", "긴 본문", Some("짧은 요약"));
-        let connection =
-            storage::open_writable_connection(&store.database_path).expect("database opens");
-        connection
-            .execute(
-                "DELETE FROM momso_record_bodies WHERE record_id = ?1",
-                [&record.id],
-            )
-            .expect("body row is removed for the boundary test");
-
-        let report = list_summaries(&store.database_path).expect("metadata list succeeds");
-        assert_eq!(report.metadata_read_count, 1);
-        assert_eq!(report.body_read_count, 0);
-        assert_eq!(report.records[0].summary.as_deref(), Some("짧은 요약"));
     }
 
     #[test]
@@ -1618,48 +1045,6 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_change_requires_explicit_confirmation() {
-        let store = TestStore::new();
-        let record = store.create("수업 기록", "원문", None);
-        let proposal = change_proposal(
-            &record,
-            "수업 기록",
-            "검수한 원문",
-            Some("검수한 요약"),
-            RecordStatus::Reviewed,
-        );
-        let plan = plan_change(&store.database_path, proposal.clone()).expect("plan is created");
-        assert_eq!(plan.summary_state_after, SummaryState::Fresh);
-
-        let error = apply_change(
-            &store.database_path,
-            ApplyRecordChangeInput {
-                proposal: proposal.clone(),
-                plan_digest: plan.plan_digest.clone(),
-                reviewer: "김성균".to_string(),
-                review_confirmed: false,
-            },
-        )
-        .expect_err("unconfirmed change is rejected");
-        assert!(matches!(error, RecordError::ReviewRequired));
-
-        let updated = apply_change(
-            &store.database_path,
-            ApplyRecordChangeInput {
-                proposal,
-                plan_digest: plan.plan_digest,
-                reviewer: "김성균".to_string(),
-                review_confirmed: true,
-            },
-        )
-        .expect("confirmed change is applied");
-        assert_eq!(updated.current_version, 2);
-        assert_eq!(updated.status, RecordStatus::Reviewed);
-        assert_eq!(updated.summary_state, SummaryState::Fresh);
-        assert_eq!(updated.reviewed_by.as_deref(), Some("김성균"));
-    }
-
-    #[test]
     fn database_rejects_reviewed_state_without_a_confirmed_summary_basis() {
         let store = TestStore::new();
         let record = store.create("수업 기록", "원문", None);
@@ -1680,69 +1065,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_change_plan_cannot_overwrite_a_newer_version() {
-        let store = TestStore::new();
-        let record = store.create("기록", "v1", None);
-        let stale_proposal = change_proposal(
-            &record,
-            "기록",
-            "stale body",
-            None,
-            RecordStatus::NeedsReview,
-        );
-        let stale_plan =
-            plan_change(&store.database_path, stale_proposal.clone()).expect("stale plan");
-
-        let winning_proposal =
-            change_proposal(&record, "기록", "v2", None, RecordStatus::NeedsReview);
-        let winning_plan =
-            plan_change(&store.database_path, winning_proposal.clone()).expect("winning plan");
-        apply_change(
-            &store.database_path,
-            ApplyRecordChangeInput {
-                proposal: winning_proposal,
-                plan_digest: winning_plan.plan_digest,
-                reviewer: "김성균".to_string(),
-                review_confirmed: true,
-            },
-        )
-        .expect("winning plan applies");
-
-        let error = apply_change(
-            &store.database_path,
-            ApplyRecordChangeInput {
-                proposal: stale_proposal,
-                plan_digest: stale_plan.plan_digest,
-                reviewer: "김성균".to_string(),
-                review_confirmed: true,
-            },
-        )
-        .expect_err("stale plan is rejected");
-        assert!(matches!(error, RecordError::VersionConflict { .. }));
-    }
-
-    #[test]
     fn restore_appends_an_exact_new_version_without_erasing_history() {
         let store = TestStore::new();
         let v1 = store.create("기록 v1", "본문 v1", Some("요약 v1"));
-        let update = change_proposal(
-            &v1,
-            "기록 v2",
-            "본문 v2",
-            Some("요약 v2"),
-            RecordStatus::NeedsReview,
-        );
-        let update_plan = plan_change(&store.database_path, update.clone()).expect("update plan");
-        let v2 = apply_change(
-            &store.database_path,
-            ApplyRecordChangeInput {
-                proposal: update,
-                plan_digest: update_plan.plan_digest,
-                reviewer: "김성균".to_string(),
-                review_confirmed: true,
-            },
-        )
-        .expect("update applies");
+        let connection = storage::open_writable_connection(&store.database_path).unwrap();
+        connection.execute("INSERT INTO momso_record_versions(record_id,version,record_kind,title,status,summary,summary_sha256,summary_basis_body_sha256,body_sha256,body_bytes,change_kind,source_version,actor,confirmed_by,reviewed_by,reviewed_at,plan_digest,created_at) SELECT record_id,2,record_kind,'기록 v2',status,summary,summary_sha256,summary_basis_body_sha256,body_sha256,body_bytes,'update',NULL,actor,confirmed_by,reviewed_by,reviewed_at,plan_digest,created_at FROM momso_record_versions WHERE record_id=?1 AND version=1", [&v1.id]).unwrap();
+        connection.execute("INSERT INTO momso_record_bodies(record_id,version,body,body_sha256,body_bytes) SELECT record_id,2,body,body_sha256,body_bytes FROM momso_record_bodies WHERE record_id=?1 AND version=1", [&v1.id]).unwrap();
+        connection
+            .execute(
+                "UPDATE momso_records SET current_version=2,title='기록 v2' WHERE id=?1",
+                [&v1.id],
+            )
+            .unwrap();
+        drop(connection);
+        let v2 = get_record(&store.database_path, &v1.id).unwrap();
 
         let restore_proposal = RecordRestoreProposal {
             record_id: v2.id.clone(),
@@ -1791,52 +1127,5 @@ mod tests {
         assert_eq!(report.body_read_count, 1);
         assert_eq!(report.integrity_issue_count, 1);
         assert_eq!(report.records[0].state, SummaryState::BodyIntegrityError);
-    }
-
-    #[test]
-    fn body_continuation_requires_the_hash_from_the_first_page() {
-        let store = TestStore::new();
-        let record = store.create("긴 기록", "가나다라마바사아자차카타파하", None);
-        let first =
-            read_body_page(&store.database_path, &record.id, None, 0, None, 8).expect("first page");
-        assert_eq!(first.content, "가나");
-
-        let cursor = first.next_cursor.expect("continuation cursor");
-        assert!(matches!(
-            read_body_page(&store.database_path, &record.id, None, cursor, None, 8),
-            Err(RecordError::ContinuationHashRequired)
-        ));
-        let second = read_body_page(
-            &store.database_path,
-            &record.id,
-            None,
-            cursor,
-            Some(&first.body_sha256),
-            8,
-        )
-        .expect("second page");
-        assert_eq!(second.content, "다라");
-    }
-
-    #[test]
-    fn paged_read_rejects_a_version_ledger_hash_that_differs_from_the_body_row() {
-        let store = TestStore::new();
-        let record = store.create("기록", "원본 본문", None);
-        let connection =
-            storage::open_writable_connection(&store.database_path).expect("database opens");
-        connection
-            .execute(
-                "UPDATE momso_record_versions
-                 SET body_sha256 = ?2
-                 WHERE record_id = ?1 AND version = 1",
-                params![record.id, "0".repeat(64)],
-            )
-            .expect("version ledger is altered for the integrity test");
-        drop(connection);
-
-        assert!(matches!(
-            read_body_page(&store.database_path, &record.id, Some(1), 0, None, 1024),
-            Err(RecordError::Integrity(_))
-        ));
     }
 }

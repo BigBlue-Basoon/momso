@@ -1,0 +1,20 @@
+/* 첫 실행의 이름 받기와 AI 연결. 바탕은 몸소 첫 화면(FirstLaunch)과 같은 색을 이어 쓴다. 눈썹 글, 꾸밈 선 없음. */
+.first-run { min-height: 0; flex: 1; display: flex; justify-content: center; overflow-y: auto; padding: 56px 32px 40px; background: #f8f9f7; color: var(--ink); }
+.first-run-step { width: min(440px, 100%); display: flex; flex-direction: column; gap: 18px; margin: auto 0; animation: first-run-in 320ms var(--material-ease); }
+.first-run-step.is-wide { width: min(560px, 100%); }
+.first-run-head { display: grid; gap: 8px; }
+.first-run-head h1 { margin: 0; font-size: 22px; font-weight: 700; line-height: 1.35; letter-spacing: 0; word-break: keep-all; }
+.first-run-head p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; word-break: keep-all; }
+.first-run-input { height: 40px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink); font: inherit; font-size: 14px; }
+.first-run-input:focus { outline: none; border-color: var(--ink-soft); }
+.first-run-input[aria-invalid='true'] { border-color: var(--coral); }
+.first-run-error { margin: -8px 0 0; color: var(--coral); font-size: 12px; }
+.first-run-checking { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 12.5px; }
+.first-run-problem { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.first-run-problem p { margin: 0; color: var(--ink-soft); font-size: 13px; }
+.first-run .provider-sign-in { margin: 0; }
+.first-run .provider-rows { margin: 0; }
+.first-run-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 4px; }
+.first-run-primary, .first-run-secondary { height: 38px; min-width: 96px; padding: 0 18px; font-size: 13px; }
+@keyframes first-run-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .first-run-step { animation: none; } }

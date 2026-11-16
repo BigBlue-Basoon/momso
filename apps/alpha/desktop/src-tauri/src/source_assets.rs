@@ -1,25 +1,18 @@
-use crate::{
-    storage::{self, StorageError},
-    text_paging,
-};
+use crate::storage::{self, StorageError};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 use thiserror::Error;
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 const MAX_ACTOR_CHARS: usize = 120;
 const MAX_FILE_NAME_CHARS: usize = 255;
 const MAX_MEDIA_TYPE_CHARS: usize = 120;
-const MAX_TEXT_ASSET_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_AUDIT_ISSUE_SAMPLES: usize = 20;
 
 #[derive(Debug, Error)]
 pub(crate) enum SourceAssetError {
@@ -39,20 +32,6 @@ pub(crate) enum SourceAssetError {
     ConfirmationRequired,
     #[error("Source file integrity check failed: {0}")]
     Integrity(String),
-    #[error("A continuation read requires the complete content hash returned by the first page")]
-    ContinuationHashRequired,
-    #[error("The source text changed after the first page was read")]
-    ContentChanged,
-    #[error("The selected source file is not supported as bounded UTF-8 text: {0}")]
-    UnsupportedText(String),
-    #[error("The source file integrity audit was cancelled")]
-    Cancelled,
-    #[error("The source file is healthy and does not need quarantine")]
-    Healthy,
-    #[error("Source file quarantine requires explicit confirmation")]
-    QuarantineConfirmationRequired,
-    #[error(transparent)]
-    Paging(#[from] text_paging::TextPagingError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,32 +137,6 @@ pub(crate) struct ApplySourceAssetImportInput {
     import_confirmed: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SourceAssetQuarantineProposal {
-    asset_id: String,
-    actor: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SourceAssetQuarantinePlan {
-    plan_digest: String,
-    asset_id: String,
-    issue: String,
-    expected_content_sha256: String,
-    expected_byte_length: u64,
-    requires_confirmation: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ApplySourceAssetQuarantineInput {
-    proposal: SourceAssetQuarantineProposal,
-    plan_digest: String,
-    quarantine_confirmed: bool,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SourceAssetRecordLink {
@@ -229,48 +182,6 @@ impl SourceAssetIntegrityState {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SourceTextPage {
-    asset_id: String,
-    content_sha256: String,
-    byte_length: u64,
-    cursor: u64,
-    next_cursor: Option<u64>,
-    content: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum SourceAssetAuditIssueKind {
-    Missing,
-    Changed,
-    UnsafePath,
-    Unreadable,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SourceAssetAuditIssue {
-    asset_id: String,
-    issue: SourceAssetAuditIssueKind,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SourceAssetAuditResult {
-    pub(crate) total_assets: u64,
-    pub(crate) total_object_files: u64,
-    healthy_assets: u64,
-    missing_assets: u64,
-    changed_assets: u64,
-    unsafe_path_assets: u64,
-    unreadable_assets: u64,
-    unregistered_files: u64,
-    issue_samples: Vec<SourceAssetAuditIssue>,
-    samples_truncated: bool,
-}
-
 #[derive(Debug)]
 struct PreparedImport {
     canonical_source: PathBuf,
@@ -280,28 +191,11 @@ struct PreparedImport {
     plan: SourceAssetImportPlan,
 }
 
-#[derive(Debug)]
-struct PreparedQuarantine {
-    stored: StoredAssetRecord,
-    actor: String,
-    issue: String,
-    plan: SourceAssetQuarantinePlan,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredPathInspection {
     Ready,
     Missing,
     Unsafe,
-}
-
-#[derive(Debug)]
-pub(crate) struct StoredAssetRecord {
-    pub(crate) id: String,
-    pub(crate) content_sha256: String,
-    pub(crate) byte_length: u64,
-    pub(crate) storage_relative_path: String,
-    pub(crate) integrity_state: SourceAssetIntegrityState,
 }
 
 pub(crate) fn plan_import(
@@ -424,392 +318,6 @@ pub(crate) fn apply_import(
     }
     transaction.commit()?;
     get(database_path, &stored_id)
-}
-
-pub(crate) fn plan_quarantine(
-    database_path: &Path,
-    objects_path: &Path,
-    proposal: SourceAssetQuarantineProposal,
-) -> Result<SourceAssetQuarantinePlan, SourceAssetError> {
-    Ok(prepare_quarantine(database_path, objects_path, proposal)?.plan)
-}
-
-pub(crate) fn apply_quarantine(
-    database_path: &Path,
-    objects_path: &Path,
-    input: ApplySourceAssetQuarantineInput,
-) -> Result<SourceAsset, SourceAssetError> {
-    if !input.quarantine_confirmed {
-        return Err(SourceAssetError::QuarantineConfirmationRequired);
-    }
-    let prepared = prepare_quarantine(database_path, objects_path, input.proposal)?;
-    if prepared.plan.plan_digest != input.plan_digest {
-        return Err(SourceAssetError::PlanMismatch);
-    }
-
-    move_quarantined_bytes(objects_path, &prepared.stored, &prepared.issue)?;
-    let connection = storage::open_writable_connection(database_path)?;
-    let changed = connection.execute(
-        "UPDATE momso_source_assets
-         SET integrity_state = 'quarantined', integrity_issue = ?2,
-             quarantined_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             quarantined_by = ?3
-         WHERE id = ?1 AND integrity_state = 'active'",
-        params![prepared.stored.id, prepared.issue, prepared.actor],
-    )?;
-    if changed != 1 {
-        return Err(SourceAssetError::PlanMismatch);
-    }
-    get(database_path, &prepared.plan.asset_id)
-}
-
-pub(crate) fn list(
-    database_path: &Path,
-    record_id: Option<&str>,
-) -> Result<Vec<SourceAsset>, SourceAssetError> {
-    let connection = storage::open_writable_connection(database_path)?;
-    let mut assets = Vec::new();
-    if let Some(record_id) = record_id {
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT a.id, a.asset_kind, a.content_sha256, a.byte_length,
-                    a.original_file_name, a.media_type, a.captured_by, a.created_at,
-                    a.integrity_state, a.integrity_issue, a.quarantined_at, a.quarantined_by
-             FROM momso_source_assets a
-             JOIN momso_record_source_assets l ON l.asset_id = a.id
-             WHERE l.record_id = ?1
-             ORDER BY a.created_at, a.id",
-        )?;
-        let rows = statement.query_map([record_id], read_asset_row)?;
-        for row in rows {
-            assets.push(row?);
-        }
-    } else {
-        let mut statement = connection.prepare(
-            "SELECT id, asset_kind, content_sha256, byte_length,
-                    original_file_name, media_type, captured_by, created_at,
-                    integrity_state, integrity_issue, quarantined_at, quarantined_by
-             FROM momso_source_assets
-             ORDER BY created_at, id",
-        )?;
-        let rows = statement.query_map([], read_asset_row)?;
-        for row in rows {
-            assets.push(row?);
-        }
-    }
-
-    for asset in &mut assets {
-        asset.links = load_links(&connection, &asset.id)?;
-    }
-    Ok(assets)
-}
-
-pub(crate) fn read_text_page(
-    database_path: &Path,
-    objects_path: &Path,
-    asset_id: &str,
-    cursor: u64,
-    expected_content_sha256: Option<&str>,
-    max_bytes: u64,
-) -> Result<SourceTextPage, SourceAssetError> {
-    let stored = stored_asset(database_path, asset_id)?;
-    if stored.integrity_state == SourceAssetIntegrityState::Quarantined {
-        return Err(SourceAssetError::Integrity(format!(
-            "source file {asset_id} is quarantined"
-        )));
-    }
-    if stored.byte_length > MAX_TEXT_ASSET_BYTES {
-        return Err(SourceAssetError::UnsupportedText(format!(
-            "file is larger than {MAX_TEXT_ASSET_BYTES} bytes"
-        )));
-    }
-    if cursor > 0 && expected_content_sha256.is_none() {
-        return Err(SourceAssetError::ContinuationHashRequired);
-    }
-
-    let path = resolve_storage_path(objects_path, &stored.storage_relative_path)?;
-    match inspect_stored_file(objects_path, &path)? {
-        StoredPathInspection::Ready => {}
-        StoredPathInspection::Missing => {
-            return Err(SourceAssetError::NotFound(asset_id.to_owned()));
-        }
-        StoredPathInspection::Unsafe => {
-            return Err(SourceAssetError::Integrity(format!(
-                "stored path is unsafe for source file {asset_id}"
-            )));
-        }
-    }
-    let bytes = fs::read(path)?;
-    let actual_sha256 = hash_bytes(&bytes);
-    if actual_sha256 != stored.content_sha256 || bytes.len() as u64 != stored.byte_length {
-        return Err(SourceAssetError::Integrity(format!(
-            "stored bytes differ for source file {asset_id}"
-        )));
-    }
-    if expected_content_sha256.is_some_and(|expected| expected != actual_sha256) {
-        return Err(SourceAssetError::ContentChanged);
-    }
-
-    let text = String::from_utf8(bytes)
-        .map_err(|_| SourceAssetError::UnsupportedText("file is not valid UTF-8".to_owned()))?;
-    let page = text_paging::page(&text, cursor, max_bytes)?;
-    Ok(SourceTextPage {
-        asset_id: asset_id.to_owned(),
-        content_sha256: actual_sha256,
-        byte_length: stored.byte_length,
-        cursor,
-        next_cursor: page.next_cursor,
-        content: page.content,
-    })
-}
-
-pub(crate) fn stored_assets(
-    database_path: &Path,
-) -> Result<Vec<StoredAssetRecord>, SourceAssetError> {
-    let connection = storage::open_writable_connection(database_path)?;
-    let mut statement = connection.prepare(
-        "SELECT id, content_sha256, byte_length, storage_relative_path, integrity_state
-         FROM momso_source_assets
-         WHERE integrity_state = 'active'
-         ORDER BY created_at, id",
-    )?;
-    let rows = statement.query_map([], |row| {
-        let byte_length: i64 = row.get(2)?;
-        Ok(StoredAssetRecord {
-            id: row.get(0)?,
-            content_sha256: row.get(1)?,
-            byte_length: u64::try_from(byte_length).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Integer,
-                    Box::new(error),
-                )
-            })?,
-            storage_relative_path: row.get(3)?,
-            integrity_state: SourceAssetIntegrityState::from_db(&row.get::<_, String>(4)?)
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-        })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(SourceAssetError::from)
-}
-
-pub(crate) fn audit_integrity<Progress, Cancelled>(
-    database_path: &Path,
-    objects_path: &Path,
-    mut progress: Progress,
-    cancelled: Cancelled,
-) -> Result<SourceAssetAuditResult, SourceAssetError>
-where
-    Progress: FnMut(u64, u64) -> Result<(), SourceAssetError>,
-    Cancelled: Fn() -> bool,
-{
-    let assets = stored_assets(database_path)?;
-    let total_assets = assets.len() as u64;
-    let mut object_files = Vec::new();
-    let mut scan_unreadable = 0;
-    let mut scan_unsafe = 0;
-    let mut scanned_entries = 0_u64;
-    if objects_path.exists() {
-        for entry in WalkDir::new(objects_path).follow_links(false) {
-            if cancelled() {
-                return Err(SourceAssetError::Cancelled);
-            }
-            scanned_entries += 1;
-            if scanned_entries.is_multiple_of(250) {
-                progress(0, 0)?;
-            }
-            match entry {
-                Ok(entry) if entry.file_type().is_symlink() => scan_unsafe += 1,
-                Ok(entry) if entry.file_type().is_file() => {
-                    object_files.push(entry.path().to_path_buf());
-                }
-                Ok(_) => {}
-                Err(_) => scan_unreadable += 1,
-            }
-        }
-    }
-    object_files.sort();
-    let total_object_files = object_files.len() as u64;
-    let total_work = total_assets
-        .checked_add(total_object_files)
-        .ok_or_else(|| SourceAssetError::Validation("source audit is too large".to_owned()))?;
-    progress(0, total_work)?;
-    let mut result = SourceAssetAuditResult {
-        total_assets,
-        total_object_files,
-        healthy_assets: 0,
-        missing_assets: 0,
-        changed_assets: 0,
-        unsafe_path_assets: scan_unsafe,
-        unreadable_assets: scan_unreadable,
-        unregistered_files: 0,
-        issue_samples: Vec::new(),
-        samples_truncated: false,
-    };
-
-    for (index, asset) in assets.iter().enumerate() {
-        if cancelled() {
-            return Err(SourceAssetError::Cancelled);
-        }
-        let issue = match resolve_storage_path(objects_path, &asset.storage_relative_path) {
-            Err(_) => Some(SourceAssetAuditIssueKind::UnsafePath),
-            Ok(path) => match inspect_stored_file(objects_path, &path) {
-                Ok(StoredPathInspection::Missing) => Some(SourceAssetAuditIssueKind::Missing),
-                Ok(StoredPathInspection::Unsafe) => Some(SourceAssetAuditIssueKind::UnsafePath),
-                Ok(StoredPathInspection::Ready) => match hash_file(&path) {
-                    Ok((sha256, byte_length))
-                        if sha256 == asset.content_sha256 && byte_length == asset.byte_length =>
-                    {
-                        None
-                    }
-                    Ok(_) => Some(SourceAssetAuditIssueKind::Changed),
-                    Err(_) => Some(SourceAssetAuditIssueKind::Unreadable),
-                },
-                Err(_) => Some(SourceAssetAuditIssueKind::Unreadable),
-            },
-        };
-
-        match issue {
-            None => result.healthy_assets += 1,
-            Some(issue) => {
-                match issue {
-                    SourceAssetAuditIssueKind::Missing => result.missing_assets += 1,
-                    SourceAssetAuditIssueKind::Changed => result.changed_assets += 1,
-                    SourceAssetAuditIssueKind::UnsafePath => result.unsafe_path_assets += 1,
-                    SourceAssetAuditIssueKind::Unreadable => result.unreadable_assets += 1,
-                }
-                if result.issue_samples.len() < MAX_AUDIT_ISSUE_SAMPLES {
-                    result.issue_samples.push(SourceAssetAuditIssue {
-                        asset_id: asset.id.clone(),
-                        issue,
-                    });
-                } else {
-                    result.samples_truncated = true;
-                }
-            }
-        }
-
-        let completed = index as u64 + 1;
-        if completed == total_assets || completed.is_multiple_of(25) {
-            progress(completed, total_work)?;
-        }
-    }
-
-    let registered_paths = assets
-        .iter()
-        .map(|asset| asset.storage_relative_path.replace('\\', "/"))
-        .collect::<HashSet<_>>();
-    for (index, path) in object_files.iter().enumerate() {
-        if cancelled() {
-            return Err(SourceAssetError::Cancelled);
-        }
-        match path.strip_prefix(objects_path) {
-            Ok(relative) => {
-                let relative = relative.to_string_lossy().replace('\\', "/");
-                if !registered_paths.contains(&relative) {
-                    result.unregistered_files += 1;
-                }
-            }
-            Err(_) => {
-                result.unsafe_path_assets += 1;
-            }
-        }
-        let completed = total_assets + index as u64 + 1;
-        if completed == total_work || completed.is_multiple_of(100) {
-            progress(completed, total_work)?;
-        }
-    }
-    Ok(result)
-}
-
-fn prepare_quarantine(
-    database_path: &Path,
-    objects_path: &Path,
-    proposal: SourceAssetQuarantineProposal,
-) -> Result<PreparedQuarantine, SourceAssetError> {
-    let actor = validate_required("actor", &proposal.actor, MAX_ACTOR_CHARS)?;
-    let stored = stored_asset(database_path, proposal.asset_id.trim())?;
-    if stored.integrity_state == SourceAssetIntegrityState::Quarantined {
-        return Err(SourceAssetError::Validation(
-            "source file is already quarantined".to_owned(),
-        ));
-    }
-    let issue = inspect_quarantine_issue(objects_path, &stored)?;
-    let plan_digest = quarantine_plan_digest(&stored, &actor, &issue);
-    let plan = SourceAssetQuarantinePlan {
-        plan_digest,
-        asset_id: stored.id.clone(),
-        issue: issue.clone(),
-        expected_content_sha256: stored.content_sha256.clone(),
-        expected_byte_length: stored.byte_length,
-        requires_confirmation: true,
-    };
-    Ok(PreparedQuarantine {
-        stored,
-        actor,
-        issue,
-        plan,
-    })
-}
-
-fn inspect_quarantine_issue(
-    objects_path: &Path,
-    stored: &StoredAssetRecord,
-) -> Result<String, SourceAssetError> {
-    let path = match resolve_storage_path(objects_path, &stored.storage_relative_path) {
-        Ok(path) => path,
-        Err(_) => return Ok("unsafe_path".to_owned()),
-    };
-    let inspection = match inspect_stored_file(objects_path, &path) {
-        Ok(inspection) => inspection,
-        Err(_) => return Ok("unreadable".to_owned()),
-    };
-    match inspection {
-        StoredPathInspection::Missing => Ok("missing".to_owned()),
-        StoredPathInspection::Unsafe => Ok("unsafe_path".to_owned()),
-        StoredPathInspection::Ready => match hash_file(&path) {
-            Ok((sha256, bytes))
-                if sha256 == stored.content_sha256 && bytes == stored.byte_length =>
-            {
-                Err(SourceAssetError::Healthy)
-            }
-            Ok(_) => Ok("changed".to_owned()),
-            Err(_) => Ok("unreadable".to_owned()),
-        },
-    }
-}
-
-fn move_quarantined_bytes(
-    objects_path: &Path,
-    stored: &StoredAssetRecord,
-    issue: &str,
-) -> Result<(), SourceAssetError> {
-    if !matches!(issue, "changed" | "unreadable") {
-        return Ok(());
-    }
-    let source = resolve_storage_path(objects_path, &stored.storage_relative_path)?;
-    if inspect_stored_file(objects_path, &source)? != StoredPathInspection::Ready {
-        return Ok(());
-    }
-    let data_root = objects_path.parent().ok_or_else(|| {
-        SourceAssetError::Validation("objects directory has no data root".to_owned())
-    })?;
-    let quarantine = data_root.join(".source-quarantine");
-    fs::create_dir_all(&quarantine)?;
-    let destination = quarantine.join(format!("{}-{}", stored.id, stored.content_sha256));
-    if destination.exists() {
-        return Err(SourceAssetError::Integrity(
-            "quarantine destination already exists".to_owned(),
-        ));
-    }
-    fs::rename(source, destination)?;
-    Ok(())
 }
 
 fn prepare_import(
@@ -995,11 +503,22 @@ fn materialize_source_file(
     objects_path: &Path,
     prepared: &PreparedImport,
 ) -> Result<(), SourceAssetError> {
+    materialize_source_file_with_hook(objects_path, prepared, |_| Ok(()))
+}
+
+fn materialize_source_file_with_hook(
+    objects_path: &Path,
+    prepared: &PreparedImport,
+    before_publish: impl FnOnce(&Path) -> Result<(), SourceAssetError>,
+) -> Result<(), SourceAssetError> {
     let destination = resolve_storage_path(objects_path, &prepared.storage_relative_path)?;
     match inspect_stored_file(objects_path, &destination)? {
         StoredPathInspection::Ready => {
             let (sha256, byte_length) = hash_file(&destination)?;
             if sha256 == prepared.plan.content_sha256 && byte_length == prepared.plan.byte_length {
+                let mut permissions = fs::metadata(&destination)?.permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(&destination, permissions)?;
                 return Ok(());
             }
             return Err(SourceAssetError::Integrity(
@@ -1054,7 +573,8 @@ fn materialize_source_file(
                 "the content-addressed destination path became unsafe".to_owned(),
             ));
         }
-        match fs::rename(&temporary, &destination) {
+        before_publish(&destination)?;
+        match tempfile::TempPath::try_from_path(&temporary)?.persist_noclobber(&destination) {
             Ok(()) => Ok(()),
             Err(error) => match inspect_stored_file(objects_path, &destination)? {
                 StoredPathInspection::Ready => {
@@ -1073,14 +593,18 @@ fn materialize_source_file(
                 StoredPathInspection::Unsafe => Err(SourceAssetError::Integrity(
                     "the content-addressed destination became unsafe".to_owned(),
                 )),
-                StoredPathInspection::Missing => Err(SourceAssetError::Io(error)),
+                StoredPathInspection::Missing => Err(SourceAssetError::Io(error.error)),
             },
         }
     })();
     if finalize_result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    finalize_result
+    finalize_result?;
+    let mut permissions = fs::metadata(&destination)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&destination, permissions)?;
+    Ok(())
 }
 
 fn copy_and_hash(source: &Path, destination: &Path) -> Result<(String, u64), SourceAssetError> {
@@ -1123,10 +647,6 @@ fn hash_file(path: &Path) -> Result<(String, u64), SourceAssetError> {
             .ok_or_else(|| SourceAssetError::Validation("source file is too large".to_owned()))?;
     }
     Ok((format!("{:x}", hasher.finalize()), byte_length))
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn relative_storage_path(content_sha256: &str) -> String {
@@ -1259,18 +779,6 @@ fn import_plan_digest(
             .unwrap_or("")
             .as_bytes(),
     );
-    format!("{:x}", hasher.finalize())
-}
-
-fn quarantine_plan_digest(stored: &StoredAssetRecord, actor: &str, issue: &str) -> String {
-    let mut hasher = Sha256::new();
-    push_digest_field(&mut hasher, b"momso.source-asset-quarantine.v1");
-    push_digest_field(&mut hasher, stored.id.as_bytes());
-    push_digest_field(&mut hasher, stored.content_sha256.as_bytes());
-    push_digest_field(&mut hasher, stored.byte_length.to_string().as_bytes());
-    push_digest_field(&mut hasher, stored.storage_relative_path.as_bytes());
-    push_digest_field(&mut hasher, actor.as_bytes());
-    push_digest_field(&mut hasher, issue.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
@@ -1412,48 +920,10 @@ fn get(database_path: &Path, asset_id: &str) -> Result<SourceAsset, SourceAssetE
     Ok(asset)
 }
 
-fn stored_asset(
-    database_path: &Path,
-    asset_id: &str,
-) -> Result<StoredAssetRecord, SourceAssetError> {
-    let connection = storage::open_writable_connection(database_path)?;
-    connection
-        .query_row(
-            "SELECT id, content_sha256, byte_length, storage_relative_path, integrity_state
-             FROM momso_source_assets WHERE id = ?1",
-            [asset_id],
-            |row| {
-                let byte_length: i64 = row.get(2)?;
-                Ok(StoredAssetRecord {
-                    id: row.get(0)?,
-                    content_sha256: row.get(1)?,
-                    byte_length: u64::try_from(byte_length).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Integer,
-                            Box::new(error),
-                        )
-                    })?,
-                    storage_relative_path: row.get(3)?,
-                    integrity_state: SourceAssetIntegrityState::from_db(&row.get::<_, String>(4)?)
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                })
-            },
-        )
-        .optional()?
-        .ok_or_else(|| SourceAssetError::NotFound(asset_id.to_owned()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::{self, CreateRecordDraftInput};
+    use crate::records;
     use tempfile::TempDir;
 
     struct TestStore {
@@ -1461,6 +931,24 @@ mod tests {
         database_path: PathBuf,
         objects_path: PathBuf,
         source_path: PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            for entry in walkdir::WalkDir::new(&self.objects_path)
+                .into_iter()
+                .flatten()
+            {
+                if entry.file_type().is_file() {
+                    if let Ok(metadata) = entry.metadata() {
+                        let mut permissions = metadata.permissions();
+                        permissions.set_readonly(false);
+                        let _ = fs::set_permissions(entry.path(), permissions);
+                    }
+                }
+            }
+        }
     }
 
     impl TestStore {
@@ -1516,81 +1004,48 @@ mod tests {
         let stored = resolve_storage_path(&store.objects_path, &relative).expect("safe path");
 
         assert_eq!(
-            fs::read(stored).expect("stored bytes"),
+            fs::read(&stored).expect("stored bytes"),
             "바순은 원본 표현입니다.\n".as_bytes()
         );
-        assert_eq!(list(&store.database_path, None).expect("assets").len(), 1);
+        assert!(fs::metadata(stored).unwrap().permissions().readonly());
+        let connection = storage::open_writable_connection(&store.database_path).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM momso_source_assets", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
+    #[cfg(windows)]
     #[test]
-    fn changed_source_can_be_quarantined_without_erasing_its_ledger() {
-        let store = TestStore::new("original bytes");
+    fn fake_cli_cannot_write_readonly_import_and_a_bypass_is_detected() {
+        let store = TestStore::new("original source");
         let asset = store.import();
-        let connection =
-            storage::open_writable_connection(&store.database_path).expect("database opens");
-        assert!(connection
-            .execute(
-                "UPDATE momso_source_assets SET integrity_state = 'quarantined' WHERE id = ?1",
-                [&asset.id],
-            )
-            .is_err());
-        drop(connection);
-        let stored_path = resolve_storage_path(
+        let stored = resolve_storage_path(
             &store.objects_path,
             &relative_storage_path(&asset.content_sha256),
         )
-        .expect("safe path");
-        fs::write(&stored_path, b"changed bytes").expect("stored bytes change");
-        let proposal = SourceAssetQuarantineProposal {
-            asset_id: asset.id.clone(),
-            actor: "human reviewer".to_owned(),
-        };
-        let plan = plan_quarantine(&store.database_path, &store.objects_path, proposal.clone())
-            .expect("quarantine plans");
-        assert_eq!(plan.issue, "changed");
-        assert!(matches!(
-            apply_quarantine(
-                &store.database_path,
-                &store.objects_path,
-                ApplySourceAssetQuarantineInput {
-                    proposal: proposal.clone(),
-                    plan_digest: plan.plan_digest.clone(),
-                    quarantine_confirmed: false,
-                },
-            ),
-            Err(SourceAssetError::QuarantineConfirmationRequired)
-        ));
-
-        let quarantined = apply_quarantine(
-            &store.database_path,
-            &store.objects_path,
-            ApplySourceAssetQuarantineInput {
-                proposal,
-                plan_digest: plan.plan_digest,
-                quarantine_confirmed: true,
-            },
-        )
-        .expect("quarantine applies");
-
+        .unwrap();
+        let root = store.objects_path.parent().unwrap();
+        let before = crate::chat_file_changes::capture(root).unwrap();
+        let status = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "try { [IO.File]::WriteAllText($env:MOMSO_FAKE_RAW, 'changed'); exit 0 } catch { exit 7 }"])
+            .env("MOMSO_FAKE_RAW", &stored)
+            .status().unwrap();
+        assert!(!status.success());
+        assert_eq!(fs::read(&stored).unwrap(), b"original source");
+        let mut permissions = fs::metadata(&stored).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&stored, permissions).unwrap();
+        fs::write(&stored, b"bypass").unwrap();
+        let after = crate::chat_file_changes::capture(root).unwrap();
         assert_eq!(
-            quarantined.integrity_state,
-            SourceAssetIntegrityState::Quarantined
+            crate::chat_file_changes::source_changes(&before, &after)
+                .get(&format!("sha256:{}", asset.content_sha256))
+                .map(String::as_str),
+            Some("edited")
         );
-        assert_eq!(quarantined.integrity_issue.as_deref(), Some("changed"));
-        assert_eq!(
-            quarantined.quarantined_by.as_deref(),
-            Some("human reviewer")
-        );
-        assert!(!stored_path.exists());
-        assert!(stored_assets(&store.database_path)
-            .expect("active ledger")
-            .is_empty());
-        assert_eq!(
-            list(&store.database_path, None).expect("full ledger").len(),
-            1
-        );
-        crate::backup_profile::local_content_state(&store.database_path, &store.objects_path)
-            .expect("quarantined ledger no longer blocks backup");
     }
 
     #[test]
@@ -1612,9 +1067,13 @@ mod tests {
         )
         .expect_err("stale plan fails");
         assert!(matches!(error, SourceAssetError::PlanMismatch));
-        assert!(stored_assets(&store.database_path)
-            .expect("ledger")
-            .is_empty());
+        let connection = storage::open_writable_connection(&store.database_path).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM momso_source_assets", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -1624,24 +1083,86 @@ mod tests {
         let second = store.import();
 
         assert_eq!(first.id, second.id);
+        let connection = storage::open_writable_connection(&store.database_path).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM momso_source_assets", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn same_filename_with_different_content_preserves_both_originals() {
+        let store = TestStore::new("first contents");
+        let first = store.import();
+        fs::write(&store.source_path, "second contents").unwrap();
+        let second = store.import();
+        assert_ne!(first.id, second.id);
+        let first_path = resolve_storage_path(
+            &store.objects_path,
+            &relative_storage_path(&first.content_sha256),
+        )
+        .unwrap();
+        let second_path = resolve_storage_path(
+            &store.objects_path,
+            &relative_storage_path(&second.content_sha256),
+        )
+        .unwrap();
+        assert_eq!(fs::read(first_path).unwrap(), b"first contents");
+        assert_eq!(fs::read(second_path).unwrap(), b"second contents");
+    }
+
+    #[test]
+    fn concurrent_destination_conflict_never_overwrites_existing_bytes() {
+        let store = TestStore::new("new source");
+        let prepared =
+            prepare_import(&store.database_path, &store.objects_path, store.proposal()).unwrap();
+        let mut collision = None;
+        let result =
+            materialize_source_file_with_hook(&store.objects_path, &prepared, |destination| {
+                fs::write(destination, b"other existing bytes")?;
+                collision = Some(destination.to_path_buf());
+                Ok(())
+            });
+        assert!(matches!(result, Err(SourceAssetError::Integrity(_))));
         assert_eq!(
-            stored_assets(&store.database_path).expect("ledger").len(),
-            1
+            fs::read(collision.unwrap()).unwrap(),
+            b"other existing bytes"
         );
+        assert_eq!(fs::read(&store.source_path).unwrap(), b"new source");
+    }
+
+    #[test]
+    fn audit_reproduces_previous_rename_overwriting_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_destination = temp.path().join("destination");
+        let incoming = temp.path().join("incoming");
+        fs::write(&old_destination, b"existing bytes").unwrap();
+        fs::write(&incoming, b"new bytes").unwrap();
+        fs::rename(&incoming, &old_destination).unwrap();
+        assert_eq!(fs::read(old_destination).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn concurrent_identical_destination_is_reused() {
+        let store = TestStore::new("same source");
+        let prepared =
+            prepare_import(&store.database_path, &store.objects_path, store.proposal()).unwrap();
+        materialize_source_file_with_hook(&store.objects_path, &prepared, |destination| {
+            fs::write(destination, b"same source")?;
+            Ok(())
+        })
+        .unwrap();
+        let staging = store.objects_path.parent().unwrap().join(".source-staging");
+        assert_eq!(fs::read_dir(staging).unwrap().count(), 0);
     }
 
     #[test]
     fn source_file_can_be_bound_to_an_exact_record_version() {
         let store = TestStore::new("raw transcript");
-        let input = serde_json::from_value::<CreateRecordDraftInput>(serde_json::json!({
-            "recordKind": "class_record",
-            "title": "Morning class",
-            "body": "review copy",
-            "summary": null,
-            "actor": "tester"
-        }))
-        .expect("record input");
-        records::create_draft(&store.database_path, input).expect("record creates");
+        records::fixture_record(&store.database_path, "Morning class", "review copy", None)
+            .unwrap();
         let connection =
             storage::open_writable_connection(&store.database_path).expect("database opens");
         let (record_id, record_version): (String, i64) = connection
@@ -1673,129 +1194,6 @@ mod tests {
         assert_eq!(asset.links.len(), 1);
         assert_eq!(asset.links[0].record_id, record_id);
         assert_eq!(asset.links[0].record_version, 1);
-    }
-
-    #[test]
-    fn continuation_pages_are_bound_to_the_first_complete_hash() {
-        let store = TestStore::new("가나다라마바사아자차카타파하");
-        let asset = store.import();
-        let first = read_text_page(
-            &store.database_path,
-            &store.objects_path,
-            &asset.id,
-            0,
-            None,
-            8,
-        )
-        .expect("first page");
-        let second = read_text_page(
-            &store.database_path,
-            &store.objects_path,
-            &asset.id,
-            first.next_cursor.expect("continuation"),
-            Some(&first.content_sha256),
-            8,
-        )
-        .expect("second page");
-
-        assert_eq!(first.content, "가나");
-        assert_eq!(second.content, "다라");
-        assert!(matches!(
-            read_text_page(
-                &store.database_path,
-                &store.objects_path,
-                &asset.id,
-                second.next_cursor.expect("next"),
-                Some("changed"),
-                8,
-            ),
-            Err(SourceAssetError::ContentChanged)
-        ));
-    }
-
-    #[test]
-    fn integrity_audit_reports_changed_bytes_without_exposing_them() {
-        let store = TestStore::new("original");
-        let asset = store.import();
-        let stored = resolve_storage_path(
-            &store.objects_path,
-            &relative_storage_path(&asset.content_sha256),
-        )
-        .expect("safe path");
-        fs::write(stored, "changed").expect("stored bytes change");
-        let mut progress_updates = Vec::new();
-
-        let report = audit_integrity(
-            &store.database_path,
-            &store.objects_path,
-            |completed, total| {
-                progress_updates.push((completed, total));
-                Ok(())
-            },
-            || false,
-        )
-        .expect("audit completes");
-
-        assert_eq!(report.total_assets, 1);
-        assert_eq!(report.total_object_files, 1);
-        assert_eq!(report.healthy_assets, 0);
-        assert_eq!(report.changed_assets, 1);
-        assert_eq!(report.issue_samples[0].asset_id, asset.id);
-        assert_eq!(progress_updates, vec![(0, 2), (1, 2), (2, 2)]);
-    }
-
-    #[test]
-    fn integrity_audit_rejects_a_non_file_at_a_registered_storage_path() {
-        let store = TestStore::new("original");
-        let asset = store.import();
-        let stored = resolve_storage_path(
-            &store.objects_path,
-            &relative_storage_path(&asset.content_sha256),
-        )
-        .expect("safe path");
-        fs::remove_file(&stored).expect("stored file removes");
-        fs::create_dir(&stored).expect("directory replaces file");
-
-        let report = audit_integrity(
-            &store.database_path,
-            &store.objects_path,
-            |_completed, _total| Ok(()),
-            || false,
-        )
-        .expect("audit completes");
-
-        assert_eq!(report.healthy_assets, 0);
-        assert_eq!(report.unsafe_path_assets, 1);
-        assert!(matches!(
-            read_text_page(
-                &store.database_path,
-                &store.objects_path,
-                &asset.id,
-                0,
-                None,
-                8,
-            ),
-            Err(SourceAssetError::Integrity(_))
-        ));
-    }
-
-    #[test]
-    fn integrity_audit_counts_files_that_have_no_ledger_entry() {
-        let store = TestStore::new("source outside storage");
-        fs::write(store.objects_path.join("unregistered.mp3"), b"bytes")
-            .expect("loose file writes");
-
-        let report = audit_integrity(
-            &store.database_path,
-            &store.objects_path,
-            |_completed, _total| Ok(()),
-            || false,
-        )
-        .expect("audit completes");
-
-        assert_eq!(report.total_assets, 0);
-        assert_eq!(report.total_object_files, 1);
-        assert_eq!(report.unregistered_files, 1);
     }
 
     #[test]

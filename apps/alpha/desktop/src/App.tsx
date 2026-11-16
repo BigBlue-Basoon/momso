@@ -6,37 +6,34 @@ import { useAppUpdate } from './components/AppUpdate'
 import { QuestionDialog } from './components/ZetPanel'
 import { restartApp } from './app-update'
 import { isMissingCommand as isMissingMediaCommand } from './ai-models'
-import { chatItemCount, getChatItems, listenChatItems, type ChatItems } from './chat-items'
+import { EMPTY_CHAT_ITEMS, attachFileToChat, chatItemCount, getChatItems, listenChatItems, type ChatItems } from './chat-items'
 import { listSkills, type SkillEntry } from './skills'
 import { listMedia } from './media'
 import { AssistantPanel, type ChatViewMessage } from './components/AssistantPanel'
 import type { ApprovalItem } from './components/ApprovalCard'
 import { listenApprovals, respondApproval, type ApprovalChoice } from './approvals'
+import type { SecretItem } from './components/SecretRequestCard'
+import { cancelSecret, listenSecretRequests, submitSecret } from './setup-secrets'
 import { ChatSidebar } from './components/ChatSidebar'
 import { Composer, type PermissionState } from './components/Composer'
-import { ImportDialog, type ImportMode } from './components/ImportDialog'
-import { SettingsView } from './components/SettingsView'
+import { SettingsView, type SettingsSection } from './components/SettingsView'
 import { WindowTitlebar } from './components/WindowTitlebar'
 import { ZetPanel, ZetPanelToggle, useZetPanelFrame } from './components/ZetPanel'
-import { AiWelcome } from './components/AiWelcome'
-import { FirstLaunch } from './components/FirstLaunch'
+import { FirstRun } from './components/FirstRun'
+import { effortKorean } from './permission-labels'
+import { checkFirstRun, type FirstRunCheck } from './first-run'
 import './App.css'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
+import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import {
-  createRuntimeBackup,
-  createRecord,
-  cancelAiAssistant,
-  getRecordDetail,
   initializeRuntime,
   isDesktopRuntime,
-  listRecordSummaries,
   openRuntimeDataRoot,
-  runAiAssistant,
   type RuntimeSession,
 } from './runtime'
 import { archiveErrorMessage } from './archive'
 import { GROUP_WORD, W } from './words'
 import {
-  appendChatMessage,
   cancelChatMessage,
   createChat,
   probeSendableProviders,
@@ -49,6 +46,7 @@ import {
   type ChatGroup,
   archiveChat,
   listArchivedChats,
+  listenChatListUpdated,
   setChatPinned,
   listenChatEvents,
   listChats,
@@ -61,6 +59,7 @@ import {
   type ChatEntry,
 } from './chats'
 import {
+  PROVIDER_NAME,
   defaultModel,
   findModelName,
   resolveEffort,
@@ -79,16 +78,7 @@ import {
   loadPreferences,
   saveChatModels,
   savePreferences,
-  type AppPreferences,
 } from './preferences'
-import {
-  workspaceRecordCreateInput,
-  workspaceRecordFromDetail,
-} from './record-persistence'
-import {
-  WORKSPACE_RECORDS,
-  type WorkspaceRecord,
-} from './workbench-data'
 
 const INITIAL_SESSION: RuntimeSession = {
   mode: 'starting',
@@ -100,19 +90,27 @@ type DirectoryPickerWindow = Window & {
   showDirectoryPicker?: (options?: { mode?: 'read' | 'readwrite' }) => Promise<unknown>
 }
 
-// 파일 가져오기 창은 예전 기록(SQLite)을 만든다. 같은 파일을 두 번 가져오지 않게 하려고 예전 기록을 읽어 둔다.
-// 예전 기록은 화면에 보이지 않는다.
-async function readStoredRecords() {
-  const report = await listRecordSummaries()
-  const details = await Promise.all(report.records.map((record) => getRecordDetail(record.id)))
-  return details.map(workspaceRecordFromDetail)
-}
-
 // 모델 목록을 읽지 못했을 때 고를 수 있는 곳: 설정의 AI 연결에 있는 두 곳.
 const FALLBACK_PROVIDERS: AiProvider[] = ['codex', 'claude']
 
 // 뒤로·앞으로가 오가는 곳. 'new' 는 새 대화, 'settings' 는 설정, 'chat:번호' 는 그 대화.
 type Place = 'new' | 'settings' | 'documents' | 'media' | `chat:${string}`
+
+const retryClock = new Intl.DateTimeFormat('ko-KR', { hour: 'numeric', minute: '2-digit' })
+const retryDay = new Intl.DateTimeFormat('ko-KR', { month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+/**
+ * 회사가 준 "다시 쓸 수 있는 때"를 화면 글로. 숫자면 초(10^12 보다 크면 밀리초)로 읽고, 글이면 날짜로 읽는다.
+ * 지금보다 앞서거나 40일보다 먼 값은 단위를 잘못 읽었을 수 있어 보이지 않는다(클로드는 단위가 확인되지 않음, G18).
+ */
+function retryTimeText(value: number | string | null) {
+  if (value === null || value === undefined || value === '') return null
+  const ms = typeof value === 'number' ? (value > 1e12 ? value : value * 1000) : Date.parse(value)
+  if (!Number.isFinite(ms)) return null
+  const now = Date.now()
+  if (ms <= now || ms - now > 40 * 86_400_000) return null
+  const date = new Date(ms)
+  return new Date(now).toDateString() === date.toDateString() ? retryClock.format(date) : retryDay.format(date)
+}
 
 type ShortcutAction = 'back' | 'forward' | 'toggleList' | 'togglePanel' | 'search'
 
@@ -139,19 +137,23 @@ function shortcutFor(event: KeyboardEvent): ShortcutAction | null {
 
 function App() {
   const desktopRuntime = isDesktopRuntime()
-  const [welcomeStarted, setWelcomeStarted] = useState(false)
+  // 첫 실행 화면을 보일지(설치판과 개발용 앱 모두). 'checking' 동안은 빈 창만 둔다.
+  // 개발용 앱에서 작업 화면을 바로 볼 때는 VITE_MOMSO_OPEN_WORKBENCH=1 을 주고 개발 서버를 켠다.
+  const skipFirstRun = !desktopRuntime || (import.meta.env.DEV && import.meta.env.VITE_MOMSO_OPEN_WORKBENCH === '1')
+  const [firstRun, setFirstRun] = useState<FirstRunCheck | 'checking' | null>(skipFirstRun ? null : 'checking')
+  useEffect(() => {
+    if (skipFirstRun) return
+    let alive = true
+    void checkFirstRun().then((result) => { if (alive) setFirstRun(result.show ? result : null) })
+    return () => { alive = false }
+  }, [skipFirstRun])
   const [preferences, setPreferences] = useState(loadPreferences)
   const [session, setSession] = useState<RuntimeSession>(INITIAL_SESSION)
-  const [records, setRecords] = useState<WorkspaceRecord[]>(() => (
-    desktopRuntime ? [] : WORKSPACE_RECORDS
-  ))
   // 지금 화면: 홈(채팅방), 문서(읽는 글 모아 보기), 미디어, 설정.
   const [screen, setScreen] = useState<AppScreen>('home')
   const settingsOpen = screen === 'settings'
   // 미디어를 주는 백엔드(media_list)가 있는지. 없으면 미디어 단추는 눌리지 않는다.
   const [mediaAvailable, setMediaAvailable] = useState(false)
-  const [importOpen, setImportOpen] = useState(false)
-  const [importInitialMode, setImportInitialMode] = useState<ImportMode>('file')
 
   // 대화. selectedChatId 가 null 이면 새 대화를 쓰는 중이다(첫 말을 보낼 때 만들어진다).
   const [chats, setChats] = useState<ChatEntry[]>([])
@@ -164,6 +166,8 @@ function App() {
   const [pendingMessage, setPendingMessage] = useState<ChatViewMessage | null>(null)
   // 채팅방 고정·보관 명령이 있는지(앱을 열 때 알아본다).
   const [chatKeep, setChatKeep] = useState(false)
+  const stopChatListUpdated = useRef<(() => void) | null>(null)
+  useEffect(() => () => stopChatListUpdated.current?.(), [])
   const [generatingChatId, setGeneratingChatId] = useState<string | null>(null)
   const [prompt, setPrompt] = useState('')
   // 답이 오는 중이면 지금까지 온 글(chat-stream).
@@ -173,6 +177,11 @@ function App() {
   const [fastRefused, setFastRefused] = useState<Record<string, true>>({})
   // 마지막으로 보낸 곳(chat-error 의 fast_unavailable 이 어느 모델의 것인지 알려고).
   const lastSendRef = useRef<{ chatId: string; provider: AiProvider; model: string | null } | null>(null)
+  // 답이 오지 않은 채팅방마다 그 까닭(G18 chat-error 의 error)과 보냈던 글. 그 채팅방에서 다시 보내면 지운다.
+  const [chatFailures, setChatFailures] = useState<Record<string, { kind: string; retryAt: number | string | null; actions: string[]; provider: AiProvider; text: string }>>({})
+  const lastSentTextRef = useRef<{ chatId: string; text: string } | null>(null)
+  // 설정을 열 때 처음 보일 쪽(알림 줄의 "AI 연결 열기"면 'ai').
+  const [settingsStart, setSettingsStart] = useState<SettingsSection>('profile')
   const [models, setModels] = useState<ProviderModels[] | null>(null)
   // 모델 목록과 보낼 수 있는 곳을 읽었는지(앱을 연 직후 잠깐). 개발용 화면(데스크톱 밖)은 처음부터 됨.
   const [modelsReady, setModelsReady] = useState({ models: !desktopRuntime, sendable: !desktopRuntime })
@@ -187,15 +196,14 @@ function App() {
   const replacePlace = useRef(false)
   // 대화마다 적다 만 말. 다른 대화로 갔다 와도 남아 있다.
   const drafts = useRef(new Map<string, string>())
-  // chat_send 가 백엔드에 있는지. 처음 보낼 때 알게 된다.
-  const chatSendSupported = useRef<boolean | null>(null)
-  // 지금 보낼 수 있는 곳. 새 보내기(chat_send)가 있으면 세 곳, 없으면 예전 길로 부를 수 있는 Codex·Claude.
+  // 지금 보낼 수 있는 곳(chat_send 에 물어 안다). 알기 전에는 Codex·Claude.
   const [sendableProviders, setSendableProviders] = useState<AiProvider[]>(FALLBACK_PROVIDERS)
-  const generatingRef = useRef<{ chatId: string; via: 'send' | 'old' } | null>(null)
+  const generatingRef = useRef<{ chatId: string } | null>(null)
   // 채팅방이 길어져 앞의 내용을 줄여 담은 때(chat-compacted). 그 자리에 한 줄로 남는다(앱을 닫으면 사라짐).
   const [compactions, setCompactions] = useState<Array<{ id: string; chatId: string; at: number }>>([])
   // AI 가 허락을 구한 물음들. 대화마다 둔다(다른 대화로 갔다 와도 그대로 있다). 앱을 닫으면 사라진다.
   const [approvals, setApprovals] = useState<ApprovalItem[]>([])
+  const [secretRequests, setSecretRequests] = useState<SecretItem[]>([])
   // 지금 보이는 대화의 말 수(물음이 온 자리를 적어 두려고).
   const shownCountRef = useRef(0)
 
@@ -231,14 +239,13 @@ function App() {
   // 문서 화면에서는 같은 패널을 화면 가득 넓혀 글 목록과 글을 보인다(같은 목록이 두 번 보이지 않게 하나만 둔다).
   const panelShown = (zetPanelOpen && screen === 'home') || screen === 'documents'
   const zetPanelFrame = useZetPanelFrame(panelShown, listHidden)
-  const activeAiRequest = useRef<string | null>(null)
   const toastTimer = useRef<number | null>(null)
   const selectedChatRef = useRef<string | null>(null)
 
   // 그 채팅방에서 다룬 것을 다시 읽는다. 답이 끝났거나 백엔드가 바뀌었다고 알리면(fromEvent) 패널이 닫혀 있을 때 새로 생긴 것을 표시한다.
   const refreshChatItems = useCallback((chatId: string | null, fromEvent = false) => {
     if (!desktopRuntime || chatItemsSupported.current === false) return
-    if (!chatId) { if (chatItemsSupported.current) setChatItems({ documents: [], media: [] }); return }
+    if (!chatId) { if (chatItemsSupported.current) setChatItems(EMPTY_CHAT_ITEMS); return }
     getChatItems(chatId).then((next) => {
       chatItemsSupported.current = true
       if (chatId !== selectedChatRef.current) return
@@ -330,10 +337,7 @@ function App() {
     setSession((current) => ({ ...current, mode: 'starting', error: null }))
     const nextSession = await initializeRuntime()
     setSession(nextSession)
-    if (nextSession.mode !== 'ready') {
-      if (nextSession.mode === 'preview') setRecords(WORKSPACE_RECORDS)
-      return
-    }
+    if (nextSession.mode !== 'ready') return
 
     // 앱을 열면 가장 최근 대화를 연다. 대화가 없으면 새 대화(빈 칸)로 시작한다.
     const listed = await refreshChats()
@@ -347,23 +351,18 @@ function App() {
     void refreshGroups()
     // 채팅방 고정·보관 명령이 있는지(보관된 목록을 읽어 본다. 아무것도 바뀌지 않는다). 없으면 고정·보관 단추와 설정 쪽을 그리지 않는다.
     void listArchivedChats().then(() => setChatKeep(true)).catch((error) => setChatKeep(!isMissingCommand(error)))
+    // 고정·보관·되돌리기·삭제가 되면(다른 곳에서 바뀐 것도) 목록을 다시 읽는다.
+    if (!stopChatListUpdated.current) {
+      stopChatListUpdated.current = () => {}
+      void listenChatListUpdated(() => { void refreshChats() }).then((stop) => { stopChatListUpdated.current = stop })
+    }
     refreshSkills()
     void listMedia().then(() => setMediaAvailable(true)).catch((error) => setMediaAvailable(!isMissingMediaCommand(error)))
-    // 어느 AI 로 보낼 수 있는지 미리 안다(아무것도 저장되지 않는 물음). chat_send 가 없으면 예전 길의 두 곳.
+    // 어느 AI 로 보낼 수 있는지 미리 안다(아무것도 저장되지 않는 물음).
     void probeSendableProviders(['codex', 'claude', 'gemini']).then((sendable) => {
-      chatSendSupported.current = sendable !== null
       setSendableProviders(sendable ?? FALLBACK_PROVIDERS)
     }).finally(() => setModelsReady((current) => ({ ...current, sendable: true })))
-
-    try {
-      setRecords(await readStoredRecords())
-    } catch {
-      // 예전 기록을 읽지 못해도 대화는 쓸 수 있다. 가져오기 창의 같은 파일 알아보기만 빠진다.
-      setRecords([])
-    }
   }, [openChat, refreshChats])
-
-  const closeImport = useCallback(() => setImportOpen(false), [])
 
   useEffect(() => {
     void refreshRuntime()
@@ -374,13 +373,8 @@ function App() {
   }, [preferences])
 
   useEffect(() => () => {
-    if (activeAiRequest.current) void cancelAiAssistant(activeAiRequest.current)
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
   }, [])
-
-  function updatePreference<K extends keyof AppPreferences>(key: K, value: AppPreferences[K]) {
-    setPreferences((current) => ({ ...current, [key]: value }))
-  }
 
   const chatPlace: Place = selectedChatId ? `chat:${selectedChatId}` : 'new'
   const place: Place = screen === 'home' ? chatPlace : screen
@@ -405,7 +399,6 @@ function App() {
   // 그 곳을 보인다. 대화를 옮길 때 적다 만 말은 대화마다 남겨 둔다.
   function showPlace(next: Place) {
     if (next === 'settings' || next === 'documents' || next === 'media') {
-      setImportOpen(false)
       setScreen(next)
       return
     }
@@ -435,6 +428,15 @@ function App() {
   const canGoForward = history.index < history.places.length - 1
 
   // 설정 닫기: 설정에 오기 전 곳으로 돌아간다(뒤로와 같다).
+  // 설정을 떠나면 다음에 열 때는 처음 쪽(나에 대해)부터.
+  useEffect(() => { if (screen !== 'settings') setSettingsStart('profile') }, [screen])
+
+  /** 설정을 그 쪽으로 연다(채팅의 알림 줄에서). */
+  function openSettingsAt(section: SettingsSection) {
+    setSettingsStart(section)
+    showPlace('settings')
+  }
+
   function closeSettings() {
     if (canGoBack) moveInHistory(-1)
     else setScreen('home')
@@ -448,31 +450,39 @@ function App() {
     showPlace(next)
   }
 
-  // 가져오기 창이 만든 예전 기록. 화면에는 보이지 않는다(가져온 파일은 보관함의 원본으로도 남는다).
-  async function createRecords(nextRecords: WorkspaceRecord[]): Promise<WorkspaceRecord[]> {
-    if (nextRecords.length === 0) return []
-    let storedRecords = nextRecords
-    if (session.mode === 'ready') {
-      const createdRecords: WorkspaceRecord[] = []
-      try {
-        for (const record of nextRecords) {
-          const detail = await createRecord(workspaceRecordCreateInput(record))
-          createdRecords.push(workspaceRecordFromDetail(detail))
-        }
-      } catch (error) {
-        setRecords(await readStoredRecords().catch(() => records))
-        throw error
+  // 클립(또는 끌어 놓기)으로 고른 파일을 지금 채팅방에 첨부한다. 채팅방이 아직 없으면(새 채팅방) 보낼 때처럼 먼저 만든다
+  // (뒤쪽 chat_attach_asset 은 있는 채팅방에만 첨부된다). 첨부한 것은 오른쪽 패널의 "이 채팅방에서 다룬 것"에 보인다.
+  const attachingRef = useRef(false)
+  async function attachFiles(paths: string[]) {
+    if (paths.length === 0 || attachingRef.current) return
+    attachingRef.current = true
+    try {
+      let chatId = selectedChatId
+      if (!chatId) {
+        const created = await createChat()
+        chatId = created.id
+        selectedChatRef.current = chatId
+        replacePlace.current = true
+        setSelectedChatId(chatId)
+        setChat({ id: created.id, title: created.title, createdAt: created.createdAt, updatedAt: created.updatedAt, messages: [] })
+        rememberChatModel(created.id, chosen)
+        void refreshChats()
       }
-      storedRecords = createdRecords
-    } else if (desktopRuntime) {
-      throw new Error(session.error ?? W.app.text3)
+      const names: string[] = []
+      for (const path of paths) names.push(await attachFileToChat(chatId, path))
+      refreshChatItems(chatId, true)
+      showToast(names.length === 1 ? W.attach.done(names[0]) : W.attach.doneMany(names.length))
+    } catch (error) {
+      showToast(archiveErrorMessage(error, W.attach.failed))
+    } finally {
+      attachingRef.current = false
     }
+  }
 
-    setRecords((current) => [...storedRecords, ...current])
-    showToast(storedRecords.length === 1
-      ? W.app.text4(storedRecords[0].title)
-      : W.app.text5(storedRecords.length))
-    return storedRecords
+  async function pickAndAttach() {
+    const picked = await openDialog({ multiple: true }).catch(() => null)
+    const paths = Array.isArray(picked) ? picked : typeof picked === 'string' ? [picked] : []
+    await attachFiles(paths)
   }
 
   // 입력 칸 아래에서 고른 모델. 고른 적이 없으면 설정의 AI 곳의 기본 모델.
@@ -634,7 +644,7 @@ function App() {
         setCompactions((current) => [...current, { id: `${chatId}-${Date.now()}`, chatId, at }])
         refreshContext(chatId)
       },
-      onError: ({ chatId, reason, message, status }) => {
+      onError: ({ chatId, reason, message, status, error }) => {
         if (generatingRef.current?.chatId !== chatId) return
         if (status === 'fast_unavailable') {
           // 보낸 뒤 고속 모드를 쓸 수 없다고 왔다(보낸 말은 채팅방에 남고, 같은 글을 다시 보내면 백엔드가 그 말을 다시 쓴다).
@@ -644,7 +654,23 @@ function App() {
           return
         }
         const why = reason ?? message ?? ''
-        if (!String(why).includes('중단')) showToast(archiveErrorMessage(why, W.app.text7))
+        if (String(why).includes('중단') && !error) { finishGenerating(chatId); return }
+        // 까닭을 가른 값(G18)으로 채팅방 끝에 한 줄을 남긴다. 회사가 준 원문은 화면에 두지 않는다.
+        // 로그인이 풀린 것(status auth_failed)은 error 가 없던 예전 계약에서도 authentication 으로 본다. 그 밖에 값이 없으면 unknown.
+        const sent = lastSendRef.current
+        const sentText = lastSentTextRef.current?.chatId === chatId ? lastSentTextRef.current.text : ''
+        const kind = error?.kind ?? (status === 'auth_failed' ? 'authentication' : 'unknown')
+        setChatFailures((current) => ({
+          ...current,
+          [chatId]: {
+            kind,
+            retryAt: error?.retryAt ?? null,
+            actions: Array.isArray(error?.actions) ? error.actions : status === 'auth_failed' ? ['signIn', 'switchProvider'] : [],
+            provider: (sent?.chatId === chatId ? sent.provider : null) ?? 'codex',
+            text: sentText,
+          },
+        }))
+        // 오다가 끊긴 답은 뒤쪽이 저장해 두므로(messageId) finishGenerating 이 채팅방을 다시 읽어 그때까지 온 글을 보인다.
         finishGenerating(chatId)
       },
     }).then((unlisten) => {
@@ -687,6 +713,46 @@ function App() {
     }
   }, [desktopRuntime])
 
+  // 스킬로 하는 연결에서 키를 넣어 달라는 물음(agent-setup-secret-request)과 거두기. 채팅방 번호가 없으면 답을 쓰는 중인 대화에 둔다.
+  useEffect(() => {
+    if (!desktopRuntime) return
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenSecretRequests({
+      onRequest: (request) => {
+        const chatId = request.chatId ?? generatingRef.current?.chatId ?? selectedChatRef.current
+        const at = chatId && chatId === selectedChatRef.current ? shownCountRef.current : Number.MAX_SAFE_INTEGER
+        setSecretRequests((current) => (
+          current.some((item) => item.request.requestId === request.requestId)
+            ? current
+            : [...current, { request: { ...request, chatId }, at, status: 'pending', error: null }]
+        ))
+      },
+      onClosed: (requestId) => {
+        setSecretRequests((current) => current.filter((item) => item.request.requestId !== requestId || item.status !== 'pending'))
+      },
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [desktopRuntime])
+
+  /** values 가 null 이면 "그만두기"(agent_setup_secret_cancel). */
+  async function answerSecret(requestId: string, values: Record<string, string> | null) {
+    const update = (patch: Partial<SecretItem>) => setSecretRequests((current) => current.map((item) => (
+      item.request.requestId === requestId ? { ...item, ...patch } : item
+    )))
+    const item = secretRequests.find((entry) => entry.request.requestId === requestId)
+    if (!item) return
+    update({ status: 'sending', error: null })
+    try {
+      // 값은 여기서 바로 넘기고 어디에도 담지 않는다. 계약의 chatId 는 이벤트가 준 그대로(없으면 null).
+      if (values) await submitSecret({ requestId, chatId: item.request.chatId }, values)
+      else await cancelSecret({ requestId, chatId: item.request.chatId })
+      update({ status: values ? 'saved' : 'cancelled' })
+    } catch {
+      update({ status: 'pending', error: values ? W.secretRequest.failed : W.secretRequest.cancelFailed })
+    }
+  }
+
   async function answerApproval(requestId: string, choice: ApprovalChoice) {
     const update = (patch: Partial<ApprovalItem>) => setApprovals((current) => current.map((item) => (
       item.request.requestId === requestId ? { ...item, ...patch } : item
@@ -709,19 +775,21 @@ function App() {
   }
 
   // 말 보내기: 대화가 없으면 만들고 chat_send 로 보낸다(답은 이벤트로 온다).
-  // 백엔드에 chat_send 가 아직 없으면 예전 방식으로 보낸다(보낸 말을 붙이고, AI 를 부르고, 받은 답을 붙인다).
-  async function sendPrompt() {
-    const text = prompt.trim()
-    const skill = chosenSkill
+  async function sendPrompt(again?: string) {
+    // again: 알림 줄의 "다시 보내기"로 보낸 글을 그대로 다시 보낸다(입력창에 적던 글은 건드리지 않는다).
+    const text = again ?? prompt.trim()
+    const skill = again ? null : chosenSkill
     if ((!text && !skill) || generatingChatId || !sendReady) return
     const target = chosen
 
-    setPrompt('')
-    setChosenSkill(null)
+    if (!again) {
+      setPrompt('')
+      setChosenSkill(null)
+    }
     // 답을 받지 못한 마지막 말과 같은 글을 다시 보내면 백엔드가 그 말을 다시 쓸 수 있다(고속 모드 실패 뒤). 그때는 같은 말을 한 번 더 그리지 않는다.
     const last = chat && chat.id === selectedChatId ? chat.messages[chat.messages.length - 1] : undefined
     const resending = last?.role === 'user' && last.text === text
-    setPendingMessage(resending ? null : { id: `pending-${Date.now()}`, role: 'user', text, skill: skill?.title ?? null })
+    setPendingMessage(resending ? null : { id: `pending-${Date.now()}`, role: 'user', text, skill: skill?.title ?? null, createdAt: new Date().toISOString() })
     const giveBack = (error: unknown, fallback: string) => {
       setPendingMessage(null)
       setPrompt(text)
@@ -746,125 +814,81 @@ function App() {
       return
     }
     const targetId = chatId
+    lastSentTextRef.current = { chatId: targetId, text }
+    setChatFailures((current) => {
+      if (!current[targetId]) return current
+      const next = { ...current }
+      delete next[targetId]
+      return next
+    })
 
-    if (chatSendSupported.current !== false) {
-      generatingRef.current = { chatId: targetId, via: 'send' }
-      setGeneratingChatId(targetId)
-      setStreamText('')
-      try {
-        const targetModel = models?.find((list) => list.provider === target.provider)?.models.find((model) => model.id === target.model)
-        const refused = Boolean(fastRefused[`${target.provider}:${target.model ?? ''}`])
-        lastSendRef.current = { chatId: targetId, provider: target.provider, model: target.model }
-        const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null)
-        chatSendSupported.current = true
-        if (result?.status === 'skill_unavailable') {
-          // 고른 스킬이 그사이 꺼졌거나 없어졌다(말은 저장되지 않았다). 적은 말은 돌려놓고, 쓸 수 없는 스킬 조각은 빼고, 목록을 새로 읽는다.
-          generatingRef.current = null
-          setGeneratingChatId(null)
-          giveBack(null, W.skills.unavailable)
-          setChosenSkill(null)
-          refreshSkills()
-          return
-        }
-        if (result?.status === 'fast_unavailable') {
-          // 보내기 전에 고속 모드를 쓸 수 없다고 확인됐다(말은 저장되지 않았다). 오류 이벤트와 같게 알리고, 적은 말을 돌려놓는다.
-          generatingRef.current = null
-          setGeneratingChatId(null)
-          setPendingMessage(null)
-          setPrompt(text)
-          setChosenSkill(skill)
-          refuseFast(lastSendRef.current)
-          return
-        }
-        if (result?.status === 'unavailable' || result?.status === 'not_connected') {
-          // 이 AI 로는 보낼 수 없다(클로드가 연결되지 않은 not_connected 도 같다. 말은 저장되지 않았다). 고를 수 없게 하고 적은 말을 돌려놓는다(글 없음).
-          generatingRef.current = null
-          setGeneratingChatId(null)
-          setPendingMessage(null)
-          setPrompt(text)
-          setSendableProviders((current) => current.filter((provider) => provider !== target.provider))
-          return
-        }
-        // 보낸 말은 백엔드가 대화에 붙였다. 목록과 맨 위 줄을 새로 읽는다.
-        void refreshChats()
-        void readChat(targetId).then((document) => {
-          if (selectedChatRef.current !== targetId) return
-          setChat(document)
-          setPendingMessage(null)
-        }).catch(() => {})
-        return
-      } catch (error) {
+    // 보내기는 chat_send 하나로 한다(예전 길: chat_append + run_ai_assistant 는 2026-11-16 없앰). 답은 이벤트로 온다.
+    generatingRef.current = { chatId: targetId }
+    setGeneratingChatId(targetId)
+    setStreamText('')
+    try {
+      const targetModel = models?.find((list) => list.provider === target.provider)?.models.find((model) => model.id === target.model)
+      const refused = Boolean(fastRefused[`${target.provider}:${target.model ?? ''}`])
+      lastSendRef.current = { chatId: targetId, provider: target.provider, model: target.model }
+      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null)
+      if (result?.status === 'skill_unavailable') {
+        // 고른 스킬이 그사이 꺼졌거나 없어졌다(말은 저장되지 않았다). 적은 말은 돌려놓고, 쓸 수 없는 스킬 조각은 빼고, 목록을 새로 읽는다.
         generatingRef.current = null
         setGeneratingChatId(null)
-        if (!isMissingCommand(error)) {
-          giveBack(error, W.app.text10)
-          return
-        }
-        chatSendSupported.current = false
+        giveBack(null, W.skills.unavailable)
+        setChosenSkill(null)
+        refreshSkills()
+        return
       }
-    }
-
-    // 예전 방식은 Codex 와 Claude 만 부를 수 있다(Gemini 는 고를 수 없게 되어 있다).
-    if (target.provider === 'gemini') {
-      setPendingMessage(null)
-      setPrompt(text)
-      return
-    }
-
-    try {
-      const userMessage = await appendChatMessage(targetId, 'user', text)
-      setPendingMessage(null)
-      setChat((current) => (current && current.id === targetId ? { ...current, messages: [...current.messages, userMessage] } : current))
-    } catch (error) {
-      giveBack(error, W.app.text9)
-      return
-    }
-
-    // 이름이 비어 있었으면 백엔드가 첫 말로 이름을 붙였다. 목록과 맨 위 줄을 새로 읽는다.
-    void refreshChats()
-    void readChat(targetId).then((document) => {
-      if (selectedChatRef.current === targetId) setChat(document)
-    }).catch(() => {})
-
-    generatingRef.current = { chatId: targetId, via: 'old' }
-    setGeneratingChatId(targetId)
-    const requestId = crypto.randomUUID()
-    activeAiRequest.current = requestId
-    try {
-      const response = await runAiAssistant({
-        requestId,
-        provider: target.provider,
-        authMode: preferences.assistantAuthMode,
-        workflow: 'ask',
-        responseDensity: preferences.responseDensity,
-        prompt: text,
-        recordContext: null,
-      })
-      const reply = await appendChatMessage(targetId, 'assistant', response.text, target.provider, response.usage?.model ?? target.model)
-      setChat((current) => (current && current.id === targetId ? { ...current, messages: [...current.messages, reply] } : current))
+      if (result?.status === 'auth_failed') {
+        // 보내기 전에 그 회사의 로그인이 받아들여지지 않았다(말은 저장되지 않았다). 적은 말을 돌려놓고 알린다.
+        generatingRef.current = null
+        setGeneratingChatId(null)
+        setPendingMessage(null)
+        setPrompt(text)
+        setChosenSkill(skill)
+        showToast(W.app.authFailed(PROVIDER_NAME[target.provider]))
+        return
+      }
+      if (result?.status === 'fast_unavailable') {
+        // 보내기 전에 고속 모드를 쓸 수 없다고 확인됐다(말은 저장되지 않았다). 오류 이벤트와 같게 알리고, 적은 말을 돌려놓는다.
+        generatingRef.current = null
+        setGeneratingChatId(null)
+        setPendingMessage(null)
+        setPrompt(text)
+        setChosenSkill(skill)
+        refuseFast(lastSendRef.current)
+        return
+      }
+      if (result?.status === 'unavailable' || result?.status === 'not_connected') {
+        // 이 AI 로는 보낼 수 없다(클로드가 연결되지 않은 not_connected 도 같다. 말은 저장되지 않았다). 고를 수 없게 하고 적은 말을 돌려놓는다(글 없음).
+        generatingRef.current = null
+        setGeneratingChatId(null)
+        setPendingMessage(null)
+        setPrompt(text)
+        setSendableProviders((current) => current.filter((provider) => provider !== target.provider))
+        return
+      }
+      // 보낸 말은 백엔드가 대화에 붙였다. 목록과 맨 위 줄을 새로 읽는다.
       void refreshChats()
+      void readChat(targetId).then((document) => {
+        if (selectedChatRef.current !== targetId) return
+        setChat(document)
+        setPendingMessage(null)
+      }).catch(() => {})
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      if (!message.includes('중단')) showToast(archiveErrorMessage(error, W.app.text7))
-    } finally {
-      if (activeAiRequest.current === requestId) activeAiRequest.current = null
-      if (generatingRef.current?.chatId === targetId) generatingRef.current = null
+      generatingRef.current = null
       setGeneratingChatId(null)
+      giveBack(error, W.app.text10)
     }
   }
 
   function stopResponse() {
     const running = generatingRef.current
-    if (running?.via === 'send') {
-      // 멈추면 백엔드가 chat-error(또는 chat-done)를 보낸다. 오지 않아도 화면은 바로 멈춘다.
-      void cancelChatMessage(running.chatId).catch(() => {})
-      finishGenerating(running.chatId)
-      return
-    }
-    if (activeAiRequest.current) void cancelAiAssistant(activeAiRequest.current)
-    activeAiRequest.current = null
-    generatingRef.current = null
-    setGeneratingChatId(null)
+    if (!running) return
+    // 멈추면 백엔드가 chat-error(또는 chat-done)를 보낸다. 오지 않아도 화면은 바로 멈춘다.
+    void cancelChatMessage(running.chatId).catch(() => {})
+    finishGenerating(running.chatId)
   }
 
   async function renameCurrentChat(title: string) {
@@ -893,35 +917,27 @@ function App() {
     }
   }
 
-  async function createBackup() {
-    if (session.mode === 'ready') return createRuntimeBackup()
-
-    const fileName = `momso-local-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
-    const snapshot = JSON.stringify({
-      createdAt: new Date().toISOString(),
-      version: session.info?.appVersion ?? '0.1.0',
-      preferences,
-      records,
-    }, null, 2)
-    const url = URL.createObjectURL(new Blob([snapshot], { type: 'application/json' }))
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = fileName
-    anchor.click()
-    URL.revokeObjectURL(url)
-    return fileName
-  }
-
   function toggleList() {
     setListHidden((current) => !current)
     setListMoving(true)
     window.setTimeout(() => setListMoving(false), 300)
   }
 
-  function openImport() {
-    setImportInitialMode('file')
-    setImportOpen(true)
-  }
+  // 창에 파일을 끌어 놓으면 클립과 같게 지금 채팅방에 첨부한다(채팅방 화면일 때만).
+  const attachDropRef = useRef<(paths: string[]) => void>(() => {})
+  attachDropRef.current = (paths) => { if (screen === 'home' && !settingsOpen) void attachFiles(paths) }
+  useEffect(() => {
+    if (!desktopRuntime) return
+    let stop: (() => void) | undefined
+    let disposed = false
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === 'drop' && event.payload.paths.length > 0) attachDropRef.current(event.payload.paths)
+      })
+      .then((unlisten) => { if (disposed) unlisten(); else stop = unlisten })
+      .catch(() => { /* 끌어 놓기를 못 받아도 클립으로 같은 일을 한다 */ })
+    return () => { disposed = true; stop?.() }
+  }, [desktopRuntime])
 
   // 오른쪽 패널을 여닫는 단추는 화면에 하나만 둔다. 패널이 닫혀 있으면 대화 칸(또는 설정) 맨 위 줄의 오른쪽 끝에,
   // 열려 있으면 패널의 탭 줄 끝에 있다.
@@ -1004,6 +1020,24 @@ function App() {
     return found?.fast?.label?.trim() || null
   }
 
+  // 답이 오지 않았을 때의 한 줄(G18): 까닭마다 쉬운 말, 회사가 다시 쓸 수 있는 때를 주면 그 때, 지금 할 수 있는 일을 단추로.
+  const failureView = (() => {
+    const failure = selectedChatId ? chatFailures[selectedChatId] : undefined
+    if (!failure) return null
+    const name = PROVIDER_NAME[failure.provider]
+    const base = failure.kind === 'authentication' ? W.app.authFailed(name) : W.app.failure[failure.kind]?.(name) ?? W.app.text7
+    const when = retryTimeText(failure.retryAt)
+    const text = when && (failure.kind === 'usageLimit' || failure.kind === 'rateLimited') ? `${base} ${W.app.retryAt(when)}` : base
+    const actions: Array<{ id: string; label: string; run: () => void }> = []
+    const has = (...ids: string[]) => ids.some((id) => failure.actions.includes(id))
+    if (has('retry') && failure.text) actions.push({ id: 'retry', label: W.app.failureAction.retry, run: () => void sendPrompt(failure.text) })
+    if (has('signIn', 'checkApiKey', 'checkBilling', 'install')) actions.push({ id: 'settings', label: W.app.failureAction.settings, run: () => openSettingsAt('ai') })
+    if (has('switchModel')) actions.push({ id: 'switchModel', label: W.app.failureAction.switchModel, run: () => window.dispatchEvent(new CustomEvent('momso:open-picker', { detail: 'model' })) })
+    if (has('shorten')) actions.push({ id: 'shorten', label: W.app.failureAction.shorten, run: () => startNewChat() })
+    if (has('switchProvider')) actions.push({ id: 'switchProvider', label: W.app.failureAction.switchProvider, run: () => window.dispatchEvent(new CustomEvent('momso:open-picker', { detail: 'company' })) })
+    return { text, actions }
+  })()
+
   const shownChat = chat && chat.id === selectedChatId ? chat : null
   const messages: ChatViewMessage[] = [
     ...(shownChat?.messages ?? []).map((message) => ({
@@ -1012,21 +1046,39 @@ function App() {
       text: message.text,
       provider: message.role === 'assistant' ? message.provider ?? null : null,
       // 고속 모드는 확인된 true 일 때만, 넘기지 못한 말은 1 이상일 때만 적는다(null 이면 아무것도 적지 않는다).
-      modelLabel: [findModelName(models, message.provider, message.model), message.fast === true ? fastLabelOf(message.provider, message.model) : null].filter(Boolean).join(' · ') || null,
+      // 실제로 쓰인 추론 수준(actualEffort)은 확인된 값이 올 때만 적는다(T43, 제미나이는 오지 않는다).
+      modelLabel: [
+        findModelName(models, message.provider, message.model),
+        message.actualEffort && message.provider ? effortKorean(message.provider, message.actualEffort, message.actualEffort)?.label ?? message.actualEffort : null,
+        // 실제 고속 상태(fastState, 세 회사 계약): on 일 때만 적는다. 옛 답은 fastState 가 없어 예전 값(fast === true)을 본다.
+        (message.fastState === 'on' || (message.fastState == null && message.fast === true)) ? fastLabelOf(message.provider, message.model) : null,
+      ].filter(Boolean).join(' · ') || null,
+      endReason: message.role === 'assistant' && message.finishReason && message.finishReason !== 'completed' ? message.finishReason : null,
       notHandedOver: typeof message.notHandedOver === 'number' && message.notHandedOver > 0 ? message.notHandedOver : 0,
       skill: message.skill ? skills?.find((item) => item.name === message.skill)?.title ?? message.skill : null,
+      createdAt: message.createdAt,
     })),
     ...(pendingMessage ? [pendingMessage] : []),
   ]
   shownCountRef.current = messages.length
   // 물음이 온 대화(아직 저장 전인 새 대화면 null)와 지금 보는 대화가 같으면 보인다.
   const chatApprovals = approvals.filter((item) => item.chatId === selectedChatId)
-  const waitingChatIds = [...new Set(approvals.filter((item) => item.status !== 'answered' && item.chatId).map((item) => item.chatId as string))]
+  const chatSecrets = secretRequests.filter((item) => item.request.chatId === selectedChatId)
+  const waitingChatIds = [...new Set([
+    ...approvals.filter((item) => item.status !== 'answered' && item.chatId).map((item) => item.chatId as string),
+    ...secretRequests.filter((item) => (item.status === 'pending' || item.status === 'sending') && item.request.chatId).map((item) => item.request.chatId as string),
+  ])]
 
-  // 개발용 앱은 첫 실행 화면만 보여 준다. 작업 화면을 개발용 앱에서 확인할 때는
-  // VITE_MOMSO_OPEN_WORKBENCH=1 을 주고 개발 서버를 켠다(기본 동작은 그대로다).
-  if (import.meta.env.DEV && desktopRuntime && import.meta.env.VITE_MOMSO_OPEN_WORKBENCH !== '1') {
-    return <div className="desktop-shell has-window-titlebar"><WindowTitlebar appearance="welcome" />{welcomeStarted ? <AiWelcome /> : <FirstLaunch onStart={() => setWelcomeStarted(true)} />}</div>
+  // 첫 실행: 몸소 첫 화면 → 영어 사용자 이름 → AI 하나 이상 연결(건너뛸 수 없음). 이미 쓰던 사람에게는 뜨지 않는다(first-run.ts).
+  if (firstRun) {
+    return (
+      <div className="desktop-shell has-window-titlebar">
+        <WindowTitlebar appearance="welcome" />
+        {firstRun === 'checking'
+          ? <main className="first-run" aria-busy="true" />
+          : <FirstRun username={firstRun.username} nameStep={firstRun.nameStep} onDone={() => setFirstRun(null)} />}
+      </div>
+    )
   }
 
   return (
@@ -1035,6 +1087,7 @@ function App() {
         <WindowTitlebar
           listHidden={listHidden}
           onToggleList={toggleList}
+          onOpenSearch={() => setSearchOpen(true)}
           canGoBack={canGoBack}
           canGoForward={canGoForward}
           onBack={() => moveInHistory(-1)}
@@ -1065,23 +1118,16 @@ function App() {
           <MediaView onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }} />
         ) : settingsOpen ? (
           <SettingsView
+            key={settingsStart}
+            initialSection={settingsStart}
             headerActions={zetPanelToggle}
-            preferences={preferences}
-            session={session}
-            onPreferenceChange={updatePreference}
             onClose={closeSettings}
             onOpenDataRoot={() => void openDataRoot()}
-            onCreateBackup={createBackup}
             update={update}
             skills={skills}
             onSkillsChanged={refreshSkills}
             archivedChats={chatKeep}
             onChatsChanged={() => void refreshChats()}
-            onOpenAiImport={() => {
-              closeSettings()
-              setImportInitialMode('ai')
-              setImportOpen(true)
-            }}
           />
         ) : (
           <>
@@ -1114,12 +1160,12 @@ function App() {
               }}
               onRemoveGroup={(id) => void changeGroups(() => removeChatGroup(id), W.app.text20(GROUP_WORD))}
               onSetGroup={(chatId, groupId) => void changeGroups(() => setChatGroup(chatId, groupId), W.app.text21(GROUP_WORD))}
-              onOpenSearch={() => setSearchOpen(true)}
               onPinChat={chatKeep ? (chatId, pinned) => void pinChat(chatId, pinned) : undefined}
               onArchiveChat={chatKeep ? (chatId) => void keepChatAway(chatId) : undefined}
               busyChatId={generatingChatId}
             />
             <AssistantPanel
+              failure={failureView}
               headerActions={zetPanelToggle}
               title={shownChat?.title ?? ''}
               canRename={Boolean(shownChat)}
@@ -1130,6 +1176,9 @@ function App() {
               approvals={chatApprovals}
               notices={compactions.filter((item) => item.chatId === selectedChatId).map((item) => ({ id: item.id, at: item.at, text: W.app.text22 }))}
               onAnswerApproval={(requestId, choice) => void answerApproval(requestId, choice)}
+              secretRequests={chatSecrets}
+              onSubmitSecret={(requestId, values) => void answerSecret(requestId, values)}
+              onCancelSecret={(requestId) => void answerSecret(requestId, null)}
               onOpenDocument={(id) => {
                 // 오른쪽 패널을 열고 그 문서를 탭으로 연다.
                 setZetPanelOpen(true)
@@ -1146,7 +1195,7 @@ function App() {
                   onSkillChange={setChosenSkill}
                   sendReady={sendReady}
                   onStop={stopResponse}
-                  onAttach={openImport}
+                  onAttach={() => void pickAndAttach()}
                   models={models}
                   fallbackProviders={FALLBACK_PROVIDERS}
                   sendableProviders={sendableProviders}
@@ -1158,6 +1207,7 @@ function App() {
                   fastRefused={Boolean(fastRefused[`${chosen.provider}:${chosen.model ?? ''}`])}
                   permission={permission}
                   onPermissionChange={(mode) => void changePermission(mode)}
+                  onVoiceProblem={showToast}
                   context={selectedChatId ? chatContext : null}
                 />
               )}
@@ -1203,17 +1253,9 @@ function App() {
           onClose={() => setSearchOpen(false)}
           onOpenChat={(id) => showPlace(`chat:${id}`)}
           onOpenDocument={openDocumentAnywhere}
+          onOpenMedia={() => showPlace('media')}
         />
       )}
-
-      <ImportDialog
-        open={importOpen}
-        initialMode={importInitialMode}
-        preferences={preferences}
-        records={records}
-        onClose={closeImport}
-        onCreateMany={createRecords}
-      />
 
       {(toast || session.error) && (
         <div className="workbench-toast" role="status">

@@ -1,4 +1,4 @@
-use crate::{connections, credentials, process, usage_status};
+use crate::{chat_claude, connections, credentials, gemini_access, process, usage_status};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -46,17 +46,82 @@ fn key_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
+fn gemini_connection_state(installed: bool, key_saved: Option<bool>) -> &'static str {
+    if !installed {
+        return "unavailable";
+    }
+    match key_saved {
+        Some(true) => "apiKey",
+        Some(false) => "signedOut",
+        None => "unavailable",
+    }
+}
+
+fn gemini_key_status(key: Option<&str>) -> (bool, Option<bool>) {
+    match key {
+        Some(value) => (true, Some(!value.trim().is_empty())),
+        None => (false, Some(false)),
+    }
+}
+
+fn claude_connection_state(success: bool, value: &serde_json::Value) -> &'static str {
+    if value.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(false) {
+        "signedOut"
+    } else if success
+        && value.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(true)
+        && value.get("authMethod").and_then(serde_json::Value::as_str) == Some("claude.ai")
+    {
+        "account"
+    } else {
+        "unavailable"
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderStatus {
     provider: &'static str,
-    installed: bool,
-    state: &'static str,
+    pub(crate) installed: bool,
+    pub(crate) state: &'static str,
     account_label: Option<String>,
     plan_label: Option<String>,
-    api_key_saved: bool,
+    pub(crate) api_key_saved: bool,
     methods: Vec<&'static str>,
-    active: Option<&'static str>,
+    pub(crate) active: Option<&'static str>,
+}
+
+pub(crate) fn chat_auth_method(
+    provider: &str,
+    installed: bool,
+    state: &str,
+    active: Option<&str>,
+    key_saved: bool,
+    requested: Option<&str>,
+) -> Result<&'static str, &'static str> {
+    if !installed {
+        return Err("unavailable");
+    }
+    match provider {
+        "gemini" => match requested {
+            None | Some("apiKey") => Ok("apiKey"),
+            _ => Err("unavailable"),
+        },
+        "claude" => match requested.or(active) {
+            Some("account") if state == "account" => Ok("account"),
+            Some("apiKey") => Ok("apiKey"),
+            None | Some("account") => Err("not_connected"),
+            _ => Err("unavailable"),
+        },
+        "codex" => match (requested, active) {
+            (None, Some("account")) | (Some("account"), Some("account")) => Ok("account"),
+            (None, Some("apiKey")) => Ok("apiKey"),
+            (Some("apiKey"), _) if key_saved => Ok("apiKey"),
+            (Some("apiKey"), _) => Err("not_connected"),
+            (None | Some("account"), None) if state == "signedOut" => Err("not_connected"),
+            _ => Err("unavailable"),
+        },
+        _ => Err("unavailable"),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -65,7 +130,7 @@ struct Change<'a> {
     state: &'static str,
 }
 
-fn notify(app: &AppHandle, provider: &str, state: &'static str) {
+pub(crate) fn notify(app: &AppHandle, provider: &str, state: &'static str) {
     let _ = app.emit("provider-auth-changed", Change { provider, state });
 }
 
@@ -86,22 +151,25 @@ async fn run_login_tool(
     .await
 }
 
-async fn read_status(provider: &'static str) -> ProviderStatus {
-    let mut installed = process::resolve_interactive_tool(if provider == "gemini" {
-        "agy"
+pub(crate) async fn read_status(provider: &'static str) -> ProviderStatus {
+    let installed = if provider == "gemini" {
+        gemini_access::executable().is_some()
+    } else if provider == "claude" {
+        chat_claude::executable().is_some()
     } else {
-        provider
-    })
-    .is_some();
-    if provider == "gemini" && !installed {
-        installed = std::env::var_os("LOCALAPPDATA")
-            .map(std::path::PathBuf::from)
-            .is_some_and(|base| base.join("agy").join("bin").join("agy.exe").is_file());
-    }
-    let api_key_saved = key_provider(provider)
-        .and_then(|p| credentials::ai_key_name(p).ok())
-        .and_then(|name| credentials::has_secret(name).ok())
-        .unwrap_or(false);
+        process::resolve_interactive_tool(provider).is_some()
+    };
+    let (api_key_saved, key_usable) = if provider == "gemini" {
+        match credentials::ai_key_name("gemini").and_then(credentials::get_secret) {
+            Ok(key) => gemini_key_status(key.as_deref()),
+            Err(_) => (false, None),
+        }
+    } else {
+        let saved = key_provider(provider)
+            .and_then(|p| credentials::ai_key_name(p).ok())
+            .and_then(|name| credentials::has_secret(name).ok());
+        (saved == Some(true), saved)
+    };
     let mut status = ProviderStatus {
         provider,
         installed,
@@ -110,13 +178,17 @@ async fn read_status(provider: &'static str) -> ProviderStatus {
         plan_label: None,
         api_key_saved,
         methods: if provider == "gemini" {
-            vec![]
+            vec!["apiKey"]
         } else {
             vec!["account", "apiKey"]
         },
         active: None,
     };
-    if !installed || provider == "gemini" {
+    if provider == "gemini" {
+        status.state = gemini_connection_state(installed, key_usable);
+        return status;
+    }
+    if !installed {
         return status;
     }
     if provider == "codex" {
@@ -161,17 +233,9 @@ async fn read_status(provider: &'static str) -> ProviderStatus {
         .await;
         if let Ok(output) = result {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&output.stdout) {
-                if value.get("loggedIn").and_then(|v| v.as_bool()) == Some(false) {
-                    status.state = "signedOut";
-                } else if value.get("loggedIn").and_then(|v| v.as_bool()) == Some(true) {
-                    let method = value.get("authMethod").and_then(|v| v.as_str());
-                    if method == Some("claude.ai") {
-                        status.state = "account";
-                        status.active = Some("account");
-                    } else if method == Some("api_key") {
-                        status.state = "apiKey";
-                        status.active = Some("apiKey");
-                    }
+                status.state = claude_connection_state(output.success, &value);
+                if status.state == "account" {
+                    status.active = Some("account");
                     status.account_label = value
                         .get("email")
                         .and_then(|v| v.as_str())
@@ -179,6 +243,13 @@ async fn read_status(provider: &'static str) -> ProviderStatus {
                 }
             }
         }
+    }
+    if matches!(provider, "codex" | "claude")
+        && status.state == "signedOut"
+        && key_usable == Some(true)
+    {
+        status.state = "apiKey";
+        status.active = Some("apiKey");
     }
     status
 }
@@ -288,7 +359,7 @@ pub(crate) fn provider_api_key_set(
     let Some(name) = key_provider(&provider) else {
         return "unavailable";
     };
-    if api_key.trim().len() < 20 || api_key.trim().chars().any(char::is_whitespace) {
+    if !valid_api_key_shape(&api_key) {
         return "invalidKey";
     }
     if connections::save_api_key(name, &api_key).is_err() {
@@ -296,6 +367,10 @@ pub(crate) fn provider_api_key_set(
     }
     notify(&app, &provider, "keySaved");
     "keySaved"
+}
+
+fn valid_api_key_shape(api_key: &str) -> bool {
+    api_key.trim().len() >= 20 && !api_key.trim().chars().any(char::is_whitespace)
 }
 
 #[tauri::command]
@@ -312,7 +387,89 @@ pub(crate) fn provider_api_key_clear(app: AppHandle, provider: String) -> &'stat
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gemini_key_shape_rejects_invalid_without_contacting_provider() {
+        assert!(!super::valid_api_key_shape("fake-short"));
+        assert!(!super::valid_api_key_shape("fake-key-with a-space-123456"));
+        assert!(super::valid_api_key_shape(
+            "fake-key-invalid-but-long-enough"
+        ));
+    }
     use super::*;
+    #[test]
+    fn chat_auth_choices_and_absent_tools_have_consistent_states() {
+        for provider in ["codex", "claude", "gemini"] {
+            assert_eq!(
+                chat_auth_method(provider, false, "unavailable", None, false, None),
+                Err("unavailable")
+            );
+            assert_eq!(
+                chat_auth_method(provider, true, "signedOut", None, false, Some("invalid")),
+                Err("unavailable")
+            );
+        }
+        for provider in ["codex", "claude"] {
+            assert_eq!(
+                chat_auth_method(provider, true, "account", Some("account"), true, None),
+                Ok("account")
+            );
+            assert_eq!(
+                chat_auth_method(
+                    provider,
+                    true,
+                    "account",
+                    Some("account"),
+                    true,
+                    Some("apiKey")
+                ),
+                Ok("apiKey")
+            );
+            assert_eq!(
+                chat_auth_method(provider, true, "signedOut", None, false, None),
+                Err("not_connected")
+            );
+        }
+        assert_eq!(
+            chat_auth_method("gemini", true, "signedOut", None, false, Some("account")),
+            Err("unavailable")
+        );
+        assert_eq!(
+            chat_auth_method("gemini", true, "signedOut", None, false, None),
+            Ok("apiKey")
+        );
+    }
+    #[test]
+    fn gemini_requires_both_cli_and_saved_key_to_be_connected() {
+        assert_eq!(gemini_connection_state(false, Some(true)), "unavailable");
+        assert_eq!(gemini_connection_state(false, Some(false)), "unavailable");
+        assert_eq!(gemini_connection_state(true, Some(true)), "apiKey");
+        assert_eq!(gemini_connection_state(true, Some(false)), "signedOut");
+        assert_eq!(gemini_connection_state(true, None), "unavailable");
+        assert_eq!(gemini_key_status(Some("  ")), (true, Some(false)));
+        assert_eq!(gemini_key_status(Some("fake-key")), (true, Some(true)));
+        assert_eq!(gemini_key_status(None), (false, Some(false)));
+    }
+    #[test]
+    fn claude_status_matches_the_auth_modes_chat_can_use() {
+        use serde_json::json;
+        assert_eq!(
+            claude_connection_state(true, &json!({"loggedIn":true,"authMethod":"claude.ai"})),
+            "account"
+        );
+        assert_eq!(
+            claude_connection_state(false, &json!({"loggedIn":true,"authMethod":"claude.ai"})),
+            "unavailable"
+        );
+        assert_eq!(
+            claude_connection_state(true, &json!({"loggedIn":true,"authMethod":"api_key"})),
+            "unavailable"
+        );
+        assert_eq!(
+            claude_connection_state(false, &json!({"loggedIn":false})),
+            "signedOut"
+        );
+        assert_eq!(claude_connection_state(true, &json!({})), "unavailable");
+    }
     #[cfg(windows)]
     fn count_test_key<R: std::io::Read>(mut input: R, secret: &[u8]) -> std::io::Result<usize> {
         let mut matches = 0usize;

@@ -2,8 +2,8 @@
 // 백엔드가 들어오면 momso-public-prep/archive-backend-port-notes.md 의 사용량 절과 견준다.
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { isMissingCommand } from './ai-models'
 import { isDesktopRuntime } from './runtime'
+import { W } from './words'
 
 export type UsageProvider = 'codex' | 'claude' | 'gemini'
 
@@ -42,15 +42,13 @@ export type ProviderUsage = {
   provider: UsageProvider
   /** ok: 읽었다, not_connected: 연결하지 않았다, unavailable: 연결했지만 사용량을 읽을 수 없다. */
   state: 'ok' | 'not_connected' | 'unavailable'
-  /** 백엔드가 주는 까닭 칸. 화면에는 내보이지 않는다(SCREEN_RULES 1절). */
+  /** 백엔드가 주는 까닭 값(G18, 화면 문장이 아님). 단추의 풍선에 쉬운 말로 보인다(usageReason). */
   reason: string | null
   windows: UsageWindow[]
   plan: string | null
   /** 알아보기 쉬운 요금제 이름(백엔드가 아는 것만). 없으면 요금제를 보이지 않는다. */
   planLabel?: string | null
   checkedAt: string | null
-  /** 개발용 보기 숫자인지(화면 안에서만 쓰는 표시, 백엔드는 보내지 않는다). 보기 숫자는 저장하지 않는다. */
-  sample?: boolean
 }
 
 /** 읽는 데 시간이 걸리는 곳(백엔드가 그 회사의 CLI 에 물어 읽는다). 마우스를 올리면 새로 읽는다. */
@@ -58,17 +56,8 @@ export const SLOW_PROVIDERS: UsageProvider[] = ['claude', 'gemini']
 
 export async function getUsageStatus(): Promise<ProviderUsage[]> {
   if (!isDesktopRuntime()) throw new Error('usage_status needs the desktop runtime')
-  let result: ProviderUsage[]
-  try {
-    result = await invoke<ProviderUsage[]>('usage_status')
-  } catch (error) {
-    // 개발용 실행에서 백엔드에 usage_status 가 아예 없을 때: 세 곳 모두 보기 숫자.
-    if (import.meta.env.DEV && isMissingCommand(error)) return PROVIDER_IDS.map(devSample)
-    throw error
-  }
-  if (!import.meta.env.DEV) return result
-  // 개발용 실행에서는 곳 단위로 가른다: unavailable 로 오는 곳만 보기 숫자, ok 와 not_connected 는 받은 그대로.
-  return result.map((item) => (item.state === 'unavailable' ? devSample(item.provider) : item))
+  // 받은 그대로 그린다(개발용 실행도 같다). 읽지 못한 곳(unavailable)에 숫자를 지어 넣지 않는다(2026-11-16 그의 말: 화면에 임시·시험용 표시 없음).
+  return invoke<ProviderUsage[]>('usage_status')
 }
 
 /**
@@ -76,11 +65,6 @@ export async function getUsageStatus(): Promise<ProviderUsage[]> {
  * (Claude·Gemini 는 백엔드가 뒤에서 읽고 다 되면 usage-updated 로 알린다).
  */
 export async function readUsageNow(provider: UsageProvider) {
-  if (import.meta.env.DEV && devSampled.has(provider)) {
-    // 보기 숫자: 읽는 시간을 흉내 낸 뒤 70% 남음에서 40% 남음으로 내려간다. 앱을 새로 고치면 다시 70%.
-    await new Promise((resolve) => window.setTimeout(resolve, DEV_READ_MS))
-    devRead[provider] = Date.now()
-  }
   // 사람이 원해서 새로 읽을 때는 usage_refresh 로 백엔드의 5분 제한을 건너뛴다(없으면 usage_status 만).
   try {
     await invoke<unknown>('usage_refresh', { provider })
@@ -88,32 +72,6 @@ export async function readUsageNow(provider: UsageProvider) {
     // 명령이 없거나 실패해도 지금 가진 값으로 그린다.
   }
   return getUsageStatus()
-}
-
-// ---- 개발용 보기 숫자. import.meta.env.DEV 가 false 인 내보내는 빌드에서는 위의 두 길이 빠져 쓰이지 않는다. ----
-
-const PROVIDER_IDS: UsageProvider[] = ['codex', 'claude', 'gemini']
-const DEV_READ_MS = 1400
-const devLoadedAt = Date.now()
-const devSampled = new Set<UsageProvider>()
-const devRead: Partial<Record<UsageProvider, number>> = {}
-
-function devSample(provider: UsageProvider): ProviderUsage {
-  devSampled.add(provider)
-  const at = (hours: number) => Math.round((devLoadedAt + hours * 3600 * 1000) / 1000)
-  if (provider === 'codex') {
-    return { provider, state: 'ok', reason: null, plan: 'Plus', sample: true, checkedAt: new Date(devLoadedAt - 2 * 60 * 1000).toISOString(), windows: [
-      { kind: 'five_hour', usedPercent: 38, resetsAt: at(2.5) },
-      { kind: 'weekly', usedPercent: 12, resetsAt: at(80) },
-    ] }
-  }
-  // Claude·Gemini: 처음에는 마지막으로 확인한 값처럼 70% 남음(3시간 전), 새로 읽으면 40% 남음.
-  const readAt = devRead[provider]
-  const usedPercent = readAt ? 60 : 30
-  const checkedAt = new Date(readAt ?? devLoadedAt - 3 * 3600 * 1000).toISOString()
-  return provider === 'claude'
-    ? { provider, state: 'ok', reason: null, plan: 'Pro', sample: true, checkedAt, windows: [{ kind: 'weekly', usedPercent, resetsAt: at(30) }] }
-    : { provider, state: 'ok', reason: null, plan: 'AI Pro', sample: true, checkedAt, windows: [{ kind: 'daily', usedPercent, resetsAt: at(11) }] }
 }
 
 // ---- 마지막으로 확인한 값. 실제 값만 이 기기에 적어 두고, 지금 읽지 못한 곳은 이것으로 그린다. ----
@@ -160,4 +118,13 @@ export function resetDate(value: number | string | null) {
     ? new Date(value < 1e12 ? value * 1000 : value)
     : new Date(value)
   return Number.isNaN(date.getTime()) ? null : date
+}
+
+/**
+ * 숫자를 읽지 못한 곳의 까닭(usage_status 의 reason 값, G18: checking, not_installed, not_connected, api_key, no_quota_api, fetch_failed)을
+ * 풍선에 보일 쉬운 말로. 모르는 값이나 null 이면 null(이름만 보인다).
+ */
+export function usageReason(usage: ProviderUsage | null | undefined, _name: string) {
+  const reason = usage?.reason?.trim()
+  return reason ? W.usageMeter.reason[reason] ?? null : null
 }

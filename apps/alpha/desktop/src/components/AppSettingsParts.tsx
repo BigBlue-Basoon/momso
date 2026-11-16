@@ -1,10 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { FolderOpen } from 'lucide-react'
-import { getArchiveStatus } from '../archive'
-import { folderMoveRatio, getFolderLocation, listenFolderMove, openFolderLocation, setFolderLocation, type FolderMoveProgress, type FolderMoveState } from '../app-folder'
+import { getArchiveStatus, openWebAddress } from '../archive'
+import { folderMoveRatio, getFolderLocation, isFolderMoving, listenFolderMove, listenFolderMoveEnd, openFolderLocation, setFolderLocation, type FolderMoveProgress, type FolderMoveResult, type FolderMoveState } from '../app-folder'
 import { W } from '../words'
 import type { AppUpdateState } from './AppUpdate'
+
+// 라이선스 전문: 공개 레포(BigBlue-Basoon/momso)의 LICENSE. 화면에서 이 레포로 가는 링크는 여기 하나뿐이다.
+const LICENSE_URL = 'https://github.com/BigBlue-Basoon/momso/blob/main/LICENSE'
 
 const dateFormat = new Intl.DateTimeFormat('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' })
 function formatDate(value: string | null | undefined) {
@@ -29,7 +32,8 @@ const MOVE_ERROR: Partial<Record<FolderMoveState, string>> = {
 export function AppFolderSetting({ fallbackOpen }: { fallbackOpen: (path: string) => void }) {
   const [path, setPath] = useState<string | null>(null)
   const [movable, setMovable] = useState(false)
-  const [moving, setMoving] = useState(false)
+  // 다른 화면에 갔다 와도 옮기는 중이면 막대가 이어서 보인다(isFolderMoving).
+  const [moving, setMoving] = useState(isFolderMoving)
   const [progress, setProgress] = useState<FolderMoveProgress | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [oneDrive, setOneDrive] = useState(false)
@@ -45,6 +49,31 @@ export function AppFolderSetting({ fallbackOpen }: { fallbackOpen: (path: string
       })
   }, [])
 
+  // 옮긴 결과를 화면에 적는다(위치 바꾸기의 결과와 끝 이벤트가 같은 길로 온다).
+  const applyResult = useCallback(async (result: FolderMoveResult, picked?: string) => {
+    if (result.state === 'ok') {
+      const location = await getFolderLocation().catch(() => null)
+      setPath(location?.path ?? result.path ?? picked ?? null)
+      setOneDrive(location?.onCloudSyncFolder === true)
+      setKept(result.previousKept === true ? result.previousPath ?? '' : null)
+      setError(null)
+    } else if (result.state !== 'unchanged') {
+      setError(MOVE_ERROR[result.state] ?? W.appSettingsParts.text1)
+    }
+    setMoving(false)
+    setProgress(null)
+  }, [])
+
+  // 끝 이벤트(archive-location-done / -failed)와 옮기는 동안의 양을 이 화면이 열려 있는 동안 늘 듣는다.
+  // 옮기기를 시작한 뒤 화면을 떠났다 돌아와도 막대와 끝난 결과가 맞게 보인다.
+  useEffect(() => {
+    let disposed = false
+    const stops: Array<() => void> = []
+    void listenFolderMoveEnd((result) => { void applyResult(result) }).then((stop) => { if (disposed) stop(); else stops.push(stop) }).catch(() => {})
+    void listenFolderMove(setProgress).then((stop) => { if (disposed) stop(); else stops.push(stop) }).catch(() => {})
+    return () => { disposed = true; stops.forEach((stop) => stop()) }
+  }, [applyResult])
+
   async function changeLocation() {
     if (!movable || moving) return
     setError(null)
@@ -54,22 +83,11 @@ export function AppFolderSetting({ fallbackOpen }: { fallbackOpen: (path: string
     setKept(null)
     setProgress(null)
     setMoving(true)
-    // 옮기기를 부르기 전에 진행 이벤트를 듣기 시작한다(처음 온 양을 놓치지 않게).
-    const stopProgress = await listenFolderMove(setProgress).catch(() => undefined)
+    // 진행 양은 위의 듣기가 받는다(화면이 열릴 때부터 듣고 있다).
     try {
-      const result = await setFolderLocation(picked)
-      if (result.state === 'ok') {
-        const location = await getFolderLocation().catch(() => null)
-        setPath(location?.path ?? result.path ?? picked)
-        setOneDrive(location?.onCloudSyncFolder === true)
-        if (result.previousKept === true) setKept(result.previousPath ?? '')
-      } else if (result.state !== 'unchanged') {
-        setError(MOVE_ERROR[result.state] ?? W.appSettingsParts.text1)
-      }
+      await applyResult(await setFolderLocation(picked), picked)
     } catch {
       setError(W.appSettingsParts.text1)
-    } finally {
-      stopProgress?.()
       setMoving(false)
       setProgress(null)
     }
@@ -141,6 +159,7 @@ export function AppInfoSettings({ update }: { update: AppUpdateState }) {
       )}
       <div className="app-update" aria-disabled={!supported || undefined}>
         {supported && info?.state === 'up_to_date' && phase === 'idle' && <p className="app-update-state">{W.appSettingsParts.text7}</p>}
+        {supported && info?.state === 'failed' && phase === 'idle' && <p className="app-update-state is-quiet">{W.appUpdate.notChecked}</p>}
         {supported && available && phase !== 'ready' && (
           <div className="app-update-new">
             <p className="app-update-state">{W.appSettingsParts.text8}<strong>{info?.latestVersion}</strong>{W.appSettingsParts.text9}{formatDate(info?.publishedAt) && <span className="app-update-date">{formatDate(info?.publishedAt)}</span>}
@@ -159,6 +178,16 @@ export function AppInfoSettings({ update }: { update: AppUpdateState }) {
           <button className="secondary-button" type="button" disabled={!supported || phase === 'checking' || phase === 'downloading'} onClick={update.check}>{W.appSettingsParts.text11}</button>
           <button className="confirm-button" type="button" disabled={!supported || !available || phase === 'downloading' || phase === 'ready'} onClick={update.install}>{W.appSettingsParts.text6}</button>
         </div>
+      </div>
+      {/* 저작권(2026-11-16 그의 말 "앱 정보에 … 저작권 그런거 문구도"). 글은 레포의 NOTICE·LICENSE 에서 가져와 짧게: 저작권 한 줄,
+          라이선스 이름과 전문 링크, 다른 회사 이름·로고는 각 회사의 것. 장식 선·작은 라벨 없이 흐린 글로. */}
+      <div className="app-legal">
+        <p>{W.appSettingsParts.copyright}</p>
+        <p>
+          {W.appSettingsParts.license('PolyForm Shield 1.0.0')}{' '}
+          <button className="app-legal-link" type="button" onClick={() => { void openWebAddress(LICENSE_URL).catch(() => {}) }}>{W.appSettingsParts.licenseLink}</button>
+        </p>
+        <p>{W.appSettingsParts.otherMarks}</p>
       </div>
     </section>
   )

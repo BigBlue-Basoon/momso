@@ -1,6 +1,6 @@
 import { type DragEvent, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Archive, ChevronDown, ChevronRight, FolderPlus, MoreHorizontal, Pin, PinOff, Search, SquarePen } from 'lucide-react'
+import { Archive, ChevronDown, ChevronRight, FolderPlus, MoreHorizontal, Pin, PinOff, SquarePen } from 'lucide-react'
 import type { ChatEntry, ChatGroup } from '../chats'
 import { GROUP_WORD, W } from '../words'
 import { ShortcutTip } from './ShortcutTip'
@@ -27,8 +27,6 @@ type ChatSidebarProps = {
   onMoveGroup: (id: string, step: -1 | 1) => void
   onRemoveGroup: (id: string) => void
   onSetGroup: (chatId: string, groupId: string | null) => void
-  /** "검색" 단추: 검색 창을 연다(Ctrl+K). */
-  onOpenSearch: () => void
   /**
    * 채팅방 고정·보관. 없으면(명령이 없음) 단추를 그리지 않는다. Codex 앱처럼 줄에 올리면 줄 끝에 고정·보관 단추가 보이고,
    * 고정한 채팅방은 목록 맨 위 "고정된 채팅방"에 모인다(프로젝트 안이든 밖이든 그 자리에는 다시 그리지 않는다).
@@ -61,7 +59,6 @@ export function ChatSidebar({
   onMoveGroup,
   onRemoveGroup,
   onSetGroup,
-  onOpenSearch,
   onPinChat,
   onArchiveChat,
   busyChatId = null,
@@ -81,7 +78,7 @@ export function ChatSidebar({
   const orderedGroups = [...(groups ?? [])].sort((a, b) => a.order - b.order)
   const groupIds = new Set(orderedGroups.map((group) => group.id))
   // 고정한 채팅방은 맨 위에만 그린다(같은 줄을 두 번 두지 않는다).
-  const pinned = onPinChat ? chats.filter((chat) => chat.pinned) : []
+  const pinned = onPinChat ? chats.filter((chat) => chat.pinned).sort((a, b) => (a.pinnedOrder ?? 0) - (b.pinnedOrder ?? 0)) : []
   const listed = pinned.length > 0 ? chats.filter((chat) => !chat.pinned) : chats
   const ungrouped = listed.filter((chat) => !chat.groupId || !groupIds.has(chat.groupId))
 
@@ -134,12 +131,7 @@ export function ChatSidebar({
             </button>
           </ShortcutTip>
         </div>
-        <ShortcutTip label={W.search} keys={['Ctrl', 'K']} side="right">
-          <button className="chat-new chat-search-button" type="button" onClick={onOpenSearch}>
-            <Search size={16} strokeWidth={1.75} aria-hidden />
-            {W.search}
-          </button>
-        </ShortcutTip>
+        {/* 검색은 창 맨 위 왼쪽의 돋보기로 옮겼다(2026-11-16 그의 말). 같은 것을 두 번 두지 않는다. */}
       </div>
 
       <div className="record-list chat-list" aria-live="polite">

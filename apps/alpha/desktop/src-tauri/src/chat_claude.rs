@@ -18,7 +18,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-fn executable() -> Option<PathBuf> {
+pub(crate) fn executable() -> Option<PathBuf> {
     let path = process::resolve_interactive_tool("claude")?;
     if path
         .extension()
@@ -33,27 +33,44 @@ fn executable() -> Option<PathBuf> {
     Some(path)
 }
 
-pub(crate) async fn connected() -> bool {
-    if executable().is_none() {
+pub(crate) async fn authentication_selected(archive: &Path, key: Option<&str>) -> bool {
+    let Some(exe) = executable() else {
         return false;
+    };
+    let mut command = Command::new(exe);
+    command
+        .args(["auth", "status", "--json"])
+        .current_dir(archive)
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_USE_BEDROCK")
+        .env_remove("CLAUDE_CODE_USE_VERTEX")
+        .env_remove("CLAUDE_CODE_USE_FOUNDRY")
+        .env_remove("CLAUDECODE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    if let Some(key) = key {
+        command.env("ANTHROPIC_API_KEY", key);
     }
-    let result = process::run_tool(
-        "claude",
-        &["auth", "status", "--json"],
-        None,
-        None,
-        &process::empty_environment(),
-        Duration::from_secs(15),
-    )
-    .await;
-    result
-        .ok()
-        .filter(|o| o.success)
-        .and_then(|o| serde_json::from_str::<Value>(&o.stdout).ok())
-        .is_some_and(|v| {
-            v.get("loggedIn").and_then(Value::as_bool) == Some(true)
-                && v.get("authMethod").and_then(Value::as_str) == Some("claude.ai")
-        })
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(15), command.output()).await
+    else {
+        return false;
+    };
+    output.status.success()
+        && serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .is_some_and(|v| {
+                v.get("authMethod").and_then(Value::as_str)
+                    == Some(if key.is_some() {
+                        "api_key"
+                    } else {
+                        "claude.ai"
+                    })
+            })
 }
 
 pub(crate) fn previous(db: &Path, id: &str) -> Result<Option<String>, String> {
@@ -83,6 +100,14 @@ fn save_usage(db: &Path, id: &str, value: &Value) -> Result<(), String> {
     .map_err(|_| "채팅방을 저장하지 못했습니다")?;
     Ok(())
 }
+
+fn reported_effort(value: &Value) -> Option<String> {
+    value
+        .get("effort")
+        .and_then(Value::as_str)
+        .filter(|level| ["low", "medium", "high", "xhigh", "max"].contains(level))
+        .map(str::to_owned)
+}
 fn arguments(
     model: Option<&str>,
     effort: Option<&str>,
@@ -104,6 +129,8 @@ fn arguments(
         "stdio",
         "--permission-mode",
         if mode == "default" { "manual" } else { mode },
+        "--disallowedTools",
+        "Edit(./objects/**)",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -132,6 +159,20 @@ fn text_delta(v: &Value) -> Option<&str> {
     }
     v.pointer("/event/delta/text")?.as_str()
 }
+fn result_finish_reason(value: &Value) -> Option<chat::FinishReason> {
+    if value["subtype"] == "error_max_turns" {
+        return Some(chat::FinishReason::TurnLimit);
+    }
+    match value["stop_reason"].as_str() {
+        Some("max_tokens") => Some(chat::FinishReason::LengthLimit),
+        Some("refusal") => Some(chat::FinishReason::Refusal),
+        Some("end_turn" | "stop_sequence") => Some(chat::FinishReason::Completed),
+        None if value["subtype"] == "success" || value["is_error"] == false => {
+            Some(chat::FinishReason::Completed)
+        }
+        _ => None,
+    }
+}
 fn stream_payload(chat_id: &str, event: &Value) -> Option<Value> {
     text_delta(event).map(|delta| json!({"chatId": chat_id, "delta": delta}))
 }
@@ -143,6 +184,7 @@ fn context_values(value: &Value) -> Option<(i64, Option<i64>, Option<&str>)> {
         .filter(|v| *v > 0);
     Some((used, limit, value.get("model").and_then(Value::as_str)))
 }
+#[cfg(test)]
 fn fast_available(initialization: &Value) -> bool {
     initialization["response"]["response"]["fast_mode_state"] == "on"
 }
@@ -151,6 +193,7 @@ pub(crate) enum FastProbe {
     Available,
     Unavailable,
     Unknown,
+    AuthFailed,
     Failed,
 }
 
@@ -159,6 +202,7 @@ pub(crate) async fn probe_fast(
     model: Option<&str>,
     effort: Option<&str>,
     mode: &str,
+    api_key: Option<&str>,
 ) -> FastProbe {
     let Some(exe) = executable() else {
         return FastProbe::Failed;
@@ -167,10 +211,14 @@ pub(crate) async fn probe_fast(
     command
         .args(arguments(model, effort, mode, None, true))
         .arg("--no-session-persistence");
-    probe_fast_command(command, archive).await
+    probe_fast_command(command, archive, api_key).await
 }
 
-async fn probe_fast_command(mut command: Command, archive: &Path) -> FastProbe {
+async fn probe_fast_command(
+    mut command: Command,
+    archive: &Path,
+    api_key: Option<&str>,
+) -> FastProbe {
     command
         .current_dir(archive)
         .stdin(Stdio::piped())
@@ -180,7 +228,13 @@ async fn probe_fast_command(mut command: Command, archive: &Path) -> FastProbe {
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_USE_BEDROCK")
+        .env_remove("CLAUDE_CODE_USE_VERTEX")
+        .env_remove("CLAUDE_CODE_USE_FOUNDRY")
         .env_remove("CLAUDECODE");
+    if let Some(key) = api_key {
+        command.env("ANTHROPIC_API_KEY", key);
+    }
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     let Ok(mut child) = command.spawn() else {
@@ -203,6 +257,9 @@ async fn probe_fast_command(mut command: Command, archive: &Path) -> FastProbe {
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            if authentication_failed(&value) {
+                return Ok(FastProbe::AuthFailed);
+            }
             if value["type"] == "control_response"
                 && value["response"]["request_id"] == "momso-fast-probe"
             {
@@ -247,7 +304,7 @@ fn missing_session_error(value: &Value, session: &str) -> bool {
                 errors.len() == 1 && errors[0].as_str() == Some(expected.as_str())
             })
 }
-fn initial_title(db: &Path, id: &str) -> Option<String> {
+pub(crate) fn initial_title(db: &Path, id: &str) -> Option<String> {
     let c = Connection::open(db).ok()?;
     let (title, first, count): (String, String, i64) = c.query_row(
         "SELECT title,(SELECT text FROM chat_messages WHERE chat_id=?1 AND role='user' ORDER BY rowid LIMIT 1),(SELECT count(*) FROM chat_messages WHERE chat_id=?1 AND role='assistant') FROM chats WHERE id=?1",
@@ -261,7 +318,7 @@ fn initial_title(db: &Path, id: &str) -> Option<String> {
         .collect();
     (count == 1 && title == automatic).then_some(title)
 }
-fn store_generated_title(db: &Path, id: &str, original: &str, generated: &str) -> bool {
+pub(crate) fn store_generated_title(db: &Path, id: &str, original: &str, generated: &str) -> bool {
     let title: String = generated
         .trim()
         .trim_matches(['"', '\'', '`', '*'])
@@ -355,6 +412,41 @@ async fn name_chat<F: FnMut(&str, Value)>(
         emit("chat-renamed", json!({"chatId":id,"title":title}));
     }
 }
+// Authentication failure does not prove that the key itself is malformed:
+// an account token may have expired or access may have been revoked.
+fn authentication_failed(value: &Value) -> bool {
+    (value["type"] == "assistant" && value["error"] == "authentication_failed")
+        || (value["type"] == "result" && value["api_error_status"].as_u64() == Some(401))
+}
+// Only annotate the unambiguous, single-path spelling. The original command
+// remains visible and the approval remains a command approval.
+fn literal_rm_target(command: &str) -> Option<&str> {
+    // Rust recognizes Unicode whitespace that a shell may treat as part of a
+    // word. Accept only ordinary spaces so the annotation cannot invent a
+    // command/target split the shell does not make.
+    if command.chars().any(|ch| ch.is_whitespace() && ch != ' ') {
+        return None;
+    }
+    let parts: Vec<_> = command.split_whitespace().collect();
+    let path = match parts.as_slice() {
+        ["rm", path] | ["rm", "--", path] => *path,
+        _ => return None,
+    };
+    if path.starts_with('-')
+        || path.starts_with('/')
+        || path.is_empty()
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return None;
+    }
+    Some(path)
+}
+
 fn approval_request(archive: &Path, chat_id: &str, request: &Value) -> Option<ApprovalRequest> {
     if request["subtype"] != "can_use_tool" {
         return None;
@@ -373,6 +465,14 @@ fn approval_request(archive: &Path, chat_id: &str, request: &Value) -> Option<Ap
         .get("file_path")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty());
+    let shell_delete = if tool == "Bash" {
+        input
+            .get("command")
+            .and_then(Value::as_str)
+            .and_then(literal_rm_target)
+    } else {
+        None
+    };
     let change = match tool {
         "Edit" | "MultiEdit" => Some(crate::approval::ChangeKind::Edit),
         "Write" => path.and_then(|path| {
@@ -390,6 +490,7 @@ fn approval_request(archive: &Path, chat_id: &str, request: &Value) -> Option<Ap
                 Err(_) => None,
             }
         }),
+        "Bash" if shell_delete.is_some() => Some(crate::approval::ChangeKind::Delete),
         _ => None,
     };
     let targets = if kind == "file_change" {
@@ -400,7 +501,13 @@ fn approval_request(archive: &Path, chat_id: &str, request: &Value) -> Option<Ap
         .into_iter()
         .collect()
     } else {
-        vec![]
+        shell_delete
+            .map(|path| crate::approval::ApprovalTarget {
+                path: path.into(),
+                change,
+            })
+            .into_iter()
+            .collect()
     };
     Some(ApprovalRequest {
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -412,6 +519,7 @@ fn approval_request(archive: &Path, chat_id: &str, request: &Value) -> Option<Ap
         targets,
         reason: request["decision_reason"].as_str().map(str::to_owned),
         options: vec![ApprovalChoice::AllowOnce, ApprovalChoice::Deny],
+        setup: None,
     })
 }
 fn approval_response(id: &str, request: &Value, choice: ApprovalChoice) -> Value {
@@ -438,7 +546,7 @@ pub(crate) async fn run<F: FnMut(&str, Value) + Send>(
     emit: F,
 ) -> Result<(), String> {
     run_with_skill(
-        db, archive, id, text, model, effort, mode, fast, None, None, approvals, cancel, emit,
+        db, archive, id, text, model, effort, mode, fast, None, None, None, approvals, cancel, emit,
     )
     .await
 }
@@ -454,6 +562,7 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
     fast: bool,
     skill: Option<&str>,
     fallback_prompt: Option<&str>,
+    api_key: Option<&str>,
     approvals: Option<ApprovalChannel>,
     cancel: CancellationToken,
     mut emit: F,
@@ -462,17 +571,26 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
     let session = previous(db, id)?;
     let mut command = Command::new(&exe);
     command.args(arguments(model, effort, mode, session.as_deref(), fast));
+    let mcp = crate::momso_mcp::claude_config(&crate::momso_mcp::executable()?, id);
+    command.args([
+        "--mcp-config",
+        &mcp.to_string(),
+        "--allowedTools",
+        "mcp__momso_internal_runtime_v1__momso_version,mcp__momso_internal_runtime_v1__momso_github_connect,mcp__momso_internal_runtime_v1__momso_object_store_r2_connect,mcp__momso_internal_runtime_v1__momso_object_store_gcp_connect,mcp__momso_internal_runtime_v1__momso_object_store_aws_connect",
+    ]);
     let result = run_command_ref(
         command,
         db,
         archive,
         id,
         text,
+        model,
         effort,
         fast,
         skill,
         session.as_deref(),
         &approvals,
+        api_key,
         cancel.clone(),
         &mut emit,
     )
@@ -485,9 +603,16 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
             emit("momso-internal-handoff-fallback", Value::Null);
             let mut command = Command::new(exe);
             command.args(arguments(model, effort, mode, None, fast));
+            let mcp = crate::momso_mcp::claude_config(&crate::momso_mcp::executable()?, id);
+            command.args([
+                "--mcp-config",
+                &mcp.to_string(),
+                "--allowedTools",
+                "mcp__momso_internal_runtime_v1__momso_version,mcp__momso_internal_runtime_v1__momso_github_connect,mcp__momso_internal_runtime_v1__momso_object_store_r2_connect,mcp__momso_internal_runtime_v1__momso_object_store_gcp_connect,mcp__momso_internal_runtime_v1__momso_object_store_aws_connect",
+            ]);
             return run_command_ref(
-                command, db, archive, id, fallback, effort, fast, skill, None, &approvals, cancel,
-                &mut emit,
+                command, db, archive, id, fallback, model, effort, fast, skill, None, &approvals,
+                api_key, cancel, &mut emit,
             )
             .await;
         }
@@ -511,23 +636,26 @@ async fn run_command<F: FnMut(&str, Value) + Send>(
     mut emit: F,
 ) -> Result<(), String> {
     run_command_ref(
-        command, db, archive, id, text, effort, fast, skill, None, &approvals, cancel, &mut emit,
+        command, db, archive, id, text, None, effort, fast, skill, None, &approvals, None, cancel,
+        &mut emit,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_command_ref<F: FnMut(&str, Value) + Send>(
+pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
     mut command: Command,
     db: &Path,
     archive: &Path,
     id: &str,
     text: &str,
+    model: Option<&str>,
     effort: Option<&str>,
     fast: bool,
     skill: Option<&str>,
     missing_session: Option<&str>,
     approvals: &Option<ApprovalChannel>,
+    api_key: Option<&str>,
     cancel: CancellationToken,
     emit: &mut F,
 ) -> Result<(), String> {
@@ -540,12 +668,20 @@ async fn run_command_ref<F: FnMut(&str, Value) + Send>(
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("CLAUDE_CODE_USE_BEDROCK")
+        .env_remove("CLAUDE_CODE_USE_VERTEX")
+        .env_remove("CLAUDE_CODE_USE_FOUNDRY")
         .env_remove("CLAUDECODE");
+    if let Some(key) = api_key {
+        command.env("ANTHROPIC_API_KEY", key);
+    }
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     let mut child = command
         .spawn()
         .map_err(|_| "Claude를 시작하지 못했습니다")?;
+    #[cfg(windows)]
+    crate::setup_bridge::bind(id, child.id());
     let result = async {
         let mut input = child.stdin.take().ok_or("AI에 요청을 보내지 못했습니다")?;
         let prompt = format_skill_prompt(skill, text, &Local::now().to_rfc3339());
@@ -559,12 +695,14 @@ async fn run_command_ref<F: FnMut(&str, Value) + Send>(
                 line = tokio::time::timeout(Duration::from_secs(60), lines.next_line()) => line.map_err(|_| "AI의 응답 시간이 초과되었습니다")?.map_err(|_| "AI의 답을 읽지 못했습니다")?.ok_or("AI 연결이 끊겼습니다")?,
             };
             let Ok(value) = serde_json::from_str::<Value>(&line) else { continue; };
+            if let Some(info) = crate::chat_finish::claude_error(&value) { emit("momso-internal-provider-error", info); if !authentication_failed(&value) { return Err("AI가 응답을 완료하지 못했습니다".into()); } }
+            if authentication_failed(&value) { return Err("__momso_auth_failed".into()); }
             if missing_session.is_some_and(|session| missing_session_error(&value, session)) {
                 return Err("__momso_claude_session_missing".to_string());
             }
             if value["type"] == "control_response" && value["response"]["request_id"] == "momso-init" {
                 if value["response"]["subtype"] != "success" { return Err("AI를 시작하지 못했습니다".into()); }
-                if fast && !fast_available(&value) { return Err("__momso_fast_unavailable".into()); }
+                if fast && value["response"]["response"]["fast_mode_state"].as_str() == Some("off") { return Err("__momso_fast_unavailable".into()); }
                 break;
             }
         }
@@ -584,6 +722,8 @@ async fn run_command_ref<F: FnMut(&str, Value) + Send>(
             };
             if line.len() > 2 * 1024 * 1024 { return Err("AI의 답을 읽지 못했습니다".into()); }
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue; };
+            if let Some(info) = crate::chat_finish::claude_error(&v) { emit("momso-internal-provider-error", info); if v["type"] != "rate_limit_event" && !authentication_failed(&v) { return Err("AI가 응답을 완료하지 못했습니다".into()); } }
+            if authentication_failed(&v) { return Err("__momso_auth_failed".into()); }
             items.observe(archive, &v);
             emit("momso-internal-file-writes", json!(items.written()));
             emit("momso-internal-file-reads", json!(items.read()));
@@ -622,7 +762,10 @@ async fn run_command_ref<F: FnMut(&str, Value) + Send>(
                 emit("chat-stream", payload);
             }
             if v["type"] == "result" {
-                if !initialized || v["is_error"].as_bool() != Some(false) || answer.is_empty() { return Err("AI가 응답을 완료하지 못했습니다".into()); }
+                if !initialized || v["is_error"].as_bool() != Some(false) || answer.is_empty() {
+                    match result_finish_reason(&v) { Some(chat::FinishReason::LengthLimit) => emit("momso-internal-finish-reason", json!("length_limit")), Some(chat::FinishReason::TurnLimit) => emit("momso-internal-finish-reason", json!("turn_limit")), Some(chat::FinishReason::Refusal) => emit("momso-internal-finish-reason", json!("refusal")), _ => () }
+                    return Err("AI가 응답을 완료하지 못했습니다".into());
+                }
                 let context_request = json!({"type":"control_request","request_id":"momso-context","request":{"subtype":"get_context_usage","detail":"summary"}});
                 if input.write_all(format!("{context_request}\n").as_bytes()).await.is_ok() && input.flush().await.is_ok() {
                     let response = async {
@@ -637,23 +780,35 @@ async fn run_command_ref<F: FnMut(&str, Value) + Send>(
                         result = tokio::time::timeout(Duration::from_secs(5), response) => result.ok().flatten(),
                     };
                     if let Some(reply) = reply.filter(|r| r["response"]["subtype"] == "success") {
-                        if let Some((used, limit, model)) = context_values(&reply["response"]["response"]) {
-                            if let Some(context) = chat_context::update_measurement(db, id, "claude", model, used, limit)? {
+                        if let Some((used, limit, reported_model)) = context_values(&reply["response"]["response"]) {
+                            if let (Some(requested), Some(actual), Some(window)) = (model, actual_model.as_deref(), limit) {
+                                if reported_model == Some(actual) { chat_context::record_model_limit(db, id, "claude", requested, used, window)?; }
+                            }
+                            if let Some(context) = chat_context::update_measurement(db, id, "claude", reported_model.or(actual_model.as_deref()), used, limit)? {
                                 emit("chat-context-updated", json!({"chatId":id,"context":context}));
                             }
                         }
                     }
                 }
                 save_usage(db, id, &v)?;
-                let actual_effort = v.get("effort").and_then(Value::as_str).or_else(|| effort.filter(|s| !s.trim().is_empty())).map(str::to_owned);
-                let msg = chat::append_with_effort(db, id, chat::Role::Assistant, &answer, Some("claude".into()), actual_model, actual_effort)?;
-                let mut done = json!({"chatId": id, "messageId": msg.id});
-                if let Some(state) = v.get("fast_mode_state").and_then(Value::as_str).filter(|state| ["on", "off"].contains(state)) {
+                let actual_effort = reported_effort(&v);
+                let requested_effort = effort.filter(|s| !s.trim().is_empty()).map(str::to_owned);
+                let reason = result_finish_reason(&v);
+                let msg = chat::append_finished_with_optional_reason(db, id, &answer, "claude".into(), actual_model, requested_effort, actual_effort.clone(), reason)?;
+                let mut done = json!({"chatId": id, "messageId": msg.id, "actualEffort": actual_effort, "fastState":null,"stopReason":null,"finishReason":reason});
+                if reason == Some(chat::FinishReason::LengthLimit) { done["stopReason"] = json!("max_tokens"); }
+                if reason == Some(chat::FinishReason::TurnLimit) { done["stopReason"] = json!("max_turn_requests"); }
+                if reason == Some(chat::FinishReason::Refusal) { done["stopReason"] = json!("refusal"); }
+                if let Some(state) = v.get("fast_mode_state").and_then(Value::as_str).filter(|state| ["on", "off", "cooldown"].contains(state)) {
                     done["fastState"] = json!(state);
-                } else if fast { done["fastState"] = json!("unavailable"); }
+                }
                 emit("chat-done", done);
                 input.shutdown().await.map_err(|_| "AI에 요청을 보내지 못했습니다")?;
-                name_chat(db, archive, id, text, &answer, &cancel, emit).await;
+                // An extra model call for naming would silently incur API charges.
+                // The shared first-message title already exists in that mode.
+                if api_key.is_none() {
+                    name_chat(db, archive, id, text, &answer, &cancel, emit).await;
+                }
                 return Ok(());
             }
         }
@@ -677,6 +832,29 @@ fn format_skill_prompt(skill: Option<&str>, text: &str, now: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn result_reason_uses_reported_stop_and_turn_limits() {
+        assert_eq!(
+            result_finish_reason(&json!({"stop_reason":"max_tokens"})),
+            Some(chat::FinishReason::LengthLimit)
+        );
+        assert_eq!(
+            result_finish_reason(&json!({"subtype":"error_max_turns"})),
+            Some(chat::FinishReason::TurnLimit)
+        );
+        assert_eq!(
+            result_finish_reason(&json!({"stop_reason":"refusal"})),
+            Some(chat::FinishReason::Refusal)
+        );
+        assert_eq!(
+            result_finish_reason(&json!({"subtype":"success"})),
+            Some(chat::FinishReason::Completed)
+        );
+        assert_eq!(
+            result_finish_reason(&json!({"subtype":"success","stop_reason":"new_unknown"})),
+            None
+        );
+    }
     #[cfg(windows)]
     #[tokio::test]
     async fn fast_probe_reads_initialization_without_sending_user_message() {
@@ -698,8 +876,27 @@ mod tests {
             .unwrap();
             let mut command = Command::new("powershell.exe");
             command.args(["-NoProfile", "-File"]).arg(script);
-            assert_eq!(probe_fast_command(command, dir.path()).await, expected);
+            assert_eq!(
+                probe_fast_command(command, dir.path(), None).await,
+                expected
+            );
         }
+        let script = dir.path().join("key.ps1");
+        std::fs::write(&script, "if (-not $env:ANTHROPIC_API_KEY -or $env:ANTHROPIC_AUTH_TOKEN) { exit 9 }\n$null = [Console]::In.ReadLine()\n[Console]::WriteLine('{\"type\":\"control_response\",\"response\":{\"request_id\":\"momso-fast-probe\",\"subtype\":\"success\",\"response\":{\"fast_mode_state\":\"on\"}}}')\n").unwrap();
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-File"]).arg(script);
+        assert_eq!(
+            probe_fast_command(command, dir.path(), Some("fake-test-only-key")).await,
+            FastProbe::Available
+        );
+        let script = dir.path().join("auth.ps1");
+        std::fs::write(&script, "$null = [Console]::In.ReadLine()\n[Console]::WriteLine('{\"type\":\"assistant\",\"error\":\"authentication_failed\"}')\n").unwrap();
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-File"]).arg(script);
+        assert_eq!(
+            probe_fast_command(command, dir.path(), Some("fake-test-only-key")).await,
+            FastProbe::AuthFailed
+        );
     }
     #[test]
     fn missing_session_is_distinct_from_other_errors_and_processed_turns() {
@@ -741,10 +938,12 @@ $null = [Console]::In.ReadLine()
             "chat",
             "user text",
             None,
+            None,
             false,
             None,
             Some("missing-id"),
             &None,
+            None,
             CancellationToken::new(),
             &mut emit,
         )
@@ -753,12 +952,19 @@ $null = [Console]::In.ReadLine()
     }
     #[test]
     fn arguments_preserve_choices() {
+        for unset in [None, Some("")] {
+            let args = arguments(Some("haiku"), unset, "default", None, false);
+            assert!(!args.iter().any(|arg| arg == "--effort"));
+        }
         let a = arguments(Some("haiku"), Some("low"), "default", Some("session"), true);
         assert!(a.windows(2).any(|w| w == ["--model", "haiku"]));
         assert!(a.windows(2).any(|w| w == ["--effort", "low"]));
         assert!(a.windows(2).any(|w| w == ["--permission-mode", "manual"]));
         assert!(a.windows(2).any(|w| w == ["--resume", "session"]));
         assert!(a.windows(2).any(|w| w == ["--permission-prompts", "host"]));
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--disallowedTools", "Edit(./objects/**)"]));
         assert!(a
             .windows(2)
             .any(|w| w == ["--settings", "{\"fastMode\":true}"]));
@@ -776,6 +982,21 @@ $null = [Console]::In.ReadLine()
         }
     }
     #[test]
+    fn authentication_error_uses_only_structured_provider_fields() {
+        assert!(authentication_failed(
+            &json!({"type":"assistant","error":"authentication_failed"})
+        ));
+        assert!(authentication_failed(
+            &json!({"type":"result","api_error_status":401})
+        ));
+        assert!(!authentication_failed(
+            &json!({"type":"result","api_error_status":403})
+        ));
+        assert!(!authentication_failed(
+            &json!({"type":"assistant","message":{"content":"authentication_failed"}})
+        ));
+    }
+    #[test]
     fn approval_roundtrip_preserves_input_and_chat() {
         let wire = json!({"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"a.txt","content":"hi"}});
         let request = approval_request(Path::new("."), "room", &wire).unwrap();
@@ -791,6 +1012,43 @@ $null = [Console]::In.ReadLine()
                 ["behavior"],
             "deny"
         );
+    }
+    #[test]
+    fn shell_delete_approval_marks_only_a_single_literal_path() {
+        let request = |command: &str| {
+            approval_request(
+                Path::new("."),
+                "room",
+                &json!({"subtype":"can_use_tool","tool_name":"Bash","input":{"command":command}}),
+            )
+            .unwrap()
+        };
+        for command in ["rm a.md", "rm -- folder/a.md"] {
+            let approval = request(command);
+            assert_eq!(approval.kind, "command");
+            assert_eq!(approval.change, Some(crate::approval::ChangeKind::Delete));
+            assert_eq!(approval.targets.len(), 1);
+            assert!(approval.description.contains(command));
+        }
+        for command in [
+            "rm -rf a",
+            "rm a b",
+            "rm ../a",
+            "rm /a",
+            "rm a;echo b",
+            "rm $HOME",
+            "rm *.md",
+            "rm a\necho b",
+            "rm\u{00a0}a.md",
+            "rm a.md\u{2003}",
+            "rm\ta.md",
+            "rm 'a.md'",
+        ] {
+            let approval = request(command);
+            assert_eq!(approval.kind, "command");
+            assert_eq!(approval.change, None);
+            assert!(approval.targets.is_empty());
+        }
     }
     #[test]
     fn write_approval_distinguishes_creation_overwrite_and_edits() {
@@ -918,6 +1176,13 @@ $null = [Console]::In.ReadLine()
             include_str!("../migrations/0040_chat_claude.sql"),
             include_str!("../migrations/0070_chat_skill.sql"),
             include_str!("../migrations/0072_chat_delivery.sql"),
+            include_str!("../migrations/0073_chat_visibility.sql"),
+            include_str!("../migrations/0075_chat_actual_effort.sql"),
+            include_str!("../migrations/0080_chat_finish_reason.sql"),
+            include_str!("../migrations/0081_chat_import.sql"),
+            include_str!("../migrations/0082_provider_context_limits.sql"),
+            include_str!("../migrations/0084_chat_auth_method.sql"),
+            include_str!("../migrations/0085_chat_fast_state.sql"),
         ] {
             c.execute_batch(sql).unwrap();
         }
@@ -929,6 +1194,7 @@ $null = [Console]::In.ReadLine()
         drop(c);
         let script = d.path().join("fake.ps1");
         std::fs::write(&script, r#"
+if (-not $env:ANTHROPIC_API_KEY -or $env:ANTHROPIC_AUTH_TOKEN -or $env:CLAUDE_CODE_USE_BEDROCK) { exit 7 }
 $null = [Console]::In.ReadLine()
 [Console]::WriteLine('{"type":"control_response","response":{"request_id":"momso-init","subtype":"success"}}')
 $msg = [Console]::In.ReadLine() | ConvertFrom-Json
@@ -941,6 +1207,8 @@ $reply = [Console]::In.ReadLine() | ConvertFrom-Json
 if ($reply.response.request_id -ne 'r1' -or $reply.response.response.behavior -ne 'allow' -or $reply.response.response.updatedInput.file_path -ne 'a.txt') { exit 2 }
 [Console]::WriteLine('{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"done"}}}')
 [Console]::WriteLine('{"type":"result","is_error":false}')
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"type":"control_response","response":{"request_id":"momso-context","subtype":"success","response":{"model":"fixture-model","totalTokens":12,"maxTokens":1000}}}')
 "#).unwrap();
         let mut command = Command::new("powershell.exe");
         command.args(["-NoProfile", "-File"]).arg(script);
@@ -952,20 +1220,26 @@ if ($reply.response.request_id -ne 'r1' -or $reply.response.response.behavior -n
         let mut done = false;
         let mut compacted = false;
         let mut observed_model = None;
-        run_command(
+        let approvals = Some(channel);
+        let fake_key = "momso-fake-test-credential-a81f5c12";
+        run_command_ref(
             command,
             &db,
             d.path(),
             "test",
             "hello",
+            Some("fixture-alias"),
             Some("low"),
             false,
             Some("probe"),
-            Some(channel),
+            None,
+            &approvals,
+            Some(fake_key),
             CancellationToken::new(),
-            |name, payload| {
+            &mut |name, payload| {
                 if name == "chat-done" {
                     done = true;
+                    assert!(payload["actualEffort"].is_null());
                 }
                 if name == "chat-compacted" {
                     compacted = true;
@@ -980,6 +1254,160 @@ if ($reply.response.request_id -ne 'r1' -or $reply.response.response.behavior -n
         assert!(done);
         assert!(compacted);
         assert_eq!(observed_model.as_deref(), Some("fixture-model"));
+        assert_eq!(
+            chat_context::model_limit(&db, "test", "claude", Some("fixture-model")).unwrap(),
+            Some((1000, 12))
+        );
+        assert_eq!(
+            chat_context::model_limit(&db, "test", "claude", Some("fixture-alias")).unwrap(),
+            Some((1000, 12))
+        );
+        let messages = serde_json::to_value(chat::read(&db, "test").unwrap()).unwrap();
+        assert_eq!(messages["messages"][0]["effort"], "low");
+        assert!(messages["messages"][0]["actualEffort"].is_null());
+        assert_eq!(messages["messages"][0]["finishReason"], "completed");
+        for entry in std::fs::read_dir(d.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(!bytes
+                    .windows(fake_key.len())
+                    .any(|part| part == fake_key.as_bytes()));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn fake_cli_reported_effort_reaches_event_and_saved_message() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("db.sqlite");
+        let c = Connection::open(&db).unwrap();
+        for sql in [
+            include_str!("../migrations/0009_chats.sql"),
+            include_str!("../migrations/0010_chat_codex.sql"),
+            include_str!("../migrations/0011_chat_effort.sql"),
+            include_str!("../migrations/0012_chat_groups.sql"),
+            include_str!("../migrations/0013_chat_context.sql"),
+            include_str!("../migrations/0040_chat_claude.sql"),
+            include_str!("../migrations/0070_chat_skill.sql"),
+            include_str!("../migrations/0072_chat_delivery.sql"),
+            include_str!("../migrations/0073_chat_visibility.sql"),
+            include_str!("../migrations/0075_chat_actual_effort.sql"),
+            include_str!("../migrations/0080_chat_finish_reason.sql"),
+            include_str!("../migrations/0081_chat_import.sql"),
+            include_str!("../migrations/0083_reconcile_context_import.sql"),
+            include_str!("../migrations/0084_chat_auth_method.sql"),
+            include_str!("../migrations/0085_chat_fast_state.sql"),
+        ] {
+            c.execute_batch(sql).unwrap();
+        }
+        c.execute(
+            "INSERT INTO chats(id,title,created_at,updated_at) VALUES ('test','','a','a')",
+            [],
+        )
+        .unwrap();
+        drop(c);
+        let script = d.path().join("fake-effort.ps1");
+        std::fs::write(&script, r#"
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"type":"control_response","response":{"request_id":"momso-init","subtype":"success"}}')
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"type":"system","subtype":"init","session_id":"fixture"}')
+[Console]::WriteLine('{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"done"}}}')
+[Console]::WriteLine('{"type":"result","is_error":false,"effort":"high"}')
+"#).unwrap();
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-File"]).arg(script);
+        let mut reported = None;
+        run_command(
+            command,
+            &db,
+            d.path(),
+            "test",
+            "hello",
+            Some("low"),
+            false,
+            None,
+            None,
+            CancellationToken::new(),
+            |name, payload| {
+                if name == "chat-done" {
+                    reported = payload["actualEffort"].as_str().map(str::to_owned);
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reported.as_deref(), Some("high"));
+        let value = serde_json::to_value(chat::read(&db, "test").unwrap()).unwrap();
+        assert_eq!(value["messages"][0]["effort"], "low");
+        assert_eq!(value["messages"][0]["actualEffort"], "high");
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fake_cli_partial_is_saved_on_stop_and_error() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("db.sqlite");
+        crate::storage::initialize(&db, &d.path().join("backups"), "test").unwrap();
+        let id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let script = d.path().join("partial.ps1");
+        std::fs::write(&script, r#"
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"type":"control_response","response":{"request_id":"momso-init","subtype":"success"}}')
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"type":"system","subtype":"init","session_id":"fixture-session"}')
+[Console]::WriteLine('{"type":"assistant","message":{"model":"fixture-model","content":[]}}')
+[Console]::WriteLine('{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}}')
+if ($env:MOMSO_FAKE_STOP -eq 'yes') { [Threading.Thread]::Sleep(30000) }
+exit 20
+"#).unwrap();
+        for stopped in [true, false] {
+            chat::append(&db, &id, chat::Role::User, "question", None, None).unwrap();
+            let mut cmd = Command::new("powershell.exe");
+            cmd.args(["-NoProfile", "-File"])
+                .arg(&script)
+                .env("MOMSO_FAKE_STOP", if stopped { "yes" } else { "no" });
+            let cancel = CancellationToken::new();
+            let trigger = cancel.clone();
+            let mut capture = crate::chat_finish::Capture::default();
+            let result = run_command(
+                cmd,
+                &db,
+                d.path(),
+                &id,
+                "question",
+                None,
+                false,
+                None,
+                None,
+                cancel,
+                |name, value| {
+                    capture.observe(name, &value);
+                    if stopped && name == "chat-stream" {
+                        trigger.cancel();
+                    }
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            capture
+                .persist_partial(&db, &id, "claude", stopped, 0)
+                .unwrap();
+        }
+        let detail = serde_json::to_value(chat::read(&db, &id).unwrap()).unwrap();
+        let replies: Vec<_> = detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|value| value["role"] == "assistant")
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["finishReason"], "cancelled");
+        assert_eq!(replies[1]["finishReason"], "error");
+        assert_eq!(replies[0]["text"], "partial");
+        assert_eq!(replies[1]["model"], "fixture-model");
     }
     #[tokio::test]
     #[ignore = "requires a Claude subscription login"]
@@ -999,6 +1427,13 @@ if ($reply.response.request_id -ne 'r1' -or $reply.response.response.behavior -n
                 include_str!("../migrations/0040_chat_claude.sql"),
                 include_str!("../migrations/0070_chat_skill.sql"),
                 include_str!("../migrations/0072_chat_delivery.sql"),
+                include_str!("../migrations/0073_chat_visibility.sql"),
+                include_str!("../migrations/0075_chat_actual_effort.sql"),
+                include_str!("../migrations/0080_chat_finish_reason.sql"),
+                include_str!("../migrations/0081_chat_import.sql"),
+                include_str!("../migrations/0083_reconcile_context_import.sql"),
+                include_str!("../migrations/0084_chat_auth_method.sql"),
+                include_str!("../migrations/0085_chat_fast_state.sql"),
             ] {
                 c.execute_batch(sql).unwrap();
             }
@@ -1049,6 +1484,15 @@ if ($reply.response.request_id -ne 'r1' -or $reply.response.response.behavior -n
             ),
             Some(json!({"chatId":"room","delta":"hello"}))
         );
+    }
+    #[test]
+    fn only_provider_reported_effort_counts_as_actual() {
+        assert_eq!(
+            reported_effort(&json!({"effort":"high"})).as_deref(),
+            Some("high")
+        );
+        assert_eq!(reported_effort(&json!({})), None);
+        assert_eq!(reported_effort(&json!({"effort":"ultracode"})), None);
     }
     #[test]
     fn parses_only_explicit_claude_context_values() {
@@ -1272,6 +1716,13 @@ if ($reply.response.request_id -ne 'r1' -or $reply.response.response.behavior -n
             include_str!("../migrations/0040_chat_claude.sql"),
             include_str!("../migrations/0070_chat_skill.sql"),
             include_str!("../migrations/0072_chat_delivery.sql"),
+            include_str!("../migrations/0073_chat_visibility.sql"),
+            include_str!("../migrations/0075_chat_actual_effort.sql"),
+            include_str!("../migrations/0080_chat_finish_reason.sql"),
+            include_str!("../migrations/0081_chat_import.sql"),
+            include_str!("../migrations/0083_reconcile_context_import.sql"),
+            include_str!("../migrations/0084_chat_auth_method.sql"),
+            include_str!("../migrations/0085_chat_fast_state.sql"),
         ] {
             c.execute_batch(sql).unwrap();
         }

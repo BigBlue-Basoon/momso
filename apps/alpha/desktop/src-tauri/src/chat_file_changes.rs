@@ -101,7 +101,13 @@ pub(crate) fn reference(root: &Path, path: &str) -> Option<String> {
         root.join(path)
     };
     let root = root.canonicalize().ok()?;
-    let path = path.canonicalize().ok()?;
+    let path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            path.parent()?.canonicalize().ok()?.join(path.file_name()?)
+        }
+        Err(_) => return None,
+    };
     let parts: Vec<_> = path
         .strip_prefix(root)
         .ok()?
@@ -164,8 +170,21 @@ pub(crate) fn capture_unlocked(root: &Path) -> Result<Snapshot, String> {
                     })
                     .map(|hash| format!("sha256:{hash}"))
                     .filter(|id| crate::archive_zet::valid_asset_id(id))
+            } else if folder == "objects" {
+                Some(format!(
+                    "object-path:{}",
+                    relative.to_str().ok_or("unsafe_path")?
+                ))
             } else {
                 None
+            };
+            let reference = match reference {
+                Some(reference) => Some(reference),
+                None if folder == "objects" => Some(format!(
+                    "object-path:{}",
+                    relative.to_str().ok_or("unsafe_path")?
+                )),
+                None => None,
             };
             let Some(reference) = reference else {
                 continue;
@@ -191,12 +210,27 @@ pub(crate) fn capture_unlocked(root: &Path) -> Result<Snapshot, String> {
 }
 
 pub(crate) fn changes(before: &Snapshot, after: &Snapshot) -> BTreeMap<String, String> {
-    after
+    let mut result: BTreeMap<String, String> = after
         .iter()
         .filter_map(|(id, hash)| match before.get(id) {
             None => Some((id.clone(), "created".into())),
             Some(old) if old != hash => Some((id.clone(), "edited".into())),
             _ => None,
+        })
+        .collect();
+    for id in before.keys() {
+        if !after.contains_key(id) {
+            result.insert(id.clone(), "deleted".into());
+        }
+    }
+    result
+}
+
+pub(crate) fn source_changes(before: &Snapshot, after: &Snapshot) -> BTreeMap<String, String> {
+    changes(before, after)
+        .into_iter()
+        .filter(|(id, action)| {
+            (id.starts_with("sha256:") || id.starts_with("object-path:")) && action != "created"
         })
         .collect()
 }
@@ -209,12 +243,12 @@ struct Attribution {
 }
 
 fn attribute(
-    mut actions: BTreeMap<String, String>,
+    actions: BTreeMap<String, String>,
     tool_writes: &BTreeSet<String>,
     app_writes: &BTreeSet<String>,
     overlapping_chat: bool,
+    app_write_unknown: bool,
 ) -> Attribution {
-    actions.retain(|id, _| !app_writes.contains(id));
     let mut evidence = BTreeMap::new();
     let mut unknown_actor = Vec::new();
     for id in actions.keys() {
@@ -222,9 +256,13 @@ fn attribute(
             evidence.insert(id.clone(), "tool".into());
         } else {
             evidence.insert(id.clone(), "diff".into());
-            if overlapping_chat {
-                unknown_actor.push(id.clone());
-            }
+        }
+        if app_write_unknown
+            || app_writes.contains(id)
+            || (!tool_writes.contains(id)
+                && (overlapping_chat || actions.get(id).is_some_and(|action| action == "deleted")))
+        {
+            unknown_actor.push(id.clone());
         }
     }
     Attribution {
@@ -242,7 +280,8 @@ pub(crate) fn record(
     before: &Snapshot,
     after: &Snapshot,
 ) -> Result<bool, String> {
-    let actions = changes(before, after);
+    let mut actions = changes(before, after);
+    actions.retain(|id, _| !id.starts_with("object-path:"));
     if actions.is_empty() && input.read.is_empty() {
         return Ok(false);
     }
@@ -261,11 +300,14 @@ pub(crate) fn record_tracked(
     tracking: Tracking,
 ) -> Result<bool, String> {
     let activity = tracking.finish();
+    let mut actions = changes(before, after);
+    actions.retain(|id, _| !id.starts_with("object-path:"));
     let result = attribute(
-        changes(before, after),
+        actions,
         tool_writes,
         &activity.app_writes,
-        activity.overlapping_chat || activity.app_write_unknown,
+        activity.overlapping_chat,
+        activity.app_write_unknown,
     );
     if result.actions.is_empty() && input.read.is_empty() {
         return Ok(false);
@@ -286,6 +328,33 @@ pub(crate) fn record_tracked(
 mod tests {
     use super::*;
     #[test]
+    fn deleted_file_tool_reference_and_uncertain_actor_are_distinguished() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("zettels")).unwrap();
+        let path = dir.path().join("zettels/zet_20261115_120000.md");
+        assert_eq!(
+            reference(dir.path(), path.to_str().unwrap()).as_deref(),
+            Some("zet_20261115_120000")
+        );
+        let actions = BTreeMap::from([("zet_20261115_120000".to_string(), "deleted".to_string())]);
+        let unknown = attribute(
+            actions.clone(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+            false,
+        );
+        assert_eq!(unknown.unknown_actor, ["zet_20261115_120000"]);
+        let observed = attribute(
+            actions,
+            &BTreeSet::from(["zet_20261115_120000".to_string()]),
+            &BTreeSet::new(),
+            false,
+            false,
+        );
+        assert!(observed.unknown_actor.is_empty());
+    }
+    #[test]
     fn attribution_distinguishes_tool_diff_and_app_writes_during_overlap() {
         let actions = [("a", "created"), ("b", "edited"), ("c", "edited")]
             .into_iter()
@@ -296,11 +365,29 @@ mod tests {
             &BTreeSet::from(["a".into()]),
             &BTreeSet::from(["c".into()]),
             true,
+            false,
         );
         assert_eq!(result.evidence.get("a").map(String::as_str), Some("tool"));
         assert_eq!(result.evidence.get("b").map(String::as_str), Some("diff"));
-        assert_eq!(result.unknown_actor, ["b"]);
-        assert!(!result.actions.contains_key("c"));
+        assert_eq!(result.unknown_actor, ["b", "c"]);
+        assert!(result.actions.contains_key("c"));
+        let observed_with_app_write = attribute(
+            BTreeMap::from([("c".into(), "edited".into())]),
+            &BTreeSet::from(["c".into()]),
+            &BTreeSet::from(["c".into()]),
+            false,
+            false,
+        );
+        assert_eq!(observed_with_app_write.evidence["c"], "tool");
+        assert_eq!(observed_with_app_write.unknown_actor, ["c"]);
+        let unknown_app_write = attribute(
+            BTreeMap::from([("c".into(), "edited".into())]),
+            &BTreeSet::from(["c".into()]),
+            &BTreeSet::new(),
+            false,
+            true,
+        );
+        assert_eq!(unknown_app_write.unknown_actor, ["c"]);
     }
 
     #[test]
@@ -373,7 +460,11 @@ mod tests {
             .unwrap();
         assert_eq!(diff["evidence"], "diff");
         assert!(diff["by"].is_null());
-        assert!(!docs.iter().any(|x| x["id"] == "zet_20261115_120002"));
+        let shared = docs
+            .iter()
+            .find(|x| x["id"] == "zet_20261115_120002")
+            .unwrap();
+        assert!(shared["by"].is_null());
         assert_eq!(value["media"][0]["evidence"], "diff");
         assert!(value["media"][0]["by"].is_null());
         let second_input = crate::archive_receipt::ReceiptCreate {
@@ -404,7 +495,11 @@ mod tests {
             .unwrap();
         assert_eq!(other_diff["evidence"], "diff");
         assert!(other_diff["by"].is_null());
-        assert!(!other_docs.iter().any(|x| x["id"] == "zet_20261115_120002"));
+        let shared = other_docs
+            .iter()
+            .find(|x| x["id"] == "zet_20261115_120002")
+            .unwrap();
+        assert!(shared["by"].is_null());
         let reverse = serde_json::to_value(
             crate::archive_receipt::chats_for_reference(&root, &db, "zet_20261115_120001").unwrap(),
         )
@@ -423,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn app_document_edit_is_not_recorded_as_ai_write() {
+    fn app_document_edit_is_recorded_without_claiming_ai_wrote_it() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("archive");
         fs::create_dir_all(root.join("zettels")).unwrap();
@@ -465,13 +560,13 @@ mod tests {
         let input = crate::archive_receipt::ReceiptCreate {
             tool: "codex".into(),
             model: "model".into(),
-            chat: Some(chat),
+            chat: Some(chat.clone()),
             read: vec![],
             wrote: vec![],
             prompt: String::new(),
             changes: String::new(),
         };
-        assert!(!record_tracked(
+        assert!(record_tracked(
             &root,
             &db,
             input,
@@ -481,6 +576,15 @@ mod tests {
             tracking
         )
         .unwrap());
+        let items =
+            serde_json::to_value(crate::chat_items::list(&root, &db, &chat).unwrap()).unwrap();
+        let item = items["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .unwrap();
+        assert!(item["by"].is_null());
     }
     #[test]
     fn interrupted_reply_uses_only_an_observed_model() {
@@ -513,6 +617,105 @@ mod tests {
         assert_eq!(
             result.get("zet_20261115_120001").map(String::as_str),
             Some("created")
+        );
+    }
+
+    #[test]
+    fn deletion_is_detected_but_does_not_itself_preserve_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("zettels")).unwrap();
+        let file = dir.path().join("zettels/zet_20261115_120000.md");
+        fs::write(&file, b"unsaved lesson").unwrap();
+        let before = capture(dir.path()).unwrap();
+        fs::remove_file(&file).unwrap();
+        let after = capture(dir.path()).unwrap();
+        assert!(!file.exists());
+        assert_eq!(
+            changes(&before, &after)
+                .get("zet_20261115_120000")
+                .map(String::as_str),
+            Some("deleted")
+        );
+    }
+
+    #[test]
+    fn deleted_document_is_recorded_and_listed_after_file_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("zettels")).unwrap();
+        fs::create_dir_all(root.join("objects")).unwrap();
+        fs::create_dir_all(root.join("receipts")).unwrap();
+        let db = root.join("state.db");
+        crate::storage::initialize(&db, &root.join("backups"), "test").unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let file = root.join("zettels/zet_20261115_120000.md");
+        fs::write(&file, b"private unsaved document").unwrap();
+        let before = capture(root).unwrap();
+        fs::remove_file(&file).unwrap();
+        let after = capture(root).unwrap();
+        let input = crate::archive_receipt::ReceiptCreate {
+            tool: "claude".into(),
+            model: "test".into(),
+            chat: Some(chat.clone()),
+            read: vec![],
+            wrote: vec![],
+            prompt: String::new(),
+            changes: String::new(),
+        };
+        assert!(record(root, &db, input, &before, &after).unwrap());
+        let result =
+            serde_json::to_value(crate::chat_items::list(root, &db, &chat).unwrap()).unwrap();
+        assert_eq!(result["deleted"][0]["id"], "zet_20261115_120000");
+        assert_eq!(result["deleted"][0]["how"], "deleted");
+        assert_eq!(result["deleted"][0]["by"]["provider"], "claude");
+    }
+
+    #[test]
+    fn modified_and_missing_originals_raise_integrity_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("objects/sha256/aa");
+        fs::create_dir_all(&folder).unwrap();
+        let hash = "a".repeat(64);
+        let file = folder.join(&hash);
+        fs::write(&file, b"original").unwrap();
+        let before = capture(dir.path()).unwrap();
+        fs::write(&file, b"changed").unwrap();
+        let changed = source_changes(&before, &capture(dir.path()).unwrap());
+        assert_eq!(
+            changed.get(&format!("sha256:{hash}")).map(String::as_str),
+            Some("edited")
+        );
+        fs::remove_file(&file).unwrap();
+        let deleted = source_changes(&before, &capture(dir.path()).unwrap());
+        assert_eq!(
+            deleted.get(&format!("sha256:{hash}")).map(String::as_str),
+            Some("deleted")
+        );
+    }
+
+    #[test]
+    fn non_content_addressed_original_changes_are_reported_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("objects/legacy");
+        fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("recording.wav");
+        fs::write(&file, b"original").unwrap();
+        let before = capture(dir.path()).unwrap();
+        fs::remove_file(&file).unwrap();
+        let after = capture(dir.path()).unwrap();
+        assert_eq!(
+            source_changes(&before, &after)
+                .get(&format!(
+                    "object-path:{}",
+                    std::path::Path::new("legacy")
+                        .join("recording.wav")
+                        .display()
+                ))
+                .map(String::as_str),
+            Some("deleted")
         );
     }
 

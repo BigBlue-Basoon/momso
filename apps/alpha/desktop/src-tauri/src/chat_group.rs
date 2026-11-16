@@ -15,13 +15,13 @@ pub(crate) struct ChatGroup {
 
 fn db(path: &Path) -> Result<Connection, String> {
     let connection =
-        Connection::open(path).map_err(|_| "채팅방 묶음을 열지 못했습니다".to_string())?;
+        Connection::open(path).map_err(|_| "프로젝트를 열지 못했습니다".to_string())?;
     connection
         .busy_timeout(Duration::from_secs(5))
-        .map_err(|_| "채팅방 묶음을 열지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 열지 못했습니다".to_string())?;
     connection
         .execute_batch("PRAGMA foreign_keys=ON")
-        .map_err(|_| "채팅방 묶음을 열지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 열지 못했습니다".to_string())?;
     Ok(connection)
 }
 fn read_group(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatGroup> {
@@ -37,38 +37,38 @@ fn one(connection: &Connection, id: &str) -> Result<ChatGroup, String> {
     connection
         .query_row(&format!("{GROUP_SELECT} WHERE g.id=?1"), [id], read_group)
         .optional()
-        .map_err(|_| "채팅방 묶음을 읽지 못했습니다".to_string())?
-        .ok_or_else(|| "채팅방 묶음을 찾을 수 없습니다".to_string())
+        .map_err(|_| "프로젝트를 읽지 못했습니다".to_string())?
+        .ok_or_else(|| "프로젝트를 찾을 수 없습니다".to_string())
 }
 pub(crate) fn list(path: &Path) -> Result<Vec<ChatGroup>, String> {
     let connection = db(path)?;
     let mut query = connection
         .prepare(&format!("{GROUP_SELECT} ORDER BY g.position,g.rowid"))
-        .map_err(|_| "채팅방 묶음을 읽지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 읽지 못했습니다".to_string())?;
     let rows = query
         .query_map([], read_group)
-        .map_err(|_| "채팅방 묶음을 읽지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 읽지 못했습니다".to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "채팅방 묶음을 읽지 못했습니다".into())
+        .map_err(|_| "프로젝트를 읽지 못했습니다".into())
 }
 pub(crate) fn create(path: &Path, name: &str) -> Result<ChatGroup, String> {
     if name.trim().is_empty() {
-        return Err("묶음 이름을 입력해 주세요".into());
+        return Err("프로젝트 이름을 입력해 주세요".into());
     }
     let mut connection = db(path)?;
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| "묶음을 만들지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 만들지 못했습니다".to_string())?;
     let id = Uuid::new_v4().to_string();
-    tx.execute("INSERT INTO chat_groups(id,name,position,created_at) VALUES (?1,?2,(SELECT COALESCE(MAX(position),-1)+1 FROM chat_groups),?3)",params![id,name,Local::now().to_rfc3339()]).map_err(|_| "묶음을 만들지 못했습니다".to_string())?;
+    tx.execute("INSERT INTO chat_groups(id,name,position,created_at) VALUES (?1,?2,(SELECT COALESCE(MAX(position),-1)+1 FROM chat_groups),?3)",params![id,name,Local::now().to_rfc3339()]).map_err(|_| "프로젝트를 만들지 못했습니다".to_string())?;
     let result = one(&tx, &id)?;
     tx.commit()
-        .map_err(|_| "묶음을 만들지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 만들지 못했습니다".to_string())?;
     Ok(result)
 }
 pub(crate) fn rename(path: &Path, id: &str, name: &str) -> Result<(), String> {
     if name.trim().is_empty() {
-        return Err("묶음 이름을 입력해 주세요".into());
+        return Err("프로젝트 이름을 입력해 주세요".into());
     }
     let connection = db(path)?;
     let n = connection
@@ -76,9 +76,9 @@ pub(crate) fn rename(path: &Path, id: &str, name: &str) -> Result<(), String> {
             "UPDATE chat_groups SET name=?1 WHERE id=?2",
             params![name, id],
         )
-        .map_err(|_| "묶음 이름을 바꾸지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트 이름을 바꾸지 못했습니다".to_string())?;
     if n == 0 {
-        return Err("채팅방 묶음을 찾을 수 없습니다".into());
+        return Err("프로젝트를 찾을 수 없습니다".into());
     }
     Ok(())
 }
@@ -86,40 +86,40 @@ pub(crate) fn reorder(path: &Path, ids: &[String]) -> Result<(), String> {
     let mut connection = db(path)?;
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| "묶음 순서를 바꾸지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트 순서를 바꾸지 못했습니다".to_string())?;
     let mut query = tx
         .prepare("SELECT id FROM chat_groups")
-        .map_err(|_| "묶음 순서를 바꾸지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트 순서를 바꾸지 못했습니다".to_string())?;
     let existing: HashSet<String> = query
         .query_map([], |row| row.get(0))
-        .map_err(|_| "묶음 순서를 바꾸지 못했습니다".to_string())?
+        .map_err(|_| "프로젝트 순서를 바꾸지 못했습니다".to_string())?
         .collect::<Result<_, _>>()
-        .map_err(|_| "묶음 순서를 바꾸지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트 순서를 바꾸지 못했습니다".to_string())?;
     drop(query);
     let received: HashSet<&str> = ids.iter().map(String::as_str).collect();
     if received.len() != ids.len()
         || ids.len() != existing.len()
         || !ids.iter().all(|id| existing.contains(id))
     {
-        return Err("묶음 목록이 바뀌었습니다. 다시 확인해 주세요".into());
+        return Err("프로젝트 목록이 바뀌었습니다. 다시 확인해 주세요".into());
     }
     for (index, id) in ids.iter().enumerate() {
         tx.execute(
             "UPDATE chat_groups SET position=?1 WHERE id=?2",
             params![index as i64, id],
         )
-        .map_err(|_| "묶음 순서를 바꾸지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트 순서를 바꾸지 못했습니다".to_string())?;
     }
     tx.commit()
-        .map_err(|_| "묶음 순서를 바꾸지 못했습니다".into())
+        .map_err(|_| "프로젝트 순서를 바꾸지 못했습니다".into())
 }
 pub(crate) fn remove(path: &Path, id: &str) -> Result<(), String> {
     let connection = db(path)?;
     let n = connection
         .execute("DELETE FROM chat_groups WHERE id=?1", [id])
-        .map_err(|_| "묶음을 없애지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 없애지 못했습니다".to_string())?;
     if n == 0 {
-        return Err("채팅방 묶음을 찾을 수 없습니다".into());
+        return Err("프로젝트를 찾을 수 없습니다".into());
     }
     Ok(())
 }
@@ -131,7 +131,7 @@ pub(crate) fn set_group(
     let mut connection = db(path)?;
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| "채팅방 묶음을 바꾸지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 바꾸지 못했습니다".to_string())?;
     let group_id = group_id.filter(|id| !id.is_empty());
     if let Some(id) = &group_id {
         one(&tx, id)?;
@@ -141,12 +141,12 @@ pub(crate) fn set_group(
             "UPDATE chats SET group_id=?1 WHERE id=?2",
             params![group_id, chat_id],
         )
-        .map_err(|_| "채팅방 묶음을 바꾸지 못했습니다".to_string())?;
+        .map_err(|_| "프로젝트를 바꾸지 못했습니다".to_string())?;
     if n == 0 {
         return Err("채팅방을 찾을 수 없습니다".into());
     }
     tx.commit()
-        .map_err(|_| "채팅방 묶음을 바꾸지 못했습니다".into())
+        .map_err(|_| "프로젝트를 바꾸지 못했습니다".into())
 }
 
 #[cfg(test)]

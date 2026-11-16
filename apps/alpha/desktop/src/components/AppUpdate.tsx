@@ -36,13 +36,16 @@ export function useAppUpdate(): AppUpdateState {
         // unavailable: 업데이트 설정이 아직 없음 → 업데이트 쪽은 눌리지 않게만(글 없음).
         setSupported(next.state !== 'unavailable')
         setInfo(next)
-        setPhase(next.state === 'failed' ? 'failed' : 'idle')
-        if (next.state === 'failed') setError(W.appUpdate.text1)
+        // failed: 아직 릴리스가 없을 때도, 연결이 안 될 때도 온다(archive-backend-port-notes.md B14). 까닭을 단정하지 않고
+        // 오류로 띄우지도 않는다. 설정의 앱 정보에 흐린 한 줄만(AppInfoSettings). 사람이 "업데이트 확인"을 다시 누를 수 있다.
+        setPhase('idle')
       })
       .catch((reason) => {
-        if (isMissingCommand(reason)) setSupported(false)
-        else { setSupported(true); setError(W.appUpdate.text1) }
-        setPhase(isMissingCommand(reason) ? 'idle' : 'failed')
+        if (isMissingCommand(reason)) { setSupported(false); setPhase('idle'); return }
+        // 명령은 있는데 부르지 못했으면 failed 와 같게(오류 꼴 없이).
+        setSupported(true)
+        setInfo({ state: 'failed', currentVersion: null, latestVersion: null, notes: null, publishedAt: null })
+        setPhase('idle')
       })
   }, [])
 

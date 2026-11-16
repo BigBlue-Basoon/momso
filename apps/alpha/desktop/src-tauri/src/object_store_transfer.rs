@@ -1056,6 +1056,7 @@ mod tests {
         let server_data = Arc::clone(&data);
         let server_writes = Arc::clone(&writes);
         let server_stop = Arc::clone(&stop);
+        let google = provider == "gcp";
         let server = std::thread::spawn(move || {
             let mut failed_once = false;
             while !server_stop.load(Ordering::Relaxed) {
@@ -1125,7 +1126,14 @@ mod tests {
                     ("503 Service Unavailable", Vec::new())
                 } else if method == "PUT" {
                     let mut objects = server_data.lock().unwrap();
-                    if conditional && objects.contains_key(key) {
+                    let create_only = head.lines().any(|line| {
+                        if google {
+                            line.eq_ignore_ascii_case("x-goog-if-generation-match: 0")
+                        } else {
+                            line.eq_ignore_ascii_case("if-none-match: *")
+                        }
+                    });
+                    if conditional && create_only && objects.contains_key(key) {
                         ("412 Precondition Failed", Vec::new())
                     } else {
                         objects.insert(

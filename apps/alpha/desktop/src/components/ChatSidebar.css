@@ -29,10 +29,6 @@
   background: var(--surface);
 }
 
-.chat-search {
-  margin: 0;
-}
-
 /* 예전 목록의 위쪽 선(App.css)은 쓰지 않는다. App.css 가 이 파일보다 나중에 읽혀서 한 단계 좁혀 덮는다. */
 .chat-sidebar .chat-list {
   border-top: 0;
@@ -99,18 +95,6 @@
 
 .chat-row.selected .chat-row-title {
   font-weight: 680;
-}
-
-.chat-row-snippet {
-  display: -webkit-box;
-  overflow: hidden;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.5;
-  word-break: keep-all;
-  overflow-wrap: anywhere;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
 }
 
 @keyframes chat-row-enter {
@@ -372,15 +356,6 @@
   background: var(--surface-muted);
 }
 
-.chat-row-group {
-  margin-right: 6px;
-  padding: 0 5px;
-  border-radius: 4px;
-  background: var(--surface-muted);
-  color: var(--ink-soft);
-  font-weight: 600;
-}
-
 /* ---- 읽기 쉽게(2026-11-16, Claude 앱 목록에 맞춤 — 기록 40절의 잰 표) ----
    줄 간격 32px, 글 13px 보통 굵기, 고른 줄은 옅은 바탕만(흰 상자·그림자 없음), 위쪽 도구는 같은 모양의 두 줄. */
 .chat-sidebar-tools {
@@ -404,10 +379,6 @@
 
 .chat-sidebar .shortcut-tip-anchor {
   display: flex;
-}
-
-.chat-search-button {
-  width: 100%;
 }
 
 .chat-group-add {

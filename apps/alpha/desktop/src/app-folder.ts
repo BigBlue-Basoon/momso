@@ -21,15 +21,40 @@ export async function getFolderLocation() {
   return invoke<FolderLocation>('archive_location_get')
 }
 
-export async function setFolderLocation(path: string): Promise<FolderMoveResult> {
-  if (!isDesktopRuntime()) throw new Error('archive_location_set needs the desktop runtime')
-  const result = await invoke<Partial<FolderMoveResult> | null>('archive_location_set', { path })
+function readMoveResult(result: Partial<FolderMoveResult> | null | undefined): FolderMoveResult {
   return {
     state: (result?.state ?? 'failed') as FolderMoveState,
     path: result?.path ?? null,
     previousPath: result?.previousPath ?? null,
     previousKept: typeof result?.previousKept === 'boolean' ? result.previousKept : null,
   }
+}
+
+// 옮기는 중인지(앱 전체에서 하나). 설정 화면을 떠났다 돌아와도 옮기는 중이면 막대가 다시 보이게 한다.
+let movingNow = false
+export function isFolderMoving() { return movingNow }
+
+export async function setFolderLocation(path: string): Promise<FolderMoveResult> {
+  if (!isDesktopRuntime()) throw new Error('archive_location_set needs the desktop runtime')
+  movingNow = true
+  try {
+    return readMoveResult(await invoke<Partial<FolderMoveResult> | null>('archive_location_set', { path }))
+  } finally {
+    movingNow = false
+  }
+}
+
+/**
+ * 옮기기가 끝났을 때(archive-location-done / archive-location-failed, archive_location_set 의 결과와 같은 모양).
+ * 옮기는 도중에 설정 화면을 떠났다 돌아와도 화면이 끝을 알 수 있게 듣는다.
+ */
+export async function listenFolderMoveEnd(onEnd: (result: FolderMoveResult) => void) {
+  if (!isDesktopRuntime()) return () => {}
+  const stops = await Promise.all([
+    listen<Partial<FolderMoveResult>>('archive-location-done', (event) => onEnd(readMoveResult(event.payload))),
+    listen<Partial<FolderMoveResult>>('archive-location-failed', (event) => onEnd(readMoveResult(event.payload))),
+  ])
+  return () => stops.forEach((stop) => stop())
 }
 
 /** 옮기는 동안 온 양. 끝은 setFolderLocation 의 결과로 안다. */

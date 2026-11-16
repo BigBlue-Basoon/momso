@@ -2,8 +2,23 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-// Real built-in content is deliberately absent until the product owner supplies it.
-const BUNDLED_SKILLS: &[(&str, &str)] = &[];
+pub(crate) const BUNDLED_SKILLS: &[(&str, &str)] = &[
+    ("naver-smartplace", include_str!("../bundled-skills/naver-smartplace/SKILL.md")),
+    ("onstudio-operations", include_str!("../bundled-skills/onstudio-operations/SKILL.md")),
+    ("studiomate-operations", include_str!("../bundled-skills/studiomate-operations/SKILL.md")),
+    ("soomgo-operations", include_str!("../bundled-skills/soomgo-operations/SKILL.md")),
+    ("frip-host-operations", include_str!("../bundled-skills/frip-host-operations/SKILL.md")),
+    ("sssd-host-operations", include_str!("../bundled-skills/sssd-host-operations/SKILL.md")),
+    ("conversation-import", include_str!("../bundled-skills/conversation-import/SKILL.md")),
+    (
+        "github-connect",
+        include_str!("../bundled-skills/github-connect/SKILL.md"),
+    ),
+    (
+        "object-store-connect",
+        include_str!("../bundled-skills/object-store-connect/SKILL.md"),
+    ),
+];
 
 pub(crate) fn install_bundled(root: &Path, resources: &Path) -> Result<(), &'static str> {
     install(root, resources, BUNDLED_SKILLS)
@@ -236,6 +251,27 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn bundled_setup_skill_sources_parse() {
+        for &(name, source) in BUNDLED_SKILLS {
+            assert_eq!(parse(name, source).unwrap().0.name, name);
+        }
+    }
+    #[test]
+    fn setup_skills_are_installed_for_all_three_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        for &(name, _) in BUNDLED_SKILLS {
+            let skill = read(&root, name).unwrap();
+            assert!(skill.summary.enabled);
+            assert!(skill.summary.builtin);
+            assert_eq!(skill.summary.providers, ["codex", "antigravity", "claude"]);
+            for folder in ["skills", ".agents/skills", ".claude/skills"] {
+                assert!(root.join(folder).join(name).join("SKILL.md").is_file());
+            }
+        }
+    }
+    #[test]
     fn korean_and_yaml_punctuation_round_trip() {
         let head = SkillHead {
             name: "yoga-1".into(),
@@ -371,6 +407,27 @@ mod tests {
                 .replace(&format!("{line}\n"), "");
             std::fs::write(path, legacy).unwrap();
         }
+        let tool = crate::archive::storage_tool(dir.path()).unwrap().0;
+        crate::archive::run_storage_tool(
+            &tool,
+            &root,
+            &["add", "--", "AGENTS.md", "CLAUDE.md", "GEMINI.md"],
+        )
+        .unwrap();
+        crate::archive::run_storage_tool(
+            &tool,
+            &root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "previous version",
+            ],
+        )
+        .unwrap();
         let custom = root.join("CLAUDE.md");
         std::fs::write(&custom, "custom").unwrap();
         crate::archive::initialize(&root, dir.path()).unwrap();

@@ -47,6 +47,9 @@ fn info(state: &'static str, version: &str) -> UpdateInfo {
         published_at: None,
     }
 }
+fn check_failed(version: &str) -> UpdateInfo {
+    info("failed", version)
+}
 fn configured(key: &str, endpoint: &str) -> bool {
     !key.trim().is_empty()
         && endpoint
@@ -122,7 +125,7 @@ async fn check(app: &tauri::AppHandle) -> UpdateInfo {
             }
             info("up_to_date", &version)
         }
-        Err(_) => info("failed", &version),
+        Err(_) => check_failed(&version),
     }
 }
 
@@ -306,6 +309,21 @@ mod tests {
         assert!(!configured("public", "http://example.invalid/latest.json"));
     }
     #[test]
+    fn configured_public_key_and_endpoint_are_available() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let updater = &config["plugins"]["updater"];
+        let key = updater["pubkey"].as_str().unwrap();
+        assert!(!key.is_empty());
+        let endpoint = updater["endpoints"]
+            .as_array()
+            .unwrap()
+            .first()
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(configured(key, endpoint));
+    }
+    #[test]
     fn version_comparison() {
         assert!(newer("0.1.0", "0.2.0"));
         assert!(!newer("0.2.0", "0.1.0"));
@@ -357,7 +375,7 @@ mod tests {
         let mut context = tauri::test::mock_context(tauri::test::noop_assets());
         context.config_mut().plugins.0.insert(
             "updater".into(),
-            serde_json::json!({"pubkey":"", "endpoints":[]}),
+            serde_json::json!({"pubkey":"", "endpoints":[], "dangerousInsecureTransportProtocol":true}),
         );
         let app = tauri::test::mock_builder()
             .plugin(tauri_plugin_updater::Builder::new().build())
@@ -375,6 +393,47 @@ mod tests {
             .unwrap();
         let update = updater.check().await.unwrap().unwrap();
         assert_eq!(update.version, "0.2.0");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_release_returns_failed_without_an_available_update() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.config_mut().plugins.0.insert(
+            "updater".into(),
+            serde_json::json!({"pubkey":"", "endpoints":[], "dangerousInsecureTransportProtocol":true}),
+        );
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .build(context)
+            .unwrap();
+        let updater = app
+            .handle()
+            .updater_builder()
+            .endpoints(vec![format!("http://127.0.0.1:{port}/latest.json")
+                .parse()
+                .unwrap()])
+            .unwrap()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        assert!(updater.check().await.is_err());
+        let result = check_failed("0.1.0");
+        assert_eq!(result.state, "failed");
+        assert!(result.latest_version.is_none());
         server.join().unwrap();
     }
 }

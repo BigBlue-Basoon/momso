@@ -1,4 +1,4 @@
-use crate::process;
+use crate::{gemini_access, process};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{path::Path, time::Duration};
@@ -16,7 +16,7 @@ struct Effort {
 }
 #[derive(Debug, Serialize)]
 struct Fast {
-    supported: bool,
+    supported: Option<bool>,
     state: &'static str,
     label: &'static str,
 }
@@ -69,7 +69,11 @@ fn fast(provider: &str, model: &str) -> Fast {
         _ => false,
     };
     Fast {
-        supported,
+        supported: if provider == "gemini" {
+            None
+        } else {
+            Some(supported)
+        },
         state: "unavailable",
         label: if provider == "claude" {
             "고속 모드"
@@ -103,6 +107,7 @@ struct Model {
     toggles: Vec<Toggle>,
     fast: Fast,
     default_effort: Option<String>,
+    effective_default_effort: Option<String>,
     is_default: Option<bool>,
 }
 #[derive(Debug, Serialize)]
@@ -145,7 +150,7 @@ fn codex_model(v: &Value) -> Option<Model> {
                 .filter_map(|x| {
                     x.get("reasoningEffort")
                         .and_then(Value::as_str)
-                        .filter(|id| !id.eq_ignore_ascii_case("ultracode"))
+                        .filter(|id| !id.eq_ignore_ascii_case("ultracode") && !id.eq_ignore_ascii_case("ultra"))
                         .map(|id| {
                             effort(
                                 id,
@@ -177,6 +182,7 @@ fn codex_model(v: &Value) -> Option<Model> {
         resolved,
         efforts,
         default_effort: default_effort.map(str::to_owned),
+        effective_default_effort: None,
         is_default: v.get("isDefault").and_then(Value::as_bool),
     })
 }
@@ -266,7 +272,7 @@ fn latest_by_family(models: Vec<Model>) -> Vec<Model> {
     }
     selected
 }
-async fn codex() -> ProviderModels {
+async fn codex(cwd: &Path) -> ProviderModels {
     if process::resolve_interactive_tool("codex").is_none() {
         return empty("codex", "not_connected");
     }
@@ -285,6 +291,16 @@ async fn codex() -> ProviderModels {
         Ok(_) => return empty("codex", "not_connected"),
         Err(_) => return empty("codex", "unavailable"),
     }
+    let effective_config = process::run_json_rpc_tool(
+        "codex",
+        &["app-server"],
+        Some(cwd),
+        &env,
+        rpc("config/read", json!({"includeLayers":false,"cwd":cwd})),
+        Duration::from_secs(15),
+    )
+    .await
+    .ok();
     let mut models = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..50 {
@@ -315,16 +331,27 @@ async fn codex() -> ProviderModels {
             Some(next) if Some(next) != cursor.as_deref() => cursor = Some(next.to_owned()),
             Some(_) => return empty("codex", "unavailable"),
             None => {
+                apply_codex_effective_config(&mut models, effective_config.as_ref());
                 return ProviderModels {
                     provider: "codex",
                     state: "ok",
                     reason: None,
                     models: latest_by_family(models),
-                }
+                };
             }
         }
     }
     empty("codex", "unavailable")
+}
+fn apply_codex_effective_config(models: &mut [Model], config: Option<&Value>) {
+    let configured = config
+        .and_then(|v| v.pointer("/config/model_reasoning_effort"))
+        .and_then(Value::as_str);
+    for model in models {
+        model.effective_default_effort = configured
+            .filter(|level| model.efforts.iter().any(|effort| effort.id == *level))
+            .map(str::to_owned);
+    }
 }
 fn claude_models(output: &str) -> Vec<Model> {
     for line in output.lines() {
@@ -369,14 +396,9 @@ fn claude_models(output: &str) -> Vec<Model> {
                         "더 높은 노력은 더 철저한 응답을 의미하지만, 시간이 더 오래 걸리고 한도를 더 빨리 사용합니다.".into(),
                     ),
                     fast: fast("claude", m.get("resolvedModel").and_then(Value::as_str).unwrap_or(&id)),
-                    toggles: vec![Toggle {
-                        id: "ultracode".into(),
-                        kind: "toggle",
-                        label: "Ultracode".into(),
-                        description: None,
-                        available: false,
-                        state: None,
-                    }],
+                    // The CLI does not prove model and account eligibility. Do not
+                    // advertise a toggle that may silently fall back.
+                    toggles: vec![],
                     resolved: m
                         .get("resolvedModel")
                         .and_then(Value::as_str)
@@ -387,11 +409,96 @@ fn claude_models(output: &str) -> Vec<Model> {
                     label,
                     efforts,
                     default_effort: None,
+                    effective_default_effort: None,
                 })
             })
             .collect();
     }
     Vec::new()
+}
+
+fn status_effort(output: &str, supports_auto_current: bool) -> Option<String> {
+    let value: Value = serde_json::from_str(output).ok()?;
+    if value.get("is_error").and_then(Value::as_bool) != Some(false)
+        || value.get("local_command").and_then(Value::as_str) != Some("effort")
+    {
+        return None;
+    }
+    let text = value.get("result")?.as_str()?;
+    let level = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Effort level: "))?;
+    let level = if supports_auto_current {
+        level
+            .strip_prefix("auto (currently ")
+            .and_then(|v| v.strip_suffix(')'))
+            .unwrap_or(level)
+    } else {
+        level
+    };
+    ["low", "medium", "high", "xhigh", "max"]
+        .contains(&level)
+        .then(|| level.to_owned())
+}
+
+fn claude_auto_current_is_reliable(output: &str) -> bool {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|value| {
+            let Some(version) = value
+                .pointer("/response/response/claude_code_version")
+                .and_then(Value::as_str)
+            else {
+                return false;
+            };
+            let parts: Vec<u64> = version.split('.').filter_map(|v| v.parse().ok()).collect();
+            parts.len() == 3 && parts.as_slice() >= [2, 1, 304].as_slice()
+        })
+}
+
+async fn claude_model_effort(
+    cwd: &Path,
+    model: &str,
+    supports_auto_current: bool,
+) -> Option<String> {
+    if !supports_auto_current {
+        return None;
+    }
+    let mut args = vec![
+        "--safe-mode",
+        "-p",
+        "/effort status",
+        "--output-format",
+        "json",
+        "--no-session-persistence",
+        "--tools=",
+    ];
+    if model != "default" {
+        args.extend(["--model", model]);
+    }
+    run_effort_probe(cwd, "claude", &args, supports_auto_current).await
+}
+async fn run_effort_probe(
+    cwd: &Path,
+    tool: &str,
+    args: &[&str],
+    supports_auto_current: bool,
+) -> Option<String> {
+    let output = process::run_tool(
+        tool,
+        args,
+        Some(cwd),
+        None,
+        &process::empty_environment(),
+        Duration::from_secs(20),
+    )
+    .await
+    .ok()?;
+    if !output.success {
+        return None;
+    }
+    status_effort(&output.stdout, supports_auto_current)
 }
 async fn claude(cwd: &Path) -> ProviderModels {
     if process::resolve_tool("claude").is_none() {
@@ -439,7 +546,13 @@ async fn claude(cwd: &Path) -> ProviderModels {
     .await
     {
         Ok(output) => {
-            let models = claude_models(&output.stdout);
+            let supports_auto_current = claude_auto_current_is_reliable(&output.stdout);
+            let mut models = latest_by_family(claude_models(&output.stdout));
+            for model in &mut models {
+                let level = claude_model_effort(cwd, &model.id, supports_auto_current).await;
+                model.effective_default_effort =
+                    level.filter(|level| model.efforts.iter().any(|effort| &effort.id == level));
+            }
             if models.is_empty() {
                 empty("claude", "unavailable")
             } else {
@@ -447,39 +560,47 @@ async fn claude(cwd: &Path) -> ProviderModels {
                     provider: "claude",
                     state: "ok",
                     reason: None,
-                    models: latest_by_family(models),
+                    models,
                 }
             }
         }
         Err(_) => empty("claude", "unavailable"),
     }
 }
-#[cfg(test)]
 fn gemini_models(output: &str) -> ProviderModels {
-    let Ok(list) = serde_json::from_str::<Vec<Value>>(output) else {
-        return empty("gemini", "unavailable");
-    };
-    let models = list
-        .iter()
-        .filter_map(|m| {
+    let models: Vec<Model> = output
+        .lines()
+        .filter_map(|line| {
+            let (id, label) = line.trim().split_once('\t')?;
+            if id.is_empty()
+                || id.len() > 200
+                || label.is_empty()
+                || label.len() > 300
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+                || label.chars().any(char::is_control)
+            {
+                return None;
+            }
             Some(Model {
-                id: m.get("modelId")?.as_str()?.to_owned(),
+                id: id.to_owned(),
                 family: None,
-                label: m
-                    .get("displayName")
-                    .or_else(|| m.get("name"))?
-                    .as_str()?
-                    .to_owned(),
+                label: label.to_owned(),
                 resolved: None,
                 efforts: vec![],
                 effort_note: None,
                 toggles: vec![],
                 fast: fast("gemini", ""),
                 default_effort: None,
+                effective_default_effort: None,
                 is_default: None,
             })
         })
         .collect();
+    if models.is_empty() {
+        return empty("gemini", "unavailable");
+    }
     ProviderModels {
         provider: "gemini",
         state: "ok",
@@ -487,9 +608,62 @@ fn gemini_models(output: &str) -> ProviderModels {
         models,
     }
 }
+async fn gemini() -> ProviderModels {
+    let environment = match gemini_access::api_key_environment() {
+        Ok(Some(environment)) => environment,
+        Ok(None) => return empty("gemini", "not_configured"),
+        Err(_) => return empty("gemini", "unavailable"),
+    };
+    let Some(executable) = gemini_access::executable() else {
+        return empty("gemini", "unavailable");
+    };
+    let mut command = tokio::process::Command::new(executable);
+    command.args([
+        "--settings",
+        gemini_access::API_KEY_SESSION_SETTINGS,
+        "models",
+    ]);
+    run_gemini_models(command, environment).await
+}
+async fn run_gemini_models(
+    mut command: tokio::process::Command,
+    environment: std::collections::HashMap<String, String>,
+) -> ProviderModels {
+    command
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    for name in [
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
+    command.envs(&environment);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    match tokio::time::timeout(Duration::from_secs(20), command.output()).await {
+        Ok(Ok(output)) if output.status.success() && output.stdout.len() <= 2 * 1024 * 1024 => {
+            match std::str::from_utf8(&output.stdout) {
+                Ok(text)
+                    if !environment
+                        .values()
+                        .any(|secret| !secret.is_empty() && text.contains(secret)) =>
+                {
+                    gemini_models(text)
+                }
+                _ => empty("gemini", "unavailable"),
+            }
+        }
+        _ => empty("gemini", "unavailable"),
+    }
+}
 pub(crate) async fn all(cwd: &Path) -> Vec<ProviderModels> {
-    let (a, b) = tokio::join!(codex(), claude(cwd));
-    let c = empty("gemini", "unavailable");
+    let (a, b, c) = tokio::join!(codex(cwd), claude(cwd), gemini());
     vec![a, b, c]
 }
 
@@ -536,12 +710,82 @@ mod tests {
             .is_none());
     }
     #[test]
+    fn codex_does_not_advertise_unverified_special_modes() {
+        let model = codex_model(&json!({"id":"a","displayName":"A","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"ultra"}]})).unwrap();
+        assert_eq!(model.efforts.len(), 1);
+        assert_eq!(model.efforts[0].id, "high");
+        assert!(model.toggles.is_empty());
+    }
+    #[test]
+    fn codex_effective_default_uses_only_supported_configured_value() {
+        let make = || {
+            codex_model(&json!({"id":"a","displayName":"A","defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"}]})).unwrap()
+        };
+        let mut models = vec![make()];
+        apply_codex_effective_config(&mut models, None);
+        assert_eq!(models[0].effective_default_effort, None);
+        apply_codex_effective_config(
+            &mut models,
+            Some(&json!({"config":{"model_reasoning_effort":"low"}})),
+        );
+        assert_eq!(models[0].effective_default_effort.as_deref(), Some("low"));
+        apply_codex_effective_config(
+            &mut models,
+            Some(&json!({"config":{"model_reasoning_effort":"xhigh"}})),
+        );
+        assert_eq!(models[0].effective_default_effort, None);
+    }
+    #[test]
     fn claude_reads_cli_models_and_supported_effort() {
         let v=json!({"type":"control_response","response":{"subtype":"success","response":{"models":[{"value":"opus","displayName":"Opus 5","resolvedModel":"actual","supportedEffortLevels":["high"]}]}}}).to_string();
         let models = claude_models(&v);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].resolved.as_deref(), Some("actual"));
         assert_eq!(models[0].efforts[0].id, "high");
+    }
+    #[test]
+    fn reads_only_confirmed_local_effort_status() {
+        let value = |text: &str| {
+            json!({"type":"result","is_error":false,"local_command":"effort","num_turns":0,"result":text}).to_string()
+        };
+        assert_eq!(
+            status_effort(&value("Effort level: high"), true).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            status_effort(&value("Effort level: auto (currently medium)"), true).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            status_effort(&value("Effort level: auto (currently medium)"), false),
+            None
+        );
+        assert_eq!(status_effort(&value("Effort level: auto"), true), None);
+        assert_eq!(status_effort(&json!({"is_error":false,"local_command":"effort","num_turns":1,"result":"Effort level: medium"}).to_string(), true).as_deref(), Some("medium"));
+        assert_eq!(
+            status_effort(
+                &json!({"is_error":false,"num_turns":1,"result":"Effort level: high"}).to_string(),
+                true
+            ),
+            None
+        );
+        assert!(!claude_auto_current_is_reliable(
+            r#"{"response":{"response":{"claude_code_version":"2.1.303"}}}"#
+        ));
+        assert!(claude_auto_current_is_reliable(
+            r#"{"response":{"response":{"claude_code_version":"2.1.319"}}}"#
+        ));
+    }
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn fake_cli_reports_effective_default_effort() {
+        let d = tempfile::tempdir().unwrap();
+        let script = d.path().join("fake-status.ps1");
+        std::fs::write(&script, "[Console]::WriteLine('{\"type\":\"result\",\"is_error\":false,\"local_command\":\"effort\",\"num_turns\":0,\"result\":\"Effort level: medium\"}')\n").unwrap();
+        let path = script.to_str().unwrap();
+        let value =
+            run_effort_probe(d.path(), "powershell", &["-NoProfile", "-File", path], true).await;
+        assert_eq!(value.as_deref(), Some("medium"));
     }
     #[test]
     fn claude_korean_labels_are_serialized_without_invented_recommendations() {
@@ -560,17 +804,17 @@ mod tests {
             .unwrap()
             .get("recommended")
             .is_none()));
-        assert!(model.fast.supported);
+        assert_eq!(model.fast.supported, Some(true));
         assert_eq!(model.fast.label, "고속 모드");
         assert_eq!(model.fast.state, "unavailable");
-        assert!(!model.toggles[0].available);
+        assert!(model.toggles.is_empty());
         let wire = serde_json::to_value(model).unwrap();
         assert!(wire["efforts"]
             .as_array()
             .unwrap()
             .iter()
             .all(|e| e["kind"] == "level"));
-        assert_eq!(wire["toggles"][0]["kind"], "toggle");
+        assert_eq!(wire["toggles"], json!([]));
     }
     #[test]
     fn fast_capabilities_do_not_assert_current_session_state() {
@@ -578,18 +822,34 @@ mod tests {
             &json!({"id":"gpt-6.1-terra","displayName":"GPT-6.1 Terra","model":"gpt-6.1-terra"}),
         )
         .unwrap();
-        assert!(model.fast.supported);
+        assert_eq!(model.fast.supported, Some(true));
         assert_eq!(model.fast.label, "Fast mode");
         assert_eq!(model.fast.state, "unavailable");
-        assert!(!fast("claude", "claude-sonnet-5-5").supported);
-        assert!(!fast("codex", "future-model").supported);
+        assert_eq!(fast("claude", "claude-sonnet-5-5").supported, Some(false));
+        assert_eq!(fast("codex", "future-model").supported, Some(false));
     }
     #[test]
     fn gemini_reads_cli_model_list() {
-        let v = json!([{"modelId":"m","name":"M"}]).to_string();
-        let p = gemini_models(&v);
+        let p = gemini_models("Fetching available models...\nm\tM\n");
         assert_eq!(p.state, "ok");
         assert_eq!(p.models[0].id, "m");
+        assert_eq!(gemini_models("not a model").state, "unavailable");
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn gemini_fake_cli_receives_key_only_in_environment() {
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-Command", "if ($env:GEMINI_API_KEY -ne 'momso-fake-key-for-test' -or $env:GOOGLE_API_KEY) { exit 1 }; Write-Output \"fake-model`tFake Model\""]);
+        let environment = std::collections::HashMap::from([(
+            "GEMINI_API_KEY".to_owned(),
+            "momso-fake-key-for-test".to_owned(),
+        )]);
+        let result = run_gemini_models(command, environment).await;
+        assert_eq!(result.state, "ok");
+        assert_eq!(result.models[0].id, "fake-model");
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("momso-fake-key-for-test"));
     }
     #[tokio::test]
     #[ignore = "실제 CLI 연결 확인"]

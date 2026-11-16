@@ -211,6 +211,24 @@ export function isWebAddress(address: string) {
 }
 
 /** 바깥 주소(http, https)를 기본 브라우저에서 연다. 앱 화면은 다른 곳으로 넘어가지 않는다. */
+/**
+ * 원자료 찾기: source_search({ query }) → [{ id, originalFileName, mediaType, size, createdAt, linkedDocumentIds }].
+ * 원자료의 파일 이름에 찾는 말이 든 것(대소문자 무시), 새것부터. linkedDocumentIds 는 그 원자료와 이어진 문서 번호들.
+ */
+export type SourceSearchResult = {
+  id: string
+  originalFileName: string
+  mediaType: string | null
+  size: number
+  createdAt: string
+  linkedDocumentIds: string[]
+}
+
+export async function searchSources(query: string) {
+  if (!isDesktopRuntime()) throw new Error('source_search needs the desktop runtime')
+  return invoke<SourceSearchResult[]>('source_search', { query })
+}
+
 export async function openWebAddress(address: string) {
   if (!isWebAddress(address)) throw new Error(W.archive.text1)
   await openUrl(address)

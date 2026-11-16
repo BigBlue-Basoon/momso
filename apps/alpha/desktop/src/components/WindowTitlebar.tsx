@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { ArrowLeft, ArrowRight, Copy, Minus, PanelLeft, Square, X } from 'lucide-react'
+import { ArrowLeft, ArrowRight, Copy, Minus, PanelLeft, Search, Square, X } from 'lucide-react'
 import { prepareWindowShift } from '../window-shift'
 import { ShortcutTip } from './ShortcutTip'
 import { W } from '../words'
@@ -15,12 +15,15 @@ type WindowTitlebarProps = {
   canGoForward?: boolean
   onBack?: () => void
   onForward?: () => void
+  /** 검색 창 열기(Ctrl+K 와 같다). 목록 숨기기 단추 바로 왼쪽의 돋보기. */
+  onOpenSearch?: () => void
 }
 
 export function WindowTitlebar({
   appearance = 'default',
   listHidden = false,
   onToggleList,
+  onOpenSearch,
   canGoBack = false,
   canGoForward = false,
   onBack,
@@ -54,8 +57,15 @@ export function WindowTitlebar({
   return (
     <header className={`window-titlebar ${appearance === 'welcome' ? 'window-titlebar--welcome' : ''}`} aria-label={W.windowTitlebar.aria1}>
       {onToggleList && (
-        // Claude 앱과 같은 차례: 목록 숨기기, 뒤로, 앞으로.
+        // 차례: 검색, 목록 숨기기, 뒤로, 앞으로. 검색은 Aside 앱처럼 목록 숨기기 바로 왼쪽(2026-11-16 그의 말). 목록을 닫아도 보인다.
         <div className="window-titlebar-tools">
+          {onOpenSearch && (
+            <ShortcutTip label={W.search} keys={['Ctrl', 'K']}>
+              <button type="button" aria-label={W.search} aria-keyshortcuts="Control+K" onClick={onOpenSearch}>
+                <Search size={16} strokeWidth={1.6} aria-hidden />
+              </button>
+            </ShortcutTip>
+          )}
           <ShortcutTip label={listHidden ? W.windowTitlebar.label1 : W.windowTitlebar.label2} keys={['Ctrl', '[']}>
             <button
               type="button"

@@ -333,6 +333,14 @@
   background: var(--surface-soft);
 }
 
+/* 첨부파일 줄: 열어 볼 명령이 오기 전까지는 눌리지 않는 줄이라 손 모양과 밝아짐을 두지 않는다. */
+.chat-file-row { width: 100%; }
+/* 첨부파일의 글(읽기만). 파일 이름은 탭에만. 글 파일은 줄바꿈과 빈칸 그대로, 긴 줄은 패널 폭에서 꺾는다. */
+.attachment-text { padding: 18px 20px 28px; }
+.attachment-text-plain { margin: 0; color: var(--ink); font-family: inherit; font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.chat-file-name { display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--ink-soft); }
+.chat-file-name svg { flex: none; }
+
 .zet-row strong {
   font-size: 13px;
   font-weight: 700;
@@ -622,9 +630,6 @@ button.zet-link-row:hover {
   gap: 8px;
 }
 
-.zet-version-bar .secondary-button:disabled {
-  opacity: 0.5;
-}
 
 /* 지난 판의 제목과 요약. 지금 글의 머리와 헷갈리지 않게 본문 칸 안에 작게 둔다. */
 .zet-version-head {
@@ -799,15 +804,7 @@ button.zet-link-row:hover {
   margin: 0.25em 0;
 }
 
-.zet-md li.task-list-item {
-  list-style: none;
-}
-
 /* 확인 칸은 글머리 기호가 놓이는 자리에 둔다. */
-.zet-md li.task-list-item > input {
-  margin: 0 0.45em 0 -1.5em;
-  vertical-align: -2px;
-}
 
 .zet-md blockquote {
   margin: 1em 0;
@@ -986,17 +983,6 @@ button.zet-link-row:hover {
 }
 
 /* 대화 칸이 화면에 없을 때(기록이 없을 때)는 그 자리의 맨 위 오른쪽에 둔다. */
-.workbench-body .workspace-empty {
-  position: relative;
-}
-
-.workspace-top-actions {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  display: flex;
-  gap: 4px;
-}
 
 @keyframes zet-tab-enter {
   from { opacity: 0; transform: translateY(3px); }

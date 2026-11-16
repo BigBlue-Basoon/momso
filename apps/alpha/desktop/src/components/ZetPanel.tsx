@@ -35,6 +35,7 @@ import {
   type ZetListEntry,
   type ZetStatus,
 } from '../archive'
+import { readAttachmentText } from '../chat-items'
 import { ZetMarkdown } from './ZetMarkdown'
 import './ZetPanel.css'
 import { W } from '../words'
@@ -247,6 +248,7 @@ type PanelTab =
   | { key: string; kind: 'list'; scope: string }
   | { key: string; kind: 'zet'; id: string; scope: string }
   | { key: string; kind: 'receipt'; id: string; scope: string }
+  | { key: string; kind: 'file'; id: string; title: string; scope: string }
 
 const listTab = (scope: string): PanelTab => ({ key: `${scope}|list`, kind: 'list', scope })
 
@@ -395,6 +397,21 @@ export function ZetPanel({
   }, [openZet])
   const openReceipt = useCallback((id: string) => openDocument('receipt', id), [openDocument])
 
+  // 첨부파일의 글(Codex 앱처럼 패널에서 연다). 문서와 같게: 고르는 탭에서 고르면 그 탭이 바뀌고, 이미 열려 있으면 그 탭으로.
+  const openFile = useCallback((id: string, title: string) => {
+    const where = scopeRef.current
+    const key = `${where}|file:${id}`
+    setTabs((current) => {
+      if (current.some((tab) => tab.key === key)) return current
+      const next: PanelTab = { key, kind: 'file', id, title, scope: where }
+      const activeIndex = current.findIndex((tab) => tab.key === activeKeyRef.current)
+      if (activeIndex >= 0 && current[activeIndex].kind === 'list') return current.map((tab, index) => (index === activeIndex ? next : tab))
+      const insertAt = activeIndex >= 0 ? activeIndex + 1 : current.length
+      return [...current.slice(0, insertAt), next, ...current.slice(insertAt)]
+    })
+    setActiveKey(key)
+  }, [setActiveKey])
+
   function showList() {
     const first = listTab(scope)
     setTabs((current) => (current.some((tab) => tab.key === first.key) ? current : [...current, first]))
@@ -508,6 +525,7 @@ export function ZetPanel({
   function tabTitle(tab: PanelTab) {
     if (tab.kind === 'list') return byChat ? W.gallery.chatTab : W.document
     if (tab.kind === 'receipt') return W.workLog
+    if (tab.kind === 'file') return tab.title
     return titleOf(tab.id) ?? W.document
   }
 
@@ -581,7 +599,7 @@ export function ZetPanel({
                   >
                     {tab.kind === 'receipt'
                       ? <ScrollText size={13} strokeWidth={1.75} aria-hidden />
-                      : tab.kind === 'zet'
+                      : tab.kind === 'zet' || tab.kind === 'file'
                         ? <FileText size={13} strokeWidth={1.75} aria-hidden />
                         : null}
                     <span>{title}</span>
@@ -627,7 +645,7 @@ export function ZetPanel({
             <section key={tab.key} className="zet-pane" role="tabpanel" aria-label={tabTitle(tab)} hidden={tab.scope !== scope || tab.key !== activeKey}>
               {tab.kind === 'list' ? (
                 byChat && tab.scope !== 'all'
-                  ? (tab.scope === scope ? <ChatItemsView items={chatItems ?? null} onOpenZet={openZet} onOpenChat={onOpenChat} /> : null)
+                  ? (tab.scope === scope ? <ChatItemsView items={chatItems ?? null} onOpenZet={openZet} onOpenFile={openFile} onOpenChat={onOpenChat} /> : null)
                   : <ZetListView list={list} onOpen={openZet} onReload={reloadList} />
               ) : tab.kind === 'zet' ? (
                 <ZetDocumentView
@@ -648,6 +666,8 @@ export function ZetPanel({
                     onNotice(W.zetPanel.text24)
                   }}
                 />
+              ) : tab.kind === 'file' ? (
+                <AttachmentTextView assetId={tab.id} title={tab.title} onOpenZet={openZet} onOpenAddress={openAddress} />
               ) : (
                 <ReceiptView id={tab.id} onOpenZet={openZet} onOpenAddress={openAddress} />
               )}
@@ -683,35 +703,53 @@ function ItemDid({ how, by, at }: { how: string | null; by: ItemBy | null; at: s
   )
 }
 
+type ChatItemsTab = 'documents' | 'media' | 'files'
+
 /**
- * 오른쪽 패널의 첫 탭(홈): 지금 연 채팅방에서 다룬 문서와 미디어만. 둘 다 있으면 위에 탭 둘(문서 / 미디어).
+ * 오른쪽 패널의 첫 탭(홈): 지금 연 채팅방에서 다룬 문서, 미디어, 첨부파일만. 둘 이상 있으면 위에 탭(문서 / 미디어 / 첨부파일).
  * 문서는 누르면 패널 안에서 열리고, 미디어는 패널 폭에 맞는 작은 갤러리(누르면 크게).
+ * 첨부파일(T42 files, 글 파일 등)은 Codex 앱의 "소스" 패널처럼 파일 이름과 "첨부", 때를 한 줄씩 보이고,
+ * 누르면 그 글이 패널의 새 탭으로 열린다(attachment_text_read, 2026-11-16 그의 말 "txt나 md가 오른쪽 패널에 보여야").
  */
-function ChatItemsView({ items, onOpenZet, onOpenChat }: {
+function ChatItemsView({ items, onOpenZet, onOpenFile, onOpenChat }: {
   items: ChatItems | null
   onOpenZet: (id: string) => void
+  onOpenFile: (id: string, title: string) => void
   onOpenChat?: (chatId: string) => void
 }) {
-  const [view, setView] = useState<'documents' | 'media'>('documents')
+  const [view, setView] = useState<ChatItemsTab>('documents')
   if (!items) return <PaneMessage text={W.zetPanel.text26} />
-  const hasDocs = items.documents.length > 0
-  const hasMedia = items.media.length > 0
-  if (!hasDocs && !hasMedia) return <PaneMessage text={W.gallery.chatEmpty} />
-  const current = hasDocs && hasMedia ? view : hasDocs ? 'documents' : 'media'
+  const counts: Record<ChatItemsTab, number> = { documents: items.documents.length, media: items.media.length, files: items.files.length }
+  const present = (['documents', 'media', 'files'] as const).filter((id) => counts[id] > 0)
+  if (present.length === 0) return <PaneMessage text={W.gallery.chatEmpty} />
+  const current = present.includes(view) ? view : present[0]
   const docs = [...items.documents].sort((a: ChatDocumentItem, b: ChatDocumentItem) => (b.at ?? b.updatedAt ?? '').localeCompare(a.at ?? a.updatedAt ?? ''))
+  const files = [...items.files].sort((a, b) => (b.at ?? b.createdAt ?? '').localeCompare(a.at ?? a.createdAt ?? ''))
+  const tabName: Record<ChatItemsTab, string> = { documents: W.document, media: W.mediaView.aria1, files: W.gallery.files }
   return (
     <div className="chat-items">
-      {hasDocs && hasMedia && (
+      {present.length > 1 && (
         <div className="chat-items-tabs" role="tablist">
-          {(['documents', 'media'] as const).map((id) => (
+          {present.map((id) => (
             <button key={id} type="button" role="tab" aria-selected={current === id} className={current === id ? 'is-active' : undefined} onClick={() => setView(id)}>
-              {id === 'documents' ? W.document : W.mediaView.aria1}
-              <span className="chat-items-count">{id === 'documents' ? items.documents.length : items.media.length}</span>
+              {tabName[id]}
+              <span className="chat-items-count">{counts[id]}</span>
             </button>
           ))}
         </div>
       )}
-      {current === 'documents' ? (
+      {current === 'files' ? (
+        <ul className="zet-rows chat-item-rows chat-file-rows">
+          {files.map((entry) => (
+            <li key={entry.id}>
+              <button className="zet-row chat-file-row" type="button" onClick={() => onOpenFile(entry.id, entry.title)}>
+                <span className="chat-file-name"><FileText size={14} strokeWidth={1.75} aria-hidden /><strong>{entry.title}</strong></span>
+                <span className="zet-row-meta"><ItemDid how={entry.how} by={entry.by} at={entry.at ?? entry.createdAt} /></span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : current === 'documents' ? (
         <ul className="zet-rows chat-item-rows">
           {docs.map((entry) => (
             <li key={`${entry.id}-${entry.how}`}>
@@ -756,6 +794,73 @@ function SummarizedBelow({ targets, onOpenZet, onOpenAddress }: { targets: strin
         </section>
       ))}
     </>
+  )
+}
+
+/**
+ * 첨부파일의 글을 패널에서 읽기만 한다. 파일 이름은 탭에 있으니 안에 다시 적지 않는다. .md·.markdown 은 답과 같은 도구로 그리고, 그 밖의 글은 줄바꿈 그대로.
+ * 큰 파일은 64KiB 씩 받는다: 글 끝 가까이 내려가면 nextCursor 로 다음 쪽을 이어 받는다(nextCursor 가 null 이면 끝).
+ * not_found / not_text / invalid_encoding 은 한 줄 알림, invalid_cursor 는 그때까지 받은 글만 둔다.
+ */
+function AttachmentTextView({ assetId, title, onOpenZet, onOpenAddress }: {
+  assetId: string
+  title: string
+  onOpenZet: (id: string) => void
+  onOpenAddress: (address: string) => void
+}) {
+  const [text, setText] = useState<string | null>(null)
+  const [problem, setProblem] = useState<string | null>(null)
+  const [next, setNext] = useState<number | null>(null)
+  const loading = useRef(false)
+  const end = useRef<HTMLDivElement>(null)
+  const markdown = /[.](md|markdown)$/i.test(title)
+
+  const load = useCallback(async (cursor: number | null) => {
+    if (loading.current) return
+    loading.current = true
+    try {
+      const page = await readAttachmentText(assetId, cursor)
+      if (page.state === 'ok') {
+        setText((current) => (cursor ? (current ?? '') : '') + (page.content ?? ''))
+        setNext(typeof page.nextCursor === 'number' ? page.nextCursor : null)
+      } else if (page.state === 'invalid_cursor' && cursor) {
+        setNext(null)
+      } else {
+        setProblem(page.state === 'not_found' ? W.gallery.fileNotFound
+          : page.state === 'invalid_encoding' ? W.gallery.fileNotUtf8
+            : page.state === 'not_text' ? W.gallery.fileNotText : W.gallery.fileFailed)
+        setNext(null)
+      }
+    } catch (error) {
+      if (!cursor) setProblem(archiveErrorMessage(error, W.gallery.fileFailed))
+      setNext(null)
+    } finally {
+      loading.current = false
+    }
+  }, [assetId])
+
+  useEffect(() => { void load(null) }, [load])
+
+  // 다음 쪽이 있으면 글 끝이 보일 때 이어 받는다.
+  useEffect(() => {
+    const target = end.current
+    if (next === null || !target) return
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) void load(next)
+    }, { rootMargin: '400px' })
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [next, load])
+
+  if (problem) return <PaneMessage text={problem} />
+  if (text === null) return <PaneMessage text={W.gallery.fileLoading} />
+  return (
+    <div className="attachment-text">
+      {markdown
+        ? <ZetMarkdown text={text} onOpenZet={onOpenZet} onOpenAddress={onOpenAddress} />
+        : <pre className="attachment-text-plain">{text}</pre>}
+      <div ref={end} aria-hidden="true" />
+    </div>
   )
 }
 

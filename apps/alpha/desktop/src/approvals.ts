@@ -11,7 +11,25 @@ import type { AiProvider } from './ai-models'
 import { isDesktopRuntime } from './runtime'
 
 export type ApprovalChoice = 'allow_once' | 'allow_session' | 'deny' | 'cancel'
-export type ApprovalKind = 'command' | 'file_change' | 'other'
+export type ApprovalKind = 'command' | 'file_change' | 'setup_change' | 'other'
+
+/**
+ * 스킬("GitHub 연결", "원자료 저장소 연결")로 AI 가 몸소의 도구를 불러 무언가를 만들고 연결하려 할 때의 물음.
+ * 모양은 archive-backend-port-notes.md "2026-11-16 옮긴 것"의 C9 설정 승인 계약(화면 폴더에 옮겨짐, cef940fa):
+ *   kind 'setup_change', setup { action:'create_and_connect', service:'github'|'cloudflare'|'gcp'|'aws', account, region, resourceName,
+ *   visibility:'private', cost:'possible' }, targets 에 만들 이름과 change 'create', options allow_once·deny·cancel,
+ *   답은 지금과 같은 agent_approval_respond({ requestId, choice }).
+ * 화면은 "이번만 허락"과 "거절"만 보인다(2026-11-16 본부): "이 채팅방에서 항상 허락"과 "그만두기"는 options 에 와도 두지 않는다.
+ */
+export type SetupAction = {
+  action: 'create_and_connect' | string
+  service: string
+  account?: string | null
+  region?: string | null
+  resourceName?: string | null
+  visibility?: 'private' | string | null
+  cost?: 'possible' | string | null
+}
 export type ApprovalChange = 'create' | 'edit' | 'overwrite' | 'delete'
 export type ApprovalTarget = { path: string; change: ApprovalChange | null }
 
@@ -31,6 +49,8 @@ export type ApprovalRequest = {
   change?: ApprovalChange | null
   /** 바뀌는 파일들(모르면 빈 목록). */
   targets?: ApprovalTarget[] | null
+  /** kind 가 'setup_change' 일 때 하려는 일(위 SetupAction). */
+  setup?: SetupAction | null
 }
 
 /**
@@ -60,8 +80,9 @@ export const CHOICE_DONE: Record<ApprovalChoice, string> = {
 
 const CHOICE_ORDER: ApprovalChoice[] = ['allow_once', 'allow_session', 'deny', 'cancel']
 
-export function orderedChoices(options: ApprovalChoice[]) {
-  return CHOICE_ORDER.filter((choice) => options.includes(choice))
+export function orderedChoices(options: ApprovalChoice[], request?: ApprovalRequest) {
+  const setup = request?.kind === 'setup_change'
+  return CHOICE_ORDER.filter((choice) => options.includes(choice) && !(setup && (choice === 'allow_session' || choice === 'cancel')))
 }
 
 export async function respondApproval(requestId: string, choice: ApprovalChoice) {

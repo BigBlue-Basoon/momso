@@ -114,6 +114,9 @@ pub(crate) fn update_measurement(
         return Ok(None);
     }
     let old = get(path, chat_id)?;
+    if let (Some(model), Some(limit)) = (model, limit) {
+        record_model_limit(path, chat_id, provider, model, used, limit)?;
+    }
     let model = model.map(str::to_owned).or_else(|| {
         if old.provider.as_deref() == Some(provider) {
             old.model.clone()
@@ -135,6 +138,41 @@ pub(crate) fn update_measurement(
     }
     db(path)?.execute("INSERT INTO chat_context_state(chat_id,provider,model,used_tokens,limit_tokens,updated_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(chat_id) DO UPDATE SET provider=excluded.provider,model=excluded.model,used_tokens=excluded.used_tokens,limit_tokens=excluded.limit_tokens,updated_at=excluded.updated_at",params![chat_id,next.provider,next.model,next.used_tokens,next.limit_tokens,next.updated_at]).map_err(|_|"채팅방 정보를 저장하지 못했습니다".to_string())?;
     Ok(Some(next))
+}
+
+pub(crate) fn record_model_limit(
+    path: &Path,
+    chat_id: &str,
+    provider: &str,
+    model: &str,
+    used: i64,
+    limit: i64,
+) -> Result<(), String> {
+    if !matches!(provider, "claude" | "gemini")
+        || model.trim().is_empty()
+        || model == "default"
+        || used < 0
+        || limit <= 0
+    {
+        return Ok(());
+    }
+    db(path)?.execute("INSERT INTO provider_context_limits(chat_id,provider,model,limit_tokens,used_tokens,updated_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(chat_id,provider,model) DO UPDATE SET limit_tokens=excluded.limit_tokens,used_tokens=excluded.used_tokens,updated_at=excluded.updated_at", params![chat_id,provider,model,limit,used,Local::now().to_rfc3339()]).map_err(|_| "채팅방 정보를 저장하지 못했습니다".to_string())?;
+    Ok(())
+}
+
+pub(crate) fn model_limit(
+    path: &Path,
+    chat_id: &str,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<Option<(i64, i64)>, String> {
+    let Some(model) = model.filter(|value| !value.trim().is_empty() && *value != "default") else {
+        return Ok(None);
+    };
+    if !matches!(provider, "claude" | "gemini") {
+        return Ok(None);
+    }
+    db(path)?.query_row("SELECT limit_tokens,used_tokens FROM provider_context_limits WHERE chat_id=?1 AND provider=?2 AND model=?3", params![chat_id,provider,model], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(|_| "채팅방 정보를 읽지 못했습니다".to_string())
 }
 
 #[cfg(test)]
@@ -170,6 +208,29 @@ mod tests {
         assert_eq!(
             switch_provider(&p, &id, "codex").unwrap().unwrap().state,
             "unavailable"
+        );
+    }
+    #[test]
+    fn provider_model_measurements_survive_switch_and_are_scoped() {
+        let (_t, p, id) = fixture();
+        update_measurement(&p, &id, "claude", Some("claude-fake"), 10, Some(5000)).unwrap();
+        switch_provider(&p, &id, "gemini").unwrap();
+        update_measurement(&p, &id, "gemini", Some("gemini-fake"), 20, Some(6000)).unwrap();
+        assert_eq!(
+            model_limit(&p, &id, "claude", Some("claude-fake")).unwrap(),
+            Some((5000, 10))
+        );
+        assert_eq!(
+            model_limit(&p, &id, "gemini", Some("gemini-fake")).unwrap(),
+            Some((6000, 20))
+        );
+        assert_eq!(
+            model_limit(&p, &id, "codex", Some("claude-fake")).unwrap(),
+            None
+        );
+        assert_eq!(
+            model_limit(&p, &id, "gemini", Some("claude-fake")).unwrap(),
+            None
         );
     }
     #[test]

@@ -6,7 +6,7 @@ use std::{
 };
 use thiserror::Error;
 
-const LATEST_SCHEMA_VERSION: u32 = 72;
+const LATEST_SCHEMA_VERSION: u32 = 85;
 const MAX_AUTOMATED_BACKUPS: usize = 5;
 
 struct Migration {
@@ -106,6 +106,51 @@ const MIGRATIONS: &[Migration] = &[
         description: "track chat delivery metadata and fast retry",
         sql: include_str!("../migrations/0072_chat_delivery.sql"),
     },
+    Migration {
+        version: 73,
+        description: "store chat pin and archive state",
+        sql: include_str!("../migrations/0073_chat_visibility.sql"),
+    },
+    Migration {
+        version: 74,
+        description: "link chat attachments to messages",
+        sql: include_str!("../migrations/0074_chat_attachments.sql"),
+    },
+    Migration {
+        version: 75,
+        description: "track provider reported actual reasoning effort",
+        sql: include_str!("../migrations/0075_chat_actual_effort.sql"),
+    },
+    Migration {
+        version: 80,
+        description: "store chat reply finish reason",
+        sql: include_str!("../migrations/0080_chat_finish_reason.sql"),
+    },
+    Migration {
+        version: 81,
+        description: "track imported conversations",
+        sql: include_str!("../migrations/0081_chat_import.sql"),
+    },
+    Migration {
+        version: 82,
+        description: "store provider model context limits",
+        sql: include_str!("../migrations/0082_provider_context_limits.sql"),
+    },
+    Migration {
+        version: 83,
+        description: "reconcile imported conversations and provider model context limits",
+        sql: include_str!("../migrations/0083_reconcile_context_import.sql"),
+    },
+    Migration {
+        version: 84,
+        description: "record chat authentication method",
+        sql: include_str!("../migrations/0084_chat_auth_method.sql"),
+    },
+    Migration {
+        version: 85,
+        description: "store reported chat fast state",
+        sql: include_str!("../migrations/0085_chat_fast_state.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -120,6 +165,8 @@ pub(crate) enum StorageError {
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("System clock is earlier than the Unix epoch")]
     InvalidSystemTime,
+    #[error("Restore failed and the safety backup could not be reapplied")]
+    RestoreRollbackFailed,
 }
 
 pub(crate) struct StorageStatus {
@@ -227,14 +274,15 @@ pub(crate) fn validate_snapshot_file(snapshot_path: &Path) -> Result<(), Storage
     let connection = open_connection(snapshot_path)?;
     let version = ensure_supported_schema(&connection)?;
     let pending = pending_migrations(&connection, MIGRATIONS)?;
-    let previous_delivery_schema = version == 71 && pending.len() == 1 && pending[0].version == 72;
-    if version != LATEST_SCHEMA_VERSION && !previous_delivery_schema {
+    let compatible_previous = (71..LATEST_SCHEMA_VERSION).contains(&version)
+        && pending.iter().all(|migration| migration.version > version);
+    if version != LATEST_SCHEMA_VERSION && !compatible_previous {
         return Err(StorageError::UnsupportedSchema {
             found: version,
             supported: LATEST_SCHEMA_VERSION,
         });
     }
-    if !pending.is_empty() && !previous_delivery_schema {
+    if !pending.is_empty() && !compatible_previous {
         return Err(StorageError::Integrity(
             "누락된 데이터베이스 변경이 있습니다".into(),
         ));
@@ -247,10 +295,19 @@ pub(crate) fn restore_snapshot_file(
     database_path: &Path,
     backups_path: &Path,
 ) -> Result<PathBuf, StorageError> {
+    restore_snapshot_file_with_hook(snapshot_path, database_path, backups_path, || Ok(()))
+}
+
+pub(crate) fn restore_snapshot_file_with_hook(
+    snapshot_path: &Path,
+    database_path: &Path,
+    backups_path: &Path,
+    after_replace: impl FnOnce() -> Result<(), StorageError>,
+) -> Result<PathBuf, StorageError> {
     validate_snapshot_file(snapshot_path)?;
     let original = open_connection(snapshot_path)?;
     let mut migrated_dir = None;
-    let source = if schema_version(&original)? == 71 {
+    let source = if schema_version(&original)? < LATEST_SCHEMA_VERSION {
         fs::create_dir_all(backups_path)?;
         let dir = tempfile::Builder::new()
             .prefix("momso-snapshot-upgrade-")
@@ -261,13 +318,9 @@ pub(crate) fn restore_snapshot_file(
             let backup = Backup::new(&original, &mut copy)?;
             backup.run_to_completion(128, Duration::from_millis(10), None)?;
         }
-        let migration = MIGRATIONS
-            .iter()
-            .find(|migration| migration.version == 72)
-            .ok_or_else(|| {
-                StorageError::Integrity("데이터베이스 변경 기록을 찾지 못했습니다".into())
-            })?;
-        apply_migration(&mut copy, migration)?;
+        for migration in pending_migrations(&copy, MIGRATIONS)? {
+            apply_migration(&mut copy, migration)?;
+        }
         copy.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES('schema_version',?1,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", [LATEST_SCHEMA_VERSION.to_string()])?;
         check_integrity(&copy)?;
         migrated_dir = Some(dir);
@@ -286,14 +339,20 @@ pub(crate) fn restore_snapshot_file(
             let backup = Backup::new(&source, &mut destination)?;
             backup.run_to_completion(128, Duration::from_millis(10), None)?;
         }
+        after_replace()?;
         check_integrity(&destination)?;
         Ok(())
     })();
     if let Err(error) = restore_result {
-        let safety_source = open_connection(&safety_backup)?;
-        {
+        let rollback = (|| -> Result<(), StorageError> {
+            let safety_source = open_connection(&safety_backup)?;
             let backup = Backup::new(&safety_source, &mut destination)?;
             backup.run_to_completion(128, Duration::from_millis(10), None)?;
+            drop(backup);
+            check_integrity(&destination)
+        })();
+        if rollback.is_err() {
+            return Err(StorageError::RestoreRollbackFailed);
         }
         return Err(error);
     }
@@ -354,8 +413,32 @@ fn pending_migrations<'a>(
             )
             .optional()?;
         match recorded {
-            None => pending.push(migration),
+            None => {
+                if migration.version == 82 {
+                    let has_context: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_context_limits')", [], |r| r.get(0))?;
+                    if has_context && !legacy_context_81_is_exact(connection)? {
+                        return Err(StorageError::Integrity(
+                            "모델 한도 표의 구조를 확인할 수 없습니다".into(),
+                        ));
+                    }
+                }
+                pending.push(migration)
+            }
             Some(description) if description == migration.description => {}
+            Some(description)
+                if migration.version == 81
+                    && description == "store provider model context limits"
+                    && legacy_context_81_is_exact(connection)? => {}
+            Some(description)
+                if migration.version == 82
+                    && description
+                        == "reconcile imported conversations and provider model context limits"
+                    && legacy_context_81_is_exact(connection)?
+                    && table_is_exact(
+                        connection,
+                        "chat_imports",
+                        include_str!("../migrations/0081_chat_import.sql"),
+                    )? => {}
             Some(_) => {
                 return Err(StorageError::Integrity(format!(
                     "데이터베이스 변경 번호 {}가 다른 내용에 사용됐습니다",
@@ -365,6 +448,40 @@ fn pending_migrations<'a>(
         }
     }
     Ok(pending)
+}
+
+fn legacy_context_81_is_exact(connection: &Connection) -> Result<bool, StorageError> {
+    table_is_exact(
+        connection,
+        "provider_context_limits",
+        include_str!("../migrations/0082_provider_context_limits.sql"),
+    )
+}
+
+fn table_is_exact(
+    connection: &Connection,
+    table: &str,
+    expected: &str,
+) -> Result<bool, StorageError> {
+    let sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let normalize = |value: &str| {
+        value
+            .replace("\r\n", "\n")
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_owned()
+    };
+    Ok(sql.as_deref().is_some_and(|value| {
+        normalize(value)
+            == normalize(&expected.replace("CREATE TABLE IF NOT EXISTS", "CREATE TABLE"))
+    }))
 }
 
 fn ensure_supported_schema(connection: &Connection) -> Result<u32, StorageError> {
@@ -457,7 +574,8 @@ fn create_backup(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| StorageError::InvalidSystemTime)?
         .as_millis();
-    let backup_path = backups_path.join(format!("{prefix}-{timestamp}.db"));
+    let backup_path =
+        backups_path.join(format!("{prefix}-{timestamp}-{}.db", uuid::Uuid::new_v4()));
     let backup_result = (|| -> Result<(), StorageError> {
         let mut destination = Connection::open(&backup_path)?;
         destination.busy_timeout(Duration::from_secs(5))?;
@@ -677,6 +795,231 @@ mod tests {
     }
 
     #[test]
+    fn previous_delivery_snapshot_restores_with_unknown_finish_reason() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("previous72.db");
+        let mut conn = open_connection(&snapshot).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 72)
+        {
+            apply_migration(&mut conn, migration).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO chats(id,title,created_at,updated_at) VALUES('chat_test','class','x','x')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at) VALUES('old','chat_test','assistant','original','x')", []).unwrap();
+        drop(conn);
+        let before = fs::read(&snapshot).unwrap();
+        validate_snapshot_file(&snapshot).unwrap();
+        let current = temp.path().join("current.db");
+        let backups = temp.path().join("backups");
+        initialize(&current, &backups, "test").unwrap();
+        restore_snapshot_file(&snapshot, &current, &backups).unwrap();
+        assert_eq!(fs::read(&snapshot).unwrap(), before);
+        let conn = open_connection(&current).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT finish_reason FROM chat_messages WHERE id='old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, None);
+        drop(conn);
+        let detail =
+            serde_json::to_value(crate::chat::read(&current, "chat_test").unwrap()).unwrap();
+        assert!(detail["messages"][0]["finishReason"].is_null());
+    }
+
+    #[test]
+    fn snapshot_from_other_branch_keeps_its_earlier_migration() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("other-branch.db");
+        let mut conn = open_connection(&snapshot).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 75)
+        {
+            apply_migration(&mut conn, migration).unwrap();
+        }
+        let other = Migration { version: 76, description: "other branch fixture", sql: "CREATE TABLE other_branch_marker(value TEXT); INSERT INTO other_branch_marker VALUES('preserved');" };
+        apply_migration(&mut conn, &other).unwrap();
+        drop(conn);
+        let before = fs::read(&snapshot).unwrap();
+        validate_snapshot_file(&snapshot).unwrap();
+        let current = temp.path().join("current.db");
+        let backups = temp.path().join("backups");
+        initialize(&current, &backups, "test").unwrap();
+        restore_snapshot_file(&snapshot, &current, &backups).unwrap();
+        assert_eq!(fs::read(&snapshot).unwrap(), before);
+        let conn = open_connection(&current).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            conn.query_row("SELECT value FROM other_branch_marker", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+    }
+
+    #[test]
+    fn schema_80_snapshot_restores_without_modifying_original() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("schema80.db");
+        let mut connection = open_connection(&snapshot).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 80) {
+            apply_migration(&mut connection, migration).unwrap();
+        }
+        connection.execute("INSERT INTO chats(id,title,created_at,updated_at) VALUES('chat_test','class','x','x')", []).unwrap();
+        drop(connection);
+        let before = fs::read(&snapshot).unwrap();
+        let current = temp.path().join("current.db");
+        let backups = temp.path().join("backups");
+        initialize(&current, &backups, "test").unwrap();
+        restore_snapshot_file(&snapshot, &current, &backups).unwrap();
+        assert_eq!(fs::read(&snapshot).unwrap(), before);
+        let connection = open_connection(&current).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM chats WHERE id='chat_test'", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn previous_reconciliation_82_upgrades_without_losing_data() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("legacy82.db");
+        let mut connection = open_connection(&path).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 81) {
+            apply_migration(&mut connection, migration).unwrap();
+        }
+        connection.execute("INSERT INTO chats(id,title,created_at,updated_at) VALUES('chat_test','class','x','x')", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO chat_imports VALUES('chat_test','claude','fixture')",
+                [],
+            )
+            .unwrap();
+        let previous = Migration {
+            version: 82,
+            description: "reconcile imported conversations and provider model context limits",
+            sql: include_str!("../migrations/0083_reconcile_context_import.sql"),
+        };
+        apply_migration(&mut connection, &previous).unwrap();
+        connection.execute("INSERT INTO provider_context_limits VALUES('chat_test','claude','fake',1000,10,'x')", []).unwrap();
+        drop(connection);
+        initialize(&path, &temp.path().join("backups"), "test").unwrap();
+        let db = open_connection(&path).unwrap();
+        assert_eq!(schema_version(&db).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            db.query_row("SELECT source_id FROM chat_imports", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "fixture"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT limit_tokens FROM provider_context_limits",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1000
+        );
+    }
+
+    #[test]
+    fn both_schema_81_branches_upgrade_and_restore_without_data_loss() {
+        for legacy_context in [false, true] {
+            let temp = tempdir().unwrap();
+            let snapshot = temp.path().join("branch.db");
+            let mut connection = open_connection(&snapshot).unwrap();
+            for migration in MIGRATIONS.iter().filter(|m| m.version <= 80) {
+                apply_migration(&mut connection, migration).unwrap();
+            }
+            connection.execute("INSERT INTO chats(id,title,created_at,updated_at) VALUES('chat_test','class','x','x')", []).unwrap();
+            let branch = if legacy_context {
+                Migration {
+                    version: 81,
+                    description: "store provider model context limits",
+                    sql: include_str!("../migrations/0082_provider_context_limits.sql"),
+                }
+            } else {
+                Migration {
+                    version: 81,
+                    description: "track imported conversations",
+                    sql: include_str!("../migrations/0081_chat_import.sql"),
+                }
+            };
+            apply_migration(&mut connection, &branch).unwrap();
+            if legacy_context {
+                connection.execute("INSERT INTO provider_context_limits VALUES('chat_test','claude','fake',1000,10,'x')", []).unwrap();
+            } else {
+                connection
+                    .execute(
+                        "INSERT INTO chat_imports VALUES('chat_test','claude','fixture')",
+                        [],
+                    )
+                    .unwrap();
+            }
+            drop(connection);
+            let before = fs::read(&snapshot).unwrap();
+            let upgrade = temp.path().join("upgrade.db");
+            fs::copy(&snapshot, &upgrade).unwrap();
+            initialize(&upgrade, &temp.path().join("upgrade-backups"), "test").unwrap();
+            let restored = temp.path().join("restored.db");
+            let backups = temp.path().join("restore-backups");
+            initialize(&restored, &backups, "test").unwrap();
+            restore_snapshot_file(&snapshot, &restored, &backups).unwrap();
+            assert_eq!(fs::read(&snapshot).unwrap(), before);
+            for path in [&upgrade, &restored] {
+                let connection = open_connection(path).unwrap();
+                assert_eq!(schema_version(&connection).unwrap(), LATEST_SCHEMA_VERSION);
+                let contexts: i64 = connection
+                    .query_row("SELECT count(*) FROM provider_context_limits", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                let imports: i64 = connection
+                    .query_row("SELECT count(*) FROM chat_imports", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(
+                    (contexts, imports),
+                    if legacy_context { (1, 0) } else { (0, 1) }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn schema_81_context_collision_requires_the_exact_prior_table() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("invalid.db");
+        let mut connection = open_connection(&path).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 80) {
+            apply_migration(&mut connection, migration).unwrap();
+        }
+        let foreign = Migration {
+            version: 81,
+            description: "store provider model context limits",
+            sql: "CREATE TABLE provider_context_limits (unexpected TEXT);",
+        };
+        apply_migration(&mut connection, &foreign).unwrap();
+        assert!(matches!(
+            pending_migrations(&connection, MIGRATIONS),
+            Err(StorageError::Integrity(_))
+        ));
+    }
+
+    #[test]
     fn restoring_previous_schema_migrates_a_copy_without_altering_snapshot() {
         let temp = tempdir().unwrap();
         let snapshot = temp.path().join("previous.db");
@@ -699,7 +1042,7 @@ mod tests {
         restore_snapshot_file(&snapshot, &current, &backups).unwrap();
         assert_eq!(fs::read(&snapshot).unwrap(), before);
         let conn = open_connection(&current).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), 72);
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
         let (text, fast, omitted): (String, Option<i64>, Option<i64>) = conn
             .query_row(
                 "SELECT text,fast,not_handed_over FROM chat_messages WHERE id='old'",
