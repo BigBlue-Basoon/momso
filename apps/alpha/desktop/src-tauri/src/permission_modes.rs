@@ -111,15 +111,15 @@ pub(crate) fn available(provider: Provider) -> Vec<ModeAvailability> {
             ),
         ],
         Provider::Gemini => vec![
-            mode("default", "Default", "Prompts for approval", false, true),
+            mode("default", "Default", "Prompts for approval", true, true),
             mode(
                 "auto_edit",
                 "Auto Edit",
                 "Auto-approves edit tools",
-                false,
+                true,
                 false,
             ),
-            mode("plan", "Plan", "Read-only mode", false, false),
+            mode("plan", "Plan", "", true, false),
             mode("yolo", "YOLO", "Auto-approves all tools", false, false),
         ],
     }
@@ -155,7 +155,10 @@ fn apply_requirements(
 pub(crate) async fn available_for_runtime(provider: Provider) -> Vec<ModeAvailability> {
     let mut modes = available(provider);
     if provider == Provider::Claude {
-        if crate::chat_claude::connected().await {
+        if matches!(
+            crate::provider_auth::read_status("claude").await.state,
+            "account" | "apiKey"
+        ) {
             for mode in &mut modes {
                 mode.available = matches!(mode.id, "default" | "acceptEdits" | "plan");
             }
@@ -189,7 +192,9 @@ pub(crate) async fn available_for_runtime(provider: Provider) -> Vec<ModeAvailab
         std::time::Duration::from_secs(12),
     )
     .await;
-    if !matches!(account, Ok(v) if v.get("account").is_some_and(serde_json::Value::is_object)) {
+    if !matches!(account, Ok(v) if v.get("account").is_some_and(serde_json::Value::is_object))
+        && crate::provider_auth::read_status("codex").await.state != "apiKey"
+    {
         disable(&mut modes);
         return modes;
     }
@@ -252,13 +257,17 @@ pub(crate) fn get(path: &Path, provider: Provider) -> Result<String, String> {
         .optional()
         .map_err(|_| "권한 설정을 읽지 못했습니다".to_string())?;
     match value {
+        Some(v) if provider == Provider::Gemini && v == "yolo" => Ok(provider.default().into()),
         Some(v) if available(provider).iter().any(|m| m.id == v) => Ok(v),
         Some(_) => Err("권한 설정을 읽지 못했습니다".into()),
         None => Ok(provider.default().into()),
     }
 }
 pub(crate) fn set(path: &Path, provider: Provider, value: &str) -> Result<(), String> {
-    if !available(provider).iter().any(|m| m.id == value) {
+    if !available(provider)
+        .iter()
+        .any(|m| m.id == value && (provider != Provider::Gemini || m.available))
+    {
         return Err("권한 설정을 저장하지 못했습니다".into());
     }
     let db = Connection::open(path).map_err(|_| "권한 설정을 저장하지 못했습니다".to_string())?;
@@ -309,6 +318,19 @@ mod tests {
         }
     }
     #[test]
+    fn gemini_exposes_only_modes_supported_by_chat() {
+        let modes = available(Provider::Gemini);
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|m| m.available)
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            ["default", "auto_edit", "plan"]
+        );
+        assert!(!modes.iter().find(|m| m.id == "yolo").unwrap().available);
+    }
+    #[test]
     fn modes_are_saved_separately() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("x.db");
@@ -324,6 +346,13 @@ mod tests {
         assert_eq!(get(&path, Provider::Claude).unwrap(), "acceptEdits");
         assert_eq!(get(&path, Provider::Gemini).unwrap(), "auto_edit");
         assert!(set(&path, Provider::Gemini, "acceptEdits").is_err());
+        assert!(set(&path, Provider::Gemini, "yolo").is_err());
+        c.execute(
+            "UPDATE app_runtime_meta SET value='yolo' WHERE key='permission_mode_gemini'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get(&path, Provider::Gemini).unwrap(), "default");
     }
     #[test]
     fn managed_requirements_limit_modes_without_changing_them() {

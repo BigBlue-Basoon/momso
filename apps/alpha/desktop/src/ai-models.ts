@@ -30,6 +30,8 @@ export type AiModel = {
   /** 이 모델이 받는 추론 수준. 예전 계약은 값의 목록, 새 계약은 항목의 목록. 둘 이상일 때만 고르기가 보인다. */
   efforts?: Array<string | EffortOption> | null
   defaultEffort?: string | null
+  /** 고르지 않았을 때 실제로 쓰이는 수준(그 회사 도구의 설정에서 읽은 것, T43). 확인되지 않으면 null. 보이기만 하고 보내지는 않는다. */
+  effectiveDefaultEffort?: string | null
   /** 추론 수준 전체의 설명 한 줄(그 회사의 글). */
   effortNote?: string | null
   /** 켜고 끄는 특별한 항목(예: 클로드 Ultracode). 계약: { id, label, description, available, state }. 슬라이더 아래 스위치 자리에 둔다. */
@@ -146,13 +148,17 @@ export function modelName(model: AiModel) {
 }
 
 /**
- * 그 모델에 보낼 추론 수준: 고른 값이 그 모델이 쓸 수 있는 값이면 그것, 아니면 백엔드가 준 기본값.
- * 기본값도 없으면 null(보내지 않아 그 회사의 기본으로 가게 한다. 화면이 값을 짐작해 고르지 않는다).
+ * 그 모델에 보낼(그리고 단추에 보일) 추론 수준: 고른 값이 그 모델이 쓸 수 있는 값이면 그것.
+ * 고르지 않았으면 그 회사 도구에서 실제로 쓰이는 수준(effectiveDefaultEffort, 사용자의 도구 설정), 그것이 없으면 모델의 기본값(defaultEffort).
+ * (2026-11-16 실제 앱에서 코덱스는 defaultEffort 'low', effectiveDefaultEffort 'high' 로 왔다. 예전처럼 defaultEffort 를 보내면
+ *  사용자의 코덱스 설정을 덮어써 보이는 것과 쓰이는 것이 달라진다.) 둘 다 없으면 null(보내지 않는다. 화면이 값을 짐작해 고르지 않는다).
  */
 export function resolveEffort(model: AiModel | undefined, wanted: string | null | undefined) {
   const usable = effortOptions(model).filter((item) => item.available).map((item) => item.id)
+  const fits = (level: string | null | undefined): level is string => Boolean(level) && (usable.length === 0 || usable.includes(level as string))
   if (wanted && usable.includes(wanted)) return wanted
-  if (model?.defaultEffort && (usable.length === 0 || usable.includes(model.defaultEffort))) return model.defaultEffort
+  if (fits(model?.effectiveDefaultEffort)) return model!.effectiveDefaultEffort!
+  if (fits(model?.defaultEffort)) return model!.defaultEffort!
   return null
 }
 

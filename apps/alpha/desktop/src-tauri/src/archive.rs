@@ -2,7 +2,10 @@ use serde::Serialize;
 use std::io::Write;
 const ARCHIVE_RULES: &str = include_str!("archive_rules.md");
 const RULE_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md"];
-const PREVIOUS_RULE_HASHES: [&str; 7] = [
+const PREVIOUS_RULE_HASHES: [&str; 10] = [
+    "2f1f610ebd2c56e38dd119b5946167924d6ff9692e274553732d1db1a6020903",
+    "7b000c37a5ff805250fc3b7b01f666ac55f87d06ece27e7eb4b81d40987467da",
+    "b29284f807489bfa9f76d2639f3355d6776ff6a7023713007b37a5afa9624c24",
     "a8302846395936f0c2282ebe581b1133ca2745f5285a05c2d296f1220ba974dc",
     "5c14c28814896e6597ccea941dd479fd34ad8239d37a86c0480838eb92a6e458",
     "cb50058d83310c64913f37bda14d0c8f71416422e0a2f122b1ba2ad0ab34bd79",
@@ -33,24 +36,9 @@ pub(crate) struct ArchiveStatus {
     rules_modified: bool,
 }
 
-pub(crate) fn storage_tool(resources: &Path) -> Result<(PathBuf, bool), String> {
-    let bundled = resources.join("mingit").join("cmd").join("git.exe");
-    if bundled.is_file() {
-        return Ok((bundled, true));
-    }
-    let output = Command::new("where.exe")
-        .arg("git.exe")
-        .output()
-        .map_err(|_| "저장 도구를 찾지 못했습니다".to_string())?;
-    if !output.status.success() {
-        return Err("저장 도구를 찾지 못했습니다".into());
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .map(|path| (path, false))
+pub(crate) fn storage_tool(_resources: &Path) -> Result<(PathBuf, bool), String> {
+    crate::git_tool::resolve()
+        .map(|(path, _)| (path, false))
         .ok_or_else(|| "저장 도구를 찾지 못했습니다".into())
 }
 
@@ -82,6 +70,19 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
     }
     let profile = profile_get(root)?;
     let expected_rules = profile_rules(&profile);
+    let _rule_guard = crate::archive_zet::WRITE_LOCK
+        .lock()
+        .map_err(|_| "몸소 폴더 설정을 확인하지 못했습니다".to_string())?;
+    let has_history = root.join(".git").exists()
+        && run_storage_tool(&executable, root, &["rev-parse", "--verify", "HEAD"]).is_ok();
+    let profile_clean = !has_history
+        || run_storage_tool(
+            &executable,
+            root,
+            &["status", "--porcelain", "--", "profile.md"],
+        )
+        .is_ok_and(|status| status.trim().is_empty());
+    let mut upgraded: Vec<(&str, Vec<u8>)> = Vec::new();
     let legacy_rules = expected_rules.replacen(
         if ARCHIVE_RULES.contains("\r\n") {
             "- `skills/` 와 `.agents/skills/`, `.claude/skills/` 는 몸소가 관리한다. AI는 사람이 시켰을 때만 스킬을 고친다.\r\n"
@@ -118,8 +119,32 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
                 }) || normalized_contents
                     == normalized_rule_text(legacy_rules.as_bytes());
                 if is_previous {
+                    let clean = has_history
+                        && profile_clean
+                        && run_storage_tool(
+                            &executable,
+                            root,
+                            &["status", "--porcelain", "--", name],
+                        )
+                        .is_ok_and(|status| status.trim().is_empty())
+                        && run_storage_tool(&executable, root, &["show", &format!("HEAD:{name}")])
+                            .is_ok_and(|saved| {
+                                normalized_rule_text(saved.as_bytes()) == normalized_contents
+                            });
+                    if has_history
+                        && !clean
+                        && normalized_contents != normalized_rule_text(expected.as_bytes())
+                    {
+                        continue;
+                    }
+                    if normalized_contents == normalized_rule_text(expected.as_bytes()) {
+                        continue;
+                    }
                     fs::write(path, expected_rules.as_bytes())
                         .map_err(|_| "규칙 파일을 갱신하지 못했습니다".to_string())?;
+                    if clean {
+                        upgraded.push((name, contents));
+                    }
                 }
             }
             Err(_) => return Err("규칙 파일을 만들지 못했습니다".into()),
@@ -139,6 +164,40 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
     if !root.join(".git").exists() {
         run_storage_tool(&executable, root, &["init", "--initial-branch=main"])?;
     }
+    if !upgraded.is_empty() {
+        if upgraded.iter().any(|(name, _)| {
+            fs::read(root.join(name)).ok().as_deref() != Some(expected_rules.as_bytes())
+                || run_storage_tool(
+                    &executable,
+                    root,
+                    &["diff", "--cached", "--quiet", "--", name],
+                )
+                .is_err()
+        }) {
+            return Err("규칙 파일이 그사이 바뀌었습니다".to_string());
+        }
+        let mut args = vec![
+            "-c",
+            "user.name=momso",
+            "-c",
+            "user.email=archive@momso.local",
+            "commit",
+            "--only",
+            "-m",
+            "몸소 업데이트: 기본 규칙 갱신",
+            "--",
+        ];
+        args.extend(upgraded.iter().map(|(name, _)| *name));
+        if let Err(error) = run_storage_tool(&executable, root, &args) {
+            for (name, before) in &upgraded {
+                fs::write(root.join(name), before)
+                    .map_err(|_| "규칙 파일 복구를 완료하지 못했습니다".to_string())?;
+            }
+            return Err(error);
+        }
+    }
+    crate::yoga_dictionary::initialize(root)?;
+    drop(_rule_guard);
     crate::skills::install_bundled(root, resources).map_err(str::to_owned)?;
     Ok(())
 }
@@ -831,22 +890,24 @@ pub(crate) fn save(root: &Path, resources: &Path, database: &Path) -> Result<(),
         root,
         &["add", "--", "AGENTS.md", "CLAUDE.md", "GEMINI.md"],
     )?;
-    let changed = run_storage_tool(
-        &tool,
-        root,
-        &[
-            "diff",
-            "--cached",
-            "--name-only",
-            "--no-renames",
-            "--",
-            "zettels/",
-            "receipts/",
-            "AGENTS.md",
-            "CLAUDE.md",
-            "GEMINI.md",
-        ],
-    )?;
+    let dictionary_paths = crate::yoga_dictionary::paths();
+    let mut add_dictionary = vec!["add", "--"];
+    add_dictionary.extend(dictionary_paths.iter().map(String::as_str));
+    run_storage_tool(&tool, root, &add_dictionary)?;
+    let mut diff_paths = vec![
+        "diff",
+        "--cached",
+        "--name-only",
+        "--no-renames",
+        "--",
+        "zettels/",
+        "receipts/",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "GEMINI.md",
+    ];
+    diff_paths.extend(dictionary_paths.iter().map(String::as_str));
+    let changed = run_storage_tool(&tool, root, &diff_paths)?;
     let paths: Vec<String> = changed.lines().map(str::to_owned).collect();
     if paths.is_empty() {
         return Err("저장할 변경 사항이 없습니다".into());
@@ -1183,15 +1244,16 @@ mod tests {
         );
     }
     #[test]
-    fn bundled_storage_tool_has_priority() {
+    fn resource_directory_is_not_used_as_a_git_bundle() {
         let temp = tempfile::tempdir().unwrap();
         let directory = temp.path().join("mingit/cmd");
         fs::create_dir_all(&directory).unwrap();
         let bundled = directory.join("git.exe");
         fs::write(&bundled, b"fixture").unwrap();
-        let (path, is_bundled) = storage_tool(temp.path()).unwrap();
-        assert_eq!(path, bundled);
-        assert!(is_bundled);
+        assert_ne!(
+            storage_tool(temp.path()).ok().map(|(path, _)| path),
+            Some(bundled)
+        );
     }
     #[test]
     fn same_second_waits_before_allocating_next_number() {
@@ -1253,7 +1315,7 @@ mod tests {
     }
 
     fn before_skills_rules() -> String {
-        ARCHIVE_RULES.replace("\r\n", "\n").replace("- `skills/` 와 `.agents/skills/`, `.claude/skills/` 는 몸소가 관리한다. AI는 사람이 시켰을 때만 스킬을 고친다.\n", "")
+        include_str!("testdata/archive_rules_before_dictionary.md").replace("\r\n", "\n").replace("- `skills/` 와 `.agents/skills/`, `.claude/skills/` 는 몸소가 관리한다. AI는 사람이 시켰을 때만 스킬을 고친다.\n", "")
     }
 
     #[test]
@@ -1295,6 +1357,50 @@ mod tests {
         assert!(!ARCHIVE_RULES.contains("(추정)"));
         assert!(ARCHIVE_RULES.contains("?김성균:"));
         assert!(ARCHIVE_RULES.contains("말의 내용에 있는 물음표는 건드리지 않는다"));
+    }
+
+    #[test]
+    fn upgrades_previous_dictionary_rules_preserving_custom_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        initialize(&root, temp.path()).unwrap();
+        let previous =
+            include_str!("testdata/archive_rules_before_spelling_policy.md").replace("\r\n", "\n");
+        fs::write(root.join("AGENTS.md"), &previous).unwrap();
+        fs::write(root.join("CLAUDE.md"), &previous).unwrap();
+        fs::write(root.join("GEMINI.md"), "custom rules").unwrap();
+        initialize(&root, temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            ARCHIVE_RULES.replace("\r\n", "\n")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("CLAUDE.md")).unwrap(),
+            ARCHIVE_RULES.replace("\r\n", "\n")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("GEMINI.md")).unwrap(),
+            "custom rules"
+        );
+    }
+
+    #[test]
+    fn upgrades_rules_before_fragment_lookup_without_touching_custom_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        initialize(&root, temp.path()).unwrap();
+        let old = include_str!("testdata/archive_rules_before_fragments.md").replace("\r\n", "\n");
+        fs::write(root.join("AGENTS.md"), &old).unwrap();
+        fs::write(root.join("CLAUDE.md"), "custom rules").unwrap();
+        initialize(&root, temp.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            ARCHIVE_RULES.replace("\r\n", "\n")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("CLAUDE.md")).unwrap(),
+            "custom rules"
+        );
     }
 
     #[test]
@@ -1370,6 +1476,72 @@ mod tests {
             "사람이 고친 규칙"
         );
         assert!(status(&root, temp.path()).unwrap().rules_modified);
+    }
+
+    #[test]
+    fn automatic_rule_update_saves_only_clean_known_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        initialize(&root, temp.path()).unwrap();
+        let previous = prior_language_rules();
+        for name in RULE_FILES {
+            fs::write(root.join(name), previous.as_bytes()).unwrap();
+        }
+        let (tool, _) = storage_tool(temp.path()).unwrap();
+        run_storage_tool(
+            &tool,
+            &root,
+            &["add", "--", "AGENTS.md", "CLAUDE.md", "GEMINI.md"],
+        )
+        .unwrap();
+        run_storage_tool(
+            &tool,
+            &root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )
+        .unwrap();
+        fs::write(root.join("user-staged.txt"), "keep staged").unwrap();
+        run_storage_tool(&tool, &root, &["add", "--", "user-staged.txt"]).unwrap();
+        fs::write(
+            root.join("profile.md"),
+            "---\nname: ''\nabout: ''\nstyle: ''\n---\n",
+        )
+        .unwrap();
+        initialize(&root, temp.path()).unwrap();
+        assert_eq!(
+            fs::read(root.join("AGENTS.md")).unwrap(),
+            previous.as_bytes()
+        );
+        fs::remove_file(root.join("profile.md")).unwrap();
+        initialize(&root, temp.path()).unwrap();
+        assert!(!status(&root, temp.path()).unwrap().has_unsaved_changes);
+        let message = run_storage_tool(
+            &tool,
+            &root,
+            &["log", "-1", "--format=%s", "--", "AGENTS.md"],
+        )
+        .unwrap();
+        assert_eq!(message.trim(), "몸소 업데이트: 기본 규칙 갱신");
+        let staged = run_storage_tool(&tool, &root, &["diff", "--cached", "--name-only"]).unwrap();
+        assert!(staged.lines().any(|line| line == "user-staged.txt"));
+        let saved =
+            run_storage_tool(&tool, &root, &["show", "--format=", "--name-only", "HEAD"]).unwrap();
+        assert!(!saved.lines().any(|line| line == "user-staged.txt"));
+        fs::write(root.join("CLAUDE.md"), previous.as_bytes()).unwrap();
+        initialize(&root, temp.path()).unwrap();
+        assert_eq!(
+            fs::read(root.join("CLAUDE.md")).unwrap(),
+            previous.as_bytes()
+        );
+        assert!(status(&root, temp.path()).unwrap().has_unsaved_changes);
     }
 
     #[test]
@@ -1659,10 +1831,16 @@ mod tests {
         let (tool, _) = storage_tool(temp.path()).unwrap();
         let files =
             run_storage_tool(&tool, &root, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
-        assert_eq!(
-            files.lines().collect::<Vec<_>>(),
-            vec!["AGENTS.md", "CLAUDE.md", "GEMINI.md", "profile.md"]
-        );
+        let files: Vec<_> = files.lines().collect();
+        for name in ["AGENTS.md", "CLAUDE.md", "GEMINI.md", "profile.md"] {
+            assert!(files.contains(&name));
+        }
+        for (skill, _) in crate::skills::BUNDLED_SKILLS {
+            for folder in ["skills", ".agents/skills", ".claude/skills"] {
+                assert!(files.contains(&format!("{folder}/{skill}/SKILL.md").as_str()));
+            }
+        }
+        assert_eq!(files.len(), 4 + 3 * crate::skills::BUNDLED_SKILLS.len());
         profile_set(&root, temp.path(), "".into(), "".into(), "".into()).unwrap();
         for file in RULE_FILES {
             assert_eq!(fs::read_to_string(root.join(file)).unwrap(), ARCHIVE_RULES);

@@ -1,0 +1,7 @@
+{
+  "identifier": "app.momso.desktop.r2-test",
+  "build": {
+    "beforeDevCommand": "npm run dev -- --port 1422",
+    "devUrl": "http://localhost:1422"
+  }
+}

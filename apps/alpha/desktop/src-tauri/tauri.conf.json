@@ -31,14 +31,14 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
-      "endpoints": []
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJBNUIxNjQ1ODVDMjU5NzcKUldSM1djS0ZSUlpidWlBd2JRdzNhb2xPanFra2hkMS9wMDk2NXFvdW5PR2VHL2NtM1lseEZhS00K",
+      "endpoints": ["https://github.com/BigBlue-Basoon/momso/releases/latest/download/latest.json"]
     }
   },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "resources": { "generated/": "" },
+    "resources": { "generated/node/": "node/", "../third-party/": "third-party/" },
     "publisher": "MOW · BigBlue",
     "category": "Productivity",
     "shortDescription": "요가 수업 기록을 로컬에 보존하는 momso Windows 알파",

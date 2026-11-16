@@ -51,7 +51,7 @@ function justify(list: Array<{ item: MediaItem; index: number }>, width: number,
 }
 
 /**
- * 누가 만들었는지: AI 면 회사 CI 와 모델 이름, 그리고 뒤쪽이 적은 how("만듦"/"붙임").
+ * 누가 만들었는지: AI 면 회사 CI 와 모델 이름, 그리고 뒤쪽이 적은 how("만듦"/"첨부").
  * by·how 가 null 이면(뒤쪽이 아직 모름) 그 칸은 그리지 않는다. 화면이 짐작해 넣지 않는다(2026-11-16 옮긴 것 절).
  */
 export function MediaBy({ item, small = false }: { item: MediaItem; small?: boolean }) {

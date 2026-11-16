@@ -6,15 +6,53 @@
  * 색과 유리 느낌은 App.css 의 .prompt-composer 를 그대로 쓴다.
  */
 
-.workbench-grid .prompt-composer.composer-compact {
+/*
+ * 2026-11-16 Aside 앱처럼 바꿈(그의 말 "우리도 저렇게 하자"): 단추들을 칸 아래 바깥 줄에서 칸 안 아랫줄로 옮겼다.
+ *   칸 안 윗줄: 글(한 줄 28px 에서 시작해 자란다). 칸 안 아랫줄(28px): 왼쪽 첨부·권한 단계, 오른쪽 회사·모델·추론 수준·
+ *   고속 모드·고리·마이크·보내기. 빈 칸 높이는 약 74px(전에는 칸 44px + 바깥 줄 30px 로 거의 같다).
+ */
+.workbench-grid .prompt-composer.composer-boxed {
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: 4px;
-  padding: 7px;
-  border-radius: 12px;
+  padding: 8px 7px 7px;
+  border-radius: 14px;
 }
 
-.workbench-grid .prompt-composer.composer-compact textarea {
+.composer-input-row,
+.composer-toolbar {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-width: 0;
+}
+
+.composer-input-row {
+  align-items: flex-end;
+  gap: 4px;
+  padding: 0 4px;
+}
+
+.composer-toolbar {
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  container-type: inline-size;
+}
+
+.composer-toolbar-start,
+.composer-toolbar-end {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+}
+
+/* 자리가 모자라면 왼쪽 무리(권한 이름)만 줄임표로 줄어든다. 오른쪽 무리(보내기까지)는 잘리지 않는다. */
+.composer-toolbar-start { flex: 0 1 auto; }
+.composer-toolbar-end { flex: 0 0 auto; margin-left: auto; }
+
+.workbench-grid .prompt-composer.composer-boxed textarea {
   flex: 1 1 auto;
   min-width: 0;
   height: 28px;
@@ -27,12 +65,12 @@
 }
 
 /* 좁은 칸에서 안내 글이 두 줄로 넘어가 칸이 커지지 않게 한다. */
-.workbench-grid .prompt-composer.composer-compact textarea::placeholder {
+.workbench-grid .prompt-composer.composer-boxed textarea::placeholder {
   white-space: nowrap;
 }
 
-.prompt-composer.composer-compact .composer-icon,
-.prompt-composer.composer-compact .send-button {
+.prompt-composer.composer-boxed .composer-icon,
+.prompt-composer.composer-boxed .send-button {
   position: relative;
   z-index: 1;
   width: 28px;
@@ -40,16 +78,11 @@
   border-radius: 7px;
 }
 
-/* 칸 아래 오른쪽 줄: 모델, 권한 단계, 대화가 찬 정도 */
-
-.composer-status {
-  display: flex;
-  min-width: 0;
-  min-height: 24px;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 2px;
-  margin-top: 6px;
+/* 마이크(Windows 받아쓰기). 쓸 수 없으면 흐리게만(글 없음). */
+.prompt-composer.composer-boxed .composer-mic:disabled {
+  cursor: default;
+  opacity: 0.4;
+  background: transparent;
 }
 
 .composer-chip {
@@ -134,6 +167,39 @@
   transition: stroke-dasharray 400ms var(--material-ease);
 }
 
+/* 고리에 올리면 뜨는 카드(Aside 앱처럼 밝은 작은 카드). 고리 위에, 오른쪽 끝을 고리 오른쪽 끝에 맞춘다. */
+.composer-context-card {
+  position: fixed;
+  z-index: 80;
+  display: grid;
+  width: max-content;
+  max-width: min(260px, calc(100vw - 16px));
+  gap: 3px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  word-break: keep-all;
+  animation: composer-menu-enter 120ms var(--material-ease) both;
+}
+
+.composer-context-card-main {
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.composer-context-card-note,
+.composer-context-card-amount {
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.composer-context-card-amount { font-variant-numeric: tabular-nums; }
+
 /* 단추가 여는 작은 창 */
 
 .composer-menu {
@@ -152,12 +218,6 @@
   box-shadow: var(--shadow);
   color: var(--ink);
   animation: composer-menu-enter 160ms var(--material-ease) both;
-}
-
-.model-menu-group + .model-menu-group {
-  margin-top: 4px;
-  padding-top: 4px;
-  border-top: 1px solid var(--line);
 }
 
 .model-menu-heading {
@@ -269,38 +329,29 @@
 }
 
 /* 추론 수준 전체의 설명 한 줄(그 회사의 글) */
-.effort-note {
-  margin: 0;
-  padding: 6px 8px 8px;
-  border-bottom: 1px solid var(--line);
-  margin-bottom: 4px;
-  color: var(--muted);
-  font-size: 11.5px;
-  line-height: 1.5;
-  word-break: keep-all;
-}
 
 /* 그 회사에만 있는 특별한 수준은 선 아래에 따로 */
-.effort-special {
-  display: grid;
-  margin-top: 4px;
-  padding-top: 4px;
-  border-top: 1px solid var(--line);
-}
 
-/* 단추 줄이 좁을 때(좁은 창, 보는 창을 연 때): 회사 단추는 로고만, 나머지 글은 짧게 줄임표로. */
-.composer-status {
-  container-type: inline-size;
-}
+/* 아랫줄이 좁을 때(좁은 창, 패널을 연 때): 회사 단추는 로고만, 펼침 화살표는 숨기고, 긴 권한 이름만 줄임표로 줄어든다.
+   더 좁으면 고속 모드는 번개만 남는다(이름은 풍선과 화면 읽기 이름에 남는다). */
+.composer-toolbar .composer-chip { flex-shrink: 0; }
+.composer-toolbar .permission-chip { flex-shrink: 1; }
 
-/* 짧은 이름(모델, 추론 수준)은 줄이지 않고, 긴 권한 이름만 줄임표로 줄어든다. */
-.composer-status .composer-chip { flex-shrink: 0; }
-.composer-status .permission-chip { flex-shrink: 1; }
-
-@container (max-width: 400px) {
+@container (max-width: 520px) {
   .company-chip .composer-chip-label { display: none; }
-  .composer-status .composer-chip > svg:last-child { display: none; }
+  .composer-toolbar .composer-chip > svg:last-child { display: none; }
   .permission-chip .composer-chip-label { max-width: 120px; }
+}
+
+@container (max-width: 380px) {
+  .fast-chip .composer-chip-label { display: none; }
+}
+
+/* 가장 좁을 때(창 960, 패널을 연 때 약 300px): 단추 안쪽 여백과 사이를 좁혀 권한 이름이 조금 더 보이게 한다. */
+@container (max-width: 340px) {
+  .composer-toolbar .composer-chip { padding: 0 4px; }
+  .composer-toolbar-start,
+  .composer-toolbar-end { gap: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -346,8 +397,7 @@
   grid-template-columns: max-content max-content minmax(0, 1fr) auto;
 }
 
-.model-menu > .model-menu-heading,
-.model-menu > .model-menu-group {
+.model-menu > .model-menu-heading {
   grid-column: 1 / -1;
 }
 

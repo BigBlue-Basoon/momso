@@ -5,6 +5,8 @@ import {
   cancelProviderLogin,
   clearProviderApiKey,
   getProviderAuth,
+  installProvider,
+  listenInstallProgress,
   listenProviderAuth,
   logoutProvider,
   setProviderApiKey,
@@ -34,20 +36,17 @@ export function useProviderAuth() {
 }
 
 /**
- * 설정 "AI와 개인정보"의 AI 연결: 회사 셋마다 한 줄. 그 회사 계정으로 로그인(브라우저가 열림)과 API 키 넣기, 로그아웃과 키 지우기.
+ * AI 연결: 회사 셋마다 한 줄. 설정 "AI 연결"과 첫 실행 화면이 같은 이 부품을 쓴다.
+ * 그 회사의 도구가 이 컴퓨터에 없으면(installed=false) 설치부터 하게 한다(한 번 묻고, 설치 중과 실패를 보인다).
+ * 설치된 뒤에는 그 회사 계정으로 로그인(브라우저가 열림)과 API 키 넣기, 로그아웃과 키 지우기.
  * 쓸 수 없는 방법(methods 에 없음)은 단추·칸이 눌리지 않게만 한다. 로그아웃과 키 지우기는 먼저 묻는다.
  * API 키는 입력 칸에서 받아 바로 넘기고 칸을 비운다. 저장된 키는 다시 보이지 않는다("API 키 저장됨"만).
  */
 export function ProviderSignIn({ list, onChanged }: { list: ProviderAuth[]; onChanged: () => void }) {
   const byProvider = new Map(list.map((item) => [item.provider, item]))
   return (
-    <section className="settings-group provider-sign-in" aria-labelledby="provider-sign-in-title">
-      <div className="settings-group-heading">
-        <div>
-          <h3 id="provider-sign-in-title">{W.signIn.title}</h3>
-          <p>{W.signIn.intro}</p>
-        </div>
-      </div>
+    // 쪽 제목 "AI 연결"이 위에 있으니 같은 제목을 다시 두지 않는다(2026-11-16). 안내 한 줄은 쪽 머리말로 옮겼다.
+    <section className="settings-group provider-sign-in" aria-label={W.settingsView.text4}>
       <ul className="provider-rows">
         {PROVIDER_ORDER.map((provider) => {
           const item = byProvider.get(provider)
@@ -63,7 +62,13 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
   const [pending, setPending] = useState(false)
   const [key, setKey] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [asking, setAsking] = useState<'logout' | 'clear' | null>(null)
+  const [asking, setAsking] = useState<'logout' | 'clear' | 'install' | null>(null)
+  // 설치: idle → working(설치하고 있습니다) → 끝나면 상태를 다시 읽는다. 실패면 까닭(reason)에 맞는 한 줄.
+  // 뒤쪽이 unavailable 을 주거나 명령이 없으면 단추만 눌리지 않게 한다(SCREEN_RULES 1절).
+  // 받은 양은 뒤쪽이 모르면 null 이라, 둘 다 숫자로 올 때만 막대를 보인다(퍼센트를 지어내지 않는다).
+  const [install, setInstall] = useState<'idle' | 'working' | 'failed' | 'unavailable'>('idle')
+  const [installReason, setInstallReason] = useState<string | null>(null)
+  const [installBytes, setInstallBytes] = useState<{ received: number; total: number } | null>(null)
   const keyInput = useRef<HTMLInputElement>(null)
   const canAccount = item.methods.includes('account')
   const canKey = item.methods.includes('apiKey')
@@ -72,7 +77,52 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
 
   // 백엔드가 로그인을 마쳤다고 알리면(목록이 다시 읽혀 상태가 바뀌면) 기다림을 거둔다.
   useEffect(() => { if (item.state === 'account') setPending(false) }, [item.state])
+  useEffect(() => { if (item.installed) setInstall('idle') }, [item.installed])
   useEffect(() => listenOnce(item.provider, (state) => { if (state && state !== 'inProgress') setPending(false) }), [item.provider])
+
+  // 설치 진행 이벤트(이 회사 것만). 다른 곳에서 시작한 설치도 여기서 보인다.
+  const changedRef = useRef(onChanged)
+  changedRef.current = onChanged
+  useEffect(() => {
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenInstallProgress((progress) => {
+      if (progress.provider !== item.provider) return
+      if (progress.phase === 'installing') {
+        setInstall('working')
+        setInstallBytes(typeof progress.receivedBytes === 'number' && typeof progress.totalBytes === 'number' && progress.totalBytes > 0
+          ? { received: progress.receivedBytes, total: progress.totalBytes } : null)
+      } else if (progress.phase === 'completed') {
+        setInstallBytes(null)
+        changedRef.current()
+      } else {
+        setInstallBytes(null)
+        if (progress.reason === 'unavailable') setInstall('unavailable')
+        else { setInstallReason(progress.reason); setInstall('failed') }
+        changedRef.current()
+      }
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [item.provider])
+
+  async function runInstall() {
+    setAsking(null)
+    setError(null)
+    setInstallReason(null)
+    setInstall('working')
+    try {
+      const state = await installProvider(item.provider)
+      if (state === 'unavailable') { setInstall('unavailable'); return }
+      // 다른 설치가 진행 중이면 완료 이벤트를 기다린다(위의 듣기가 받는다).
+      if (state === 'inProgress') return
+      const fresh = (await getProviderAuth()).find((entry) => entry.provider === item.provider)
+      if (fresh?.installed) setInstall('idle')
+      else { setInstallReason((current) => current ?? 'installFailed'); setInstall('failed') }
+    } catch (problem) {
+      setInstall(/not found/i.test(String(problem)) ? 'unavailable' : 'failed')
+    }
+    onChanged()
+  }
 
   async function login() {
     setError(null)
@@ -119,18 +169,41 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
     onChanged()
   }
 
-  const stateText = item.state === 'unavailable' ? null : W.signIn.state[item.state]
+  const installed = item.installed
+  // 제미나이는 키가 없을 때 state 가 unavailable 로 오지만 API 키는 넣을 수 있다(methods ['apiKey'], 2026-11-16 실제 앱 값). 그때는 "연결 안 됨"으로 본다.
+  const shownState = item.state === 'unavailable' && (canAccount || canKey) ? 'signedOut' : item.state
+  const stateText = !installed ? W.signIn.state.notInstalled : shownState === 'unavailable' ? null : W.signIn.state[shownState]
   const account = [item.accountLabel, item.planLabel].filter(Boolean).join(' · ')
   return (
-    <li className={`provider-row${item.state === 'unavailable' ? ' is-unavailable' : ''}`}>
+    <li className={`provider-row${installed && shownState === 'unavailable' ? ' is-unavailable' : ''}`}>
       <ProviderMark provider={MARK[item.provider]} className="provider-row-mark" />
       <div className="provider-row-body">
         <div className="provider-row-head">
           <strong>{name}</strong>
-          {stateText && <span className={`provider-state is-${item.state}`}>{stateText}</span>}
+          {stateText && <span className={`provider-state is-${installed ? shownState : 'notInstalled'}`}>{stateText}</span>}
         </div>
-        {item.state === 'account' && account && <p className="provider-account">{account}</p>}
+        {installed && item.state === 'account' && account && <p className="provider-account">{account}</p>}
 
+        {/* 도구가 없으면 설치만 보인다. 로그인과 API 키는 설치한 뒤에 나타난다. */}
+        {!installed && (
+          <div className="provider-actions">
+            {install === 'working' ? (
+              <span className="provider-pending" role="status">
+                <LoaderCircle size={14} className="is-spinning" aria-hidden />{W.signIn.installing}
+                {installBytes && (
+                  <span className="provider-install-bar" aria-hidden><span style={{ width: `${Math.min(100, (installBytes.received / installBytes.total) * 100)}%` }} /></span>
+                )}
+              </span>
+            ) : (
+              <button className="secondary-button" type="button" disabled={install === 'unavailable'} onClick={() => setAsking('install')}>
+                {install === 'failed' ? W.signIn.installRetry : W.signIn.install}
+              </button>
+            )}
+          </div>
+        )}
+        {!installed && install === 'failed' && <p className="provider-error" role="alert">{(installReason && W.signIn.installReason[installReason]) || W.signIn.installFailed}</p>}
+
+        {installed && <>
         {/* 제미나이는 계정 로그인을 받지 않아(뒤쪽이 unavailable) 계정 단추를 두지 않고 API 키 칸만 둔다(2026-11-16 김성균 개발자가 정함). */}
         {loginLabel && (
           <div className="provider-actions">
@@ -174,7 +247,20 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
         </div>
         {W.signIn.apiCost[item.provider] && <p className="provider-hint">{W.signIn.apiCost[item.provider]}</p>}
         {error && <p className="provider-error" role="alert">{error}</p>}
+        </>}
       </div>
+
+      {asking === 'install' && (
+        <QuestionDialog
+          title={W.signIn.installTitle(name)}
+          text={W.signIn.installText}
+          actions={[
+            { label: W.signIn.cancel, onSelect: () => setAsking(null) },
+            { label: W.signIn.install, primary: true, autoFocus: true, onSelect: () => void runInstall() },
+          ]}
+          onDismiss={() => setAsking(null)}
+        />
+      )}
 
       {asking === 'logout' && (
         <QuestionDialog

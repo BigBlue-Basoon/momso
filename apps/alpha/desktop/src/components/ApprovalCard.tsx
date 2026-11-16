@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import { Check } from 'lucide-react'
 import { findZetId, readZet } from '../archive'
 import { PROVIDER_NAME, type AiProvider } from '../ai-models'
-import { CHOICE_DONE, CHOICE_LABEL, approvalChange, orderedChoices, type ApprovalChange, type ApprovalChoice, type ApprovalRequest } from '../approvals'
+import { CHOICE_DONE, CHOICE_LABEL, approvalChange, orderedChoices, type ApprovalChange, type ApprovalChoice, type ApprovalRequest, type SetupAction } from '../approvals'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 import './ApprovalCard.css'
 
@@ -70,6 +70,80 @@ function headline(request: ApprovalRequest, title: string | null, change: Approv
   return title ? words.doc(name) : words.file(name)
 }
 
+/** 회사 이름: GitHub 은 그대로, 원자료 저장소 회사는 설정과 같은 이름(AWS·GCP·Cloudflare·NCP). 모르는 값은 받은 그대로. */
+export function serviceName(service: string) {
+  if (service === 'github') return 'GitHub'
+  return (W.backup.storeName as Record<string, string>)[service] ?? service
+}
+
+/**
+ * 스킬로 하는 연결에서 AI 가 무언가를 만들고 연결하려 할 때의 물음(kind 'setup_change', approvals.ts 의 계약).
+ * 파일 대신 "무엇을 하려는지": 어느 회사의 어느 계정에, 지역, 새로 만들 것의 정확한 이름, 보이는 사람, 돈이 들 수 있는지(온 것만).
+ * 한 번 한 번 묻는 일이라 "이번만 허락"과 "거절"만 둔다(orderedChoices).
+ */
+function SetupApprovalCard({ item, setup, onAnswer }: { item: ApprovalItem; setup: SetupAction; onAnswer: (choice: ApprovalChoice) => void }) {
+  const { request } = item
+  const who = providerName(request.provider)
+  const where = serviceName(setup.service)
+  const words = W.approvalCard.setup
+  const known = setup.action === 'create_and_connect'
+  // GitHub 은 저장소, 원자료 저장소 회사(Cloudflare·GCP·AWS)는 원자료를 보관할 곳.
+  const head = !known ? W.approvalCard.text4(who)
+    : setup.service === 'github' ? words.createRepository(who, where) : words.createStorage(who, where)
+  // 끝난 뒤 남는 한 줄: 같은 이름을 여러 회사에 만들 수 있어 회사 이름을 앞에 붙인다(예: GitHub momso-teacher).
+  const subject = setup.resourceName ? `${where} ${setup.resourceName}` : where
+  const visibility = setup.visibility ? words.visibilityText[setup.visibility] : null
+  const cost = setup.cost ? words.costText[setup.cost] : null
+
+  if (item.status === 'answered' && item.choice) {
+    return (
+      <p className="approval-done">
+        <Check size={13} aria-hidden />
+        <span>{CHOICE_DONE[item.choice]}</span>
+        <span className="approval-done-subject">{subject}</span>
+      </p>
+    )
+  }
+
+  const choices = orderedChoices(request.options, request)
+  const mark = MARK[request.provider as AiProvider]
+  return (
+    <section className="approval-card is-setup" role="group" aria-label={W.approvalCard.aria1} aria-busy={item.status === 'sending'}>
+      <div className="approval-head">
+        {mark && <ProviderMark provider={mark} className="approval-mark" />}
+        <strong>{head}</strong>
+      </div>
+      <dl className="approval-facts">
+        {/* 회사 이름은 머리 글에 있으니 다시 적지 않는다. 머리 글을 모를 때(그 밖의 일)만 적는다. */}
+        {!known && <div><dt>{words.service}</dt><dd>{where}</dd></div>}
+        {setup.account && <div><dt>{words.account}</dt><dd>{setup.account}</dd></div>}
+        {setup.region && <div><dt>{words.region}</dt><dd>{words.regionName[setup.region] ?? setup.region}</dd></div>}
+        {setup.resourceName && <div><dt>{words.name}</dt><dd className="approval-fact-name">{setup.resourceName}</dd></div>}
+        {visibility && <div><dt>{words.visibility}</dt><dd>{visibility}</dd></div>}
+        {cost && <div><dt>{words.cost}</dt><dd>{cost}</dd></div>}
+      </dl>
+      {!known && request.description.trim() && (
+        <p className="approval-subject is-plain">{request.description}</p>
+      )}
+      {request.reason && <p className="approval-reason">{request.reason}</p>}
+      {item.error && <p className="approval-error" role="alert">{item.error}</p>}
+      <div className="approval-actions">
+        {choices.map((choice) => (
+          <button
+            key={choice}
+            className={choice === 'allow_once' ? 'approval-button is-primary' : 'approval-button'}
+            type="button"
+            disabled={item.status === 'sending'}
+            onClick={() => onAnswer(choice)}
+          >
+            {CHOICE_LABEL[choice]}
+          </button>
+        ))}
+      </div>
+    </section>
+  )
+}
+
 /**
  * 대화 안에서 허락을 묻는 물음. Claude 앱의 대화 안 물음 상자처럼 대화 흐름 끝에 둥근 상자로 뜨고,
  * 무엇을 하려는지와 답 단추(그 AI 가 받는 것만)를 보인다. 답하면 고른 것을 적은 한 줄로 줄어 대화에 남는다.
@@ -90,6 +164,8 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
     ? (targets.length > 1 ? targets.map((target) => fileName(target.path)).join(', ') : title ?? fileName(path))
     : request.kind === 'command' ? command : request.description
 
+  if (request.kind === 'setup_change' && request.setup) return <SetupApprovalCard item={item} setup={request.setup} onAnswer={onAnswer} />
+
   if (item.status === 'answered' && item.choice) {
     return (
       <p className="approval-done">
@@ -100,7 +176,7 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
     )
   }
 
-  const choices = orderedChoices(request.options)
+  const choices = orderedChoices(request.options, request)
   const primary = choices.find((choice) => choice === 'allow_once' || choice === 'allow_session')
   const mark = MARK[request.provider as AiProvider]
 

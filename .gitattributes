@@ -1,2 +1,5 @@
 # 규칙 파일은 앱에 그대로 박히므로 어느 PC 에서 받아도 줄바꿈이 같아야 한다.
 apps/alpha/desktop/src-tauri/src/archive_rules.md text eol=lf
+apps/alpha/desktop/src-tauri/bundled-dictionary/*.json text eol=lf
+apps/alpha/desktop/src-tauri/bundled-skills/**/SKILL.md text eol=lf
+apps/alpha/desktop/src-tauri/src/testdata/archive_rules*.md text eol=lf

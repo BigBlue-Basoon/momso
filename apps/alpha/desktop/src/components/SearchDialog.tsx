@@ -1,26 +1,32 @@
 import { Fragment, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { FileText, FolderOpen, MessageSquare, Search, Settings, SquarePen, X } from 'lucide-react'
-import { listZets, type ZetListEntry } from '../archive'
+import { FileArchive, FileText, FolderOpen, MessageSquare, Search, Settings, SquarePen, X } from 'lucide-react'
+import { listZets, searchSources, type SourceSearchResult, type ZetListEntry } from '../archive'
 import { searchChats, type ChatEntry, type ChatGroup, type ChatSearchResult } from '../chats'
 import { W } from '../words'
 import './SearchDialog.css'
 
-type Tab = 'all' | 'chats' | 'documents' | 'actions'
+type Tab = 'all' | 'chats' | 'documents' | 'sources' | 'actions'
 
 export type SearchAction = { id: string; label: string; icon: 'new' | 'documents' | 'settings'; run: () => void }
 
 type Item =
   | { kind: 'chat'; id: string; title: string; detail: string | null; snippet: string | null }
   | { kind: 'document'; id: string; title: string; detail: string | null; snippet: string | null }
+  | { kind: 'source'; id: string; title: string; detail: string | null; snippet: null; documentId: string | null; media: boolean }
   | { kind: 'action'; id: string; title: string; icon: SearchAction['icon']; run: () => void }
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'all', label: W.searchDialog.text1 },
   { id: 'chats', label: W.chatRoom },
   { id: 'documents', label: W.document },
+  { id: 'sources', label: W.rawMaterial },
   { id: 'actions', label: W.searchDialog.text2 },
 ]
+
+// 원자료를 눌렀을 때 갈 곳: 이어진 문서가 있으면 그 문서, 사진·소리·영상이면 미디어 화면. 그 밖(이어진 문서 없는 글 파일 등)은
+// 원자료 하나를 여는 뒤쪽 명령이 아직 없어(넷째 줄이 만드는 중) 눌리지 않는 줄로 둔다.
+const isMediaType = (type: string | null) => Boolean(type && /^(audio|video|image)\//.test(type))
 
 const RECENT = 6
 const dateFormat = new Intl.DateTimeFormat('ko-KR', { month: 'long', day: 'numeric' })
@@ -30,7 +36,7 @@ function shortDate(value: string) {
 }
 
 /**
- * 검색 창: 채팅방(이름과 말), 문서(제목과 요약), 할 일을 한 창에서 찾는다. Claude 앱의 검색 창 틀(제목과 닫기,
+ * 검색 창: 채팅방(이름과 말), 문서(제목과 요약), 원자료(파일 이름, source_search), 할 일을 한 창에서 찾는다. Claude 앱의 검색 창 틀(제목과 닫기,
  * 위에 종류 탭, 아래에 키 안내)을 따랐다. 찾는 말이 없으면 최근 것. 키보드만으로 쓸 수 있다
  * (↑↓ 고르기, Enter 열기, ← → 종류 바꾸기, Esc·Ctrl+K 닫기).
  */
@@ -41,6 +47,7 @@ export function SearchDialog({
   onClose,
   onOpenChat,
   onOpenDocument,
+  onOpenMedia,
 }: {
   chats: ChatEntry[]
   groups: ChatGroup[] | null
@@ -48,12 +55,15 @@ export function SearchDialog({
   onClose: () => void
   onOpenChat: (id: string) => void
   onOpenDocument: (id: string) => void
+  /** 사진·소리·영상 원자료를 고르면 미디어 화면으로. */
+  onOpenMedia?: () => void
 }) {
   const [query, setQuery] = useState('')
   const [tab, setTab] = useState<Tab>('all')
   const [active, setActive] = useState(0)
   const [chatResults, setChatResults] = useState<ChatSearchResult[] | null>(null)
   const [documents, setDocuments] = useState<ZetListEntry[] | null>(null)
+  const [sourceResults, setSourceResults] = useState<SourceSearchResult[] | null>(null)
   const [leaving, setLeaving] = useState(false)
   const input = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
@@ -76,6 +86,15 @@ export function SearchDialog({
     return () => window.clearTimeout(timer)
   }, [text])
 
+  // 원자료도 뒤쪽에서 찾는다(파일 이름). 찾는 말이 있을 때만(빈 말이면 최근 원자료를 늘어놓지 않는다).
+  useEffect(() => {
+    if (!text) { setSourceResults(null); return }
+    const timer = window.setTimeout(() => {
+      searchSources(text).then(setSourceResults).catch(() => setSourceResults([]))
+    }, 180)
+    return () => window.clearTimeout(timer)
+  }, [text])
+
   const groupName = (id: string | null | undefined) => groups?.find((group) => group.id === id)?.name ?? null
 
   const sections = useMemo(() => {
@@ -92,16 +111,26 @@ export function SearchDialog({
       ? docSource.filter((entry) => `${entry.title} ${entry.summary}`.toLocaleLowerCase('ko-KR').includes(lower))
       : docSource.slice(0, RECENT)
     ).map((entry) => ({ kind: 'document', id: entry.id, title: entry.title, detail: shortDate(entry.updatedAt), snippet: text ? entry.summary : null }))
+    const sourceItems: Item[] = (text ? sourceResults ?? [] : []).map((entry) => ({
+      kind: 'source',
+      id: entry.id,
+      title: entry.originalFileName,
+      detail: shortDate(entry.createdAt),
+      snippet: null,
+      documentId: entry.linkedDocumentIds[0] ?? null,
+      media: isMediaType(entry.mediaType),
+    }))
     const actionItems: Item[] = actions
       .filter((action) => !text || action.label.toLocaleLowerCase('ko-KR').includes(lower))
       .map((action) => ({ kind: 'action', id: action.id, title: action.label, icon: action.icon, run: action.run }))
     const all: Array<{ key: Tab; title: string; items: Item[] }> = [
       { key: 'chats', title: text ? W.chatRoom : W.searchDialog.text4(W.chatRoom), items: chatItems },
       { key: 'documents', title: text ? W.document : W.searchDialog.text4(W.document), items: docItems },
+      { key: 'sources', title: W.rawMaterial, items: sourceItems },
       { key: 'actions', title: W.searchDialog.text2, items: actionItems },
     ]
     return all.filter((section) => (tab === 'all' || tab === section.key) && section.items.length > 0)
-  }, [text, chatResults, chats, documents, actions, tab, groups])
+  }, [text, chatResults, sourceResults, chats, documents, actions, tab, groups])
 
   const flat = sections.flatMap((section) => section.items)
 
@@ -115,12 +144,14 @@ export function SearchDialog({
     window.setTimeout(onClose, 120)
   }
 
+  const canOpen = (item: Item) => item.kind !== 'source' || Boolean(item.documentId) || (item.media && Boolean(onOpenMedia))
   const choose = (item: Item | undefined) => {
-    if (!item) return
+    if (!item || !canOpen(item)) return
     close()
     window.setTimeout(() => {
       if (item.kind === 'chat') onOpenChat(item.id)
       else if (item.kind === 'document') onOpenDocument(item.id)
+      else if (item.kind === 'source') { if (item.documentId) onOpenDocument(item.documentId); else onOpenMedia?.() }
       else item.run()
     }, 130)
   }
@@ -166,7 +197,7 @@ export function SearchDialog({
           <input
             ref={input}
             value={query}
-            placeholder={W.searchDialog.hint1(W.chatRoom, W.document)}
+            placeholder={W.searchDialog.hint2(W.chatRoom, W.document, W.rawMaterial)}
             aria-label={W.search}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -186,6 +217,7 @@ export function SearchDialog({
                     aria-selected={at === active}
                     data-index={at}
                     className="search-item"
+                    aria-disabled={!canOpen(item) || undefined}
                     onMouseMove={() => setActive(at)}
                     onClick={() => choose(item)}
                   >
@@ -217,6 +249,7 @@ function ItemIcon({ item }: { item: Item }) {
   let icon: ReactNode
   if (item.kind === 'chat') icon = <MessageSquare size={15} aria-hidden />
   else if (item.kind === 'document') icon = <FileText size={15} aria-hidden />
+  else if (item.kind === 'source') icon = <FileArchive size={15} aria-hidden />
   else icon = item.icon === 'new' ? <SquarePen size={15} aria-hidden /> : item.icon === 'documents' ? <FolderOpen size={15} aria-hidden /> : <Settings size={15} aria-hidden />
   return <span className="search-item-icon">{icon}</span>
 }

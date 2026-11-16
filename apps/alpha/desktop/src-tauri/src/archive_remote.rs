@@ -18,7 +18,7 @@ pub(crate) struct UsernameResult {
     username: Option<String>,
 }
 
-fn valid_username(value: &str) -> bool {
+pub(crate) fn valid_username(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 94
         && value
@@ -28,7 +28,7 @@ fn valid_username(value: &str) -> bool {
         && !value.to_ascii_lowercase().ends_with(".wiki")
 }
 
-fn username_get_db(path: &Path) -> Result<Option<String>, ()> {
+pub(crate) fn username_get_db(path: &Path) -> Result<Option<String>, ()> {
     Connection::open(path)
         .map_err(|_| ())?
         .query_row(
@@ -61,10 +61,11 @@ pub(crate) async fn momso_username_set(
     state: State<'_, crate::AppState>,
     username: String,
 ) -> Result<UsernameResult, String> {
+    let _lease = state.paths.archive.current.clone().read_owned().await;
     Ok(username_set_db(&state.paths.database_path, username))
 }
 
-fn username_set_db(path: &Path, username: String) -> UsernameResult {
+pub(crate) fn username_set_db(path: &Path, username: String) -> UsernameResult {
     if !valid_username(&username) {
         return UsernameResult {
             state: "invalid_username",
@@ -110,6 +111,32 @@ fn run_gh(args: &[&str]) -> Result<GhReply, ()> {
         code: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
     })
+}
+
+#[allow(dead_code)]
+pub(crate) fn setup_candidate(db: &Path) -> Result<(String, String), &'static str> {
+    let username = username_get_db(db)
+        .map_err(|_| "unavailable")?
+        .ok_or("username_missing")?;
+    if !valid_username(&username) {
+        return Err("invalid_username");
+    }
+    let auth = run_gh(&["auth", "status", "--active", "--hostname", "github.com"])
+        .map_err(|_| "gh_missing")?;
+    if auth.code != Some(0) {
+        return Err("signed_out");
+    }
+    let response = run_gh(&["api", "--hostname", "github.com", "user", "--jq", ".login"])
+        .map_err(|_| "unavailable")?;
+    if response.code != Some(0) {
+        return Err("unavailable");
+    }
+    let account = response.stdout.trim().to_owned();
+    let name = format!("momso-{username}");
+    if !valid_repo(&format!("{account}/{name}")) {
+        return Err("unavailable");
+    }
+    Ok((account, name))
 }
 
 #[derive(Deserialize)]
@@ -158,8 +185,21 @@ fn inspect_gh_repo(
     }
 }
 
+#[cfg(test)]
 fn create_auto(
     username: Option<String>,
+    call: impl FnMut(&[&str]) -> Result<GhReply, ()>,
+    connected: impl FnMut() -> bool,
+    classify: impl FnMut(&AutoRepo) -> &'static str,
+    connect: impl FnMut(&str) -> bool,
+) -> AutoCreateResult {
+    create_auto_checked(username, None, || false, call, connected, classify, connect)
+}
+
+fn create_auto_checked(
+    username: Option<String>,
+    expected: Option<&str>,
+    mut cancelled: impl FnMut() -> bool,
     mut call: impl FnMut(&[&str]) -> Result<GhReply, ()>,
     mut connected: impl FnMut() -> bool,
     mut classify: impl FnMut(&AutoRepo) -> &'static str,
@@ -192,9 +232,17 @@ fn create_auto(
     if !valid_repo(&repo) {
         return auto_result("unavailable", None);
     }
+    if expected.is_some_and(|value| value != repo) {
+        return auto_result("approval_stale", None);
+    }
+    if cancelled() {
+        return auto_result("cancelled", None);
+    }
     match inspect_gh_repo(&mut call, &repo) {
         Ok(Some(existing)) => {
-            let state = if !existing.is_private {
+            let state = if expected.is_some() {
+                "exists"
+            } else if !existing.is_private {
                 "exists_public"
             } else if existing.is_empty {
                 "exists_empty"
@@ -206,6 +254,9 @@ fn create_auto(
         Err(error) => return auto_result(error, None),
         Ok(None) => {}
     }
+    if cancelled() {
+        return auto_result("cancelled", None);
+    }
     let created = match call(&["repo", "create", &repo, "--private"]) {
         Ok(reply) => reply,
         Err(_) => return auto_result("gh_missing", None),
@@ -213,7 +264,9 @@ fn create_auto(
     if created.code != Some(0) {
         // A name can be claimed between lookup and creation. Inspect again without replacing it.
         if let Ok(Some(existing)) = inspect_gh_repo(&mut call, &repo) {
-            let state = if !existing.is_private {
+            let state = if expected.is_some() {
+                "exists"
+            } else if !existing.is_private {
                 "exists_public"
             } else if existing.is_empty {
                 "exists_empty"
@@ -226,6 +279,9 @@ fn create_auto(
     }
     match inspect_gh_repo(&mut call, &repo) {
         Ok(Some(existing)) if existing.is_private && existing.is_empty => {
+            if cancelled() {
+                return auto_result("created_not_connected", Some(existing.name_with_owner));
+            }
             if connect(&existing.name_with_owner) {
                 auto_result("created", Some(existing.name_with_owner))
             } else {
@@ -298,6 +354,34 @@ pub(crate) async fn archive_remote_create(
     app: tauri::AppHandle,
     state: State<'_, crate::AppState>,
 ) -> Result<AutoCreateResult, String> {
+    create_internal(app, state, None, None).await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn create_approved(
+    app: tauri::AppHandle,
+    state: State<'_, crate::AppState>,
+    chat_id: &str,
+    permit: crate::setup_approval::SetupPermit,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<AutoCreateResult, String> {
+    let details = permit.consume(chat_id).map_err(str::to_owned)?;
+    if details.service != "github" || cancellation.is_cancelled() {
+        return Ok(auto_result("cancelled", None));
+    }
+    let expected = format!("{}/{}", details.account, details.resource_name);
+    if !valid_repo(&expected) {
+        return Ok(auto_result("unavailable", None));
+    }
+    create_internal(app, state, Some(expected), Some(cancellation)).await
+}
+
+async fn create_internal(
+    app: tauri::AppHandle,
+    state: State<'_, crate::AppState>,
+    expected: Option<String>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> Result<AutoCreateResult, String> {
     let Ok((root, resources, db)) = command_paths(&app, &state).await else {
         return Ok(auto_result("unavailable", None));
     };
@@ -320,13 +404,37 @@ pub(crate) async fn archive_remote_create(
         let Some(tool) = git_path(&resources) else {
             return auto_result("git_missing", None);
         };
-        create_auto(
+        let result = create_auto_checked(
             username,
+            expected.as_deref(),
+            || cancellation.as_ref().is_some_and(|v| v.is_cancelled()),
             run_gh,
             || git(&tool, &root, &["remote", "get-url", REMOTE]).is_ok(),
             |repo| classify_existing(&tool, &root, repo),
             |repo| connect_local(&tool, &root, &url(repo)).is_ok(),
-        )
+        );
+        if result.state == "exists_private_unknown" && fresh_archive(&tool, &root) {
+            let Some(repo) = result.repo.as_deref() else {
+                return result;
+            };
+            let Ok((remote, _)) = github(repo) else {
+                return result;
+            };
+            let branch = remote
+                .default_branch_ref
+                .as_ref()
+                .map(|x| x.name.as_str())
+                .unwrap_or("main");
+            let target = url(&remote.name_with_owner);
+            if connect_local(&tool, &root, &target).is_err() {
+                return result;
+            }
+            if receive_connected(&tool, &root, &db, &target, branch).is_err() {
+                return auto_result("unavailable", Some(remote.name_with_owner));
+            }
+            return auto_result("connected", Some(remote.name_with_owner));
+        }
+        result
     })
     .await
     .unwrap_or_else(|_| auto_result("unavailable", None)))
@@ -420,9 +528,8 @@ fn valid_branch(branch: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'/' | b'.'))
 }
-fn git_path(resources: &Path) -> Option<PathBuf> {
-    let bundled = resources.join("mingit/cmd/git.exe");
-    bundled.is_file().then_some(bundled)
+fn git_path(_resources: &Path) -> Option<PathBuf> {
+    crate::git_tool::resolve().map(|(path, _)| path)
 }
 fn git_raw(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
     let output = hidden(&mut Command::new(tool))
@@ -458,7 +565,7 @@ fn git_raw(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
-fn git(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
+pub(crate) fn git(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
     git_raw(tool, root, args).map(|s| s.trim().to_owned())
 }
 fn gh(args: &[&str]) -> Result<String, ()> {
@@ -528,11 +635,22 @@ fn configured(tool: &Path, root: &Path) -> Option<String> {
         .strip_suffix(".git")?;
     valid_repo(repo).then(|| repo.to_owned())
 }
-fn connect_local(tool: &Path, root: &Path, target: &str) -> Result<(), &'static str> {
+pub(crate) fn connect_local(tool: &Path, root: &Path, target: &str) -> Result<(), &'static str> {
     if git(tool, root, &["remote", "get-url", REMOTE]).is_ok() {
         return Err("already_connected");
     }
     git(tool, root, &["remote", "add", REMOTE, target]).map_err(|_| "git_unavailable")?;
+    Ok(())
+}
+pub(crate) fn receive_connected(
+    tool: &Path,
+    root: &Path,
+    db: &Path,
+    target: &str,
+    branch: &str,
+) -> Result<(), &'static str> {
+    transfer(tool, root, target, branch, "pull")?;
+    crate::archive::reindex(root, db).map_err(|_| "reindex_failed")?;
     Ok(())
 }
 fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static str> {
@@ -568,6 +686,7 @@ fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static
                     | "profile.md"
             )
             || safe_skill_path(p)
+            || crate::yoga_dictionary::is_path(p)
             || ((p.starts_with("zettels/") || p.starts_with("receipts/"))
                 && p.ends_with(".md")
                 && !p.contains("..")
@@ -651,7 +770,323 @@ fn relation(
         nums.next().ok_or("remote_unavailable")?,
     ))
 }
-fn transfer(
+
+// An unborn repository is eligible only if every visible and ignored file is
+// an untouched file created by archive::initialize. Never infer this from
+// git status alone: objects/ and other user files can be ignored by Git.
+fn default_file_unchanged(path: &Path, name: &str) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || crate::archive_location::is_link_or_reparse(&metadata) {
+        return false;
+    }
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let expected = if name == ".gitignore" {
+        "objects/\n"
+    } else {
+        include_str!("archive_rules.md")
+    };
+    contents.replace("\r\n", "\n") == expected.replace("\r\n", "\n")
+}
+
+// First receive moves only exact bundled files aside and preserves them; any
+// additional file, edited byte, or link blocks first receive.
+fn default_skills_unchanged(root: &Path, folder: &str) -> bool {
+    let base = root.join(folder);
+    for entry in walkdir::WalkDir::new(&base).follow_links(false) {
+        let Ok(entry) = entry else { return false };
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            return false;
+        };
+        if crate::archive_location::is_link_or_reparse(&meta) {
+            return false;
+        }
+        let Ok(relative) = entry.path().strip_prefix(&base) else {
+            return false;
+        };
+        let parts: Vec<_> = relative.iter().collect();
+        let prefix: &[&str] = if folder == "skills" { &[] } else { &["skills"] };
+        let matches_prefix =
+            parts.len() >= prefix.len() && prefix.iter().zip(&parts).all(|(a, b)| *b == *a);
+        if relative.as_os_str().is_empty() {
+            if !meta.is_dir() {
+                return false;
+            }
+        } else if !matches_prefix {
+            return false;
+        } else if parts.len() == prefix.len() {
+            if !meta.is_dir() {
+                return false;
+            }
+        } else if parts.len() == prefix.len() + 1 {
+            if !meta.is_dir()
+                || !crate::skills::BUNDLED_SKILLS
+                    .iter()
+                    .any(|(name, _)| parts[prefix.len()] == *name)
+            {
+                return false;
+            }
+        } else if parts.len() == prefix.len() + 2 {
+            let Some((_, content)) = crate::skills::BUNDLED_SKILLS
+                .iter()
+                .find(|(name, _)| parts[prefix.len()] == *name)
+            else {
+                return false;
+            };
+            if parts[prefix.len() + 1] != "SKILL.md"
+                || !meta.is_file()
+                || !fs::read(entry.path()).is_ok_and(|bytes| bytes == content.as_bytes())
+            {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    let skill_root = if folder == "skills" {
+        base
+    } else {
+        base.join("skills")
+    };
+    crate::skills::BUNDLED_SKILLS.iter().all(|(name, content)| {
+        let file = skill_root.join(*name).join("SKILL.md");
+        fs::symlink_metadata(&file)
+            .is_ok_and(|meta| meta.is_file() && !crate::archive_location::is_link_or_reparse(&meta))
+            && fs::read(file).is_ok_and(|bytes| bytes == content.as_bytes())
+    })
+}
+
+fn copy_recovery_if_absent(source: &Path, target: &Path) -> Result<(), &'static str> {
+    let mut original = fs::File::open(source).map_err(|_| "local_state_unavailable")?;
+    let mut copy = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(_) => return Err("local_state_unavailable"),
+    };
+    std::io::copy(&mut original, &mut copy).map_err(|_| "local_state_unavailable")?;
+    copy.sync_all().map_err(|_| "local_state_unavailable")
+}
+
+fn restore_missing_default_skills(
+    tool: &Path,
+    saved: &Path,
+    root: &Path,
+    folder: &str,
+) -> Result<(), &'static str> {
+    let prefix = if folder == "skills" {
+        "skills".to_owned()
+    } else {
+        format!("{folder}/skills")
+    };
+    for &(name, _) in crate::skills::BUNDLED_SKILLS {
+        if folder != "skills" {
+            let canonical = format!("skills/{name}/SKILL.md");
+            if !git(tool, root, &["ls-files", "--", &canonical])
+                .map_err(|_| "local_state_unavailable")?
+                .trim()
+                .is_empty()
+            {
+                continue;
+            }
+        }
+        let target = crate::skills::skill_path(root, &prefix, name)
+            .map_err(|_| "local_state_unavailable")?;
+        if fs::symlink_metadata(&target).is_ok() {
+            continue;
+        }
+        fs::create_dir_all(target.parent().ok_or("local_state_unavailable")?)
+            .map_err(|_| "local_state_unavailable")?;
+        let target = crate::skills::skill_path(root, &prefix, name)
+            .map_err(|_| "local_state_unavailable")?;
+        let source = saved.join(&prefix).join(name).join("SKILL.md");
+        copy_recovery_if_absent(&source, &target)?;
+    }
+    Ok(())
+}
+
+fn fresh_archive(tool: &Path, root: &Path) -> bool {
+    let Ok(has_defaults) = crate::skills_write::fresh_builtin_state_mode(root) else {
+        return false;
+    };
+    if git(tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok()
+        || !git(tool, root, &["ls-files", "--stage"]).is_ok_and(|s| s.is_empty())
+        || (has_defaults
+            && !["skills", ".agents", ".claude"]
+                .iter()
+                .all(|folder| default_skills_unchanged(root, folder)))
+    {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let Ok(kind) = entry.file_type() else {
+            return false;
+        };
+        if !fs::symlink_metadata(entry.path())
+            .is_ok_and(|m| !crate::archive_location::is_link_or_reparse(&m))
+        {
+            return false;
+        }
+        if name == ".git" {
+            if !kind.is_dir() || kind.is_symlink() {
+                return false;
+            }
+        } else if ["zettels", "receipts", "objects"].contains(&name) {
+            if !kind.is_dir()
+                || kind.is_symlink()
+                || !fs::read_dir(entry.path()).is_ok_and(|mut entries| entries.next().is_none())
+            {
+                return false;
+            }
+        } else if name == crate::yoga_dictionary::DIRECTORY {
+            if !kind.is_dir() || !crate::yoga_dictionary::defaults_unchanged(root) {
+                return false;
+            }
+        } else if ["skills", ".agents", ".claude"].contains(&name) {
+            if !has_defaults || !kind.is_dir() || !default_skills_unchanged(root, name) {
+                return false;
+            }
+        } else if ["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".gitignore"].contains(&name) {
+            if !kind.is_file() || kind.is_symlink() {
+                return false;
+            }
+            if !default_file_unchanged(&entry.path(), name) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn first_receive(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static str> {
+    first_receive_with_hook(tool, root, revision, || {})
+}
+
+fn first_receive_with_hook(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+    after_check: impl FnOnce(),
+) -> Result<(), &'static str> {
+    let _write = crate::archive_zet::WRITE_LOCK
+        .lock()
+        .map_err(|_| "unavailable")?;
+    if !fresh_archive(tool, root) {
+        return Err("unsaved_changes");
+    }
+    let has_defaults =
+        crate::skills_write::fresh_builtin_state_mode(root).map_err(|_| "unsaved_changes")?;
+    after_check();
+    let saved = root
+        .join(".git")
+        .join(format!("momso-first-pull-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&saved).map_err(|_| "local_state_unavailable")?;
+    let mut moved = Vec::new();
+    let result = (|| {
+        for name in [
+            ".gitignore",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "GEMINI.md",
+            "skills",
+            ".agents",
+            ".claude",
+            crate::yoga_dictionary::DIRECTORY,
+        ] {
+            if root.join(name).exists() {
+                fs::rename(root.join(name), saved.join(name))
+                    .map_err(|_| "local_state_unavailable")?;
+                moved.push(name);
+                let unchanged = if name == crate::yoga_dictionary::DIRECTORY {
+                    crate::yoga_dictionary::defaults_unchanged(&saved)
+                } else if ["skills", ".agents", ".claude"].contains(&name) {
+                    default_skills_unchanged(&saved, name)
+                } else {
+                    default_file_unchanged(&saved.join(name), name)
+                };
+                if !unchanged {
+                    return Err("unsaved_changes");
+                }
+            }
+        }
+        if crate::skills_write::fresh_builtin_state_mode(root) != Ok(has_defaults) {
+            return Err("unsaved_changes");
+        }
+        git(tool, root, &["merge", "--ff-only", revision]).map_err(|_| "fast_forward_failed")?;
+        if has_defaults {
+            crate::skills_write::adopt_received_builtin_states(tool, root, &saved)
+                .map_err(|_| "local_state_unavailable")?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for name in moved {
+            if [
+                "skills",
+                ".agents",
+                ".claude",
+                crate::yoga_dictionary::DIRECTORY,
+            ]
+            .contains(&name)
+            {
+                if !root.join(name).exists() {
+                    let _ = fs::rename(saved.join(name), root.join(name));
+                }
+                continue;
+            }
+            // Keep the saved original if Git or another process created the path.
+            if fs::hard_link(saved.join(name), root.join(name)).is_ok() {
+                let _ = fs::remove_file(saved.join(name));
+            }
+        }
+    } else {
+        for name in moved {
+            if ["skills", ".agents", ".claude"].contains(&name) {
+                restore_missing_default_skills(tool, &saved, root, name)?;
+                continue;
+            }
+            if name == crate::yoga_dictionary::DIRECTORY {
+                let target_dir = root.join(name);
+                fs::create_dir_all(&target_dir).map_err(|_| "local_state_unavailable")?;
+                let meta =
+                    fs::symlink_metadata(&target_dir).map_err(|_| "local_state_unavailable")?;
+                if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+                    return Err("local_state_unavailable");
+                }
+                for relative in crate::yoga_dictionary::paths() {
+                    copy_recovery_if_absent(&saved.join(&relative), &root.join(&relative))?;
+                }
+                continue;
+            }
+            // Keep the original as a recovery copy: another process may still
+            // hold it open and write after any content check.
+            copy_recovery_if_absent(&saved.join(name), &root.join(name))?;
+        }
+    }
+    if result.is_ok() {
+        crate::yoga_dictionary::initialize(root).map_err(|_| "local_state_unavailable")?;
+    }
+    let _ = fs::remove_dir(&saved);
+    result
+}
+
+pub(crate) fn transfer(
     tool: &Path,
     root: &Path,
     target: &str,
@@ -679,6 +1114,18 @@ fn transfer(
         )
         .map_err(|_| "local_state_unavailable")?;
     } else {
+        let unborn = git(tool, root, &["rev-parse", "--verify", "HEAD"]).is_err();
+        if unborn && behind > 0 {
+            let revision = git(
+                tool,
+                root,
+                &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+            )
+            .map_err(|_| "remote_unavailable")?;
+            safe_history(tool, root, &revision)?;
+            let _guard = crate::chat_file_changes::lock_app_write();
+            return first_receive(tool, root, &revision);
+        }
         let dirty = git(
             tool,
             root,
@@ -794,7 +1241,7 @@ async fn connect_impl(
     state: State<'_, crate::AppState>,
     repo: String,
 ) -> RemoteStatus {
-    let Ok((root, resources, _)) = command_paths(&app, &state).await else {
+    let Ok((root, resources, db)) = command_paths(&app, &state).await else {
         return RemoteStatus::new("unavailable", Some("local_state_unavailable"));
     };
     tauri::async_runtime::spawn_blocking(move || {
@@ -810,6 +1257,18 @@ async fn connect_impl(
         };
         if let Err(e) = connect_local(&tool, &root, &url(&remote.name_with_owner)) {
             return RemoteStatus::new("unavailable", Some(e));
+        }
+        if git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).is_err() {
+            let branch = remote
+                .default_branch_ref
+                .as_ref()
+                .map(|x| x.name.as_str())
+                .unwrap_or("main");
+            if let Err(e) =
+                receive_connected(&tool, &root, &db, &url(&remote.name_with_owner), branch)
+            {
+                return RemoteStatus::transfer_error(e);
+            }
         }
         status(&root, &resources)
     })
@@ -926,6 +1385,70 @@ mod tests {
             code: Some(code),
             stdout: stdout.into(),
         })
+    }
+
+    #[test]
+    fn approved_creation_refuses_changed_account_or_cancel_before_remote_changes() {
+        let mut calls = Vec::new();
+        let result = create_auto_checked(
+            Some("teacher".into()),
+            Some("expected/momso-teacher"),
+            || false,
+            |args| {
+                calls.push(args.join(" "));
+                if args.ends_with(&[".login"]) {
+                    reply(0, "different")
+                } else {
+                    reply(0, "ok")
+                }
+            },
+            || false,
+            |_| "exists_private_unknown",
+            |_| panic!("must not connect"),
+        );
+        assert_eq!(result.state, "approval_stale");
+        assert!(!calls.iter().any(|v| v.starts_with("repo ")));
+        let result = create_auto_checked(
+            Some("teacher".into()),
+            Some("expected/momso-teacher"),
+            || true,
+            |args| {
+                if args.ends_with(&[".login"]) {
+                    reply(0, "expected")
+                } else {
+                    reply(0, "ok")
+                }
+            },
+            || false,
+            |_| "exists_private_unknown",
+            |_| panic!("must not connect"),
+        );
+        assert_eq!(result.state, "cancelled");
+    }
+
+    #[test]
+    fn approved_creation_never_reads_existing_repository_contents() {
+        let result = create_auto_checked(
+            Some("teacher".into()),
+            Some("owner/momso-teacher"),
+            || false,
+            |args| {
+                if args.ends_with(&[".login"]) {
+                    return reply(0, "owner");
+                }
+                if args.starts_with(&["repo", "view"]) {
+                    return reply(
+                        0,
+                        r#"{"nameWithOwner":"owner/momso-teacher","isPrivate":true,"isEmpty":false,"defaultBranchRef":{"name":"main"}}"#,
+                    );
+                }
+                reply(0, "ok")
+            },
+            || false,
+            |_| panic!("must not read existing history"),
+            |_| panic!("must not connect existing repository"),
+        );
+        assert_eq!(result.state, "exists");
     }
 
     #[test]
@@ -1133,10 +1656,12 @@ mod tests {
         assert!(!created);
     }
     #[test]
-    #[ignore = "requires prepared MinGit and a PATH without system git or gh"]
-    fn prepared_mingit_status_without_system_git() {
-        let resources = PathBuf::from(std::env::var_os("MOMSO_MINGIT_TEST_RESOURCE").unwrap());
+    #[ignore = "requires verified managed MinGit and a PATH without system git or gh"]
+    fn managed_mingit_status_without_system_git() {
+        let resources = PathBuf::from(std::env::var_os("MOMSO_GIT_TEST_DATA").unwrap());
+        crate::git_tool::configure(resources.clone());
         let tool = git_path(&resources).expect("prepared MinGit");
+        assert!(tool.starts_with(resources.join("git-tools")));
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("archive");
         fs::create_dir(&root).unwrap();
@@ -1295,6 +1820,398 @@ mod tests {
             fs::read_to_string(f.root.join("zettels/a.md")).unwrap(),
             "initial"
         );
+    }
+
+    #[test]
+    fn fresh_install_receives_existing_history_and_default_files() {
+        let f = Fixture::new();
+        f.push();
+        f.clone_and_commit();
+        let fresh = f._dir.path().join("fresh");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        assert!(fresh_archive(&f.tool, &fresh));
+        connect_local(&f.tool, &fresh, f.remote()).unwrap();
+        transfer(&f.tool, &fresh, f.remote(), "main", "pull").unwrap();
+        assert_eq!(
+            fs::read_to_string(fresh.join("zettels/a.md")).unwrap(),
+            "initial"
+        );
+        assert!(fresh.join("AGENTS.md").is_file());
+        assert!(fresh.join("skills/github-connect/SKILL.md").is_file());
+        assert!(fresh.join("dictionary/yoga.json").is_file());
+        assert!(fresh
+            .join(".agents/skills/github-connect/SKILL.md")
+            .is_file());
+        assert_eq!(
+            git(&f.tool, &fresh, &["rev-list", "--count", "HEAD"]).unwrap(),
+            "2"
+        );
+        assert_eq!(
+            fs::read_to_string(fresh.join("zettels/b.md")).unwrap(),
+            "remote"
+        );
+    }
+
+    #[test]
+    fn fresh_receive_accepts_remote_dictionary_and_preserves_user_files() {
+        let f = Fixture::new();
+        crate::yoga_dictionary::initialize(&f.root).unwrap();
+        fs::write(
+            f.root.join("dictionary/my-terms.json"),
+            "remote person terms",
+        )
+        .unwrap();
+        fs::write(
+            f.root.join("dictionary/people.json"),
+            "{\"people\":[{\"name\":\"fixture-person\"}]}",
+        )
+        .unwrap();
+        git(&f.tool, &f.root, &["add", "--", "dictionary/"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "dictionary",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let fresh = f._dir.path().join("fresh-dictionary");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        connect_local(&f.tool, &fresh, f.remote()).unwrap();
+        transfer(&f.tool, &fresh, f.remote(), "main", "pull").unwrap();
+        assert_eq!(
+            fs::read(fresh.join("dictionary/my-terms.json")).unwrap(),
+            b"remote person terms"
+        );
+        assert_eq!(
+            fs::read_to_string(fresh.join("dictionary/people.json")).unwrap(),
+            "{\"people\":[{\"name\":\"fixture-person\"}]}"
+        );
+    }
+
+    #[test]
+    fn fresh_install_refuses_user_files_and_modified_defaults() {
+        for name in [
+            "zettels/user.md",
+            "objects/original",
+            "AGENTS.md",
+            "extra",
+            "skills/github-connect/SKILL.md",
+            "dictionary/yoga.json",
+            "dictionary/my-terms.json",
+            "dictionary/people.json",
+            ".agents/skills/github-connect/SKILL.md",
+            ".claude/skills/github-connect/custom.txt",
+        ] {
+            let f = Fixture::new();
+            f.push();
+            let fresh = f._dir.path().join("fresh");
+            fs::create_dir_all(&fresh).unwrap();
+            crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+            fs::write(fresh.join(name), "user content").unwrap();
+            connect_local(&f.tool, &fresh, f.remote()).unwrap();
+            assert_eq!(
+                transfer(&f.tool, &fresh, f.remote(), "main", "pull"),
+                Err("unsaved_changes")
+            );
+            assert_eq!(
+                fs::read_to_string(fresh.join(name)).unwrap(),
+                "user content"
+            );
+            assert!(git(&f.tool, &fresh, &["rev-parse", "--verify", "HEAD"]).is_err());
+        }
+    }
+
+    #[test]
+    fn fresh_install_refuses_deleted_default_skills() {
+        for folder in ["skills", ".agents/skills", ".claude/skills"] {
+            let f = Fixture::new();
+            f.push();
+            let fresh = f._dir.path().join("fresh-deleted-skill");
+            fs::create_dir_all(&fresh).unwrap();
+            crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+            let missing = fresh.join(folder).join("github-connect/SKILL.md");
+            fs::remove_file(&missing).unwrap();
+            connect_local(&f.tool, &fresh, f.remote()).unwrap();
+            assert_eq!(
+                transfer(&f.tool, &fresh, f.remote(), "main", "pull"),
+                Err("unsaved_changes")
+            );
+            assert!(!missing.exists());
+        }
+    }
+
+    #[test]
+    fn first_receive_keeps_remote_disabled_skill_disabled() {
+        let f = Fixture::new();
+        let skill = f.root.join("skills/github-connect/SKILL.md");
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        let content = crate::skills::BUNDLED_SKILLS
+            .iter()
+            .find(|(name, _)| *name == "github-connect")
+            .unwrap()
+            .1;
+        fs::write(&skill, format!("{content}\n")).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &["add", "--", "skills/github-connect/SKILL.md"],
+        )
+        .unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "remote skill",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let fresh = f._dir.path().join("fresh-disabled-skill");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        connect_local(&f.tool, &fresh, f.remote()).unwrap();
+        transfer(&f.tool, &fresh, f.remote(), "main", "pull").unwrap();
+        assert!(fresh.join("skills/github-connect/SKILL.md").is_file());
+        assert!(!fresh
+            .join(".agents/skills/github-connect/SKILL.md")
+            .exists());
+        assert!(!fresh
+            .join(".claude/skills/github-connect/SKILL.md")
+            .exists());
+        crate::skills_write::reconcile(&fresh, "github-connect").unwrap();
+        assert!(!fresh
+            .join(".agents/skills/github-connect/SKILL.md")
+            .exists());
+        assert!(!fresh
+            .join(".claude/skills/github-connect/SKILL.md")
+            .exists());
+        assert!(fresh
+            .join(".agents/skills/object-store-connect/SKILL.md")
+            .is_file());
+        let backups: Vec<_> = fs::read_dir(fresh.join(".git"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("momso-first-pull-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert!(default_skills_unchanged(&backups[0].path(), ".agents"));
+    }
+
+    #[test]
+    fn first_receive_keeps_non_utf8_remote_skill_unchanged() {
+        let f = Fixture::new();
+        let skill = f.root.join("skills/github-connect/SKILL.md");
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&skill, [0xff, 0xfe, 0xfd]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &["add", "--", "skills/github-connect/SKILL.md"],
+        )
+        .unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "remote skill",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let fresh = f._dir.path().join("fresh-non-utf8-skill");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        connect_local(&f.tool, &fresh, f.remote()).unwrap();
+        transfer(&f.tool, &fresh, f.remote(), "main", "pull").unwrap();
+        assert_eq!(
+            fs::read(fresh.join("skills/github-connect/SKILL.md")).unwrap(),
+            [0xff, 0xfe, 0xfd]
+        );
+    }
+
+    #[test]
+    fn first_receive_preserves_default_edited_after_initial_check() {
+        let f = Fixture::new();
+        f.push();
+        let fresh = f._dir.path().join("fresh-race");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        relation(&f.tool, &fresh, f.remote(), "main").unwrap();
+        let revision = git(
+            &f.tool,
+            &fresh,
+            &["rev-parse", "refs/remotes/momso/observed"],
+        )
+        .unwrap();
+        let result = first_receive_with_hook(&f.tool, &fresh, &revision, || {
+            fs::write(fresh.join("AGENTS.md"), "user edit during receive").unwrap();
+        });
+        assert_eq!(result, Err("unsaved_changes"));
+        assert_eq!(
+            fs::read_to_string(fresh.join("AGENTS.md")).unwrap(),
+            "user edit during receive"
+        );
+        assert!(git(&f.tool, &fresh, &["rev-parse", "--verify", "HEAD"]).is_err());
+    }
+
+    #[test]
+    fn first_receive_preserves_skill_edited_after_initial_check() {
+        let f = Fixture::new();
+        f.push();
+        let fresh = f._dir.path().join("fresh-skill-race");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        relation(&f.tool, &fresh, f.remote(), "main").unwrap();
+        let revision = git(
+            &f.tool,
+            &fresh,
+            &["rev-parse", "refs/remotes/momso/observed"],
+        )
+        .unwrap();
+        let path = fresh.join("skills/github-connect/SKILL.md");
+        let result = first_receive_with_hook(&f.tool, &fresh, &revision, || {
+            fs::write(&path, "user skill edit").unwrap();
+        });
+        assert_eq!(result, Err("unsaved_changes"));
+        assert_eq!(fs::read(&path).unwrap(), b"user skill edit");
+        assert!(git(&f.tool, &fresh, &["rev-parse", "--verify", "HEAD"]).is_err());
+    }
+
+    #[test]
+    fn first_receive_preserves_skill_deleted_after_initial_check() {
+        let f = Fixture::new();
+        f.push();
+        let fresh = f._dir.path().join("fresh-skill-delete-race");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        relation(&f.tool, &fresh, f.remote(), "main").unwrap();
+        let revision = git(
+            &f.tool,
+            &fresh,
+            &["rev-parse", "refs/remotes/momso/observed"],
+        )
+        .unwrap();
+        let path = fresh.join("skills/github-connect/SKILL.md");
+        let result = first_receive_with_hook(&f.tool, &fresh, &revision, || {
+            fs::remove_file(&path).unwrap();
+        });
+        assert_eq!(result, Err("unsaved_changes"));
+        assert!(!path.exists());
+        assert!(git(&f.tool, &fresh, &["rev-parse", "--verify", "HEAD"]).is_err());
+    }
+
+    #[test]
+    fn first_receive_preserves_skill_state_edited_after_initial_check() {
+        let f = Fixture::new();
+        f.push();
+        let fresh = f._dir.path().join("fresh-skill-state-race");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        relation(&f.tool, &fresh, f.remote(), "main").unwrap();
+        let revision = git(
+            &f.tool,
+            &fresh,
+            &["rev-parse", "refs/remotes/momso/observed"],
+        )
+        .unwrap();
+        let state = f._dir.path().join("skill-state/github-connect.json");
+        let changed = br#"{"hash":"changed","enabled":false}"#;
+        let result = first_receive_with_hook(&f.tool, &fresh, &revision, || {
+            fs::write(&state, changed).unwrap();
+        });
+        assert_eq!(result, Err("unsaved_changes"));
+        assert_eq!(fs::read(&state).unwrap(), changed);
+        assert!(git(&f.tool, &fresh, &["rev-parse", "--verify", "HEAD"]).is_err());
+    }
+
+    #[test]
+    fn successful_first_receive_keeps_default_recovery_copy() {
+        let f = Fixture::new();
+        f.push();
+        let fresh = f._dir.path().join("fresh-recovery");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        relation(&f.tool, &fresh, f.remote(), "main").unwrap();
+        let revision = git(
+            &f.tool,
+            &fresh,
+            &["rev-parse", "refs/remotes/momso/observed"],
+        )
+        .unwrap();
+        first_receive(&f.tool, &fresh, &revision).unwrap();
+        let backups: Vec<_> = fs::read_dir(fresh.join(".git"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("momso-first-pull-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert!(default_file_unchanged(
+            &backups[0].path().join("AGENTS.md"),
+            "AGENTS.md"
+        ));
+        for folder in ["skills", ".agents", ".claude"] {
+            assert!(default_skills_unchanged(&backups[0].path(), folder));
+            assert!(default_skills_unchanged(&fresh, folder));
+        }
+        fs::write(fresh.join("AGENTS.md"), "later user edit").unwrap();
+        fs::write(
+            fresh.join("skills/github-connect/SKILL.md"),
+            "later skill edit",
+        )
+        .unwrap();
+        assert!(default_file_unchanged(
+            &backups[0].path().join("AGENTS.md"),
+            "AGENTS.md"
+        ));
+        assert!(default_skills_unchanged(&backups[0].path(), "skills"));
+    }
+
+    #[test]
+    fn audit_reproduces_old_first_receive_discarding_a_late_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let original = root.join("AGENTS.md");
+        let staged = root.join("saved");
+        fs::write(&original, include_str!("archive_rules.md")).unwrap();
+        assert!(default_file_unchanged(&original, "AGENTS.md"));
+        fs::write(&original, "user edit during receive").unwrap();
+        fs::rename(&original, &staged).unwrap();
+        fs::write(&original, "remote file").unwrap();
+        fs::remove_file(&staged).unwrap();
+        assert_eq!(fs::read_to_string(&original).unwrap(), "remote file");
+        assert!(!staged.exists());
     }
     #[test]
     fn pushes_only_saved_content() {
@@ -1581,13 +2498,12 @@ mod tests {
         assert!(!valid_repo("a/../b"));
     }
     #[test]
-    fn requires_bundled_git() {
+    fn resource_directory_cannot_override_git_selection() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(git_path(dir.path()).is_none());
         let path = dir.path().join("mingit/cmd/git.exe");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "placeholder").unwrap();
-        assert_eq!(git_path(dir.path()), Some(path));
+        assert_ne!(git_path(dir.path()), Some(path));
     }
     #[test]
     fn rejects_public_repository_metadata() {

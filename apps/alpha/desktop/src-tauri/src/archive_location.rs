@@ -64,6 +64,14 @@ pub(crate) async fn archive_location_set(
     path: String,
 ) -> Result<LocationSetResult, String> {
     use tauri::Emitter;
+    if crate::runtime::r2_test_enabled() {
+        return Ok(LocationSetResult {
+            state: "unavailable",
+            path: None,
+            previous_path: None,
+            previous_kept: None,
+        });
+    }
     let _ = app.emit(
         "archive-location-progress",
         LocationProgress {
@@ -388,7 +396,16 @@ fn digest(path: &Path) -> io::Result<(u64, [u8; 32])> {
 fn stage_archive_copy(
     source: &Path,
     parent: &Path,
+    progress: impl FnMut(u64),
+) -> io::Result<tempfile::TempDir> {
+    stage_archive_copy_with_hook(source, parent, progress, || Ok(()))
+}
+
+fn stage_archive_copy_with_hook(
+    source: &Path,
+    parent: &Path,
     mut progress: impl FnMut(u64),
+    mut after_chunk: impl FnMut() -> io::Result<()>,
 ) -> io::Result<tempfile::TempDir> {
     let source_meta = fs::symlink_metadata(source)?;
     if !source_meta.is_dir() || is_link_or_reparse(&source_meta) {
@@ -450,6 +467,7 @@ fn stage_archive_copy(
                 break;
             }
             output.write_all(&buffer[..n])?;
+            after_chunk()?;
             completed = completed
                 .checked_add(n as u64)
                 .ok_or_else(|| io::Error::other("size overflow"))?;
@@ -607,13 +625,23 @@ mod tests {
     }
     #[test]
     fn onedrive_check_respects_component_boundaries() {
-        let roots = vec![PathBuf::from(r"C:\Users\person\OneDrive")];
+        let roots = vec![PathBuf::from(r"C:\")
+            .join("Users")
+            .join("person")
+            .join("OneDrive")];
         assert!(in_onedrive(
-            Path::new(r"c:\users\PERSON\onedrive\folder"),
+            &PathBuf::from(r"c:\")
+                .join("users")
+                .join("PERSON")
+                .join("onedrive")
+                .join("folder"),
             &roots
         ));
         assert!(!in_onedrive(
-            Path::new(r"c:\users\person\OneDrive-other"),
+            &PathBuf::from(r"c:\")
+                .join("users")
+                .join("person")
+                .join("OneDrive-other"),
             &roots
         ));
     }
@@ -648,6 +676,24 @@ mod tests {
         fs::create_dir(&source).unwrap();
         assert!(stage_archive_copy(&source, &source, |_| {}).is_err());
         assert_eq!(fs::read_dir(source).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn interrupted_copy_keeps_source_and_removes_owned_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("lesson"), vec![7u8; 100_000]).unwrap();
+        let error = stage_archive_copy_with_hook(
+            &source,
+            root.path(),
+            |_| {},
+            || Err(io::Error::from_raw_os_error(112)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(112));
+        assert_eq!(fs::read(source.join("lesson")).unwrap(), vec![7u8; 100_000]);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]

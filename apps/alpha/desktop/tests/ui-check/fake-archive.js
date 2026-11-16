@@ -251,9 +251,10 @@
     seedChat('11월 12일 저녁 하타 수업 돌아보기', 2)
     seedChat('왼쪽 어깨가 걸린다고 한 수련생', 3, [
       // chat_read 의 fast·notHandedOver(T33): 둘째 답은 코덱스에서 클로드로 바꿔 고속 모드로 받은 답, 셋째는 옛 말(둘 다 null).
-      { provider: 'codex', model: 'test-codex-terra', fast: false, notHandedOver: 0 },
-      { provider: 'claude', model: 'test-claude-fable', fast: true, notHandedOver: 2 },
-      { provider: 'claude', model: 'test-claude-opus', fast: null, notHandedOver: null },
+      // T43: actualEffort(실제로 쓰인 추론 수준), finishReason(답이 끝난 까닭). 첫째는 정상, 둘째는 길이 한도로 끊김, 셋째는 옛 말(null).
+      { provider: 'codex', model: 'test-codex-terra', fast: false, notHandedOver: 0, actualEffort: 'medium', finishReason: 'completed' },
+      { provider: 'claude', model: 'test-claude-fable', fast: true, fastState: 'on', notHandedOver: 2, actualEffort: 'high', finishReason: new URLSearchParams(location.search).get('end') || 'length_limit' },
+      { provider: 'claude', model: 'test-claude-opus', fast: null, notHandedOver: null, actualEffort: null, finishReason: null },
     ])
     seedChat('다음 주 빈야사 순서 짜기', 1)
   } else if (chatMode === 'mixed') {
@@ -295,25 +296,27 @@
     return chatGroups.slice().sort((a, b) => a.order - b.order).map((g) => ({ ...g, chatCount: Object.values(chats).filter((c) => c.groupId === g.id).length }))
   }
   function chatEntry(chat) {
-    return { id: chat.id, title: chat.title, createdAt: chat.createdAt, updatedAt: chat.updatedAt, messageCount: chat.messages.length, groupId: chat.groupId || null, pinned: Boolean(chat.pinned) }
+    return { id: chat.id, title: chat.title, createdAt: chat.createdAt, updatedAt: chat.updatedAt, messageCount: chat.messages.length, groupId: chat.groupId || null, pinned: Boolean(chat.pinned), pinnedOrder: chat.pinnedOrder ?? null }
   }
   // 보관한 채팅방은 목록과 찾기에 오지 않는다(짐작한 계약).
   function chatList() {
     return Object.values(chats).filter((chat) => !chat.archived).map(chatEntry).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
-  // ---- 채팅방 고정·보관(가짜, 이름은 짐작). ?keep=none 이면 명령이 없다. ?keep=seed 면 보관된 채팅방 둘을 미리 둔다. ----
+  // ---- 채팅방 고정·보관(가짜, 실제 계약 T38). ?keep=none 이면 명령이 없다. ?keep=seed 면 보관된 채팅방 둘을 미리 둔다. ----
   const keepMode = new URLSearchParams(location.search).get('keep') || 'ok'
   window.__keepCalls = []
+  let pinCounter = 0
   function keepCommand(command, args) {
     if (keepMode === 'none') throw `Command ${command} not found`
     window.__keepCalls.push([command, args || {}])
     const chat = args && chats[args.chatId]
+    const done = (state) => { if (state === 'ok' || state === 'deleted') window.setTimeout(() => emit('chat-list-updated', { chatId: args.chatId }), 0); return { state } }
     switch (command) {
-      case 'chat_pin': if (!chat) throw '채팅방을 찾지 못했습니다'; chat.pinned = Boolean(args.pinned); return null
-      case 'chat_archive': if (!chat) throw '채팅방을 찾지 못했습니다'; chat.archived = true; chat.pinned = false; chat.archivedAt = nextStamp(); return null
-      case 'chat_archived_list': return Object.values(chats).filter((c) => c.archived).sort((a, b) => b.archivedAt.localeCompare(a.archivedAt)).map(chatEntry)
-      case 'chat_unarchive': if (!chat) throw '채팅방을 찾지 못했습니다'; chat.archived = false; return null
-      case 'chat_delete': if (!chat || !chat.archived) throw '보관한 채팅방만 지울 수 있습니다'; delete chats[args.chatId]; return null
+      case 'chat_pin': if (!chat) return { state: 'not_found' }; chat.pinned = Boolean(args.pinned); chat.pinnedOrder = chat.pinned ? (pinCounter += 1) : null; return done('ok')
+      case 'chat_archive': if (!chat) return { state: 'not_found' }; if (running[args.chatId]) return { state: 'busy' }; chat.archived = true; chat.archivedAt = nextStamp(); return done('ok')
+      case 'chat_archived_list': return Object.values(chats).filter((c) => c.archived).sort((a, b) => b.archivedAt.localeCompare(a.archivedAt)).map((c) => ({ id: c.id, title: c.title, groupId: c.groupId || null, updatedAt: c.updatedAt, archivedAt: c.archivedAt, provider: null }))
+      case 'chat_restore': if (!chat) return { state: 'not_found' }; chat.archived = false; return done('ok')
+      case 'chat_delete': if (!chat) return { state: 'not_found' }; delete chats[args.chatId]; return { ...done('deleted'), codexSession: 'not_present', claudeSession: 'not_present' }
     }
     return undefined
   }
@@ -334,8 +337,12 @@
     if (usageMode === 'fail') throw 'Command usage_status not found'
     const checkedAt = new Date(Date.now() - 2 * 60 * 1000).toISOString()
     const ok = (provider, plan, five, week) => ({ provider, state: 'ok', reason: null, plan, checkedAt, windows: [{ kind: '5h', usedPercent: five, resetsAt: soon(2.5) }, { kind: 'weekly', usedPercent: week, resetsAt: soon(80) }] })
-    const notConnected = (provider) => ({ provider, state: 'not_connected', reason: '연결하지 않았습니다', plan: null, checkedAt, windows: [] })
-    const unavailable = (provider) => ({ provider, state: 'unavailable', reason: '이 곳은 공식 방법으로 사용량을 읽을 수 없습니다', plan: null, checkedAt, windows: [] })
+    const notConnected = (provider) => ({ provider, state: 'not_connected', reason: 'not_connected', plan: null, checkedAt, windows: [] })
+    const unavailable = (provider, reason = 'fetch_failed') => ({ provider, state: 'unavailable', reason, plan: null, checkedAt, windows: [] })
+    // ?usage=reasons1 / reasons2: G18 의 까닭 값 여섯을 세 곳에 나눠 보인다(checking·not_installed·not_connected / api_key·no_quota_api·fetch_failed).
+    if (usageMode === 'reasons1') return [unavailable('codex', 'checking'), { ...unavailable('claude', 'not_installed'), state: 'not_connected' }, notConnected('gemini')]
+    if (usageMode === 'reasons3') return [unavailable('codex', 'fetch_failed'), unavailable('claude', 'checking'), unavailable('gemini', 'api_key')]
+    if (usageMode === 'reasons2') return [unavailable('codex', 'api_key'), unavailable('claude', 'no_quota_api'), unavailable('gemini', 'fetch_failed')]
     if (usageMode === 'all-ok') return [ok('codex', 'Plus', 38, 12), ok('claude', 'Pro', 64, 41), ok('gemini', 'AI Pro', 5, 2)]
     if (usageMode === 'scopes') return [
       { ...ok('codex', 'pro', 38, 12), planLabel: '보기 요금제' },
@@ -349,7 +356,7 @@
     ]
     if (usageMode === 'none') return [notConnected('codex'), notConnected('claude'), notConnected('gemini')]
     // 지금 실제 백엔드와 같은 모습: Codex 만 숫자, 나머지는 까닭 글과 함께 unavailable.
-    if (usageMode === 'real-like') return [{ provider: 'codex', state: 'ok', reason: null, plan: 'pro', checkedAt, windows: [{ kind: 'weekly', usedPercent: 54, resetsAt: Math.round(Date.now() / 1000) + 50 * 3600 }] }, { ...unavailable('claude'), reason: '이 AI의 사용량은 아직 읽지 못합니다' }, { ...unavailable('gemini'), reason: '이 AI의 사용량은 아직 읽지 못합니다' }]
+    if (usageMode === 'real-like') return [{ provider: 'codex', state: 'ok', reason: null, plan: 'pro', checkedAt, windows: [{ kind: 'weekly', usedPercent: 54, resetsAt: Math.round(Date.now() / 1000) + 50 * 3600 }] }, unavailable('claude', 'no_quota_api'), unavailable('gemini', 'fetch_failed')]
     if (usageMode === 'low') return [ok('codex', 'Plus', 96, 70), ok('claude', 'Pro', 100, 88), ok('gemini', 'AI Pro', 91, 30)]
     return [ok('codex', 'Plus', 38, 12), unavailable('claude'), notConnected('gemini')]
   }
@@ -403,7 +410,8 @@
           { id: 'gpt-6-luna', family: null, label: 'GPT-6-Luna', resolved: null, efforts: ['low', 'high'], defaultEffort: 'low', isDefault: false },
         ] },
         { provider: 'claude', state: 'ok', reason: null, models: [
-          { id: 'claude-fable-5-2', family: 'Fable', label: 'Fable 5.2', resolved: 'claude-fable-5-2', isDefault: true, defaultEffort: null,
+          // T43: 고르지 않았을 때 실제로 쓰이는 수준(effectiveDefaultEffort). ?effective=none 이면 null.
+          { id: 'claude-fable-5-2', family: 'Fable', label: 'Fable 5.2', resolved: 'claude-fable-5-2', isDefault: true, defaultEffort: null, effectiveDefaultEffort: query.get('effective') === 'none' ? null : 'xhigh',
             efforts: [item('low'), item('medium', { recommended: true }), item('high'), item('xhigh'), item('max'), item('ultracode', { label: 'Ultracode', special: true, kind: 'toggle' })] },
           { id: 'opus', family: 'Opus', label: 'Opus 5.5', resolved: 'claude-opus-5-5', isDefault: null, defaultEffort: 'high',
             efforts: [item('low'), item('medium', { recommended: true }), item('high'), item('xhigh'), item('max', { available: false })] },
@@ -512,7 +520,19 @@
     const switched = Boolean(lastAnswer && lastAnswer.provider && lastAnswer.provider !== provider)
     const pieces = ['받은 말: "', text, '"' + String.fromCharCode(10) + String.fromCharCode(10), '**굵은 ', '글씨**와 목록:' + String.fromCharCode(10), '- 하나' + String.fromCharCode(10) + '- ', '둘' + String.fromCharCode(10) + String.fromCharCode(10), '```' + String.fromCharCode(10) + '코드 ', '조각' + String.fromCharCode(10) + '```']
     let at = 0
+    // ?chaterror=usageLimit 처럼: 답이 조금 오다가 G18 chat-error 로 끊긴다(그때까지 온 글은 답으로 저장). retryAt 은 ?retryin=분.
+    const failKind = query.get('chaterror')
+    const FAIL_ACTIONS = { usageLimit: ['wait', 'switchProvider'], rateLimited: ['wait', 'retry', 'switchProvider'], authentication: ['signIn', 'switchProvider'], billing: ['checkBilling', 'switchProvider'], modelUnavailable: ['switchModel', 'switchProvider'], connectionClosed: ['retry', 'switchProvider'], timeout: ['retry', 'switchProvider'], toolMissing: ['install', 'switchProvider'], serviceUnavailable: ['retry', 'wait', 'switchProvider'], contextTooLong: ['shorten', 'switchProvider'], unknown: [] }
     const timer = setInterval(() => {
+      if (failKind && at >= 3) {
+        clearInterval(timer)
+        delete running[chatId]
+        const partial = { id: `${chatId}-m${chat.messages.length + 1}`, role: 'assistant', text: pieces.slice(0, at).join(''), createdAt: nextStamp(), provider, model, effort, finishReason: 'error' }
+        chat.messages.push(partial)
+        const retryAt = query.get('retryin') ? Math.round(Date.now() / 1000) + Number(query.get('retryin')) * 60 : null
+        emit('chat-error', { chatId, messageId: partial.id, reason: '', ...(failKind === 'authentication' ? { status: 'auth_failed' } : {}), error: { kind: failKind, retryAt, actions: FAIL_ACTIONS[failKind] || [], providerCode: null } })
+        return
+      }
       if (at < pieces.length) {
         emit('chat-stream', { chatId, delta: pieces[at] })
         at += 1
@@ -552,6 +572,30 @@
   window.__closeApproval = (requestId) => {
     delete approvalsPending[requestId]
     emit('agent-approval-closed', { requestId })
+  }
+  // 스킬로 하는 연결의 물음(가짜). archive-backend-port-notes.md "2026-11-16 옮긴 것"의 C9 설정 승인 계약 모양:
+  //   kind 'setup_change', setup { action:'create_and_connect', service, account, region, resourceName, visibility:'private', cost:'possible' },
+  //   targets [{ path: 이름, change:'create' }], options allow_once·deny·cancel. window.__approveSetup({ service, account, ... }).
+  // 화면은 "이번만 허락"과 "거절"만 보여야 한다(일부러 allow_session 도 넣는다).
+  window.__approveSetup = (setup) => {
+    const next = { action: 'create_and_connect', service: 'github', account: null, region: null, resourceName: null, visibility: 'private', cost: 'possible', ...(setup || {}) }
+    return window.__approve('setup_change', ['allow_once', 'allow_session', 'deny', 'cancel'], {
+      provider: 'claude',
+      description: next.service === 'github' ? 'momso_github_create_and_connect' : 'momso_object_store_create_and_connect',
+      targets: next.resourceName ? [{ path: next.resourceName, change: 'create' }] : [],
+      change: 'create',
+      setup: next,
+    })
+  }
+  // 키 넣기(가짜). window.__askSecret({ service, account, resourceName, fields }). 넣은 값은 기록하지 않고 칸 이름과 값의 길이만 남긴다.
+  let secretCount = 0
+  window.__secretCalls = []
+  window.__askSecret = (extra) => { // 계약: fields 는 칸 이름 글자의 목록(GCP 는 gcpOauthToken 도)
+    secretCount += 1
+    const requestId = `secret-${secretCount}`
+    const chatId = Object.keys(chats).find((id) => chats[id].title.includes('어깨')) || null
+    emit('agent-setup-secret-request', { requestId, chatId, service: 'cloudflare', account: '0123456789abcdef0123456789abcdef', resourceName: 'momso-teacher', fields: ['accessKeyId', 'secretAccessKey'], ...(extra || {}) })
+    return requestId
   }
 
   // ---- 미디어(화면 확인용 가짜). ?media=ok(기본) / none(명령 없음). 그림은 색 띠 SVG. ----
@@ -643,14 +687,52 @@
     const pick = (entry, how, by, m) => ({ id: entry.id, title: entry.title, summary: entry.summary, kind: entry.kind, status: entry.status, updatedAt: entry.updatedAt, how, by, at: when(m) })
     let documents = []
     let media = []
+    let files = []
+    const file = (title, m) => ({ id: `sha256:${title.length.toString(16).padStart(4, '0')}`, title, createdAt: when(m), how: 'attached', by: { kind: 'user' }, at: when(m), path: '' })
     if (at === 0) {
       documents = [pick(docs[0], 'created', BY[1], 5), pick(docs[1] || docs[0], 'edited', BY[0], 40), pick(docs[2] || docs[0], 'read', BY[0], 90)]
       media = Array.from({ length: 6 }, (_, i) => ({ ...mediaItem(i * 3, () => list[0]), at: when(10 + i * 7) }))
+      files = [file('저녁 하타 전사.txt', 15), file('수련생 메모.md', 60), file('수업 사진 원본.heic', 70)]
     } else if (at === 1) {
       documents = [pick(docs[0], 'edited', { kind: 'user' }, 120)]
     }
     const extra = extraItems[chatId] || []
-    return { documents: [...extra, ...documents], media }
+    return { documents: [...extra, ...documents], media: [...(attachedMedia[chatId] || []), ...media], files: [...(attachedFiles[chatId] || []), ...files] }
+  }
+  // ---- 클립으로 붙이기(가짜): plan/apply_source_asset_import → chat_attach_asset. 소리 파일은 미디어로 "붙임"(실제처럼). ----
+  const attachedMedia = {}
+  const attachedFiles = {}
+  const importedAssets = {}
+  window.__attachCalls = []
+  function attachCommand(command, args) {
+    window.__attachCalls.push(command)
+    if (command === 'plan_source_asset_import') {
+      const p = args.proposal
+      const name = p.sourcePath.split(/[\\/]/).pop()
+      return { planDigest: 'p'.repeat(64), originalFileName: name, assetKind: p.assetKind, contentSha256: (name.length.toString(16) + 'a'.repeat(64)).slice(0, 64), byteLength: 1234567, alreadyStored: false, mediaType: p.mediaType }
+    }
+    if (command === 'apply_source_asset_import') {
+      const p = args.input.proposal
+      const id = `asset-${Object.keys(importedAssets).length + 1}`
+      importedAssets[id] = { name: p.sourcePath.split(/[\\/]/).pop(), kind: p.assetKind }
+      return { id, assetKind: p.assetKind, contentSha256: 'a'.repeat(64), byteLength: 1234567, originalFileName: importedAssets[id].name, mediaType: p.mediaType, capturedBy: 'momso-desktop', createdAt: nextStamp(), integrityState: 'active', integrityIssue: null, quarantinedAt: null, quarantinedBy: null }
+    }
+    if (command === 'chat_attach_asset') {
+      if (!chats[args.chatId]) throw '채팅방을 찾을 수 없습니다'
+      const asset = importedAssets[args.assetId]
+      if (!asset) throw '원자료를 찾을 수 없습니다'
+      if (asset.kind === 'audio_recording') {
+        const now = new Date().toISOString()
+        attachedMedia[args.chatId] = [{ id: `m-${args.assetId}`, kind: 'audio', title: asset.name, createdAt: now, width: null, height: null, durationSec: 95, path: '', posterPath: null, chatId: args.chatId, chats: [{ id: args.chatId, title: chats[args.chatId].title }], by: { kind: 'user' }, how: 'attached', at: now }, ...(attachedMedia[args.chatId] || [])]
+      } else {
+        // T42: 미디어가 아닌 첨부(글 파일 등)는 files 로.
+        const now = new Date().toISOString()
+        attachedFiles[args.chatId] = [{ id: `sha256:${args.assetId}`, title: asset.name, createdAt: now, how: 'attached', by: { kind: 'user' }, at: now, path: '' }, ...(attachedFiles[args.chatId] || [])]
+      }
+      window.setTimeout(() => emit('chat-items-updated', { chatId: args.chatId }), 0)
+      return 'rec_20261116_100000'
+    }
+    return undefined
   }
   window.__addChatItem = (chatId) => {
     const docs = listEntries()
@@ -698,14 +780,37 @@
     return undefined
   }
 
-  // ---- AI 로그인(가짜). ?auth=signedout / account / keys / mixed, 없으면 명령 없음(예전 연결 칸). 계약대로 제미나이는 unavailable, methods 빈 배열. ----
+  // ---- 첫 실행(가짜). ?firstrun=1 이면 첫 실행을 마치지 않은 컴퓨터로 본다(없으면 마친 것으로 적어 두어 다른 사진에 끼지 않는다).
+  //      ?username=none 이면 이름이 없다, 그 밖의 값이면 그 이름. ?username 이 없으면 'teacher'. ?usernamecmd=none 이면 명령 없음. ----
+  if (query.get('firstrun') === '1') { try { localStorage.removeItem('momso.firstRunDone') } catch {} }
+  else { try { localStorage.setItem('momso.firstRunDone', '1') } catch {} }
+  let fakeUsername = query.get('username') === 'none' ? null : (query.get('username') || 'teacher')
+  window.__usernameCalls = []
+  function usernameCommand(command, args) {
+    if (query.get('usernamecmd') === 'none') throw `Command ${command} not found`
+    window.__usernameCalls.push([command, args])
+    if (command === 'momso_username_get') return { state: 'ok', username: fakeUsername }
+    const name = (args && args.username) || ''
+    const lower = name.toLowerCase()
+    if (!/^[A-Za-z0-9._-]+$/.test(name) || name.length > 94 || lower.endsWith('.git') || lower.endsWith('.wiki')) return { state: 'invalid_username', username: null }
+    fakeUsername = name
+    return { state: 'ok', username: name }
+  }
+
+  // ---- AI 로그인(가짜). ?auth=signedout / account / keys / mixed, 없으면 명령 없음(예전 연결 칸). 계약대로 제미나이는 unavailable, methods 빈 배열.
+  //      ?installed=none 이면 셋 다 도구가 없다, ?installed=codex,claude 처럼 적으면 그것만 있다(없으면 코덱스·클로드만 있다).
+  //      설치는 ?installdelay=ms 뒤에 끝난다. ?installfail=1 이면 실패한다. ----
   const authMode = query.get('auth')
+  const installedParam = query.get('installed')
+  const installedSet = installedParam === null ? new Set(['codex', 'claude']) : new Set(installedParam === 'none' ? [] : installedParam.split(','))
   const authState = {}
   ;['codex', 'claude', 'gemini'].forEach((provider) => {
     const gem = provider === 'gemini'
-    const state = gem ? 'unavailable' : authMode === 'account' ? 'account' : authMode === 'keys' ? 'apiKey' : authMode === 'mixed' ? (provider === 'codex' ? 'account' : 'apiKey') : 'signedOut'
+    const installed = installedSet.has(provider)
+    // T43: 제미나이는 methods ['apiKey'](계정 로그인 없음). 실제 앱처럼 키가 없으면 unavailable, ?auth=keys 면 apiKey.
+    const state = !installed ? 'unavailable' : gem ? (authMode === 'keys' ? 'apiKey' : 'unavailable') : authMode === 'account' ? 'account' : authMode === 'keys' ? 'apiKey' : authMode === 'mixed' ? (provider === 'codex' ? 'account' : 'apiKey') : 'signedOut'
     authState[provider] = {
-      provider, installed: !gem, state, methods: gem ? [] : ['account', 'apiKey'],
+      provider, installed, state, methods: gem ? ['apiKey'] : ['account', 'apiKey'],
       accountLabel: state === 'account' ? 'teacher@example.com' : null, planLabel: state === 'account' ? (provider === 'codex' ? 'Plus' : 'Pro') : null,
       apiKeySaved: state === 'apiKey', active: state === 'signedOut' ? null : state,
     }
@@ -717,6 +822,26 @@
     const item = args && authState[args.provider]
     switch (command) {
       case 'provider_auth_status': return Object.values(authState).map((x) => ({ ...x }))
+      case 'install_external_provider': {
+        // 계약(287~289줄): 끝날 때까지 기다린 뒤 installed / installFailed / unavailable / inProgress. 진행 이벤트 provider-install-progress.
+        // ?installfail=1 이면 실패(?installreason=timeout 등, 없으면 installFailed). ?installbytes=1 이면 받은 양을 숫자로 준다.
+        if (!item) return 'unavailable'
+        const progress = (phase, extra) => emit('provider-install-progress', { provider: args.provider, phase, receivedBytes: null, totalBytes: null, canCancel: false, reason: null, ...(extra || {}) })
+        progress('installing')
+        const total = 40 * 1024 * 1024
+        const delay = Number(query.get('installdelay') || 1200)
+        if (query.get('installbytes') === '1') [0.25, 0.5, 0.75].forEach((part, i) => setTimeout(() => progress('installing', { receivedBytes: total * part, totalBytes: total }), (delay / 4) * (i + 1)))
+        return new Promise((done) => setTimeout(() => {
+          if (query.get('installfail') === '1') {
+            progress('failed', { reason: query.get('installreason') || 'installFailed' })
+            done('installFailed'); return
+          }
+          Object.assign(item, { installed: true, state: 'signedOut' })
+          progress('completed')
+          emit('provider-auth-changed', { provider: args.provider, state: 'signedOut' })
+          done('installed')
+        }, delay))
+      }
       case 'provider_login_start':
         if (!item || !item.methods.includes('account')) return 'unavailable'
         emit('provider-auth-changed', { provider: args.provider, state: 'inProgress' })
@@ -752,12 +877,22 @@
         if (/public/.test(args.repo)) return { ...remote, reason: 'repository_not_private' }
         Object.assign(remote, { state: 'connected', repo: args.repo, visibility: 'private', ahead: 0, behind: 0 }); return { ...remote }
       }
+      // ?git=missing: 이 PC 에 Git 이 없어 GitHub 쪽이 막힘(reason git_missing). 설치가 끝나면(gitInstalled) 풀린다.
+      if (command === 'archive_remote_status' && query.get('git') === 'missing' && !window.__gitInstalled) return { ...remote, state: 'unavailable', reason: 'git_missing' }
       // ?history=profile / rules / other: 올리기가 이력 때문에 막힘(T34·T35). reason 은 unsafe_history, historyReason 은 그 까닭(그 밖은 null).
       const held = { profile: 'profile_in_history', rules: 'profile_in_rules_history', other: null }
       if (command === 'archive_remote_push' && query.get('history') in held) return { ...remote, reason: 'unsafe_history', historyReason: held[query.get('history')] }
       if (command === 'archive_remote_push') { Object.assign(remote, { ahead: 0, lastPushedAt: new Date().toISOString() }); return { ...remote } }
       if (command === 'archive_remote_pull') return { ...remote, reason: query.get('pull') === 'unsaved' ? 'unsaved_changes' : null }
       if (command === 'archive_remote_disconnect') { Object.assign(remote, { state: 'not_connected', repo: null, ahead: null, behind: null }); return { ...remote } }
+      // T37 저장소 만들기(가짜). ?create=created(기본) / exists_empty / exists_public / signed_out 등.
+      if (command === 'archive_remote_create') {
+        const result = query.get('create') || 'created'
+        const repo = fakeUsername ? `teacher/momso-${fakeUsername}` : null
+        if (!fakeUsername) return { state: 'username_missing', repo: null }
+        if (result === 'created') Object.assign(remote, { state: 'connected', repo, visibility: 'private', ahead: 0, behind: 0 })
+        return { state: result, repo: result.startsWith('exists') || result.startsWith('created') ? repo : null }
+      }
       return { ...remote }
     }
     if (command.startsWith('object_store_') || command.startsWith('app_state_')) {
@@ -766,7 +901,15 @@
       if (command === 'object_store_connect') {
         if (args.provider === 'ncp') throw 'write_safety_unverified'
         if (args.secretAccessKey === 'wrong') throw 'invalid_credentials'
-        Object.assign(store, { state: 'connected', provider: args.provider, bucket: args.bucket, pendingCount: 12, pendingBytes: 52428800 }); return { ...store }
+        // 버킷을 비우면 momso-<username> 을 만들어 연결(자동 버킷 계약). ?bucketauto=taken 이면 bucket_name_taken.
+        let bucket = args.bucket
+        if (!bucket || !bucket.trim() || bucket === 'auto') {
+          if (args.provider === 'gcp') throw 'gcp_project_required'
+          if (!fakeUsername) throw 'username_required'
+          if (query.get('bucketauto') === 'taken') throw 'bucket_name_taken'
+          bucket = `momso-${fakeUsername}`
+        }
+        Object.assign(store, { state: 'connected', provider: args.provider, bucket, pendingCount: 12, pendingBytes: 52428800 }); return { ...store }
       }
       if (command === 'object_store_disconnect') { Object.assign(store, { state: 'not_connected', provider: null, bucket: null }); return null }
       if (command === 'object_store_backup') {
@@ -790,6 +933,17 @@
     switch (command) {
       case 'usage_status':
         return usageStatus()
+      case 'setup_secret_submit':
+        // 계약: setup_secret_submit({ requestId, chatId, input: { accessKeyId, secretAccessKey, gcpOauthToken? } }). 값은 남기지 않는다(칸 이름과 길이만).
+        window.__secretCalls.push(['submit', args.requestId, args.chatId, Object.fromEntries(Object.entries(args.input || {}).map(([k, v]) => [k, String(v).length]))])
+        if (query.get('secretfail') === '1') throw 'unavailable'
+        emit('agent-setup-secret-closed', { requestId: args.requestId, chatId: args.chatId })
+        return null
+      case 'agent_setup_secret_cancel':
+        // 계약(T48): agent_setup_secret_cancel({ requestId, chatId }) → 값 없음, 그 뒤 agent-setup-secret-closed.
+        window.__secretCalls.push(['cancel', args.requestId, args.chatId])
+        emit('agent-setup-secret-closed', { requestId: args.requestId, chatId: args.chatId })
+        return null
       case 'agent_approval_respond': {
         window.__approvalCalls = (window.__approvalCalls || []).concat([{ requestId: args.requestId, choice: args.choice }])
         const pending = approvalsPending[args.requestId]
@@ -888,10 +1042,23 @@
         })
       }
       case 'plugin:dialog|open':
+        // 폴더 고르기(몸소 폴더 옮기기)와 파일 고르기(클립, 여럿 고르기)를 가른다.
+        // 대화 가져오기: 내보낸 파일 하나(zip·json 거르개).
+        if (args && args.options && (args.options.filters || []).some((f) => (f.extensions || []).includes('zip'))) return ['D:', '내려받기', 'conversations.json'].join(String.fromCharCode(92))
+        if (args && args.options && args.options.multiple) return [['D:', '수업', '2026-11-15 저녁 하타 수업.m4a'].join(String.fromCharCode(92)), ['D:', '수업', '저녁 하타 전사.txt'].join(String.fromCharCode(92))]
         return ['D:', 'momso-folder'].join(String.fromCharCode(92))
-      case 'provider_auth_status': case 'provider_login_start': case 'provider_login_cancel': case 'provider_logout': case 'provider_api_key_set': case 'provider_api_key_clear':
+      case 'provider_auth_status': case 'provider_login_start': case 'provider_login_cancel': case 'provider_logout': case 'provider_api_key_set': case 'provider_api_key_clear': case 'install_external_provider':
         return authCommand(command, args)
-      case 'archive_remote_status': case 'archive_remote_connect': case 'archive_remote_push': case 'archive_remote_pull': case 'archive_remote_disconnect':
+      case 'momso_username_get': case 'momso_username_set':
+        return usernameCommand(command, args)
+      // 받아쓰기(가짜). ?voice=unsupported 면 쓸 수 없음, ?voiceopen=not_focused 처럼 열기 결과를 바꿀 수 있다(기본 requested).
+      case 'voice_typing_status':
+        if (query.get('voice') === 'none') throw `Command ${command} not found`
+        return { state: query.get('voice') === 'unsupported' ? 'unsupported' : 'unknown', microphone: 'legacy_input_detected', language: 'unknown', permission: 'unknown', network: 'unknown' }
+      case 'voice_typing_open':
+        window.__voiceCalls = (window.__voiceCalls || 0) + 1
+        return { state: query.get('voiceopen') || 'requested' }
+      case 'archive_remote_status': case 'archive_remote_connect': case 'archive_remote_push': case 'archive_remote_pull': case 'archive_remote_disconnect': case 'archive_remote_create':
       case 'object_store_status': case 'object_store_connect': case 'object_store_disconnect': case 'object_store_backup': case 'object_store_restore': case 'app_state_backup': case 'app_state_restore':
       case 'user_owned_backup_overview': case 'export_backup_recovery_key': case 'confirm_backup_recovery_key': case 'import_backup_recovery_key':
         return backupCommand(command, args)
@@ -901,6 +1068,57 @@
         return mediaList()
       case 'chat_items':
         return chatItems(args.chatId)
+      // ---- Git 설치(가짜, B12). ?git=missing 이면 approvalRequired, ?gitfail=networkFailed 처럼 실패를 흉내 낸다. ----
+      case 'git_install_status':
+        if (window.__gitInstalling) return 'inProgress'
+        return query.get('git') === 'missing' && !window.__gitInstalled ? 'approvalRequired' : 'installed'
+      case 'git_install': {
+        if (!args.approved) return 'approvalRequired'
+        window.__gitInstalling = true
+        let done = 0
+        const total = 52000000
+        const timer = setInterval(() => {
+          done += 13000000
+          if (query.get('gitfail') && done >= 26000000) { clearInterval(timer); window.__gitInstalling = false; emit('git-install-changed', { provider: 'git', state: 'installFailed', stage: query.get('gitfail'), completed: 0, total: null }); return }
+          if (done >= total) { clearInterval(timer); window.__gitInstalling = false; window.__gitInstalled = true; emit('git-install-changed', { provider: 'git', state: 'installed', stage: 'complete', completed: 0, total: null }); return }
+          emit('git-install-changed', { provider: 'git', state: 'inProgress', stage: 'downloading', completed: done, total })
+        }, 500)
+        return 'inProgress'
+      }
+      // ---- 원자료 찾기(가짜): source_search({ query }) → 파일 이름에 그 말이 든 원자료. ----
+      case 'source_search': {
+        const all = [
+          { id: 'asset-1', originalFileName: '2026-11-15 저녁 하타 수업.m4a', mediaType: 'audio/mp4', size: 18200000, createdAt: '2026-11-15T21:10:00+09:00', linkedDocumentIds: [] },
+          { id: 'asset-2', originalFileName: '저녁 하타 전사.txt', mediaType: 'text/plain', size: 4200, createdAt: '2026-11-15T21:30:00+09:00', linkedDocumentIds: [listEntries()[0]?.id].filter(Boolean) },
+          { id: 'asset-3', originalFileName: '하타 수업 메모 초안.txt', mediaType: 'text/plain', size: 900, createdAt: '2026-11-14T20:00:00+09:00', linkedDocumentIds: [] },
+        ]
+        const q = String(args.query || '').trim().toLowerCase()
+        return all.filter((item) => item.originalFileName.toLowerCase().includes(q))
+      }
+      case 'chat_import_export': {
+        // 계약: chat_import_export({ path, provider }) → { imported, duplicate, skipped, omittedNonTextMessages, omittedAttachments, updated, addedMessages, conflicts }.
+        // ?importfail=invalid_format 처럼 실패 값을 흉내 낸다. 제미나이는 unsupported_format.
+        window.__importCalls = (window.__importCalls || []).concat([[args.provider, args.path]])
+        if (args.provider === 'gemini') throw 'unsupported_format'
+        if (query.get('importfail')) throw query.get('importfail')
+        return new Promise((done) => setTimeout(() => done({ imported: 2, duplicate: 1, skipped: 0, omittedNonTextMessages: 0, omittedAttachments: 0, updated: 0, addedMessages: 0, conflicts: 0 }), 900))
+      }
+      case 'attachment_text_read': {
+        // 계약(T46·T48): { state, content, nextCursor, totalBytes }. 가짜는 2000자씩 잘라 이어 받기를 흉내 낸다.
+        window.__textCalls = (window.__textCalls || []).concat([[args.assetId, args.cursor ?? null]])
+        const byId = {}
+        for (const f of chatItems(chatList()[0]?.id).files) byId[f.id] = f.title
+        const title = byId[args.assetId]
+        if (!title) return { state: 'not_found', content: null, nextCursor: null, totalBytes: null }
+        if (!/[.](txt|md)$/.test(title)) return { state: 'not_text', content: null, nextCursor: null, totalBytes: null }
+        const body = title.endsWith('.md')
+          ? ['# 수련생 메모', '', '## 왼쪽 어깨', '- 팔을 올릴 때 걸린다고 함', '- 호흡을 길게 두고 높이를 먼저 확인', '', '## 다음 수업', '1. 고양이 자세로 풀기', '2. **아래를 보는 개** 자세는 무릎을 굽혀서'].join(String.fromCharCode(10))
+          : Array.from({ length: query.get('filetext') === 'big' ? 400 : 6 }, (_, i) => `${i + 1}. 저녁 하타 수업 전사 줄입니다. 호흡을 길게 두고 천천히 움직입니다.`).join(String.fromCharCode(10))
+        const start = Number(args.cursor || 0)
+        if (start > body.length) return { state: 'invalid_cursor', content: null, nextCursor: null, totalBytes: body.length }
+        const end = Math.min(body.length, start + 2000)
+        return { state: 'ok', content: body.slice(start, end), nextCursor: end < body.length ? end : null, totalBytes: body.length }
+      }
       case 'ai_models':
         // ?modelsdelay=2000: 모델 목록이 늦게 오는 때(앱을 연 직후)를 흉내 낸다.
         if (query.get('modelsdelay')) return new Promise((done) => window.setTimeout(() => done(aiModels()), Number(query.get('modelsdelay'))))
@@ -930,11 +1148,12 @@
         if (contextMode === 'none') return { state: 'unavailable', reason: '이 AI에서는 알 수 없습니다' }
         const chat = chats[args.chatId]
         const used = chat ? chat.messages.reduce((sum, m) => sum + m.text.length * 40, 0) : 0
-        return { state: 'ok', usedTokens: used, limitTokens: 200000, usedPercent: Math.round(used / 2000), compactAtPercent: 80, provider: 'codex', model: null, updatedAt: new Date().toISOString() }
+        // 계약(cef940fa): 공통 값 usedTokens, limitTokens, usedPercent(모르면 비움). 줄이기 시작하는 때는 오지 않는다.
+        return { state: 'ok', usedTokens: used, limitTokens: 200000, usedPercent: Math.round(used / 2000), provider: 'codex', model: null, updatedAt: new Date().toISOString() }
       }
       case 'chat_list':
         return chatList()
-      case 'chat_pin': case 'chat_archive': case 'chat_archived_list': case 'chat_unarchive': case 'chat_delete':
+      case 'chat_pin': case 'chat_archive': case 'chat_archived_list': case 'chat_restore': case 'chat_delete':
         return keepCommand(command, args)
       case 'chat_create': {
         const createdAt = nextStamp()
@@ -1112,10 +1331,8 @@
           databaseHealth: 'ok',
           womAdapterStatus: 'waiting_for_stable_contract',
         }
-      case 'list_record_summaries':
-        return { records: withRecords ? window.__fakeRecordDetails : [], metadataReadCount: 0, bodyReadCount: 0 }
-      case 'get_record_detail':
-        return window.__fakeRecordDetails.find((record) => record.id === args.recordId)
+      case 'plan_source_asset_import': case 'apply_source_asset_import': case 'chat_attach_asset':
+        return attachCommand(command, args)
       case 'list_source_assets':
         return [{ contentSha256: asset.slice(7), originalFileName: '2026-11-15 저녁 하타 수업.m4a' }]
       case 'plugin:window|is_maximized':

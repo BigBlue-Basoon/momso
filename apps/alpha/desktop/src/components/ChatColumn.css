@@ -143,12 +143,7 @@
   line-height: 1.6;
 }
 
-.workbench-grid .composer-tools {
-  font-size: 11px;
-}
-
 /* 답한 곳과 모델. 이름 옆에 흐린 글씨로 작게 둔다(Claude 앱과 Codex 앱은 답마다 모델을 보이지 않는다). */
-
 
 /* 곳을 바꿔 보냈는데 앞의 대화를 넘기지 못했을 때, 그 답 위에 한 줄. */
 .message-notice {
@@ -229,3 +224,99 @@
   font-weight: 500;
 }
 .workbench-grid .message.user .message-skill + p { margin-top: 0; }
+
+/* 말 아래의 복사 단추와 때(2026-11-16, Aside·Codex 앱처럼). 자리는 늘 잡아 두고(말에 올려도 글이 밀리지 않게) 보이기만 바꾼다.
+   내 말: 말풍선 아래 오른쪽 "때 · 복사". AI 의 답: 답 아래 왼쪽 "복사 · 때"(복사 그림이 글 왼쪽 끝에 맞게 조금 당긴다).
+   마지막 답은 늘 보이고, 나머지는 말에 올리거나 키보드로 가면 보인다. */
+.message-actions {
+  display: flex;
+  min-height: 26px;
+  align-items: center;
+  gap: 2px;
+  margin-top: 2px;
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.message:hover > .message-actions,
+.message-actions:focus-within,
+.message-actions.is-always {
+  opacity: 1;
+}
+
+.message-actions.is-assistant { margin-left: -6px; }
+
+/* 단추 줄이 자리를 잡으므로 다음 말과의 사이는 그만큼 줄여, 말 사이의 빈 곳이 전과 크게 다르지 않게 한다. */
+.workbench-grid .message:has(> .message-actions) + .message,
+.workbench-grid .message:has(> .message-actions) + .message-notice { margin-top: 8px; }
+.message-actions.is-user { margin-right: -4px; }
+
+.message-action {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.message-action:hover { background: var(--surface-muted); color: var(--ink); }
+.message-action:focus-visible { outline: 2px solid #8aa4bd; outline-offset: -2px; }
+
+.message-time {
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  user-select: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message-actions { transition: none; }
+}
+
+/* 아직 말이 없는 채팅방(홈)의 한가운데: 몸소 CI 와 한 줄(2026-11-16). Codex 앱의 빈 화면을 재어 맞췄다(설치된 앱의 화면 코드):
+   심볼 56px, 심볼과 글 사이 24px, 글 32px·줄 높이 38px·보통 굵기, 입력 칸 위 남은 곳의 세로 가운데.
+   심볼은 무채색(그의 말 "무채색으로 … codex저거처럼"): agar yoga 를 한 색 가림판(agar-yoga-mono-mask.png)으로 두고 앱의 회색 토큰 --faint 로
+   채운다. 자세(사람 모양)는 그 회색 그대로, 뒤의 옴은 그 회색의 28% 로 옅게(가림판에 담음). 아래 한 줄(--ink)보다 튀지 않는다. */
+.chat-empty-hero {
+  display: flex;
+  min-height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  user-select: none;
+  animation: message-enter 220ms ease both;
+}
+
+.chat-empty-mark {
+  display: block;
+  width: 56px;
+  height: 56px;
+  background: var(--faint);
+  -webkit-mask: url('/brand/agar-yoga-mono-mask.png') center / contain no-repeat;
+  mask: url('/brand/agar-yoga-mono-mask.png') center / contain no-repeat;
+}
+
+.chat-empty-title {
+  margin: 0;
+  color: var(--ink);
+  font-size: 32px;
+  font-weight: 400;
+  line-height: 38px;
+  letter-spacing: -0.01em;
+  text-align: center;
+  word-break: keep-all;
+}
+
+/* 답이 오지 않았을 때의 한 줄: 있던 알림 줄(.message-notice) 꼴에 글자 단추 몇 개. 아래 여백은 다른 알림 줄과 달리 다음 말에 붙지 않게 0. */
+.message-failure { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-bottom: 0; color: var(--ink-soft); }
+.message-failure-actions { display: inline-flex; flex-wrap: wrap; gap: 2px; margin-left: -6px; }
+.message-failure .approval-button { height: 26px; padding: 0 8px; font-size: 12px; }

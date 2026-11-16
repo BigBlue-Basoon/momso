@@ -13,6 +13,7 @@ import {
   type ProviderUsage,
   type UsageProvider,
   type UsageWindow,
+  usageReason,
 } from '../usage'
 import { ProviderMark, useProviderMarkHover, type ProviderMarkId } from './ProviderMark'
 import { W } from '../words'
@@ -131,7 +132,7 @@ export function UsageMeter() {
   // 새로 받은 실제 값(보기 숫자가 아닌 ok)은 마지막으로 확인한 값으로 적어 둔다.
   useEffect(() => {
     if (!usage) return
-    const fresh = usage.filter((item) => item.state === 'ok' && !item.sample)
+    const fresh = usage.filter((item) => item.state === 'ok')
     if (fresh.length === 0) return
     setLast((current) => {
       const next = { ...current }
@@ -311,7 +312,9 @@ function UsageButton({ buttonRef, name, mark, usage, open, reading, onHover, onT
   const target = usage ? remainingPercent(usage) : null
   const left = useGlide(target)
   const hasNumbers = knownWindows(usage).length > 0
-  const label = target !== null ? W.usageMeter.text8(name, Math.round(target)) : name
+  // 숫자가 없으면 이름만, 뒤쪽이 읽을 만한 까닭을 주면 이름 뒤에 그 까닭(풍선과 화면 읽기 이름, 있던 자리 그대로).
+  const reason = target === null ? usageReason(usage, name) : null
+  const label = target !== null ? W.usageMeter.text8(name, Math.round(target)) : reason ? `${name}: ${reason}` : name
   const element = useRef<HTMLButtonElement | null>(null)
   const [noticeAt, setNoticeAt] = useState<{ left: number; top: number } | null>(null)
 

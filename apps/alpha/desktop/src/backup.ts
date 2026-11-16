@@ -3,6 +3,8 @@
 //   archive_remote_status / connect({ repo }) / push / pull / disconnect → { state, reason, historyReason, repo, visibility, lastPushedAt, ahead, behind, signedInAs }
 // 오브젝트 스토리지 계약: momso-desktop-backend/outputs/2026-11-16-momso-object-store-contract.md
 //   object_store_connect({ provider, endpoint, region, bucket, accessKeyId, secretAccessKey }), object_store_status, object_store_disconnect,
+//     bucket 이 비어 있으면 저장된 username 으로 momso-<username> 버킷을 만들어(이미 있으면 그대로) 연결한다. GCP 는 프로젝트 ID 와 OAuth 토큰이 더 필요해
+//     화면은 GCP 에서 버킷 이름을 그대로 받는다(원자료 버킷 자동 생성 계약, desktop-object-store-auto-bucket.md).
 //   object_store_backup, object_store_restore({ ids }), app_state_backup, app_state_restore, 이벤트 object-store-progress / done / failed
 // 키는 받아서 바로 넘기기만 한다(화면에 남기지 않는다).
 import { invoke } from '@tauri-apps/api/core'
@@ -12,11 +14,8 @@ import { isDesktopRuntime } from './runtime'
 export type RemoteStatus = {
   state: 'not_connected' | 'connected' | 'unavailable'
   reason: string | null
-  /**
-   * reason 이 unsafe_history 일 때 그 까닭(T34·T35): profile_in_history(사용자 정보 파일이 이력에 있음),
-   * profile_in_rules_history(규칙 파일의 이력에 사용자 정보가 있음), 그 밖은 null. 사용자 정보를 올릴지 그가 정할 때까지 막아 둔 것이다.
-   */
-  historyReason?: 'profile_in_history' | 'profile_in_rules_history' | string | null
+  /** 예전 계약의 이력 까닭. 2026-11-16 그의 결정(사용자 정보도 올림) 뒤로 뒤쪽은 늘 null 을 준다. 화면은 쓰지 않는다. */
+  historyReason?: string | null
   repo: string | null
   visibility: string | null
   lastPushedAt: string | null
@@ -50,6 +49,28 @@ export async function remoteConnect(repo: string) { need(); return invoke<Remote
 export async function remotePush() { need(); return invoke<RemoteStatus>('archive_remote_push') }
 export async function remotePull() { need(); return invoke<RemoteStatus>('archive_remote_pull') }
 export async function remoteDisconnect() { need(); return invoke<RemoteStatus>('archive_remote_disconnect') }
+/**
+ * T37: 저장된 username 으로 GitHub 에 momso-<username> 비공개 저장소를 만들어 연결한다(archive-backend-port-notes.md 264줄).
+ * state: created | created_not_connected | created_unverified | create_failed | username_missing | invalid_username | already_connected
+ *        | gh_missing | signed_out | git_missing | unavailable | exists_public | exists_empty | exists_matching | exists_private_unknown
+ */
+/**
+ * Git 설치(B12, git_tool.rs): git_install_status() → installed | inProgress | approvalRequired | unavailable.
+ * approvalRequired 일 때 사람이 동의하면 git_install({ approved: true }) → 바로 inProgress, 진행과 결과는 이벤트
+ * git-install-changed { provider: 'git', state: inProgress|installed|installFailed, stage, completed, total(모르면 null) }.
+ * stage: downloading, verifying, extracting, initializing, complete 또는 실패 값(networkFailed, checksumMismatch, sizeLimit 등).
+ * 이 PC 에 쓸 수 있는 Git 이 있으면 그것을 먼저 쓰고, 없으면 공식 배포판을 받아 확인한 뒤 몸소 자료 폴더 안에 둔다.
+ */
+export type GitInstallState = 'installed' | 'inProgress' | 'approvalRequired' | 'unavailable'
+export type GitInstallEvent = { state: 'inProgress' | 'installed' | 'installFailed' | string; stage: string; completed: number; total: number | null }
+export async function gitInstallStatus() { need(); return invoke<GitInstallState>('git_install_status') }
+export async function gitInstall() { need(); return invoke<GitInstallState>('git_install', { approved: true }) }
+export async function listenGitInstall(onChange: (event: GitInstallEvent) => void) {
+  if (!isDesktopRuntime()) return () => {}
+  return listen<GitInstallEvent>('git-install-changed', (event) => onChange(event.payload))
+}
+
+export async function remoteCreate() { need(); return invoke<{ state: string; repo: string | null }>('archive_remote_create') }
 
 export async function storeStatus() { need(); return invoke<StoreStatus>('object_store_status') }
 export async function storeConnect(input: { provider: StoreProvider; endpoint: string; region: string; bucket: string; accessKeyId: string; secretAccessKey: string }) {
@@ -66,6 +87,12 @@ export async function listenStoreProgress(onProgress: (value: StoreProgress) => 
     listen<StoreProgress>('object-store-done', (event) => onProgress(event.payload)),
   ])
   return () => stops.forEach((stop) => stop())
+}
+
+/** 백업이 실패했을 때(object-store-failed { file, state }). state 는 실패 까닭 값(B.reason 의 열쇠). */
+export async function listenStoreFailed(onFailed: (state: string | null) => void) {
+  if (!isDesktopRuntime()) return () => {}
+  return listen<{ file?: string | null; state?: string | null }>('object-store-failed', (event) => onFailed(event.payload?.state ?? null))
 }
 
 /** 실패한 명령의 상태 값(오류 문자열 안의 값). */

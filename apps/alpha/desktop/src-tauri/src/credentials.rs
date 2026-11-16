@@ -19,13 +19,22 @@ pub(crate) enum CredentialError {
     InvalidRecoveryKey,
 }
 
+fn service_name(test_mode: bool) -> &'static str {
+    if test_mode {
+        "app.momso.desktop.r2-test"
+    } else {
+        SERVICE
+    }
+}
+
 fn entry(name: &str) -> Result<keyring::Entry, CredentialError> {
     // keyring marks initialization as started before the Windows store is fully registered.
     // Settings probes run concurrently, so serialize entry creation across that short window.
     let _guard = ENTRY_CREATION_LOCK
         .lock()
         .map_err(|_| CredentialError::StoreUnavailable)?;
-    keyring::Entry::new(SERVICE, name).map_err(|_| CredentialError::StoreUnavailable)
+    let service = service_name(crate::runtime::r2_test_enabled());
+    keyring::Entry::new(service, name).map_err(|_| CredentialError::StoreUnavailable)
 }
 
 pub(crate) fn has_secret(name: &str) -> Result<bool, CredentialError> {
@@ -117,6 +126,13 @@ pub(crate) fn import_backup_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_credentials_do_not_share_the_production_service() {
+        assert_eq!(service_name(false), SERVICE);
+        assert_eq!(service_name(true), "app.momso.desktop.r2-test");
+        assert_ne!(service_name(false), service_name(true));
+    }
 
     #[test]
     fn credential_names_do_not_contain_secret_material() {

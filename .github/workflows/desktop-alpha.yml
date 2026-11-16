@@ -92,6 +92,9 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --manifest-path apps/alpha/desktop/src-tauri/Cargo.toml -- --check
 
+      - name: Prepare verified Node runtime for Rust tests
+        run: node apps/alpha/desktop/scripts/prepare-node.mjs
+
       - name: Test Rust runtime
         run: cargo test --manifest-path apps/alpha/desktop/src-tauri/Cargo.toml
 

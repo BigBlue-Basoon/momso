@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::{Command as SyncCommand, Stdio},
+    sync::OnceLock,
     time::Duration,
 };
 use thiserror::Error;
@@ -12,6 +13,21 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
+static LOCAL_AI_TOOLS: OnceLock<PathBuf> = OnceLock::new();
+
+pub(crate) fn set_local_ai_tools(path: PathBuf) {
+    let _ = LOCAL_AI_TOOLS.set(path);
+}
+
+fn local_ai_tool(root: &Path, name: &str) -> Option<PathBuf> {
+    let prefix = root.join(name);
+    let executable = match name {
+        "codex" => npm_codex_binary(&prefix.join("codex.cmd"))?,
+        "claude" => prefix.join("node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+        _ => return None,
+    };
+    executable.is_file().then_some(executable)
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum ProcessError {
@@ -47,6 +63,12 @@ pub(crate) struct JsonRpcRequest<'a> {
 }
 
 pub(crate) fn resolve_tool(name: &str) -> Option<PathBuf> {
+    if let Some(path) = LOCAL_AI_TOOLS
+        .get()
+        .and_then(|root| local_ai_tool(root, name))
+    {
+        return Some(path);
+    }
     let output = SyncCommand::new("where.exe").arg(name).output().ok()?;
     if !output.status.success() {
         return None;
@@ -429,6 +451,18 @@ pub(crate) fn empty_environment() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_app_local_provider_binaries_without_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir
+            .path()
+            .join("claude/node_modules/@anthropic-ai/claude-code/bin/claude.exe");
+        std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        std::fs::write(&claude, b"fixture").unwrap();
+        assert_eq!(local_ai_tool(dir.path(), "claude"), Some(claude));
+        assert_eq!(local_ai_tool(dir.path(), "other"), None);
+    }
 
     #[test]
     fn resolves_an_installed_windows_executable() {

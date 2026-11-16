@@ -103,7 +103,7 @@ pub(crate) fn parse(text: &str) -> Result<(ReceiptHead, &str), String> {
             !crate::archive_zet::valid_zet_id(id) && !crate::archive_zet::valid_asset_id(id)
         })
         || head.write_actions.iter().any(|(id, action)| {
-            !head.wrote.contains(id) || !["created", "edited"].contains(&action.as_str())
+            !head.wrote.contains(id) || !["created", "edited", "deleted"].contains(&action.as_str())
         })
         || head.evidence.iter().any(|(id, evidence)| {
             !head.wrote.contains(id) || !["tool", "diff"].contains(&evidence.as_str())
@@ -163,7 +163,7 @@ pub(crate) enum ChatItemBy {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ReferencingChat {
     pub(crate) id: String,
-    pub(crate) title: String,
+    pub(crate) title: Option<String>,
     pub(crate) at: String,
     pub(crate) by: Option<ChatItemBy>,
 }
@@ -221,9 +221,6 @@ pub(crate) fn chats_for_reference(
             })
             .optional()
             .map_err(|_| "채팅방 연결을 읽지 못했습니다".to_string())?;
-        let Some(title) = title else {
-            continue;
-        };
         let time = chrono::DateTime::parse_from_rfc3339(&head.created_at)
             .map_err(|_| "작업 내역의 시간이 올바르지 않습니다".to_string())?;
         let by = if head.unknown_actor.iter().any(|id| id == reference) {
@@ -386,7 +383,7 @@ pub(crate) fn attach_asset(
         return Err("원자료 파일을 찾을 수 없습니다".into());
     }
     drop(conn);
-    create(
+    let receipt = create(
         root,
         database,
         ReceiptCreate {
@@ -398,7 +395,15 @@ pub(crate) fn attach_asset(
             prompt: String::new(),
             changes: "원자료를 채팅방에 첨부했습니다.".into(),
         },
+    )?;
+    let conn = crate::storage::open_writable_connection(database)
+        .map_err(|_| "원자료를 연결하지 못했습니다".to_string())?;
+    conn.execute(
+        "INSERT INTO chat_attachments(receipt_id,chat_id,asset_id) VALUES (?1,?2,?3)",
+        rusqlite::params![receipt, chat_id, asset_id],
     )
+    .map_err(|_| "원자료를 연결하지 못했습니다".to_string())?;
+    Ok(receipt)
 }
 
 pub(crate) fn create(
@@ -448,7 +453,8 @@ pub(crate) fn create_with_evidence(
             !crate::archive_zet::valid_zet_id(id) && !crate::archive_zet::valid_asset_id(id)
         })
         || write_actions.iter().any(|(id, action)| {
-            !input.wrote.contains(id) || !["created", "edited"].contains(&action.as_str())
+            !input.wrote.contains(id)
+                || !["created", "edited", "deleted"].contains(&action.as_str())
         })
         || evidence.iter().any(|(id, value)| {
             !input.wrote.contains(id) || !["tool", "diff"].contains(&value.as_str())
@@ -552,6 +558,36 @@ mod tests {
         let linked = chats_for_reference(&root, &db, &format!("sha256:{hash}")).unwrap();
         assert_eq!(linked.len(), 1);
         assert_eq!(linked[0].id, chat);
+        let other = "chat_20261115_120001";
+        conn.execute(
+            "INSERT INTO chats(id,title,created_at,updated_at) VALUES (?1,'다른 방','x','x')",
+            [other],
+        )
+        .unwrap();
+        attach_asset(&root, &db, other, "asset-1").unwrap();
+        let message =
+            crate::chat::append_for_send(&db, chat, "이 파일을 읽어 주세요", None).unwrap();
+        let paths = crate::chat::message_attachment_paths(&db, &root, chat, &message.id).unwrap();
+        let encoded = serde_json::to_value(paths).unwrap();
+        assert_eq!(
+            encoded[0]["path"],
+            format!("objects/sha256/{}/{}", &hash[..2], hash)
+        );
+        assert_eq!(encoded[0]["name"], "요가.png");
+        let pending: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chat_attachments WHERE chat_id=?1 AND message_id IS NULL",
+                [other],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+        let next = crate::chat::append_for_send(&db, chat, "다음 말", None).unwrap();
+        assert!(
+            crate::chat::message_attachment_paths(&db, &root, chat, &next.id)
+                .unwrap()
+                .is_empty()
+        );
     }
     #[test]
     fn reverse_lookup_uses_only_explicit_links_and_latest_event() {
@@ -624,6 +660,18 @@ mod tests {
         let chats = serde_json::to_value(chats_for_reference(&root, &db, &asset).unwrap()).unwrap();
         assert_eq!(chats.as_array().unwrap().len(), 1);
         assert_eq!(chats[0]["by"]["provider"], "codex");
+        conn.execute("DELETE FROM chats WHERE id=?1", ["chat_20261115_120000"])
+            .unwrap();
+        let remaining =
+            serde_json::to_value(chats_for_reference(&root, &db, zet).unwrap()).unwrap();
+        let deleted = remaining
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "chat_20261115_120000")
+            .unwrap();
+        assert!(deleted["title"].is_null());
+        assert!(root.join("receipts/rec_20261115_143004.md").exists());
         assert!(chats_for_reference(&root, &db, "bad").is_err());
         std::fs::write(
             root.join("receipts").join("rec_20261115_143005.md"),

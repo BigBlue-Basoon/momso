@@ -29,7 +29,7 @@ export type MediaItem = {
   evidence?: 'tool' | 'diff' | null
 }
 
-/** 그 미디어를 만든(붙인) 채팅방 하나. chats 가 있으면 첫째, 없으면 예전 chatId. */
+/** 그 미디어를 만든(첨부한) 채팅방 하나. chats 가 있으면 첫째, 없으면 예전 chatId. */
 export function mediaChat(item: MediaItem): { id: string; title: string | null } | null {
   if (item.chats && item.chats.length > 0) return item.chats[0]
   return item.chatId ? { id: item.chatId, title: null } : null

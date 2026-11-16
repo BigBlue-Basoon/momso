@@ -7,6 +7,7 @@ const MAX_HISTORY_BYTES: usize = 1_000_000;
 pub(crate) struct Handoff {
     pub(crate) prompt: String,
     pub(crate) not_handed_over: usize,
+    pub(crate) limit: serde_json::Value,
 }
 
 pub(crate) fn with_omitted_count(mut event: serde_json::Value, count: usize) -> serde_json::Value {
@@ -25,6 +26,7 @@ pub(crate) fn prepare(
     prepare_excluding(db, chat_id, provider, has_session, text, None)
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_excluding(
     db: &Path,
     chat_id: &str,
@@ -33,6 +35,48 @@ pub(crate) fn prepare_excluding(
     text: &str,
     excluded_message: Option<&str>,
 ) -> Result<Handoff, String> {
+    prepare_excluding_with_model(
+        db,
+        chat_id,
+        provider,
+        has_session,
+        text,
+        excluded_message,
+        None,
+    )
+}
+
+pub(crate) fn prepare_excluding_with_model(
+    db: &Path,
+    chat_id: &str,
+    provider: &str,
+    has_session: bool,
+    text: &str,
+    excluded_message: Option<&str>,
+    model: Option<&str>,
+) -> Result<Handoff, String> {
+    let measurement = crate::chat_context::model_limit(db, chat_id, provider, model)?;
+    let (max_history_bytes, limit) = if let Some((window, used)) = measurement {
+        // Bytes are a conservative approximation, not a provider tokenizer. Reserve a
+        // quarter of the window for system instructions, tools, and the response.
+        let available = window
+            .saturating_sub(window / 4)
+            .saturating_sub(if has_session { used } else { 0 })
+            .max(0);
+        let budget = usize::try_from(available)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(text.len())
+            .saturating_sub(512);
+        (
+            budget,
+            serde_json::json!({"kind":"modelEstimate","contextWindowTokens":window,"historyByteBudget":budget}),
+        )
+    } else {
+        (
+            MAX_HISTORY_BYTES,
+            serde_json::json!({"kind":"temporary","contextWindowTokens":null,"historyByteBudget":MAX_HISTORY_BYTES}),
+        )
+    };
     let connection = Connection::open(db).map_err(|e| e.to_string())?;
     let cursor: i64 = if has_session {
         connection.query_row("SELECT delivered_rowid FROM chat_provider_handoff WHERE chat_id=?1 AND provider=?2", params![chat_id, provider], |r| r.get(0)).optional().map_err(|e| e.to_string())?.unwrap_or(0)
@@ -48,11 +92,11 @@ pub(crate) fn prepare_excluding(
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
     let mut selected: Vec<String> = Vec::new();
-    let mut bytes = 0;
+    let mut bytes = 0usize;
     for (role, body) in &rows {
         let message = format!("--- {role} ({} bytes) ---\n{body}\n", body.len());
         let size = message.len();
-        if bytes + size > MAX_HISTORY_BYTES {
+        if bytes.saturating_add(size) > max_history_bytes {
             break;
         }
         bytes += size;
@@ -72,6 +116,7 @@ pub(crate) fn prepare_excluding(
     Ok(Handoff {
         prompt,
         not_handed_over,
+        limit,
     })
 }
 
@@ -105,6 +150,58 @@ mod tests {
         assert_eq!(result["chatId"], "test");
         assert_eq!(result["status"], "fast_unavailable");
         assert_eq!(result["notHandedOver"], 3);
+    }
+
+    #[test]
+    fn handoff_uses_only_matching_reported_model_and_exposes_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        crate::storage::initialize(&db, &dir.path().join("backups"), "test").unwrap();
+        let id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        chat::append(&db, &id, Role::User, &"a".repeat(300), None, None).unwrap();
+        chat::append(&db, &id, Role::Assistant, &"b".repeat(100), None, None).unwrap();
+        crate::chat_context::update_measurement(
+            &db,
+            &id,
+            "gemini",
+            Some("fake-model"),
+            200,
+            Some(1000),
+        )
+        .unwrap();
+        let known = prepare_excluding_with_model(
+            &db,
+            &id,
+            "gemini",
+            false,
+            "new",
+            None,
+            Some("fake-model"),
+        )
+        .unwrap();
+        assert_eq!(known.limit["kind"], "modelEstimate");
+        assert_eq!(known.limit["contextWindowTokens"], 1000);
+        assert_eq!(known.not_handed_over, 1);
+        let resumed =
+            prepare_excluding_with_model(&db, &id, "gemini", true, "new", None, Some("fake-model"))
+                .unwrap();
+        assert_eq!(resumed.not_handed_over, 2);
+        for (provider, model) in [
+            ("gemini", Some("other")),
+            ("gemini", None),
+            ("claude", Some("fake-model")),
+            ("codex", Some("fake-model")),
+        ] {
+            let result =
+                prepare_excluding_with_model(&db, &id, provider, false, "new", None, model)
+                    .unwrap();
+            assert_eq!(result.limit["kind"], "temporary");
+            assert_eq!(result.limit["contextWindowTokens"], serde_json::Value::Null);
+            assert_eq!(result.not_handed_over, 0);
+        }
     }
 
     #[test]

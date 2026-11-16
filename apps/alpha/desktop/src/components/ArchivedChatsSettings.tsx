@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { RotateCcw, Trash2 } from 'lucide-react'
 import { archiveErrorMessage } from '../archive'
-import { deleteChat, listArchivedChats, unarchiveChat, type ChatEntry } from '../chats'
+import { deleteChat, listArchivedChats, restoreChat, type ArchivedChat } from '../chats'
 import { W } from '../words'
 import { QuestionDialog } from './ZetPanel'
 
@@ -18,10 +18,10 @@ function when(value: string | null | undefined) {
  * 되돌리기(왼쪽 목록으로)와 영구 삭제(휴지통) 단추. 영구 삭제는 한 번 묻고 지운다. 그 밖의 것(한꺼번에 지우기 등)은 두지 않는다.
  */
 export function ArchivedChatsSettings({ onChanged }: { onChanged: () => void }) {
-  const [items, setItems] = useState<ChatEntry[] | null>(null)
+  const [items, setItems] = useState<ArchivedChat[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [working, setWorking] = useState<string | null>(null)
-  const [removing, setRemoving] = useState<ChatEntry | null>(null)
+  const [removing, setRemoving] = useState<ArchivedChat | null>(null)
 
   const refresh = useCallback(() => {
     listArchivedChats()
@@ -59,10 +59,10 @@ export function ArchivedChatsSettings({ onChanged }: { onChanged: () => void }) 
               <li key={item.id} className="archived-row" aria-busy={working === item.id || undefined}>
                 <span className="archived-main">
                   <span className="archived-title" title={title}>{title}</span>
-                  {when(item.updatedAt) && <span className="archived-date">{when(item.updatedAt)}</span>}
+                  {when(item.archivedAt ?? item.updatedAt) && <span className="archived-date">{when(item.archivedAt ?? item.updatedAt)}</span>}
                 </span>
                 <span className="archived-actions">
-                  <button className="secondary-button" type="button" disabled={working !== null} onClick={() => void run(item.id, () => unarchiveChat(item.id), K.restoreFailed)}>
+                  <button className="secondary-button" type="button" disabled={working !== null} onClick={() => void run(item.id, () => restoreChat(item.id), K.restoreFailed)}>
                     <RotateCcw size={14} aria-hidden />{K.restore}
                   </button>
                   <button className="secondary-button archived-remove" type="button" disabled={working !== null} aria-label={`${title} ${K.remove}`} title={K.remove} onClick={() => setRemoving(item)}>

@@ -21,6 +21,77 @@ struct State {
     enabled: bool,
 }
 
+pub(crate) fn fresh_builtin_state_mode(root: &Path) -> Result<bool, &'static str> {
+    let mut present = 0;
+    for &(name, content) in crate::skills::BUNDLED_SKILLS {
+        let Some(bytes) = snapshot(&state_path(root, name)?)? else {
+            continue;
+        };
+        present += 1;
+        let state: State = serde_json::from_slice(&bytes).map_err(|_| "invalid_state")?;
+        if !state.enabled || state.hash != crate::archive_zet::content_hash(content) {
+            return Err("conflict");
+        }
+    }
+    if present == 0 {
+        Ok(false)
+    } else if present == crate::skills::BUNDLED_SKILLS.len() {
+        Ok(true)
+    } else {
+        Err("conflict")
+    }
+}
+
+pub(crate) fn adopt_received_builtin_states(
+    tool: &Path,
+    root: &Path,
+    saved: &Path,
+) -> Result<(), &'static str> {
+    for &(name, default) in crate::skills::BUNDLED_SKILLS {
+        let canonical = relative(name);
+        if git(tool, root, &["ls-files", "--", &canonical])?
+            .trim()
+            .is_empty()
+        {
+            continue;
+        }
+        let path = skills::skill_path(root, "skills", name)?;
+        let content = snapshot(&path)?.ok_or("conflict")?;
+        let Ok(text) = std::str::from_utf8(&content) else {
+            continue;
+        };
+        let state_file = state_path(root, name)?;
+        let before = snapshot(&state_file)?.ok_or("conflict")?;
+        let previous: State = serde_json::from_slice(&before).map_err(|_| "invalid_state")?;
+        if !previous.enabled || previous.hash != crate::archive_zet::content_hash(default) {
+            return Err("conflict");
+        }
+        let agents = skills::skill_path(root, ".agents/skills", name)?;
+        let claude = skills::skill_path(root, ".claude/skills", name)?;
+        let enabled = snapshot(&agents)?.as_deref() == Some(content.as_slice())
+            && snapshot(&claude)?.as_deref() == Some(content.as_slice());
+        let next = State {
+            hash: crate::archive_zet::content_hash(text),
+            enabled,
+        };
+        let backup = saved.join("skill-state").join(format!("{name}.json"));
+        fs::create_dir_all(backup.parent().ok_or("io_error")?).map_err(|_| "io_error")?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(backup)
+            .map_err(|_| "io_error")?;
+        file.write_all(&before).map_err(|_| "io_error")?;
+        file.sync_all().map_err(|_| "io_error")?;
+        apply(&[Change {
+            path: state_file,
+            before: Some(before),
+            after: Some(serde_json::to_vec(&next).map_err(|_| "io_error")?),
+        }])?;
+    }
+    Ok(())
+}
+
 struct Change {
     path: PathBuf,
     before: Option<Vec<u8>>,
@@ -97,6 +168,7 @@ fn transact(
     name: &str,
     changes: Vec<Change>,
     commit: bool,
+    builtin_update: bool,
 ) -> Result<(), &'static str> {
     let canonical = relative(name);
     let mut paths = Vec::new();
@@ -162,7 +234,11 @@ fn transact(
                     "commit",
                     "--only",
                     "-m",
-                    "Save skill",
+                    if builtin_update {
+                        "몸소 업데이트: 기본 스킬 갱신"
+                    } else {
+                        "Save skill"
+                    },
                     "--",
                 ];
                 args.extend(paths.iter().map(String::as_str));
@@ -291,7 +367,26 @@ pub(crate) fn install_builtin(
         before: builtin_before,
         after: Some(serde_json::to_vec(&builtins).map_err(|_| "io_error")?),
     });
-    transact(root, resources, name, edits, true)
+    // A freshly initialized archive must remain unborn until the first remote
+    // receive. Otherwise default skills create an unrelated local history.
+    let tool = crate::archive::storage_tool(resources)
+        .map_err(|_| "save_failed")?
+        .0;
+    if git(&tool, root, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+        return Err("save_failed");
+    }
+    let has_history = git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok();
+    let is_original_builtin = crate::skills::BUNDLED_SKILLS
+        .iter()
+        .any(|(builtin_name, builtin_text)| *builtin_name == name && *builtin_text == text);
+    transact(
+        root,
+        resources,
+        name,
+        edits,
+        has_history || !is_original_builtin,
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -410,7 +505,7 @@ fn mutate(
                 state_file,
                 Some(serde_json::to_vec(&meta).map_err(|_| "io_error")?),
             )?);
-            transact(root, resources, name, changes, true)
+            transact(root, resources, name, changes, true, false)
         }
         op => {
             let old = before.ok_or("not_found")?;
@@ -466,7 +561,7 @@ fn mutate(
                         state_file,
                         Some(serde_json::to_vec(&next).map_err(|_| "io_error")?),
                     )?);
-                    transact(root, resources, name, edits, commit)
+                    transact(root, resources, name, edits, commit, false)
                 }
                 Operation::Enable(enabled) => {
                     let mut edits = copies(root, name, &meta.hash, &old, enabled)?;
@@ -478,7 +573,7 @@ fn mutate(
                         state_file,
                         Some(serde_json::to_vec(&next).map_err(|_| "io_error")?),
                     )?);
-                    transact(root, resources, name, edits, true)
+                    transact(root, resources, name, edits, true, false)
                 }
                 Operation::Remove => {
                     if skills::is_builtin(name) {
@@ -505,7 +600,7 @@ fn mutate(
                         },
                     );
                     edits.push(change(state_file, None)?);
-                    transact(root, resources, name, edits, true)
+                    transact(root, resources, name, edits, true, false)
                 }
                 Operation::Create { .. } => unreachable!(),
             }
