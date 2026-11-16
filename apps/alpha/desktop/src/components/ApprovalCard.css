@@ -1,0 +1,206 @@
+/* 대화 안에서 허락을 묻는 물음(2026-11-16).
+   Claude 앱의 대화 안 물음 상자를 보고 맞췄다: 대화 글 폭의 둥근 테두리 상자, 왼쪽에 물음, 오른쪽 끝에 짧은 글 단추.
+   색은 App.css 의 값만 쓴다. */
+
+.approval-card {
+  display: grid;
+  gap: 8px;
+  margin: 22px 0 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(35, 42, 38, 0.04);
+  animation: approval-enter 200ms var(--material-ease) both;
+}
+
+.approval-card:first-child {
+  margin-top: 0;
+}
+
+.approval-head {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.approval-head strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.5;
+}
+
+.approval-mark {
+  width: 18px;
+  height: 18px;
+}
+
+.approval-command {
+  max-height: 160px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  font: 500 12px/1.55 ui-monospace, 'Cascadia Mono', monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.approval-subject {
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.6;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 대상이 여럿일 때: 파일 이름 한 줄씩, 오른쪽에 바꾸는 종류(알 때만). */
+.approval-targets {
+  display: grid;
+  gap: 2px;
+  max-height: 160px;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  list-style: none;
+}
+
+.approval-targets li {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.approval-target-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-target-change {
+  flex: none;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.approval-subject.is-plain {
+  font-weight: 400;
+  white-space: normal;
+  word-break: keep-all;
+}
+
+.approval-reason {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: keep-all;
+}
+
+.approval-error {
+  margin: 0;
+  color: var(--coral);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.approval-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.approval-button {
+  height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.approval-button:hover:not(:disabled) {
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.approval-button.is-primary {
+  background: var(--rail);
+  color: #ffffff;
+}
+
+.approval-button.is-primary:hover:not(:disabled) {
+  background: #3b403d;
+  color: #ffffff;
+}
+
+.approval-button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.approval-button:focus-visible {
+  outline: 2px solid #8aa4bd;
+  outline-offset: 1px;
+}
+
+/* 답한 뒤 남는 한 줄. 대화 안의 다른 작은 알림 줄과 같은 흐린 글씨. */
+.approval-done {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  animation: approval-enter 200ms var(--material-ease) both;
+}
+
+.approval-done svg,
+.approval-done > span:first-of-type {
+  flex: none;
+  white-space: nowrap;
+}
+
+.approval-done-subject {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-done-subject::before {
+  margin-right: 6px;
+  content: '·';
+}
+
+@keyframes approval-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .approval-card,
+  .approval-done { animation: none; }
+}

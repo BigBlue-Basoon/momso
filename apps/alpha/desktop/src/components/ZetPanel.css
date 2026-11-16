@@ -1,0 +1,1155 @@
+/* 읽는 글 패널. 색과 그림자는 App.css 의 기존 값만 쓴다. */
+
+.workbench-body {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench-body > .workbench-grid {
+  flex: 1 1 0;
+}
+
+/* 세 칸 구성(2026-11-15): 아이콘 띠 / 목록 / 대화. 오른쪽 보는 창(패널)은 이 칸들 오른쪽에 붙는다.
+   패널이 열리면 대화 칸이 좁아져 자리를 내준다. 목록은 사람이 접을 때만 접힌다. */
+.workbench-body > .workbench-grid {
+  grid-template-columns: 52px clamp(220px, 20vw, 282px) minmax(0, 1fr);
+}
+
+.workbench-body[data-list-hidden='true'] > .workbench-grid {
+  grid-template-columns: 52px 0 minmax(0, 1fr);
+}
+
+/* 창 너비 1120 아래에서는 App.css 처럼 아이콘 띠 50, 목록 220. */
+@media (max-width: 1120px) {
+  .workbench-body > .workbench-grid {
+    grid-template-columns: 50px 220px minmax(0, 1fr);
+  }
+
+  .workbench-body[data-list-hidden='true'] > .workbench-grid {
+    grid-template-columns: 50px 0 minmax(0, 1fr);
+  }
+}
+
+.workbench-body[data-list-hidden='true'] .task-sidebar {
+  overflow: hidden;
+  border-right-width: 0;
+  visibility: hidden;
+}
+
+.workbench-body[data-zet-moving='true'] > .workbench-grid,
+.workbench-body[data-list-moving='true'] > .workbench-grid {
+  transition: grid-template-columns 260ms var(--material-ease);
+}
+
+.workbench-body[data-list-moving='true'] .task-sidebar {
+  transition: visibility 260ms;
+}
+
+.workbench-body[data-zet-resizing='true'] {
+  cursor: col-resize;
+  user-select: none;
+}
+
+.zet-panel {
+  position: relative;
+  flex: 0 0 auto;
+  width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.workbench-body[data-zet-panel='open'] > .zet-panel {
+  width: var(--zet-panel-width);
+}
+
+.workbench-body[data-zet-moving='true'] > .zet-panel {
+  transition: width 260ms var(--material-ease);
+}
+
+.zet-panel-frame {
+  position: relative;
+  display: grid;
+  /* 탭 줄의 높이는 대화 칸 맨 위 줄(56)과 같다. 패널 단추가 열릴 때와 닫힐 때 같은 높이에 있다. */
+  grid-template-rows: 56px minmax(0, 1fr);
+  width: var(--zet-panel-width);
+  height: 100%;
+  border-left: 1px solid var(--line);
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+
+.workbench-body[data-zet-panel='open'] .zet-panel-frame {
+  opacity: 1;
+}
+
+.zet-panel-resizer {
+  position: absolute;
+  z-index: 5;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 9px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.zet-panel-resizer::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  background: var(--line-strong);
+  content: '';
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.zet-panel-resizer:hover::after,
+.zet-panel-resizer:focus-visible::after,
+.workbench-body[data-zet-resizing='true'] .zet-panel-resizer::after {
+  opacity: 1;
+}
+
+.zet-panel-resizer:focus-visible {
+  outline: 0;
+}
+
+.zet-tabbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  padding: 0 12px 0 10px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(251, 252, 251, 0.86);
+}
+
+.zet-tabs {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.zet-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.zet-tab {
+  display: flex;
+  flex: 0 1 190px;
+  min-width: 104px;
+  height: 30px;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+  animation: zet-tab-enter 200ms var(--material-ease) both;
+}
+
+.zet-tab:hover {
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.zet-tab.active {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.zet-tab-label {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  align-items: center;
+  gap: 6px;
+  padding: 0 2px 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.zet-tab-label svg {
+  flex: 0 0 auto;
+}
+
+.zet-tab-label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 저장하지 않은 내용이 있는 탭의 점. */
+.zet-tab-dirty {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-left: 2px;
+  border-radius: 50%;
+  background: var(--ink-soft);
+}
+
+.zet-tab-close {
+  display: grid;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  margin-right: 3px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.zet-tab-close:hover {
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.zet-tab.active .zet-tab-close:hover {
+  background: var(--surface-soft);
+}
+
+.zet-tab-add {
+  width: 30px;
+  height: 30px;
+}
+
+.zet-panel-body {
+  position: relative;
+  min-height: 0;
+}
+
+.zet-pane {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  animation: canvas-enter 220ms var(--material-ease) both;
+}
+
+.zet-pane[hidden] {
+  display: none;
+}
+
+.zet-message {
+  display: flex;
+  min-height: 180px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  padding: 28px 24px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+  word-break: keep-all;
+}
+
+.zet-list {
+  display: flex;
+  min-height: 100%;
+  flex-direction: column;
+  padding: 12px 0 0;
+}
+
+.zet-search {
+  display: flex;
+  flex: 0 0 auto;
+  height: 34px;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 6px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.zet-search:focus-within {
+  border-color: #8aa4bd;
+  box-shadow: 0 0 0 3px rgba(49, 95, 143, 0.08);
+}
+
+.zet-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.zet-search input::placeholder {
+  color: var(--faint);
+}
+
+.zet-search input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.zet-rows,
+.zet-links {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.zet-row {
+  display: grid;
+  width: 100%;
+  gap: 5px;
+  padding: 13px 16px;
+  border: 0;
+  border-bottom: 1px solid #e6e9e6;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+.zet-row:hover {
+  background: var(--surface-soft);
+}
+
+.zet-row strong {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.4;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.zet-row-summary {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  line-height: 1.55;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.zet-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.zet-status {
+  font-weight: 680;
+}
+
+.zet-status.draft {
+  color: #7a6326;
+}
+
+.zet-status.confirmed {
+  color: var(--green);
+}
+
+.zet-document {
+  min-height: 100%;
+}
+
+.zet-head {
+  padding: 24px 24px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-soft);
+}
+
+.zet-head h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 760;
+  line-height: 1.35;
+  letter-spacing: 0;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.zet-head p {
+  margin: 10px 0 0;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.7;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+/* 머리 정보는 이름과 값을 한 줄에 나란히 둔다. */
+.zet-meta {
+  display: grid;
+  gap: 5px;
+  margin: 16px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.zet-meta div {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 10px;
+}
+
+.zet-meta dt {
+  color: var(--muted);
+}
+
+.zet-meta dd {
+  margin: 0;
+  color: var(--ink);
+  font-weight: 620;
+  overflow-wrap: anywhere;
+}
+
+.zet-viewbar {
+  position: sticky;
+  z-index: 3;
+  top: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 24px;
+  border-bottom: 1px solid var(--line);
+  /* 내려가는 본문이 이 줄 뒤로 비치지 않게 불투명하게 둔다. */
+  background: #fbfcfb;
+}
+
+.zet-views {
+  flex: 0 1 240px;
+  min-width: 0;
+}
+
+/* 고치기 단추는 보기 줄의 오른쪽 끝에 둔다. */
+.zet-edit-start {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* 고치는 동안에는 저장과 그만두기만 보인다. */
+.zet-viewbar--editing {
+  justify-content: flex-end;
+  gap: 8px;
+  min-height: 51px;
+}
+
+.zet-edit-title,
+.zet-edit-summary,
+.zet-edit-body {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.zet-edit-title:focus,
+.zet-edit-summary:focus,
+.zet-edit-body:focus {
+  border-color: #8aa4bd;
+  outline: 0;
+  box-shadow: 0 0 0 3px rgba(49, 95, 143, 0.08);
+}
+
+.zet-edit-title[aria-invalid='true'],
+.zet-edit-summary[aria-invalid='true'] {
+  border-color: #c98a80;
+}
+
+.zet-edit-title {
+  padding: 7px 10px;
+  font-size: 20px;
+  font-weight: 760;
+  line-height: 1.35;
+}
+
+.zet-edit-summary {
+  margin-top: 8px;
+  padding: 8px 10px;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.7;
+  resize: none;
+  field-sizing: content;
+}
+
+.zet-edit-body {
+  min-height: 320px;
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.8;
+  resize: none;
+  field-sizing: content;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.zet-edit-error {
+  margin: 5px 0 0;
+  color: #a54c3e;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.zet-head .zet-edit-error {
+  margin: 5px 0 0;
+  color: #a54c3e;
+  font-size: 11.5px;
+}
+
+.zet-edit-error--save {
+  margin: 0 0 12px;
+  word-break: keep-all;
+}
+
+.zet-views[data-active='linked'] .glass-slider {
+  transform: translateX(calc(100% + 2px));
+}
+
+.zet-views[data-active='history'] .glass-slider {
+  transform: translateX(calc(200% + 4px));
+}
+
+.zet-view {
+  padding: 22px 24px 48px;
+  animation: canvas-enter 220ms var(--material-ease) both;
+}
+
+.zet-linked {
+  display: grid;
+  gap: 26px;
+}
+
+.zet-linked + .zet-md {
+  margin-top: 30px;
+}
+
+.zet-linked.zet-linked--document h2 {
+  font-size: 15.5px;
+  font-weight: 740;
+}
+
+.zet-linked h2 {
+  margin: 0 0 6px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 730;
+  line-height: 1.4;
+}
+
+.zet-links li {
+  border-bottom: 1px solid #e6e9e6;
+}
+
+.zet-link-row {
+  display: grid;
+  width: calc(100% + 16px);
+  gap: 3px;
+  margin: 0 -8px;
+  padding: 11px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+}
+
+button.zet-link-row {
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+button.zet-link-row:hover {
+  background: var(--surface-soft);
+}
+
+.zet-link-row strong {
+  font-size: 12.5px;
+  font-weight: 680;
+  line-height: 1.5;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.zet-link-row > span {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.zet-link-row.missing strong {
+  color: var(--muted);
+  font-weight: 560;
+}
+
+.zet-version-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.zet-version-bar .secondary-button:disabled {
+  opacity: 0.5;
+}
+
+/* 지난 판의 제목과 요약. 지금 글의 머리와 헷갈리지 않게 본문 칸 안에 작게 둔다. */
+.zet-version-head {
+  margin: 18px 0 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.zet-version-head h2 {
+  margin: 0 0 6px;
+  font-size: 15.5px;
+  font-weight: 740;
+  line-height: 1.4;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.zet-version-head p {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  line-height: 1.7;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.zet-version-head .zet-version-time {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* 제목과 요약을 읽을 수 없는 판은 파일에 적힌 글자를 그대로 보여 준다. */
+.zet-version-raw {
+  margin: 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: var(--ink-soft);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.zet-confirm-backdrop {
+  position: fixed;
+  z-index: 40;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(26, 30, 28, 0.34);
+  -webkit-backdrop-filter: blur(7px);
+  backdrop-filter: blur(7px);
+  animation: backdrop-enter 150ms ease both;
+}
+
+.zet-confirm {
+  width: min(380px, 100%);
+  padding: 22px 22px 18px;
+  border: 1px solid rgba(255, 255, 255, 0.82);
+  border-radius: 8px;
+  background: rgba(250, 252, 250, 0.94);
+  box-shadow: 0 26px 70px rgba(20, 25, 22, 0.24), 0 1px 0 #ffffff inset;
+  -webkit-backdrop-filter: blur(24px) saturate(1.12);
+  backdrop-filter: blur(24px) saturate(1.12);
+  animation: dialog-enter 220ms var(--material-ease) both;
+}
+
+.zet-confirm h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 740;
+  line-height: 1.35;
+}
+
+.zet-confirm p {
+  margin: 10px 0 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.7;
+  word-break: keep-all;
+}
+
+.zet-confirm .zet-confirm-error {
+  color: #a54c3e;
+}
+
+.zet-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+/* 글 본문(마크다운) */
+
+.zet-md {
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.8;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.zet-md > :first-child {
+  margin-top: 0;
+}
+
+.zet-md > :last-child {
+  margin-bottom: 0;
+}
+
+.zet-md h2,
+.zet-md h3,
+.zet-md h4,
+.zet-md h5,
+.zet-md h6 {
+  margin: 1.7em 0 0.55em;
+  font-weight: 740;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+
+.zet-md h2 {
+  font-size: 18px;
+}
+
+.zet-md h3 {
+  font-size: 15.5px;
+}
+
+.zet-md h4 {
+  font-size: 13.5px;
+}
+
+.zet-md h5,
+.zet-md h6 {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.zet-md p {
+  margin: 0.75em 0;
+}
+
+.zet-md strong {
+  font-weight: 720;
+}
+
+.zet-md ul,
+.zet-md ol {
+  margin: 0.75em 0;
+  padding-left: 1.5em;
+}
+
+.zet-md li {
+  margin: 0.25em 0;
+}
+
+.zet-md li > p {
+  margin: 0.3em 0;
+}
+
+.zet-md li > ul,
+.zet-md li > ol {
+  margin: 0.25em 0;
+}
+
+.zet-md li.task-list-item {
+  list-style: none;
+}
+
+/* 확인 칸은 글머리 기호가 놓이는 자리에 둔다. */
+.zet-md li.task-list-item > input {
+  margin: 0 0.45em 0 -1.5em;
+  vertical-align: -2px;
+}
+
+.zet-md blockquote {
+  margin: 1em 0;
+  padding: 2px 0 2px 14px;
+  border-left: 3px solid var(--line-strong);
+  color: var(--ink-soft);
+}
+
+.zet-md hr {
+  height: 1px;
+  margin: 1.8em 0;
+  border: 0;
+  background: var(--line);
+}
+
+.zet-md code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-muted);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 0.9em;
+  word-break: break-all;
+}
+
+.zet-md pre {
+  margin: 1em 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  line-height: 1.6;
+}
+
+.zet-md pre code {
+  padding: 0;
+  background: transparent;
+  font-size: 12px;
+  word-break: normal;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
+.zet-md-table {
+  margin: 1em 0;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.zet-md table {
+  width: 100%;
+  min-width: calc(var(--zet-table-columns, 1) * 80px);
+  border-collapse: collapse;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 칸 안의 낱말은 중간에서 끊지 않는다. 칸이 많아 넘치면 표만 옆으로 민다. */
+.zet-md th,
+.zet-md td {
+  padding: 8px 12px;
+  overflow-wrap: normal;
+  border-bottom: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.zet-md th:first-child,
+.zet-md td:first-child {
+  border-left: 0;
+}
+
+.zet-md tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.zet-md th {
+  background: var(--surface-soft);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.zet-md-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--blue);
+  font: inherit;
+  text-align: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgba(49, 95, 143, 0.4);
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.zet-md-link:hover {
+  text-decoration-color: currentColor;
+}
+
+.zet-md-address {
+  color: var(--ink-soft);
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 3px;
+}
+
+.zet-md-image {
+  color: var(--muted);
+}
+
+/* 창 제목 표시줄 왼쪽의 목록 접기 단추. 아이콘 띠 위에 놓인다. */
+
+.window-titlebar-tools {
+  display: flex;
+  height: 40px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  /* 첫 단추(목록 숨기기)는 아이콘 띠(52px) 가운데에 온다. */
+  padding-left: 9px;
+}
+
+.window-titlebar-tools button {
+  display: grid;
+  width: 34px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--rail-muted);
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, opacity 160ms ease;
+}
+
+.window-titlebar-tools button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  color: #ffffff;
+}
+
+/* 갈 곳이 없는 뒤로·앞으로 */
+.window-titlebar-tools button:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.window-titlebar-tools button:focus-visible {
+  outline: 2px solid #a4c8b2;
+  outline-offset: -2px;
+}
+
+/* 패널을 여닫는 단추. 화면 맨 위 줄의 오른쪽 끝에 놓인다. */
+
+.zet-panel-toggle[aria-pressed='true'] {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.assistant-header-actions {
+  display: flex;
+  gap: 4px;
+  margin-left: auto;
+}
+
+/* 설정 화면에서도 단추가 다른 화면과 같은 자리(오른쪽 끝에서 12)에 오게 한다. */
+.settings-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: -6px;
+}
+
+/* 대화 칸이 화면에 없을 때(기록이 없을 때)는 그 자리의 맨 위 오른쪽에 둔다. */
+.workbench-body .workspace-empty {
+  position: relative;
+}
+
+.workspace-top-actions {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  gap: 4px;
+}
+
+@keyframes zet-tab-enter {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (forced-colors: active) {
+  .zet-tab.active {
+    border-color: Highlight;
+  }
+
+  .zet-panel-resizer::after {
+    background: CanvasText;
+  }
+}
+
+/* 문서 화면(2026-11-16): 같은 패널을 아이콘 띠 오른쪽에 화면 가득 넓힌다. 목록과 대화 칸은 그리지 않는다. */
+.workbench-body[data-screen='documents'] > .workbench-grid {
+  flex: 0 0 auto;
+  grid-template-columns: 52px;
+}
+
+@media (max-width: 1120px) {
+  .workbench-body[data-screen='documents'] > .workbench-grid {
+    grid-template-columns: 50px;
+  }
+}
+
+.workbench-body[data-screen='documents'] > .zet-panel {
+  flex: 1 1 auto;
+  width: auto;
+  border-left: 0;
+  animation: zet-page-enter 200ms var(--material-ease) both;
+}
+
+.zet-panel[data-variant='page'] .zet-panel-frame {
+  width: 100%;
+}
+
+.zet-panel[data-variant='page'] .zet-panel-resizer {
+  display: none;
+}
+
+@keyframes zet-page-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workbench-body[data-screen='documents'] > .zet-panel { animation: none; }
+}
+
+/* 문서 화면에서는 글 목록과 글을 읽기 좋은 폭(860px)으로 가운데에 둔다(채팅방 칸의 글 폭과 같은 생각). */
+.zet-panel[data-variant='page'] {
+  --page-gutter: max(24px, calc((100% - 860px) / 2));
+}
+
+.zet-panel[data-variant='page'] .zet-list {
+  padding-right: var(--page-gutter);
+  padding-left: var(--page-gutter);
+}
+
+.zet-panel[data-variant='page'] .zet-head,
+.zet-panel[data-variant='page'] .zet-viewbar,
+.zet-panel[data-variant='page'] .zet-view {
+  padding-right: var(--page-gutter);
+  padding-left: var(--page-gutter);
+}
+
+/* 오른쪽 패널: 그 채팅방에서 다룬 것(문서 / 미디어) */
+.chat-items { display: grid; min-height: 0; align-content: start; }
+
+.chat-items-tabs {
+  display: flex;
+  gap: 2px;
+  margin: 10px 12px 4px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.chat-items-tabs button {
+  display: inline-flex;
+  flex: 1;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.chat-items-tabs button.is-active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgba(35, 42, 38, 0.08); }
+.chat-items-count { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+.chat-items-media { padding: 8px 12px 16px; }
+
+.item-did { display: inline-flex; min-width: 0; align-items: center; gap: 8px; }
+.item-did-how { color: var(--ink-soft); font-weight: 600; }
+.item-did-by { display: inline-flex; min-width: 0; align-items: center; gap: 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.item-did-mark { width: 14px; height: 14px; flex: none; }
+
+/* 패널을 닫아 둔 동안 이 채팅방에 새로 생긴 것이 있으면 패널 단추에 작은 점 */
+.zet-panel-toggle.has-fresh { position: relative; }
+.zet-panel-toggle.has-fresh::after {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--coral);
+  content: '';
+  animation: fresh-in 200ms var(--material-ease) both;
+}
+@keyframes fresh-in { from { opacity: 0; transform: scale(0.4); } to { opacity: 1; transform: scale(1); } }
+
+/* 문서 본문 안의 말한 사람: 추정이든 아니든 이름 뒤에 언제나 회색 바탕(2026-11-16 김성균 개발자가 정함).
+   AI 가 스스로 가린 화자는 바탕 안 이름 앞에 작고 흐린 "?" (사람이 확인하면 뒤쪽이 "?" 를 뗀다). */
+.zet-speaker {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--surface-muted);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.zet-speaker.is-guessed { color: var(--ink-soft); }
+.zet-speaker-time { color: var(--muted); font-weight: 600; }
+.zet-speaker-mark {
+  display: inline-grid;
+  width: 14px;
+  height: 14px;
+  margin-right: 3px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: 1px;
+  cursor: help;
+}
+
+/* 요약 아래에 이어 보이는 전사(요약과 전사는 화면에서 같이) */
+.zet-summarized { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line); }
+.zet-summarized-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+.zet-summarized-kind { color: var(--muted); font-size: 11.5px; font-weight: 600; }
+.zet-summarized-title { padding: 0; border: 0; background: none; color: var(--ink); font: inherit; font-size: 13.5px; font-weight: 650; cursor: pointer; text-align: left; }
+.zet-summarized-title:hover { text-decoration: underline; }

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>momso</title>
+  </head>
+  <body>
+    <!-- 첫 화면의 AI 고르기(AiWelcome)만 띄워 보는 쪽. 로고와 올렸을 때의 효과가 바뀌지 않았는지 견줘 볼 때 쓴다. -->
+    <div id="root" style="height:100vh;display:grid"></div>
+    <script type="module">
+      import React from 'react'
+      import { createRoot } from 'react-dom/client'
+      import '/src/App.css'
+      import { AiWelcome } from '/src/components/AiWelcome.tsx'
+      createRoot(document.getElementById('root')).render(React.createElement(AiWelcome))
+    </script>
+  </body>
+</html>

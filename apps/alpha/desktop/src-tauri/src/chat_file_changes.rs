@@ -1,0 +1,612 @@
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
+use walkdir::WalkDir;
+
+pub(crate) type Snapshot = BTreeMap<String, [u8; 32]>;
+
+#[derive(Default)]
+struct Activity {
+    overlapping_chat: bool,
+    app_writes: BTreeSet<String>,
+    app_write_unknown: bool,
+}
+
+type ActivityKey = (PathBuf, String);
+static ACTIVITY: OnceLock<Mutex<BTreeMap<ActivityKey, Activity>>> = OnceLock::new();
+static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) fn lock_app_write() -> std::sync::MutexGuard<'static, ()> {
+    SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+fn activity() -> &'static Mutex<BTreeMap<ActivityKey, Activity>> {
+    ACTIVITY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+pub(crate) fn has_active(root: &Path) -> bool {
+    activity()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .any(|(active_root, _)| active_root == root)
+}
+
+pub(crate) struct Tracking(ActivityKey);
+impl Tracking {
+    pub(crate) fn start(root: &Path, chat: &str) -> Self {
+        let key = (root.to_path_buf(), chat.to_owned());
+        let mut all = activity().lock().unwrap_or_else(|e| e.into_inner());
+        let mut overlapping_chat = false;
+        for ((other_root, _), state) in all.iter_mut() {
+            if other_root == root {
+                state.overlapping_chat = true;
+                overlapping_chat = true;
+            }
+        }
+        all.insert(
+            key.clone(),
+            Activity {
+                overlapping_chat,
+                ..Activity::default()
+            },
+        );
+        Self(key)
+    }
+    fn finish(self) -> Activity {
+        activity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0)
+            .unwrap_or_default()
+    }
+}
+impl Drop for Tracking {
+    fn drop(&mut self) {
+        activity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+pub(crate) fn app_write(root: &Path, id: Option<&str>) {
+    let mut all = activity().lock().unwrap_or_else(|e| e.into_inner());
+    for ((active_root, _), state) in all.iter_mut() {
+        if active_root == root {
+            if let Some(id) = id {
+                state.app_writes.insert(id.to_owned());
+            } else {
+                state.app_write_unknown = true;
+            }
+        }
+    }
+}
+
+pub(crate) fn receipt_model(completed: Option<&str>, observed: Option<&str>) -> String {
+    completed
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| observed.filter(|model| !model.trim().is_empty()))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+pub(crate) fn reference(root: &Path, path: &str) -> Option<String> {
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let root = root.canonicalize().ok()?;
+    let path = path.canonicalize().ok()?;
+    let parts: Vec<_> = path
+        .strip_prefix(root)
+        .ok()?
+        .iter()
+        .map(|s| s.to_str())
+        .collect::<Option<_>>()?;
+    match parts.as_slice() {
+        ["zettels", file] => file
+            .strip_suffix(".md")
+            .filter(|id| crate::archive_zet::valid_zet_id(id))
+            .map(str::to_owned),
+        ["objects", "sha256", prefix, hash]
+            if hash.is_ascii() && hash.len() == 64 && *prefix == &hash[..2] =>
+        {
+            let id = format!("sha256:{hash}");
+            crate::archive_zet::valid_asset_id(&id).then_some(id)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn capture(root: &Path) -> Result<Snapshot, String> {
+    let _guard = lock_app_write();
+    capture_unlocked(root)
+}
+pub(crate) fn capture_unlocked(root: &Path) -> Result<Snapshot, String> {
+    let mut found = Snapshot::new();
+    for folder in ["zettels", "objects"] {
+        let base = root.join(folder);
+        if !base.exists() {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&base).map_err(|e| e.to_string())?;
+        if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+            return Err("invalid archive folder".into());
+        }
+        for entry in WalkDir::new(&base).follow_links(false).min_depth(1) {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(&base)
+                .map_err(|e| e.to_string())?;
+            let parts: Vec<_> = relative.components().collect();
+            let reference = if folder == "zettels" && parts.len() == 1 {
+                relative
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.strip_suffix(".md"))
+                    .filter(|id| crate::archive_zet::valid_zet_id(id))
+                    .map(str::to_owned)
+            } else if folder == "objects" && parts.len() == 3 && parts[0].as_os_str() == "sha256" {
+                parts[2]
+                    .as_os_str()
+                    .to_str()
+                    .filter(|hash| {
+                        hash.len() == 64 && hash.is_ascii() && parts[1].as_os_str() == &hash[..2]
+                    })
+                    .map(|hash| format!("sha256:{hash}"))
+                    .filter(|id| crate::archive_zet::valid_asset_id(id))
+            } else {
+                None
+            };
+            let Some(reference) = reference else {
+                continue;
+            };
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+            if crate::archive_location::is_link_or_reparse(&metadata) {
+                continue;
+            }
+            let mut file = fs::File::open(entry.path()).map_err(|e| e.to_string())?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 65536];
+            loop {
+                let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            found.insert(reference, hasher.finalize().into());
+        }
+    }
+    Ok(found)
+}
+
+pub(crate) fn changes(before: &Snapshot, after: &Snapshot) -> BTreeMap<String, String> {
+    after
+        .iter()
+        .filter_map(|(id, hash)| match before.get(id) {
+            None => Some((id.clone(), "created".into())),
+            Some(old) if old != hash => Some((id.clone(), "edited".into())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Attribution {
+    actions: BTreeMap<String, String>,
+    evidence: BTreeMap<String, String>,
+    unknown_actor: Vec<String>,
+}
+
+fn attribute(
+    mut actions: BTreeMap<String, String>,
+    tool_writes: &BTreeSet<String>,
+    app_writes: &BTreeSet<String>,
+    overlapping_chat: bool,
+) -> Attribution {
+    actions.retain(|id, _| !app_writes.contains(id));
+    let mut evidence = BTreeMap::new();
+    let mut unknown_actor = Vec::new();
+    for id in actions.keys() {
+        if tool_writes.contains(id) {
+            evidence.insert(id.clone(), "tool".into());
+        } else {
+            evidence.insert(id.clone(), "diff".into());
+            if overlapping_chat {
+                unknown_actor.push(id.clone());
+            }
+        }
+    }
+    Attribution {
+        actions,
+        evidence,
+        unknown_actor,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record(
+    root: &Path,
+    database: &Path,
+    mut input: crate::archive_receipt::ReceiptCreate,
+    before: &Snapshot,
+    after: &Snapshot,
+) -> Result<bool, String> {
+    let actions = changes(before, after);
+    if actions.is_empty() && input.read.is_empty() {
+        return Ok(false);
+    }
+    input.wrote = actions.keys().cloned().collect();
+    crate::archive_receipt::create_with_actions(root, database, input, actions)?;
+    Ok(true)
+}
+
+pub(crate) fn record_tracked(
+    root: &Path,
+    database: &Path,
+    mut input: crate::archive_receipt::ReceiptCreate,
+    before: &Snapshot,
+    after: &Snapshot,
+    tool_writes: &BTreeSet<String>,
+    tracking: Tracking,
+) -> Result<bool, String> {
+    let activity = tracking.finish();
+    let result = attribute(
+        changes(before, after),
+        tool_writes,
+        &activity.app_writes,
+        activity.overlapping_chat || activity.app_write_unknown,
+    );
+    if result.actions.is_empty() && input.read.is_empty() {
+        return Ok(false);
+    }
+    input.wrote = result.actions.keys().cloned().collect();
+    crate::archive_receipt::create_with_evidence(
+        root,
+        database,
+        input,
+        result.actions,
+        result.evidence,
+        result.unknown_actor,
+    )?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn attribution_distinguishes_tool_diff_and_app_writes_during_overlap() {
+        let actions = [("a", "created"), ("b", "edited"), ("c", "edited")]
+            .into_iter()
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            .collect();
+        let result = attribute(
+            actions,
+            &BTreeSet::from(["a".into()]),
+            &BTreeSet::from(["c".into()]),
+            true,
+        );
+        assert_eq!(result.evidence.get("a").map(String::as_str), Some("tool"));
+        assert_eq!(result.evidence.get("b").map(String::as_str), Some("diff"));
+        assert_eq!(result.unknown_actor, ["b"]);
+        assert!(!result.actions.contains_key("c"));
+    }
+
+    #[test]
+    fn overlapping_rooms_record_evidence_without_inventing_actors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        fs::create_dir_all(root.join("zettels")).unwrap();
+        fs::create_dir_all(root.join("receipts")).unwrap();
+        let db = temp.path().join("test.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let first = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second = "chat_20261115_120001";
+        rusqlite::Connection::open(&db).unwrap().execute(
+            "INSERT INTO chats(id,title,created_at,updated_at) VALUES (?1,'','2026-11-15','2026-11-15')", [second]
+        ).unwrap();
+        let one = Tracking::start(&root, &first);
+        let two = Tracking::start(&root, second);
+        let before = capture(&root).unwrap();
+        let hash = "a".repeat(64);
+        fs::create_dir_all(root.join("objects/sha256/aa")).unwrap();
+        fs::write(
+            root.join("objects/sha256/aa").join(&hash),
+            b"RIFF\0\0\0\0WAVE",
+        )
+        .unwrap();
+        for (id, title) in [
+            ("zet_20261115_120000", "One"),
+            ("zet_20261115_120001", "Two"),
+            ("zet_20261115_120002", "User"),
+        ] {
+            let head = format!("---\nid: {id}\ntitle: {title}\nsummary: summary\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T12:00:00+09:00'\nupdated_at: '2026-11-15T12:00:00+09:00'\nassets: []\nedges: []\n---\nbody\n");
+            fs::write(root.join("zettels").join(format!("{id}.md")), head).unwrap();
+        }
+        app_write(&root, Some("zet_20261115_120002"));
+        let after = capture(&root).unwrap();
+        let input = crate::archive_receipt::ReceiptCreate {
+            tool: "codex".into(),
+            model: "model".into(),
+            chat: Some(first.clone()),
+            read: vec![],
+            wrote: vec![],
+            prompt: "request".into(),
+            changes: String::new(),
+        };
+        assert!(record_tracked(
+            &root,
+            &db,
+            input,
+            &before,
+            &after,
+            &BTreeSet::from(["zet_20261115_120000".into()]),
+            one
+        )
+        .unwrap());
+        let value =
+            serde_json::to_value(crate::chat_items::list(&root, &db, &first).unwrap()).unwrap();
+        let docs = value["documents"].as_array().unwrap();
+        let tool = docs
+            .iter()
+            .find(|x| x["id"] == "zet_20261115_120000")
+            .unwrap();
+        assert_eq!(tool["evidence"], "tool");
+        assert_eq!(tool["by"]["provider"], "codex");
+        let diff = docs
+            .iter()
+            .find(|x| x["id"] == "zet_20261115_120001")
+            .unwrap();
+        assert_eq!(diff["evidence"], "diff");
+        assert!(diff["by"].is_null());
+        assert!(!docs.iter().any(|x| x["id"] == "zet_20261115_120002"));
+        assert_eq!(value["media"][0]["evidence"], "diff");
+        assert!(value["media"][0]["by"].is_null());
+        let second_input = crate::archive_receipt::ReceiptCreate {
+            tool: "claude".into(),
+            model: "model".into(),
+            chat: Some(second.into()),
+            read: vec![],
+            wrote: vec![],
+            prompt: "request".into(),
+            changes: String::new(),
+        };
+        assert!(record_tracked(
+            &root,
+            &db,
+            second_input,
+            &before,
+            &after,
+            &BTreeSet::new(),
+            two
+        )
+        .unwrap());
+        let other =
+            serde_json::to_value(crate::chat_items::list(&root, &db, second).unwrap()).unwrap();
+        let other_docs = other["documents"].as_array().unwrap();
+        let other_diff = other_docs
+            .iter()
+            .find(|x| x["id"] == "zet_20261115_120001")
+            .unwrap();
+        assert_eq!(other_diff["evidence"], "diff");
+        assert!(other_diff["by"].is_null());
+        assert!(!other_docs.iter().any(|x| x["id"] == "zet_20261115_120002"));
+        let reverse = serde_json::to_value(
+            crate::archive_receipt::chats_for_reference(&root, &db, "zet_20261115_120001").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reverse.as_array().unwrap().len(), 2);
+        assert!(reverse
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["by"].is_null()));
+        let mut media = crate::media::collect(&root.join("objects"), &db, None, None, 10).unwrap();
+        crate::chat_items::enrich_media(&root, &db, &mut media).unwrap();
+        let media = serde_json::to_value(media).unwrap();
+        assert_eq!(media[0]["evidence"], "diff");
+        assert!(media[0]["by"].is_null());
+    }
+
+    #[test]
+    fn app_document_edit_is_not_recorded_as_ai_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        fs::create_dir_all(root.join("zettels")).unwrap();
+        fs::create_dir_all(root.join("receipts")).unwrap();
+        let db = temp.path().join("test.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let id = "zet_20261115_120000";
+        fs::write(root.join("zettels").join(format!("{id}.md")), "---\nid: zet_20261115_120000\ntitle: One\nsummary: summary\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T12:00:00+09:00'\nupdated_at: '2026-11-15T12:00:00+09:00'\nassets: []\nedges: []\n---\nbefore\n").unwrap();
+        let tracking = Tracking::start(&root, &chat);
+        let before = capture(&root).unwrap();
+        {
+            let _guard = lock_app_write();
+            app_write(&root, Some(id));
+            crate::archive_zet::update_checked(
+                &root,
+                &db,
+                id,
+                crate::archive_zet::ZetUpdate {
+                    title: None,
+                    summary: None,
+                    body: Some("edited by user".into()),
+                    status: None,
+                    assets: None,
+                    edges: None,
+                },
+                None,
+            )
+            .unwrap();
+        }
+        let after = capture(&root).unwrap();
+        assert_eq!(
+            changes(&before, &after).get(id).map(String::as_str),
+            Some("edited")
+        );
+        let input = crate::archive_receipt::ReceiptCreate {
+            tool: "codex".into(),
+            model: "model".into(),
+            chat: Some(chat),
+            read: vec![],
+            wrote: vec![],
+            prompt: String::new(),
+            changes: String::new(),
+        };
+        assert!(!record_tracked(
+            &root,
+            &db,
+            input,
+            &before,
+            &after,
+            &BTreeSet::new(),
+            tracking
+        )
+        .unwrap());
+    }
+    #[test]
+    fn interrupted_reply_uses_only_an_observed_model() {
+        assert_eq!(receipt_model(None, Some("actual-model")), "actual-model");
+        assert_eq!(
+            receipt_model(Some("saved-model"), Some("actual-model")),
+            "saved-model"
+        );
+        assert_eq!(receipt_model(None, None), "");
+        assert_eq!(
+            receipt_model(Some(""), Some("actual-model")),
+            "actual-model"
+        );
+    }
+    #[test]
+    fn detects_created_and_modified_files_by_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("zettels")).unwrap();
+        let old = dir.path().join("zettels/zet_20261115_120000.md");
+        let new = dir.path().join("zettels/zet_20261115_120001.md");
+        fs::write(&old, "하나").unwrap();
+        let before = capture(dir.path()).unwrap();
+        fs::write(&old, "둘").unwrap();
+        fs::write(&new, "셋").unwrap();
+        let result = changes(&before, &capture(dir.path()).unwrap());
+        assert_eq!(
+            result.get("zet_20261115_120000").map(String::as_str),
+            Some("edited")
+        );
+        assert_eq!(
+            result.get("zet_20261115_120001").map(String::as_str),
+            Some("created")
+        );
+    }
+
+    #[test]
+    fn change_receipt_reaches_chat_and_media_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        fs::create_dir_all(root.join("zettels")).unwrap();
+        fs::create_dir_all(root.join("receipts")).unwrap();
+        let hash = "a".repeat(64);
+        let asset = format!("sha256:{hash}");
+        fs::create_dir_all(root.join("objects/sha256/aa")).unwrap();
+        let db = dir.path().join("test.db");
+        crate::storage::initialize(&db, &dir.path().join("backups"), "test").unwrap();
+        let id = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let document = root.join("zettels/zet_20261115_120000.md");
+        let header = "---\nid: zet_20261115_120000\ntitle: 수업\nsummary: 요약\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T12:00:00+09:00'\nupdated_at: '2026-11-15T12:00:00+09:00'\nassets: []\nedges: []\n---\n";
+        fs::write(&document, format!("{header}이전")).unwrap();
+        let tracking = Tracking::start(&root, &id);
+        let before = capture(&root).unwrap();
+        fs::write(&document, format!("{header}변경")).unwrap();
+        fs::write(
+            root.join("objects/sha256/aa").join(&hash),
+            b"RIFF\0\0\0\0WAVE",
+        )
+        .unwrap();
+        let after = capture(&root).unwrap();
+        let receipt = crate::archive_receipt::ReceiptCreate {
+            tool: "codex".into(),
+            model: "test-model".into(),
+            chat: Some(id.clone()),
+            read: vec![],
+            wrote: vec![],
+            prompt: "고쳐 주세요".into(),
+            changes: String::new(),
+        };
+        assert!(record_tracked(
+            &root,
+            &db,
+            receipt,
+            &before,
+            &after,
+            &BTreeSet::from(["zet_20261115_120000".into()]),
+            tracking
+        )
+        .unwrap());
+        let listed =
+            serde_json::to_value(crate::chat_items::list(&root, &db, &id).unwrap()).unwrap();
+        assert_eq!(listed["documents"][0]["how"], "edited");
+        assert_eq!(listed["documents"][0]["evidence"], "tool");
+        assert_eq!(listed["documents"][0]["by"]["model"], "test-model");
+        assert_eq!(listed["media"][0]["id"], asset);
+        assert_eq!(listed["media"][0]["how"], "created");
+        assert_eq!(listed["media"][0]["evidence"], "diff");
+        let mut media = crate::media::collect(&root.join("objects"), &db, None, None, 10).unwrap();
+        crate::chat_items::enrich_media(&root, &db, &mut media).unwrap();
+        let media = serde_json::to_value(media).unwrap();
+        assert_eq!(media[0]["how"], "created");
+        assert_eq!(media[0]["evidence"], "diff");
+        assert_eq!(media[0]["by"]["provider"], "codex");
+    }
+
+    #[test]
+    fn records_changes_without_inventing_a_model_after_an_unfinished_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        fs::create_dir_all(root.join("zettels")).unwrap();
+        fs::create_dir_all(root.join("receipts")).unwrap();
+        let db = dir.path().join("test.db");
+        crate::storage::initialize(&db, &dir.path().join("backups"), "test").unwrap();
+        let id = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let before = capture(&root).unwrap();
+        fs::write(root.join("zettels/zet_20261115_120000.md"), "---\nid: zet_20261115_120000\ntitle: 수업\nsummary: 요약\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T12:00:00+09:00'\nupdated_at: '2026-11-15T12:00:00+09:00'\nassets: []\nedges: []\n---\n본문\n").unwrap();
+        let after = capture(&root).unwrap();
+        let input = crate::archive_receipt::ReceiptCreate {
+            tool: "claude".into(),
+            model: String::new(),
+            chat: Some(id.clone()),
+            read: vec![],
+            wrote: vec![],
+            prompt: "요청".into(),
+            changes: String::new(),
+        };
+        assert!(record(&root, &db, input, &before, &after).unwrap());
+        let items =
+            serde_json::to_value(crate::chat_items::list(&root, &db, &id).unwrap()).unwrap();
+        assert_eq!(items["documents"][0]["how"], "created");
+        assert_eq!(items["documents"][0]["by"]["provider"], "claude");
+        assert!(items["documents"][0]["by"]["model"].is_null());
+    }
+}

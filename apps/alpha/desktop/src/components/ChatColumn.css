@@ -1,0 +1,231 @@
+/*
+ * 대화 칸을 가운데 칸으로 옮기면서 바꾼 모양(2026-11-15, 세 칸 구성).
+ * App.css 의 예전 규칙(오른쪽 좁은 칸에 맞춘 것)은 그대로 두고 여기서 덮는다.
+ * Codex 앱과 Claude 앱의 대화 칸처럼, 넓은 칸 가운데에 글이 읽기 좋은 폭으로 놓이고 입력 칸이 그 아래에 있다.
+ * 색은 App.css 의 기존 값만 쓴다.
+ */
+
+.workbench-grid .assistant-panel {
+  --chat-column: 760px;
+  --chat-gutter: max(24px, calc((100% - var(--chat-column)) / 2));
+  /* 맨 위 줄과 대화. 막대 목차와 입력 칸은 칸 위에 떠 있다. */
+  grid-template-rows: 56px minmax(0, 1fr);
+  border-left: 0;
+  /* 가운데 칸은 화면의 바탕이다. 목록 칸(조금 어두운 바탕)과 구분된다. */
+  background: var(--surface);
+}
+
+/* 맨 위 줄은 칸 전체 폭을 쓴다(왼쪽에 대화 이름, 오른쪽 끝에 패널 단추). */
+.workbench-grid .assistant-header {
+  padding: 8px 12px 8px 14px;
+}
+
+.chat-title {
+  min-width: 0;
+  margin: 0;
+  padding: 0 6px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 32px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-title-button {
+  max-width: 100%;
+  height: 32px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  text-align: left;
+  cursor: text;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.chat-title-button:hover {
+  border-color: var(--line);
+  background: var(--surface-soft);
+}
+
+.chat-title-input {
+  width: min(420px, 100%);
+  height: 32px;
+  padding: 0 6px;
+  border: 1px solid #8aa4bd;
+  border-radius: 6px;
+  outline: 0;
+  background: var(--surface);
+  box-shadow: 0 0 0 3px rgba(49, 95, 143, 0.08);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.workbench-grid .message-stream {
+  /* 아래 여백은 입력 칸 높이만큼(AssistantPanel 이 --composer-space 를 잰다). */
+  padding: 16px var(--chat-gutter) calc(var(--composer-space, 96px) + 28px);
+}
+
+/* 말의 모양(2026-11-16, 두 앱처럼): 이름표와 그림 상자 없음. 내 말은 오른쪽 말풍선, AI 의 답은 바탕 위 글. */
+.workbench-grid .message {
+  display: block;
+  margin-top: 22px;
+}
+
+.workbench-grid .message:first-child {
+  margin-top: 0;
+}
+
+.workbench-grid .message p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+.workbench-grid .message.user {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.workbench-grid .message.user p {
+  max-width: min(80%, 560px);
+  padding: 9px 13px;
+  border-radius: 14px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: keep-all;
+}
+
+.workbench-grid .message.assistant p {
+  color: var(--ink);
+  white-space: pre-wrap;
+  word-break: keep-all;
+}
+
+/* 답한 회사의 로고: 감싸지 않고 답 머리에 작게(SCREEN_RULES 2절). 올리면 모델 이름. */
+.message-by {
+  display: inline-flex;
+  margin-bottom: 4px;
+}
+
+.message-by-mark {
+  width: 18px;
+  height: 18px;
+}
+
+/* b: 회사마다 아주 조금 다른 글자 색. 흰 바탕 대비 Codex 13.6:1, Claude 13.7:1, Gemini 14.0:1(기본 글자 14.3:1). */
+[data-answer-style='b'] .message.assistant[data-provider='codex'] p { color: #26302c; }
+[data-answer-style='b'] .message.assistant[data-provider='claude'] p { color: #3a2a22; }
+[data-answer-style='b'] .message.assistant[data-provider='gemini'] p { color: #202c44; }
+
+.workbench-grid .thinking {
+  font-size: 12px;
+}
+
+.workbench-grid .composer-dock {
+  padding: 4px var(--chat-gutter) 12px;
+}
+
+.workbench-grid .composer-dock::before {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.92) 42%, #ffffff 72%);
+}
+
+.workbench-grid .prompt-composer textarea {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.workbench-grid .composer-tools {
+  font-size: 11px;
+}
+
+/* 답한 곳과 모델. 이름 옆에 흐린 글씨로 작게 둔다(Claude 앱과 Codex 앱은 답마다 모델을 보이지 않는다). */
+
+
+/* 곳을 바꿔 보냈는데 앞의 대화를 넘기지 못했을 때, 그 답 위에 한 줄. */
+.message-notice {
+  margin: 22px 0 -14px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  word-break: keep-all;
+}
+
+.message-notice:first-child {
+  margin-top: 0;
+}
+
+/* 답의 글(보는 창의 그리는 도구). 채팅방 글 크기에 맞춘다. */
+.workbench-grid .message.assistant .zet-md {
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+.workbench-grid .message.assistant .zet-md h2 { font-size: 16px; }
+.workbench-grid .message.assistant .zet-md h3 { font-size: 14.5px; }
+
+/* 답을 쓰는 중: 흐린 글 하나, 숨 쉬듯 옅어졌다 짙어진다. */
+.workbench-grid .thinking {
+  display: inline-block;
+  color: var(--muted);
+  font-size: 12.5px;
+  animation: thinking-breathe 1.8s ease-in-out infinite;
+}
+
+@keyframes thinking-breathe {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workbench-grid .thinking { animation: none; }
+}
+
+/* 예전 이름표용 규칙(App.css 의 .message strong, .message p)이 답 안의 굵은 글씨와 문단에 닿지 않게 되돌린다. */
+.workbench-grid .message.assistant .zet-md strong {
+  display: inline;
+  margin: 0;
+  font-size: inherit;
+  font-weight: 700;
+}
+
+.workbench-grid .message.assistant .zet-md p {
+  margin: 0 0 0.75em;
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  white-space: normal;
+}
+
+.workbench-grid .message.assistant .zet-md > :last-child,
+.workbench-grid .message.assistant .zet-md li > p:last-child {
+  margin-bottom: 0;
+}
+
+/* 채팅방 이름이 바뀔 때 새 이름이 부드럽게 나타난다. */
+.chat-title-text { display: inline-block; animation: chat-title-swap 260ms var(--material-ease) both; }
+@keyframes chat-title-swap { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .chat-title-text { animation: none; } }
+
+/* 내 말에 고른 스킬: 말풍선 바로 위, 오른쪽에 작게(그림 + 스킬 이름). */
+.workbench-grid .message.user .message-skill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(40, 43, 42, 0.07);
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.workbench-grid .message.user .message-skill + p { margin-top: 0; }

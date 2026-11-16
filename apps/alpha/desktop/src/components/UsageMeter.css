@@ -1,0 +1,249 @@
+/* 아이콘 띠 아래쪽의 사용량. 곳마다 단추 하나(2026-11-16 다시 만듦).
+   단추 38px(띠의 다른 단추와 같음), 로고 칸 26px(띠의 몸소 표시와 같음), 고리 지름 34px·선 2px.
+   로고는 띠 바탕 위에 바로 둔다. ChatGPT 로고만 같은 파일의 흰색판(ProviderMark 의 onDark)을 쓴다. */
+
+.usage-meter {
+  display: grid;
+  gap: 4px;
+  justify-items: center;
+  margin: auto 0 8px;
+}
+
+/* 사용량이 띠의 아래쪽을 차지하므로 설정 단추는 바로 그 아래에 붙는다. */
+.usage-meter + .rail-settings {
+  margin-top: 0;
+}
+
+.usage-button {
+  position: relative;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+.usage-button:hover:not([aria-disabled='true']),
+.usage-button[data-open='true'] {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.usage-button[aria-disabled='true'] {
+  cursor: default;
+}
+
+.usage-button:focus-visible {
+  outline: 2px solid #a4c8b2;
+  outline-offset: 0;
+}
+
+.usage-ring {
+  position: absolute;
+  inset: 0;
+  width: 38px;
+  height: 38px;
+  transform: rotate(-90deg);
+  pointer-events: none;
+}
+
+.usage-ring circle {
+  fill: none;
+  stroke-width: 2;
+}
+
+.usage-ring-track {
+  stroke: rgba(255, 255, 255, 0.14);
+}
+
+.usage-ring-fill {
+  stroke: #e8ebe9;
+  stroke-linecap: round;
+}
+
+.usage-logo {
+  width: 26px;
+  height: 26px;
+}
+
+/* 펼친 것 */
+
+.usage-panel {
+  position: fixed;
+  z-index: 50;
+  width: 260px;
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--ink);
+  animation: usage-panel-enter 160ms var(--material-ease) both;
+}
+
+.usage-row-head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.usage-row-head strong {
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.usage-row-plan {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-windows {
+  display: grid;
+  gap: 10px;
+}
+
+.usage-window {
+  display: grid;
+  gap: 4px;
+}
+
+.usage-window-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.usage-window-bar {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: var(--surface-muted);
+}
+
+.usage-window-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--ink-soft);
+}
+
+.usage-window-reset {
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.4;
+}
+
+.usage-panel-checked {
+  margin: 10px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+@keyframes usage-panel-enter {
+  from { opacity: 0; transform: translateX(-4px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .usage-panel { animation: none; }
+}
+
+/* 띠 위에서는 Claude 와 Gemini 로고가 ChatGPT 로고보다 작아 보여(첫 화면 비율 70%, 76%) 조금 키운다.
+   로고 칸 26px 기준 ChatGPT 26px, Claude 21px(80%), Gemini 22px(84%). 올렸을 때의 효과도 같은 자리에 맞춘다. */
+.usage-logo.provider-mark--claude img { width: 80%; height: 80%; }
+.usage-logo .claude-motion { inset: 10%; width: 80%; height: 80%; }
+.usage-logo.provider-mark--gemini img { width: 84%; height: 84%; }
+.usage-logo.provider-mark--gemini::after { inset: 8%; }
+
+/* 새로 읽는 동안 단추 옆에 잠깐 뜨는 안내. 작은 어두운 꼬리표, 글자 위로 빛이 천천히 지나간다. */
+.usage-loading {
+  position: fixed;
+  z-index: 50;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: #3a3f3c;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  font-size: 11.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translateY(-50%);
+  animation: usage-loading-enter 160ms var(--material-ease) both;
+}
+
+.usage-loading[data-leaving='true'] {
+  animation: usage-loading-leave 180ms ease both;
+}
+
+@keyframes usage-loading-leave {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+.usage-loading-text {
+  color: transparent;
+  background-image: linear-gradient(100deg, #b9c0bc 35%, #ffffff 50%, #b9c0bc 65%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: usage-loading-shine 1.6s linear infinite;
+}
+
+@keyframes usage-loading-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes usage-loading-shine {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .usage-loading { animation: none; }
+  .usage-loading-text { animation: none; color: #e8ebe9; background-image: none; }
+}
+.usage-logo .claude-motion { overflow: visible; }
+
+/* 갈래 이름 옆의 모델(그 모델만 따로 세는 갈래) */
+.usage-window-name {
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.usage-window-scope {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 띠의 고리가 그리는 갈래(가장 적게 남은 것): 막대를 짙게 */
+.usage-window.is-lowest .usage-window-bar span {
+  background: var(--ink);
+}
+
+.usage-window.is-lowest .usage-window-line > span:last-child {
+  color: var(--ink);
+  font-weight: 650;
+}

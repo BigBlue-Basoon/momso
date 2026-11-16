@@ -1,0 +1,40 @@
+.ai-welcome { overflow: auto; background: #f8f9f7; color: #222927; }
+.ai-welcome-inner { max-width: 1120px; margin: 0 auto; padding: 64px 48px 48px; }
+.ai-welcome-heading { margin-bottom: 38px; }
+.ai-welcome-heading h1 { margin: 0 0 11px; font-size: 32px; line-height: 1.35; letter-spacing: 0; }
+.ai-welcome-heading p { margin: 0; color: #6b7672; font-size: 16px; }
+.ai-provider-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.ai-provider { display: flex; flex-direction: column; align-items: stretch; text-align: left; min-width: 0; min-height: 330px; padding: 24px; border: 1px solid #dce2de; border-radius: 8px; background: white; color: #26302c; cursor: pointer; font: inherit; transition: border-color .16s, box-shadow .16s, transform .16s; }
+.ai-provider:hover { border-color: #afbbb5; }
+.ai-provider.is-selected { border-color: #d95d51; box-shadow: 0 0 0 1px #d95d51; }
+.ai-provider:focus-visible, .ai-welcome-continue:focus-visible { outline: 3px solid #e99387; outline-offset: 3px; }
+.ai-provider-top { display: flex; align-items: center; gap: 12px; margin-bottom: 25px; }
+/* 로고와 올렸을 때의 효과는 ProviderMark.css 에 있다(사용량 표시와 같이 쓴다). */
+.ai-provider-mark { width: 48px; height: 48px; }
+.ai-provider-identity { display: grid; gap: 3px; flex: 1; }
+.ai-provider-identity strong { font-size: 17px; }
+.ai-provider-identity small { font-size: 12px; color: #7d8882; }
+.ai-provider-check { display: grid; place-items: center; width: 22px; height: 22px; border: 1px solid #d6ddd9; border-radius: 50%; color: white; }
+.is-selected .ai-provider-check { background: #d95d51; border-color: #d95d51; }
+.ai-provider-title { font-size: 17px; font-weight: 700; margin-bottom: 20px; }
+.ai-provider-label { color: #89928d; font-size: 12px; font-weight: 700; margin-bottom: 7px; }
+.ai-provider-copy { color: #53605a; font-size: 13px; line-height: 1.65; margin-bottom: 19px; word-break: keep-all; }
+.ai-provider-chatgpt { background: #f6f7f4; border-color: #d7ddda; }
+.ai-provider-chatgpt .ai-provider-title { color: #1e3c30; }
+.ai-provider-claude { background: #faf5ee; border-color: #e6dcd0; color: #382e2a; }
+.ai-provider-claude .ai-provider-title { color: #a4543b; }
+.ai-provider-claude .ai-provider-copy { color: #65544a; }
+.ai-provider-gemini { background: linear-gradient(145deg, #16171f 0%, #22202a 66%, #30243a 100%); border-color: #393744; color: #f6f4f8; }
+.ai-provider-gemini .ai-provider-identity small, .ai-provider-gemini .ai-provider-label { color: #c0bac9; }
+.ai-provider-gemini .ai-provider-copy { color: #e0dde6; }
+.ai-provider-gemini .ai-provider-title { color: #f3e6f7; }
+.ai-provider-gemini .ai-provider-check { border-color: #aaa2b8; }
+.ai-provider-gemini::after { content: ''; display: block; height: 3px; width: 100%; margin-top: auto; border-radius: 3px; background: linear-gradient(90deg, #83aaff, #af8fe3, #e898ae, #e9bc87); }
+@media (prefers-reduced-motion: reduce) { .ai-provider { transition: none; } }
+.ai-welcome-footer { display: flex; justify-content: space-between; align-items: center; gap: 24px; padding-top: 28px; }
+.ai-welcome-footer p { margin: 0 0 7px; color: #4b5851; font-size: 13px; }
+.ai-welcome-footer small { color: #89928d; font-size: 12px; }
+.ai-welcome-continue { display: flex; align-items: center; justify-content: center; gap: 12px; min-width: 190px; padding: 14px 18px; border: 0; border-radius: 6px; color: white; background: #d95d51; font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; }
+.ai-welcome-continue:disabled { background: #d4d9d6; cursor: default; }
+.ai-welcome-status { font-size: 13px; color: #7a5148; text-align: right; }
+@media (max-width: 850px) { .ai-welcome-inner { padding: 40px 24px; } .ai-provider-grid { grid-template-columns: 1fr; } .ai-provider { min-height: 0; } .ai-welcome-footer { align-items: stretch; flex-direction: column; } }
