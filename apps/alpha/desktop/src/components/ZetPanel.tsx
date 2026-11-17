@@ -1,5 +1,7 @@
 import {
+  createContext,
   useCallback,
+  useContext,
   useEffect,
   useId,
   useMemo,
@@ -7,16 +9,22 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from 'react'
 import { createPortal } from 'react-dom'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { ArrowLeft, Check, FileText, PanelRight, Pencil, Plus, RefreshCw, ScrollText, Search, Undo2, X } from 'lucide-react'
+import { MenuItem, RowMenu } from './ChatSidebar'
+import { SourceDeleteDialog, type SourceNotice } from './SourceDelete'
+import { openSourceAsset } from '../source-assets'
+import { isFirstReceiving } from '../restore-progress'
 import {
   archiveErrorMessage,
   isChangedMeanwhileError,
   isUnsavedError,
   listZets,
   openWebAddress,
+  deleteReceipt,
   readReceipt,
   readZet,
   readZetHistory,
@@ -284,11 +292,16 @@ type ZetPanelProps = {
   onClose: () => void
   /** 패널을 여닫는 단추를 눌렀을 때. 패널이 열려 있는 동안 단추는 탭 줄 끝에 있다. */
   onToggle: () => void
-  onNotice: (message: string) => void
+  onNotice: SourceNotice
+  /** 사진·소리·영상 원자료를 열 때 미디어 화면으로. */
+  onOpenMedia?: () => void
   /** 지금 연 채팅방(홈의 패널). 새 채팅방이면 null. */
   chatId?: string | null
   /** 그 채팅방에서 다룬 문서와 미디어. undefined 면 명령이 없어 예전처럼 문서 전체를 보인다. null 이면 읽는 중. */
   chatItems?: ChatItems | null
+  /** 이 채팅방에서 다룬 것을 읽지 못했다. */
+  chatItemsFailed?: boolean
+  onRetryChatItems?: () => void
   /** 미디어를 크게 보다가 채팅방 이름을 눌렀을 때. */
   onOpenChat?: (chatId: string) => void
 }
@@ -305,7 +318,10 @@ export function ZetPanel({
   onNotice,
   chatId = null,
   chatItems,
+  chatItemsFailed = false,
+  onRetryChatItems,
   onOpenChat,
+  onOpenMedia,
 }: ZetPanelProps) {
   const byChat = variant === 'side' && chatItems !== undefined
   const scope = byChat ? `chat:${chatId ?? 'new'}` : 'all'
@@ -411,6 +427,17 @@ export function ZetPanel({
     })
     setActiveKey(key)
   }, [setActiveKey])
+
+  // 원자료 열기(2026-11-17, source_asset_open): 글이면 첨부파일과 같은 길(패널의 새 탭), 사진·소리·영상이면 미디어 화면.
+  const openSource = useCallback((id: string, name: string | null) => {
+    openSourceAsset(id).then((opened) => {
+      if (opened.state === 'ok' && opened.kind && opened.kind !== 'text') { onOpenMedia?.(); return }
+      if (opened.state === 'not_found') { onNotice(W.gallery.fileNotFound); return }
+      // 글이거나 글로 열 수 없다는 상태(not_text·invalid_encoding)면 패널 탭이 그 상태를 한 줄로 알린다.
+      if (opened.state === 'ok' || opened.state === 'not_text' || opened.state === 'invalid_encoding') { openFile(id, name ?? W.rawMaterial); return }
+      onNotice(W.sourceDelete.openFailed)
+    }).catch(() => onNotice(W.sourceDelete.openFailed))
+  }, [onNotice, onOpenMedia, openFile])
 
   function showList() {
     const first = listTab(scope)
@@ -558,6 +585,8 @@ export function ZetPanel({
   }
 
   return (
+    <SourceOpenContext.Provider value={openSource}>
+    <PanelNoticeContext.Provider value={onNotice}>
     <aside className="zet-panel" data-variant={variant} aria-label={W.document} aria-hidden={!open}>
       <div className="zet-panel-frame" inert={!open}>
         <div
@@ -577,7 +606,7 @@ export function ZetPanel({
         />
 
         <header className="zet-tabbar">
-          <div className="zet-tabs" role="tablist" aria-label={W.zetPanel.aria2}>
+          <div className="zet-tabs" role="tablist" aria-label={W.zetPanel.aria2} onKeyDown={moveBetweenTabs}>
             {shown.map((tab) => {
               const title = tabTitle(tab)
               const isActive = tab.key === activeKey
@@ -645,7 +674,7 @@ export function ZetPanel({
             <section key={tab.key} className="zet-pane" role="tabpanel" aria-label={tabTitle(tab)} hidden={tab.scope !== scope || tab.key !== activeKey}>
               {tab.kind === 'list' ? (
                 byChat && tab.scope !== 'all'
-                  ? (tab.scope === scope ? <ChatItemsView items={chatItems ?? null} onOpenZet={openZet} onOpenFile={openFile} onOpenChat={onOpenChat} /> : null)
+                  ? (tab.scope === scope ? <ChatItemsView items={chatItems ?? null} failed={chatItemsFailed} onRetry={onRetryChatItems} onOpenZet={openZet} onOpenFile={openFile} onOpenChat={onOpenChat} onNotice={onNotice} /> : null)
                   : <ZetListView list={list} onOpen={openZet} onReload={reloadList} />
               ) : tab.kind === 'zet' ? (
                 <ZetDocumentView
@@ -669,13 +698,15 @@ export function ZetPanel({
               ) : tab.kind === 'file' ? (
                 <AttachmentTextView assetId={tab.id} title={tab.title} onOpenZet={openZet} onOpenAddress={openAddress} />
               ) : (
-                <ReceiptView id={tab.id} onOpenZet={openZet} onOpenAddress={openAddress} />
+                <ReceiptView id={tab.id} onOpenZet={openZet} onOpenAddress={openAddress} onDeleted={() => { removeTab(tab.key); onNotice(W.receiptDelete.done) }} onFailed={(reason) => onNotice(archiveErrorMessage(reason, W.receiptDelete.failed))} />
               )}
             </section>
           ))}
         </div>
       </div>
     </aside>
+    </PanelNoticeContext.Provider>
+    </SourceOpenContext.Provider>
   )
 }
 
@@ -711,14 +742,21 @@ type ChatItemsTab = 'documents' | 'media' | 'files'
  * 첨부파일(T42 files, 글 파일 등)은 Codex 앱의 "소스" 패널처럼 파일 이름과 "첨부", 때를 한 줄씩 보이고,
  * 누르면 그 글이 패널의 새 탭으로 열린다(attachment_text_read, 2026-11-16 그의 말 "txt나 md가 오른쪽 패널에 보여야").
  */
-function ChatItemsView({ items, onOpenZet, onOpenFile, onOpenChat }: {
+function ChatItemsView({ items, failed = false, onRetry, onOpenZet, onOpenFile, onOpenChat, onNotice }: {
   items: ChatItems | null
+  failed?: boolean
+  onRetry?: () => void
   onOpenZet: (id: string) => void
   onOpenFile: (id: string, title: string) => void
   onOpenChat?: (chatId: string) => void
+  onNotice?: SourceNotice
 }) {
   const [view, setView] = useState<ChatItemsTab>('documents')
-  if (!items) return <PaneMessage text={W.zetPanel.text26} />
+  // 잘못 첨부한 파일 지우기(첨부파일 줄의 메뉴). 지우거나 되살리면 이 채팅방에서 다룬 것을 다시 읽는다.
+  const [deleting, setDeleting] = useState<{ id: string; name: string } | null>(null)
+  // 읽지 못했으면 "불러오는 중"에 멈춰 있지 않게 그 줄과 다시 불러오기, 읽는 동안은 "불러오는 중"(2026-11-17 본부 결정).
+  if (!items && failed) return <PaneMessage text={W.zetPanel.chatItemsFailed} onRetry={onRetry} />
+  if (!items) return <PaneMessage text={W.zetPanel.chatItemsLoading} />
   const counts: Record<ChatItemsTab, number> = { documents: items.documents.length, media: items.media.length, files: items.files.length }
   const present = (['documents', 'media', 'files'] as const).filter((id) => counts[id] > 0)
   if (present.length === 0) return <PaneMessage text={W.gallery.chatEmpty} />
@@ -729,7 +767,7 @@ function ChatItemsView({ items, onOpenZet, onOpenFile, onOpenChat }: {
   return (
     <div className="chat-items">
       {present.length > 1 && (
-        <div className="chat-items-tabs" role="tablist">
+        <div className="chat-items-tabs" role="tablist" onKeyDown={moveBetweenTabs}>
           {present.map((id) => (
             <button key={id} type="button" role="tab" aria-selected={current === id} className={current === id ? 'is-active' : undefined} onClick={() => setView(id)}>
               {tabName[id]}
@@ -741,11 +779,16 @@ function ChatItemsView({ items, onOpenZet, onOpenFile, onOpenChat }: {
       {current === 'files' ? (
         <ul className="zet-rows chat-item-rows chat-file-rows">
           {files.map((entry) => (
-            <li key={entry.id}>
+            <li key={entry.id} className="chat-file-item">
               <button className="zet-row chat-file-row" type="button" onClick={() => onOpenFile(entry.id, entry.title)}>
                 <span className="chat-file-name"><FileText size={14} strokeWidth={1.75} aria-hidden /><strong>{entry.title}</strong></span>
                 <span className="zet-row-meta"><ItemDid how={entry.how} by={entry.by} at={entry.at ?? entry.createdAt} /></span>
               </button>
+              {onNotice && (
+                <RowMenu label={W.sourceDelete.menu(entry.title)}>
+                  {(close) => <MenuItem close={close} onSelect={() => setDeleting({ id: entry.id, name: entry.title })}>{W.sourceDelete.trash}</MenuItem>}
+                </RowMenu>
+              )}
             </li>
           ))}
         </ul>
@@ -763,8 +806,11 @@ function ChatItemsView({ items, onOpenZet, onOpenFile, onOpenChat }: {
         </ul>
       ) : (
         <div className="chat-items-media">
-          <MediaGallery items={items.media} rowHeight={104} groupByDay={false} onOpenChat={onOpenChat} />
+          <MediaGallery items={items.media} rowHeight={104} groupByDay={false} onOpenChat={onOpenChat} onNotice={onNotice} onChanged={onRetry} />
         </div>
+      )}
+      {deleting && onNotice && (
+        <SourceDeleteDialog assetId={deleting.id} name={deleting.name} onClose={() => setDeleting(null)} onNotice={onNotice} onChanged={() => onRetry?.()} />
       )}
     </div>
   )
@@ -971,6 +1017,7 @@ function ZetDocumentView({
   onRestored: () => void
 }) {
   const viewsId = useId()
+  const notice = useContext(PanelNoticeContext)
   const [view, setView] = useState<DocumentView>('body')
   const [seen, setSeen] = useState({ linked: false, history: false })
   const [version, setVersion] = useState<ZetHistoryEntry | null>(null)
@@ -1031,6 +1078,7 @@ function ZetDocumentView({
       return true
     }
 
+    if (isFirstReceiving()) { setSaveError(W.restoreProgress.docBusy); return false }
     setSaving(true)
     setSaveError(null)
     setChangedMeanwhile(false)
@@ -1179,7 +1227,7 @@ function ZetDocumentView({
       <ZetHeadBlock head={head} />
 
       <div className="zet-viewbar">
-        <div className="glass-segmented zet-views" data-active={view} role="tablist" aria-label={W.zetPanel.aria7}>
+        <div className="glass-segmented zet-views" data-active={view} role="tablist" aria-label={W.zetPanel.aria7} onKeyDown={moveBetweenTabs}>
           <span className="glass-slider" aria-hidden />
           {DOCUMENT_VIEWS.map((item) => (
             <button
@@ -1202,6 +1250,8 @@ function ZetDocumentView({
             className="secondary-button zet-edit-start"
             type="button"
             onClick={() => {
+              // 처음 받아 오는 동안은 뒤쪽이 문서 쓰기를 거절한다. 고치기를 열지 않고 알림 줄 하나(채팅방을 막을 때와 같은 방식).
+              if (isFirstReceiving()) { notice?.(W.restoreProgress.docBusy); return }
               baseHash.current = current.contentHash
               setDraft({ title: head.title, summary: head.summary, body })
             }}
@@ -1235,7 +1285,12 @@ function ZetDocumentView({
               id={id}
               entry={version}
               latestRevision={latestRevision}
-              onBack={() => setVersion(null)}
+              onBack={() => {
+                // 이전 버전 목록의 그 줄로 초점을 돌려놓는다(키보드로 열었을 때).
+                const revision = version.revision
+                setVersion(null)
+                window.requestAnimationFrame(() => document.querySelector<HTMLElement>(`.zet-link-row[data-revision="${CSS.escape(revision)}"]`)?.focus())
+              }}
               onOpenZet={onOpenZet}
               onOpenAddress={onOpenAddress}
               onRestored={() => {
@@ -1263,7 +1318,7 @@ function ZetDocumentView({
                       ].filter(Boolean)
                       return (
                         <li key={entry.revision}>
-                          <button className="zet-link-row" type="button" onClick={() => setVersion(entry)}>
+                          <button className="zet-link-row" type="button" data-revision={entry.revision} onClick={() => setVersion(entry)}>
                             <strong>{formatDateTimeSeconds(entry.time)}</strong>
                             {notes.map((note) => <span key={note}>{note}</span>)}
                           </button>
@@ -1291,10 +1346,13 @@ export function QuestionDialog({
   text,
   actions,
   working = false,
+  detail,
   onDismiss,
 }: {
   title: string
   text: string
+  /** 글 아래에 붙는 목록 같은 것(없으면 그리지 않는다). */
+  detail?: ReactNode
   actions: QuestionAction[]
   working?: boolean
   onDismiss: () => void
@@ -1342,6 +1400,7 @@ export function QuestionDialog({
       >
         <h2 id={titleId}>{title}</h2>
         <p id={textId}>{text}</p>
+        {detail}
         <div className="zet-confirm-actions">
           {actions.map((action) => (
             <button
@@ -1430,11 +1489,41 @@ function LinkedZetRow({
   )
 }
 
-function AssetRow({ name }: { name: string | null }) {
+/**
+ * 탭 줄에서 ← → Home End 로 옆 탭에 초점을 옮기고 그 탭을 연다(2026-11-17 키보드 점검에서 남긴 것: 패널 탭은 Tab 으로만 옮겨졌다).
+ * 탭 안의 닫기 단추 등 탭이 아닌 것에 초점이 있으면 손대지 않는다.
+ */
+function moveBetweenTabs(event: ReactKeyboardEvent<HTMLElement>) {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+  const tabs = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('[role="tab"]'))
+  const at = tabs.indexOf(document.activeElement as HTMLElement)
+  if (at < 0 || tabs.length < 2) return
+  event.preventDefault()
+  const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+    : (at + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length
+  tabs[next].focus()
+  tabs[next].click()
+}
+
+const SourceOpenContext = createContext<((id: string, name: string | null) => void) | null>(null)
+/** 패널 안 깊은 곳에서 알림 줄을 띄운다(받아 오는 동안 문서를 고치려 할 때 등). */
+const PanelNoticeContext = createContext<SourceNotice | null>(null)
+
+/** 이어진 것·작업 내역의 원자료 한 줄. 누르면 연다(글은 패널의 새 탭, 사진·소리·영상은 미디어 화면). */
+function AssetRow({ id, name }: { id: string; name: string | null }) {
+  const open = useContext(SourceOpenContext)
+  const label = name ?? W.zetPanel.text57(W.rawMaterial)
+  if (!open) {
+    return (
+      <div className="zet-link-row plain">
+        <strong>{label}</strong>
+      </div>
+    )
+  }
   return (
-    <div className="zet-link-row plain">
-      <strong>{name ?? W.zetPanel.text57(W.rawMaterial)}</strong>
-    </div>
+    <button className="zet-link-row" type="button" onClick={() => open(id, name)}>
+      <strong>{label}</strong>
+    </button>
   )
 }
 
@@ -1459,7 +1548,7 @@ function LinkedView({
           <h2>{W.rawMaterial}</h2>
           <ul className="zet-links">
             {linked.assets.map((asset) => (
-              <li key={asset.id}><AssetRow name={asset.originalFileName} /></li>
+              <li key={asset.id}><AssetRow id={asset.id} name={asset.originalFileName} /></li>
             ))}
           </ul>
         </section>
@@ -1540,9 +1629,10 @@ function VersionView({
   const restorable = version.state === 'ready' && !version.value.headUnreadable && version.value.head !== null
 
   return (
-    <div className="zet-version">
+    <div className="zet-version" onKeyDown={(event) => { if (event.key === 'Escape' && !confirming) { event.preventDefault(); event.stopPropagation(); onBack() } }}>
       <div className="zet-version-bar">
-        <button className="secondary-button" type="button" onClick={onBack}>
+        {/* 열면 초점을 "목록으로" 단추에 둔다(키보드로 열었을 때 화면 밖으로 빠지지 않게). Esc 도 목록으로. */}
+        <button className="secondary-button" type="button" autoFocus onClick={onBack}>
           <ArrowLeft size={13} aria-hidden />{W.zetPanel.text60}</button>
         {restorable && (
           <button className="secondary-button" type="button" onClick={() => setConfirming(true)}>
@@ -1644,6 +1734,7 @@ function RestoreConfirm({
   }, [id, latestRevision])
 
   async function restore() {
+    if (isFirstReceiving()) { setError(W.restoreProgress.docBusy); return }
     setWorking(true)
     setError(null)
     try {
@@ -1742,12 +1833,32 @@ function ReceiptView({
   id,
   onOpenZet,
   onOpenAddress,
+  onDeleted,
+  onFailed,
 }: {
   id: string
   onOpenZet: (id: string) => void
   onOpenAddress: (address: string) => void
+  /** 지운 뒤(탭을 닫고 알림 줄). */
+  onDeleted?: () => void
+  onFailed?: (reason: unknown) => void
 }) {
   const [receipt, reloadReceipt] = useLoadable(() => readReceipt(id), W.zetPanel.text71(W.workLog), true, [id])
+  // 작업 내역 지우기(2026-11-17 본부 결정): 머리의 ⋯ 메뉴 "삭제" → 묻는 창 하나.
+  const [asking, setAsking] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  async function remove() {
+    setDeleting(true)
+    try {
+      await deleteReceipt(id)
+      setAsking(false)
+      onDeleted?.()
+    } catch (reason) {
+      setDeleting(false)
+      setAsking(false)
+      onFailed?.(reason)
+    }
+  }
 
   if (receipt.state === 'error') return <PaneMessage text={receipt.message} onRetry={reloadReceipt} />
   if (receipt.state !== 'ready') return <PaneMessage text={W.zetPanel.text72(W.workLog)} />
@@ -1758,13 +1869,20 @@ function ReceiptView({
   function reference(item: ReceiptReference) {
     return item.type === 'zet'
       ? <LinkedZetRow entry={item} onOpenZet={onOpenZet} />
-      : <AssetRow name={item.originalFileName} />
+      : <AssetRow id={item.id} name={item.originalFileName} />
   }
 
   return (
     <article className="zet-document">
       <header className="zet-head">
-        <h1>{W.workLog}</h1>
+        <div className="receipt-head-title">
+          <h1>{W.workLog}</h1>
+          {onDeleted && (
+            <RowMenu label={W.sourceDelete.menu(W.workLog)}>
+              {(close) => <MenuItem close={close} onSelect={() => setAsking(true)}>{W.sourceDelete.trash}</MenuItem>}
+            </RowMenu>
+          )}
+        </div>
         <dl className="zet-meta">
           <div>
             <dt>{W.zetPanel.text73}</dt>
@@ -1804,6 +1922,18 @@ function ReceiptView({
         </div>
         <ZetMarkdown text={body} onOpenZet={onOpenZet} onOpenAddress={onOpenAddress} />
       </div>
+      {asking && (
+        <QuestionDialog
+          title={W.receiptDelete.title}
+          text={W.receiptDelete.text}
+          working={deleting}
+          actions={[
+            { label: W.chatKeep.cancel, onSelect: () => setAsking(false), autoFocus: true },
+            { label: W.sourceDelete.trash, primary: true, onSelect: () => void remove() },
+          ]}
+          onDismiss={() => setAsking(false)}
+        />
+      )}
     </article>
   )
 }

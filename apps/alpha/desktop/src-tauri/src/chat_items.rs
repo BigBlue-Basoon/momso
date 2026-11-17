@@ -152,30 +152,27 @@ fn decode_cp949(_bytes: &[u8]) -> Option<String> {
     None
 }
 
+struct OpenableSource {
+    path: PathBuf,
+    original_name: String,
+}
+
 pub(crate) fn read_attachment_text(
     root: &Path,
     database: &Path,
     id: &str,
     cursor: u64,
 ) -> Result<AttachmentTextPage, String> {
-    if !crate::archive_zet::valid_asset_id(id) {
-        return Ok(text_state("not_found"));
-    }
-    if !events_impl(root, true)?
-        .iter()
-        .any(|e| e.attachment && e.head.read.iter().any(|item| item == id))
-    {
-        return Ok(text_state("not_found"));
-    }
-    let hash = id.strip_prefix("sha256:").ok_or("unavailable")?;
-    let conn = Connection::open(database).map_err(|_| "unavailable")?;
-    let name: Option<String> = conn.query_row("SELECT original_file_name FROM momso_source_assets WHERE content_sha256=?1 AND integrity_state='active'", [hash], |r| r.get(0)).optional().map_err(|_| "unavailable")?;
-    let Some(name) = name else {
+    let Some(source) = source_path(root, database, id)? else {
         return Ok(text_state("not_found"));
     };
-    let extension = Path::new(&name)
+    read_source_text(&source, cursor)
+}
+
+fn read_source_text(source: &OpenableSource, cursor: u64) -> Result<AttachmentTextPage, String> {
+    let extension = Path::new(&source.original_name)
         .extension()
-        .and_then(|s| s.to_str())
+        .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     if !matches!(
@@ -194,32 +191,57 @@ pub(crate) fn read_attachment_text(
     ) {
         return Ok(text_state("not_text"));
     }
+    read_text_path(&source.path, cursor)
+}
+
+fn source_path(root: &Path, database: &Path, id: &str) -> Result<Option<OpenableSource>, String> {
+    let Some(lookup) = crate::source_assets::reference_lookup(id) else {
+        return Ok(None);
+    };
+    let conn = Connection::open(database).map_err(|_| "unavailable")?;
+    let row: Option<(String, String)> = conn.query_row(
+        "SELECT a.content_sha256,a.original_file_name FROM momso_source_assets a WHERE (a.id=?1 OR a.content_sha256=?2) AND a.integrity_state='active' AND NOT EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=a.id)",
+        rusqlite::params![id, lookup], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).optional().map_err(|_| "unavailable")?;
+    let Some((hash, original_name)) = row else {
+        return Ok(None);
+    };
+    if !crate::archive_zet::valid_asset_id(&format!("sha256:{hash}")) {
+        return Err("unavailable".into());
+    }
     let archive = root.canonicalize().map_err(|_| "unavailable")?;
     let objects = root
         .join("objects")
         .canonicalize()
         .map_err(|_| "unavailable")?;
     if !objects.starts_with(&archive) {
-        return Ok(text_state("not_found"));
+        return Ok(None);
     }
     let path = match objects
         .join("sha256")
         .join(&hash[..2])
-        .join(hash)
+        .join(&hash)
         .canonicalize()
     {
         Ok(path) if path.starts_with(&objects) && path.is_file() => path,
-        _ => return Ok(text_state("not_found")),
+        _ => return Ok(None),
     };
-    let mut file = fs::File::open(&path).map_err(|_| "unavailable")?;
-    if !opened_path_matches(&file, &path) {
+    Ok(Some(OpenableSource {
+        path,
+        original_name,
+    }))
+}
+
+fn read_text_path(path: &Path, cursor: u64) -> Result<AttachmentTextPage, String> {
+    let mut file = fs::File::open(path).map_err(|_| "unavailable")?;
+    if !opened_path_matches(&file, path) {
         return Ok(text_state("not_found"));
     }
     let total = file.metadata().map_err(|_| "unavailable")?.len();
     if cursor > total {
         return Ok(text_state("invalid_cursor"));
     }
-    let utf8 = file_is_utf8(&mut file, &path)?;
+    let utf8 = file_is_utf8(&mut file, path)?;
     file.seek(SeekFrom::Start(cursor))
         .map_err(|_| "unavailable")?;
     let mut bytes = Vec::new();
@@ -269,6 +291,58 @@ pub(crate) fn read_attachment_text(
         content: Some(content),
         next_cursor: (end < total).then_some(end),
         total_bytes: Some(total),
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SourceOpen {
+    state: &'static str,
+    kind: Option<&'static str>,
+    pub(crate) path: Option<String>,
+    content: Option<String>,
+    next_cursor: Option<u64>,
+    total_bytes: Option<u64>,
+}
+
+pub(crate) fn open_source(
+    root: &Path,
+    database: &Path,
+    id: &str,
+    cursor: u64,
+) -> Result<SourceOpen, String> {
+    let Some(source) = source_path(root, database, id)? else {
+        return Ok(SourceOpen {
+            state: "not_found",
+            kind: None,
+            path: None,
+            content: None,
+            next_cursor: None,
+            total_bytes: None,
+        });
+    };
+    let mut file = fs::File::open(&source.path).map_err(|_| "unavailable")?;
+    if !opened_path_matches(&file, &source.path) {
+        return Err("unavailable".into());
+    }
+    if let Some((kind, _)) = crate::media::classify_file(&mut file)? {
+        return Ok(SourceOpen {
+            state: "ok",
+            kind: Some(kind),
+            path: Some(source.path.to_string_lossy().into_owned()),
+            content: None,
+            next_cursor: None,
+            total_bytes: None,
+        });
+    }
+    let page = read_source_text(&source, cursor)?;
+    Ok(SourceOpen {
+        state: page.state,
+        kind: (page.state == "ok").then_some("text"),
+        path: None,
+        content: page.content,
+        next_cursor: page.next_cursor,
+        total_bytes: page.total_bytes,
     })
 }
 
@@ -504,6 +578,19 @@ pub(crate) fn list(root: &Path, database: &Path, chat_id: &str) -> Result<ChatIt
     let mut deleted = Vec::new();
     let mut media_events = HashMap::new();
     for (id, (event, wrote)) in latest {
+        if let Some(hash) = id.strip_prefix("sha256:") {
+            let deleted_at: Option<String> = conn.query_row("SELECT d.requested_at FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE a.content_sha256=?1", [hash], |row| row.get(0)).optional().map_err(|_| "unavailable")?;
+            if let Some(at) = deleted_at {
+                deleted.push(DeletedItem {
+                    id,
+                    how: "deleted",
+                    by: Some(ChatItemBy::User),
+                    evidence: None,
+                    at,
+                });
+                continue;
+            }
+        }
         if wrote && write_action(event, &id) == Some("deleted") {
             deleted.push(DeletedItem {
                 id: id.clone(),
@@ -605,7 +692,7 @@ pub(crate) fn list(root: &Path, database: &Path, chat_id: &str) -> Result<ChatIt
         }
         let hash = id.strip_prefix("sha256:").ok_or("unavailable")?;
         let metadata: Option<(String, String)> = conn.query_row(
-            "SELECT original_file_name,created_at FROM momso_source_assets WHERE content_sha256=?1 AND integrity_state='active'",
+            "SELECT a.original_file_name,a.created_at FROM momso_source_assets a WHERE a.content_sha256=?1 AND a.integrity_state='active' AND NOT EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=a.id)",
             [hash], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional().map_err(|_| "unavailable")?;
         let Some((title, created_at)) = metadata else {
@@ -673,7 +760,7 @@ mod tests {
         let db = temp.path().join("db.sqlite");
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(
-            "CREATE TABLE momso_source_assets(content_sha256 TEXT,integrity_state TEXT,original_file_name TEXT)",
+            "CREATE TABLE momso_source_assets(id TEXT,content_sha256 TEXT,integrity_state TEXT,original_file_name TEXT); CREATE TABLE source_asset_deletions(asset_id TEXT)",
         )
         .unwrap();
         let hash = "a".repeat(64);
@@ -682,21 +769,70 @@ mod tests {
         let input = format!("{}요가", "a".repeat(TEXT_PAGE_BYTES as usize - 1));
         fs::write(&path, &input).unwrap();
         conn.execute(
-            "INSERT INTO momso_source_assets VALUES (?1,'active','lesson.txt')",
+            "INSERT INTO momso_source_assets VALUES ('asset',?1,'active','lesson.txt')",
             [&hash],
         )
         .unwrap();
         let id = format!("sha256:{hash}");
-        let receipt = format!("---\nid: rec_20261115_120003\ncreated_at: '2026-11-15T12:00:03+09:00'\ntool: person\nmodel: ''\nchat: chat_20261115_120000\nread: [{id}]\nwrote: []\n---\n## 시킨 말\n없음\n## 고친 내용\n원자료를 채팅방에 첨부했습니다.\n");
-        fs::write(root.join("receipts/rec_20261115_120003.md"), receipt).unwrap();
         let first = read_attachment_text(&root, &db, &id, 0).unwrap();
         assert_eq!(first.state, "ok");
+        for reference in [id.as_str(), hash.as_str(), "asset"] {
+            let page = read_attachment_text(&root, &db, reference, 0).unwrap();
+            assert_eq!(page.state, "ok");
+            assert_eq!(page.content, first.content);
+            assert_eq!(
+                open_source(&root, &db, reference, 0).unwrap().kind,
+                Some("text")
+            );
+        }
         let second = read_attachment_text(&root, &db, &id, first.next_cursor.unwrap()).unwrap();
         assert_eq!(
             format!("{}{}", first.content.unwrap(), second.content.unwrap()),
             input
         );
         assert_eq!(second.next_cursor, None);
+        let opened = open_source(&root, &db, &id, 0).unwrap();
+        assert_eq!(opened.kind, Some("text"));
+        assert_eq!(opened.next_cursor, Some(TEXT_PAGE_BYTES - 1));
+        fs::write(&path, b"RIFF\x00\x00\x00\x00WAVE").unwrap();
+        let opened = open_source(&root, &db, &id, 0).unwrap();
+        assert_eq!(opened.kind, Some("audio"));
+        assert_eq!(
+            open_source(&root, &db, "asset", 0).unwrap().kind,
+            Some("audio")
+        );
+        assert_eq!(
+            open_source(&root, &db, &hash, 0).unwrap().kind,
+            Some("audio")
+        );
+        assert_eq!(
+            Path::new(opened.path.as_ref().unwrap()),
+            path.canonicalize().unwrap()
+        );
+        fs::write(&path, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01").unwrap();
+        assert_eq!(open_source(&root, &db, &id, 0).unwrap().kind, Some("image"));
+        fs::write(&path, b"\x1a\x45\xdf\xa3webmV_VP").unwrap();
+        assert_eq!(open_source(&root, &db, &id, 0).unwrap().kind, Some("video"));
+        assert_eq!(
+            open_source(&root, &db, "../../outside", 0).unwrap().state,
+            "not_found"
+        );
+        conn.execute("INSERT INTO source_asset_deletions VALUES ('asset')", [])
+            .unwrap();
+        assert_eq!(open_source(&root, &db, &id, 0).unwrap().state, "not_found");
+        conn.execute("DELETE FROM source_asset_deletions", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE momso_source_assets SET integrity_state='quarantined'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(open_source(&root, &db, &id, 0).unwrap().state, "not_found");
+        conn.execute(
+            "UPDATE momso_source_assets SET integrity_state='active'",
+            [],
+        )
+        .unwrap();
         assert_eq!(
             read_attachment_text(&root, &db, "../../outside", 0)
                 .unwrap()
@@ -767,6 +903,8 @@ mod tests {
         let db = temp.path().join("db.sqlite");
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch("CREATE TABLE chats(id TEXT PRIMARY KEY,title TEXT); CREATE TABLE archive_zets(id TEXT PRIMARY KEY,title TEXT,summary TEXT,kind TEXT,status TEXT,updated_at TEXT); CREATE TABLE momso_source_assets(id TEXT,content_sha256 TEXT,original_file_name TEXT,created_at TEXT,integrity_state TEXT); INSERT INTO chats VALUES('chat_20261115_120000','수업'); INSERT INTO chats VALUES('chat_20261115_120001','다른 방'); INSERT INTO archive_zets VALUES('zet_20261115_120000','문서','요약','note','draft','2026-11-15T12:00:00+09:00');").unwrap();
+        conn.execute_batch("CREATE TABLE source_asset_deletions(asset_id TEXT, requested_at TEXT)")
+            .unwrap();
         let receipt = format!("---\nid: rec_20261115_120001\ncreated_at: '2026-11-15T12:00:01+09:00'\ntool: codex\nmodel: test-model\nchat: chat_20261115_120000\nread: [sha256:{hash}]\nwrote: [zet_20261115_120000]\n---\n## 시킨 말\n없음\n## 고친 내용\n없음\n");
         fs::write(root.join("receipts/rec_20261115_120001.md"), receipt).unwrap();
         let result =
@@ -812,6 +950,29 @@ mod tests {
         let result = serde_json::to_value(&items).unwrap();
         assert_eq!(result[0]["how"], "attached");
         assert_eq!(result[0]["by"]["kind"], "user");
+        conn.execute(
+            "INSERT INTO source_asset_deletions VALUES ('asset-text', '2026-11-15T12:01:00+09:00')",
+            [],
+        )
+        .unwrap();
+        let during_delete =
+            serde_json::to_value(list(&root, &db, "chat_20261115_120000").unwrap()).unwrap();
+        assert!(during_delete["files"].as_array().unwrap().is_empty());
+        assert_eq!(
+            during_delete["deleted"][0]["id"],
+            format!("sha256:{text_hash}")
+        );
+        assert_eq!(during_delete["deleted"][0]["how"], "deleted");
+        assert!(root.join("objects/sha256/bb").join(&text_hash).exists());
+        conn.execute(
+            "DELETE FROM source_asset_deletions WHERE asset_id='asset-text'",
+            [],
+        )
+        .unwrap();
+        let after_restore =
+            serde_json::to_value(list(&root, &db, "chat_20261115_120000").unwrap()).unwrap();
+        assert_eq!(after_restore["files"][0]["title"], "전사.txt");
+        assert!(after_restore["deleted"].as_array().unwrap().is_empty());
         conn.execute("DELETE FROM chats WHERE id=?1", ["chat_20261115_120000"])
             .unwrap();
         enrich_media(&root, &db, &mut items).unwrap();

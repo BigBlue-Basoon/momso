@@ -14,6 +14,16 @@ const MAX_ACTOR_CHARS: usize = 120;
 const MAX_FILE_NAME_CHARS: usize = 255;
 const MAX_MEDIA_TYPE_CHARS: usize = 120;
 
+// References in documents use sha256:<hash>; the asset table also has an
+// internal ID. Accept both without ever interpreting a reference as a path.
+pub(crate) fn reference_lookup(value: &str) -> Option<&str> {
+    if let Some(hash) = value.strip_prefix("sha256:") {
+        crate::archive_zet::valid_asset_id(value).then_some(hash)
+    } else {
+        Some(value)
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SourceAssetError {
     #[error(transparent)]
@@ -340,6 +350,13 @@ fn prepare_import(
     let destination = resolve_storage_path(objects_path, &storage_relative_path)?;
 
     let connection = storage::open_writable_connection(database_path)?;
+    let deleted: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE a.content_sha256=?1)",
+        [&content_sha256], |row| row.get(0),
+    )?;
+    if deleted {
+        return Err(SourceAssetError::Integrity("source_deleted".into()));
+    }
     let record_link = proposal
         .record_link
         .map(|link| validate_record_link(&connection, link))
@@ -903,7 +920,7 @@ fn load_links(
         .map_err(SourceAssetError::from)
 }
 
-fn get(database_path: &Path, asset_id: &str) -> Result<SourceAsset, SourceAssetError> {
+pub(crate) fn get(database_path: &Path, asset_id: &str) -> Result<SourceAsset, SourceAssetError> {
     let connection = storage::open_writable_connection(database_path)?;
     let mut asset = connection
         .query_row(
@@ -920,26 +937,24 @@ fn get(database_path: &Path, asset_id: &str) -> Result<SourceAsset, SourceAssetE
     Ok(asset)
 }
 
+#[cfg(windows)]
+pub(crate) fn clear_readonly_attribute(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+    use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_READONLY};
+    let attributes = fs::metadata(path)?.file_attributes() & !FILE_ATTRIBUTE_READONLY;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attributes) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::records;
     use tempfile::TempDir;
-
-    #[cfg(windows)]
-    fn clear_readonly(path: &Path) -> std::io::Result<()> {
-        use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
-        use windows_sys::Win32::Storage::FileSystem::{
-            SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
-        };
-        let attributes = fs::metadata(path)?.file_attributes() & !FILE_ATTRIBUTE_READONLY;
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        if unsafe { SetFileAttributesW(wide.as_ptr(), attributes) } == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
 
     struct TestStore {
         _temp: TempDir,
@@ -956,7 +971,7 @@ mod tests {
                 .flatten()
             {
                 if entry.file_type().is_file() {
-                    let _ = clear_readonly(entry.path());
+                    let _ = clear_readonly_attribute(entry.path());
                 }
             }
         }
@@ -1046,7 +1061,7 @@ mod tests {
             .status().unwrap();
         assert!(!status.success());
         assert_eq!(fs::read(&stored).unwrap(), b"original source");
-        clear_readonly(&stored).unwrap();
+        clear_readonly_attribute(&stored).unwrap();
         fs::write(&stored, b"bypass").unwrap();
         let after = crate::chat_file_changes::capture(root).unwrap();
         assert_eq!(

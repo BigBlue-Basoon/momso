@@ -2,6 +2,7 @@ import { FileText, House, Images, Settings } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { ShortcutTip } from './ShortcutTip'
 import { UsageMeter } from './UsageMeter'
+import type { ProviderAuth } from '../provider-auth'
 import { UpdateButton, type AppUpdateState } from './AppUpdate'
 import { W } from '../words'
 
@@ -14,13 +15,15 @@ type ActivityRailProps = {
   onNavigate: (screen: AppScreen) => void
   update: AppUpdateState
   onRestart: () => void
+  /** AI 연결 상태(provider_auth_status). 사용량 단추가 확인되지 않은 키를 연결로 치지 않게 넘긴다. */
+  providerAuth?: ProviderAuth[] | null
 }
 
 /**
  * 맨 왼쪽의 아이콘 띠. 위쪽에 홈(채팅방 화면), 문서(읽는 글 모아 보기), 미디어(만든 사진과 동영상),
  * 아래쪽에 AI 세 곳의 사용량과 설정. 이름은 올렸을 때 풍선으로 뜬다.
  */
-export function ActivityRail({ screen, mediaAvailable, onNavigate, update, onRestart }: ActivityRailProps) {
+export function ActivityRail({ screen, mediaAvailable, onNavigate, update, onRestart, providerAuth }: ActivityRailProps) {
   return (
     <aside className="activity-rail" aria-label={W.activityRail.aria1}>
       <nav className="rail-screens" aria-label={W.activityRail.aria2}>
@@ -40,7 +43,7 @@ export function ActivityRail({ screen, mediaAvailable, onNavigate, update, onRes
         <UpdateButton update={update} onRestart={onRestart} />
       </div>
 
-      <UsageMeter />
+      <UsageMeter auth={providerAuth} />
 
       <RailButton label={W.tip.settings} active={screen === 'settings'} className="rail-settings" onClick={() => onNavigate('settings')}>
         <Settings size={19} strokeWidth={1.75} aria-hidden />

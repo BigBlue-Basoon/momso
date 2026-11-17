@@ -47,7 +47,15 @@ try {
   try {
     const existing = await lstat(target);
     if (!existing.isDirectory() || existing.isSymbolicLink()) throw new Error('Invalid Node directory');
-    if ((await allFiles(target)).length !== files.size) throw new Error('Existing Node differs from verified archive');
+    const existingFiles = await allFiles(target);
+    const runtimeFiles = existingFiles.filter((name) => name !== '.gitkeep');
+    if (runtimeFiles.length === 0 && existingFiles.includes('.gitkeep')) {
+      for (const [name, content] of files) {
+        const out = path.join(target, ...name.split('/'));
+        await mkdir(path.dirname(out), { recursive: true });
+        await writeFile(out, content, { flag: 'wx' });
+      }
+    } else if (runtimeFiles.length !== files.size) throw new Error('Existing Node differs from verified archive');
     for (const [name, content] of files) {
       const actual = await readFile(path.join(target, ...name.split('/')));
       if (!actual.equals(Buffer.from(content))) throw new Error('Existing Node differs from verified archive');

@@ -19,6 +19,36 @@ fn normalized_rule_text(bytes: &[u8]) -> Option<String> {
         .ok()
         .map(|s| s.replace("\r\n", "\n"))
 }
+
+// Only resolve a known prior bundle against the current bundle when the
+// user-profile suffix is identical on both sides.
+pub(crate) fn select_managed_rule(local: &str, remote: &str) -> Option<bool> {
+    use sha2::{Digest, Sha256};
+    const PROFILE: &str = "\n## 사용자에 대해\n\n사용자 정보가 몸소 보관함 규칙과 어긋나면 몸소 보관함 규칙을 먼저 따른다.\n";
+    let local = normalized_rule_text(local.as_bytes())?;
+    let remote = normalized_rule_text(remote.as_bytes())?;
+    let current = normalized_rule_text(ARCHIVE_RULES.as_bytes())?;
+    fn split(text: &str) -> (&str, &str) {
+        match text.find(PROFILE) {
+            Some(offset) => (&text[..offset], &text[offset..]),
+            None => (text, ""),
+        }
+    }
+    let (local_base, local_profile) = split(&local);
+    let (remote_base, remote_profile) = split(&remote);
+    if local_profile != remote_profile {
+        return None;
+    }
+    let known = |text: &str| {
+        PREVIOUS_RULE_HASHES.contains(&format!("{:x}", Sha256::digest(text.as_bytes())).as_str())
+    };
+    match (local_base == current, remote_base == current) {
+        (true, true) => Some(true),
+        (true, false) if known(remote_base) => Some(false),
+        (false, true) if known(local_base) => Some(true),
+        _ => None,
+    }
+}
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -60,6 +90,55 @@ pub(crate) fn run_storage_tool(
         return Err("몸소 폴더 저장 작업을 완료하지 못했습니다".into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub(crate) fn commit_paths(
+    executable: &Path,
+    root: &Path,
+    message: &str,
+    paths: &[String],
+) -> Result<(), String> {
+    let mut child = Command::new(executable)
+        .args([
+            "--literal-pathspecs",
+            "-c",
+            "user.name=momso",
+            "-c",
+            "user.email=archive@momso.local",
+            "commit",
+            "--only",
+            "-m",
+            message,
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ])
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "저장 도구를 실행하지 못했습니다".to_string())?;
+    let result = (|| -> std::io::Result<()> {
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("missing stdin"))?;
+        for path in paths {
+            input.write_all(path.as_bytes())?;
+            input.write_all(&[0])?;
+        }
+        Ok(())
+    })();
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "저장 도구를 실행하지 못했습니다".to_string())?;
+    if result.is_err() || !output.status.success() {
+        return Err("몸소 폴더 저장 작업을 완료하지 못했습니다".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
@@ -119,6 +198,9 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
                 }) || normalized_contents
                     == normalized_rule_text(legacy_rules.as_bytes());
                 if is_previous {
+                    if normalized_contents == normalized_rule_text(expected.as_bytes()) {
+                        continue;
+                    }
                     let clean = has_history
                         && profile_clean
                         && run_storage_tool(
@@ -131,13 +213,7 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
                             .is_ok_and(|saved| {
                                 normalized_rule_text(saved.as_bytes()) == normalized_contents
                             });
-                    if has_history
-                        && !clean
-                        && normalized_contents != normalized_rule_text(expected.as_bytes())
-                    {
-                        continue;
-                    }
-                    if normalized_contents == normalized_rule_text(expected.as_bytes()) {
+                    if has_history && !clean {
                         continue;
                     }
                     fs::write(path, expected_rules.as_bytes())
@@ -494,16 +570,19 @@ pub(crate) struct ReindexResult {
 }
 
 pub(crate) fn reindex(root: &Path, database: &Path) -> Result<ReindexResult, String> {
+    let _guard = crate::archive_zet::WRITE_LOCK
+        .lock()
+        .map_err(|_| "색인을 다시 만들지 못했습니다".to_string())?;
     let mut zets = Vec::new();
     let mut receipts = Vec::new();
     for (folder, is_zet) in [("zettels", true), ("receipts", false)] {
         for entry in fs::read_dir(root.join(folder))
-            .map_err(|_| "몸소 폴더을 읽지 못했습니다".to_string())?
+            .map_err(|_| "몸소 폴더를 읽지 못했습니다".to_string())?
         {
-            let entry = entry.map_err(|_| "몸소 폴더을 읽지 못했습니다".to_string())?;
+            let entry = entry.map_err(|_| "몸소 폴더를 읽지 못했습니다".to_string())?;
             if !entry
                 .file_type()
-                .map_err(|_| "몸소 폴더을 읽지 못했습니다".to_string())?
+                .map_err(|_| "몸소 폴더를 읽지 못했습니다".to_string())?
                 .is_file()
                 || entry.path().extension().is_none_or(|x| x != "md")
             {
@@ -612,6 +691,7 @@ pub(crate) fn history(
             "-c",
             "i18n.logOutputEncoding=UTF-8",
             "log",
+            "--full-history",
             "--format=%H%x1f%cI%x1f%s",
             "--",
             &relative,
@@ -675,9 +755,95 @@ pub(crate) struct ArchiveIssue {
     message: String,
 }
 
-fn id_time_mismatch(
+struct IdTimeContext {
+    tool: PathBuf,
+    head: Option<String>,
+    additions: Option<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>>,
+}
+
+fn linear_additions(
+    tool: &Path,
     root: &Path,
-    resources: &Path,
+    head: &str,
+) -> Option<std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>> {
+    let parents = run_storage_tool(tool, root, &["rev-list", "--parents", head]).ok()?;
+    if parents
+        .lines()
+        .any(|line| line.split_whitespace().count() > 2)
+    {
+        return None;
+    }
+    let renames = run_storage_tool(
+        tool,
+        root,
+        &[
+            "-c",
+            "diff.renameLimit=0",
+            "log",
+            "--format=",
+            "--name-status",
+            "--diff-filter=R",
+            "-M",
+            head,
+        ],
+    )
+    .ok()?;
+    if !renames.trim().is_empty() {
+        return None;
+    }
+    let history = run_storage_tool(
+        tool,
+        root,
+        &[
+            "log",
+            "--reverse",
+            "--format=MOMSO_TIME:%cI",
+            "--name-only",
+            "--diff-filter=A",
+            "--no-renames",
+            head,
+            "--",
+            "zettels/",
+            "receipts/",
+        ],
+    )
+    .ok()?;
+    let mut additions = std::collections::HashMap::new();
+    let mut time = None;
+    for line in history
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(value) = line.strip_prefix("MOMSO_TIME:") {
+            time = Some(chrono::DateTime::parse_from_rfc3339(value).ok()?.to_utc());
+        } else if line.starts_with("zettels/") || line.starts_with("receipts/") {
+            additions.entry(line.to_owned()).or_insert(time?);
+        } else {
+            return None;
+        }
+    }
+    Some(additions)
+}
+
+fn id_time_context(root: &Path, resources: &Path) -> Result<IdTimeContext, String> {
+    let (tool, _) = storage_tool(resources)?;
+    let head = run_storage_tool(&tool, root, &["rev-parse", "--verify", "HEAD"])
+        .ok()
+        .map(|value| value.trim().to_owned());
+    let additions = head
+        .as_deref()
+        .and_then(|head| linear_additions(&tool, root, head));
+    Ok(IdTimeContext {
+        tool,
+        head,
+        additions,
+    })
+}
+
+fn id_time_mismatch_with_context(
+    root: &Path,
+    context: &IdTimeContext,
     relative: &str,
     id: &str,
 ) -> Result<bool, String> {
@@ -688,10 +854,16 @@ fn id_time_mismatch(
         .from_local_datetime(&number_time)
         .earliest()
         .ok_or_else(|| "번호의 시각을 확인하지 못했습니다".to_string())?;
-    let (tool, _) = storage_tool(resources)?;
-    let first = if run_storage_tool(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok() {
+    let cached = context
+        .additions
+        .as_ref()
+        .and_then(|items| items.get(relative))
+        .copied();
+    let first = if cached.is_some() {
+        cached
+    } else if let Some(head) = &context.head {
         let history = run_storage_tool(
-            &tool,
+            &context.tool,
             root,
             &[
                 "log",
@@ -699,6 +871,7 @@ fn id_time_mismatch(
                 "--diff-filter=A",
                 "--reverse",
                 "--format=%cI",
+                head,
                 "--",
                 relative,
             ],
@@ -728,8 +901,45 @@ fn id_time_mismatch(
         > 12 * 60 * 60 * 1000)
 }
 
+fn check_id_time(
+    root: &Path,
+    resources: &Path,
+    relative: &str,
+    id: &str,
+    context: &mut Option<IdTimeContext>,
+) -> Result<bool, String> {
+    if context.is_none() {
+        *context = Some(id_time_context(root, resources)?);
+    }
+    id_time_mismatch_with_context(
+        root,
+        context.as_ref().expect("context initialized"),
+        relative,
+        id,
+    )
+}
+
+#[cfg(test)]
+fn id_time_mismatch(
+    root: &Path,
+    resources: &Path,
+    relative: &str,
+    id: &str,
+) -> Result<bool, String> {
+    id_time_mismatch_with_context(root, &id_time_context(root, resources)?, relative, id)
+}
+
 pub(crate) fn check(root: &Path, resources: &Path) -> Result<Vec<ArchiveIssue>, String> {
+    check_selected(root, resources, None)
+}
+
+fn check_selected(
+    root: &Path,
+    resources: &Path,
+    selected: Option<&str>,
+) -> Result<Vec<ArchiveIssue>, String> {
     let mut issues = Vec::new();
+    let mut time_context = None;
     for name in RULE_FILES {
         if !root.join(name).is_file() {
             issues.push(ArchiveIssue {
@@ -740,18 +950,21 @@ pub(crate) fn check(root: &Path, resources: &Path) -> Result<Vec<ArchiveIssue>, 
     }
     for (folder, is_zet) in [("zettels", true), ("receipts", false)] {
         for entry in fs::read_dir(root.join(folder))
-            .map_err(|_| "몸소 폴더을 읽지 못했습니다".to_string())?
+            .map_err(|_| "몸소 폴더를 읽지 못했습니다".to_string())?
         {
-            let entry = entry.map_err(|_| "몸소 폴더을 읽지 못했습니다".to_string())?;
+            let entry = entry.map_err(|_| "몸소 폴더를 읽지 못했습니다".to_string())?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let file = format!("{folder}/{name}");
+            if selected.is_some_and(|selected| selected != file) {
+                continue;
+            }
             let issue = |message: String| ArchiveIssue {
                 file: file.clone(),
                 message,
             };
             if !entry
                 .file_type()
-                .map_err(|_| "몸소 폴더을 읽지 못했습니다".to_string())?
+                .map_err(|_| "몸소 폴더를 읽지 못했습니다".to_string())?
                 .is_file()
                 || entry.path().extension().is_none_or(|x| x != "md")
             {
@@ -768,7 +981,7 @@ pub(crate) fn check(root: &Path, resources: &Path) -> Result<Vec<ArchiveIssue>, 
             if is_zet {
                 match crate::archive_zet::parse(&text) {
                     Ok((head, _)) => {
-                        if id_time_mismatch(root, resources, &file, &head.id)? {
+                        if check_id_time(root, resources, &file, &head.id, &mut time_context)? {
                             issues.push(issue("번호의 시각이 실제와 많이 다름".into()));
                         }
                         if name != format!("{}.md", head.id) {
@@ -805,7 +1018,7 @@ pub(crate) fn check(root: &Path, resources: &Path) -> Result<Vec<ArchiveIssue>, 
             } else {
                 match crate::archive_receipt::parse(&text) {
                     Ok((head, _)) => {
-                        if id_time_mismatch(root, resources, &file, &head.id)? {
+                        if check_id_time(root, resources, &file, &head.id, &mut time_context)? {
                             issues.push(issue("번호의 시각이 실제와 많이 다름".into()));
                         }
                         if name != format!("{}.md", head.id) {
@@ -853,9 +1066,14 @@ pub(crate) fn save(root: &Path, resources: &Path, database: &Path) -> Result<(),
     let _guard = crate::archive_zet::WRITE_LOCK
         .lock()
         .map_err(|_| "저장을 완료하지 못했습니다".to_string())?;
+    save_unlocked(root, resources, database)
+}
+
+fn save_unlocked(root: &Path, resources: &Path, database: &Path) -> Result<(), String> {
     if !check(root, resources)?.is_empty() {
         return Err("몸소 폴더 검사를 먼저 확인해 주세요".into());
     }
+    crate::chat_archive_store::validate(root, database).map_err(str::to_string)?;
     let (tool, _) = storage_tool(resources)?;
     if run_storage_tool(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok() {
         let changed = run_storage_tool(
@@ -877,13 +1095,17 @@ pub(crate) fn save(root: &Path, resources: &Path, database: &Path) -> Result<(),
     }
     for folder in ["zettels", "receipts"] {
         let has_files = fs::read_dir(root.join(folder))
-            .map_err(|_| "몸소 폴더을 읽지 못했습니다".to_string())?
+            .map_err(|_| "몸소 폴더를 읽지 못했습니다".to_string())?
             .next()
             .is_some();
         let tracked = run_storage_tool(&tool, root, &["ls-files", "--", folder])?;
         if has_files || !tracked.trim().is_empty() {
             run_storage_tool(&tool, root, &["add", "-A", "--", folder])?;
         }
+    }
+    let chat_tracked = run_storage_tool(&tool, root, &["ls-files", "--", "chats"])?;
+    if root.join("chats").exists() || !chat_tracked.trim().is_empty() {
+        run_storage_tool(&tool, root, &["add", "-A", "--", "chats"])?;
     }
     run_storage_tool(
         &tool,
@@ -902,6 +1124,7 @@ pub(crate) fn save(root: &Path, resources: &Path, database: &Path) -> Result<(),
         "--",
         "zettels/",
         "receipts/",
+        "chats/",
         "AGENTS.md",
         "CLAUDE.md",
         "GEMINI.md",
@@ -935,19 +1158,7 @@ pub(crate) fn save(root: &Path, resources: &Path, database: &Path) -> Result<(),
         .cloned()
         .collect();
     index_changed(root, database, &indexed_paths)?;
-    let mut args = vec![
-        "-c",
-        "user.name=momso",
-        "-c",
-        "user.email=archive@momso.local",
-        "commit",
-        "--only",
-        "-m",
-        message.as_str(),
-        "--",
-    ];
-    args.extend(paths.iter().map(String::as_str));
-    run_storage_tool(&tool, root, &args)?;
+    commit_paths(&tool, root, &message, &paths)?;
     Ok(())
 }
 
@@ -1006,7 +1217,7 @@ pub(crate) fn save_one(
     }
     let written = fs::read_to_string(&path).map_err(|_| "글을 저장하지 못했습니다".to_string())?;
     let result = (|| -> Result<(), String> {
-        let issues = check(root, resources)?;
+        let issues = check_selected(root, resources, Some(&relative))?;
         if issues.iter().any(|issue| issue.file == relative) {
             return Err("글의 규칙을 확인해 주세요".into());
         }
@@ -1188,6 +1399,9 @@ pub(crate) fn restore_version(
     if !crate::archive_zet::valid_zet_id(id) {
         return Err("글 번호가 올바르지 않습니다".into());
     }
+    let _guard = crate::archive_zet::WRITE_LOCK
+        .lock()
+        .map_err(|_| "이전 글을 복원하지 못했습니다".to_string())?;
     let pending = run_storage_tool(&tool, root, &["status", "--porcelain", "--", &relative])?;
     if !discard_unsaved && !pending.trim().is_empty() {
         return Err("저장하지 않은 내용이 있습니다".into());
@@ -1216,12 +1430,219 @@ pub(crate) fn restore_version(
     temporary
         .persist(path)
         .map_err(|_| "이전 글을 복원하지 못했습니다".to_string())?;
-    save(root, resources, database)
+    save_unlocked(root, resources, database)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn commit_paths_keeps_unrelated_staged_files_and_handles_literal_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (tool, _) = storage_tool(root).unwrap();
+        run_storage_tool(&tool, root, &["init", "-b", "main"]).unwrap();
+        fs::write(root.join("literal[1].txt"), "selected").unwrap();
+        fs::write(root.join("other.txt"), "staged").unwrap();
+        run_storage_tool(
+            &tool,
+            root,
+            &[
+                "--literal-pathspecs",
+                "add",
+                "--",
+                "literal[1].txt",
+                "other.txt",
+            ],
+        )
+        .unwrap();
+        commit_paths(&tool, root, "fixture", &["literal[1].txt".into()]).unwrap();
+        assert_eq!(
+            run_storage_tool(&tool, root, &["show", "HEAD:literal[1].txt"]).unwrap(),
+            "selected"
+        );
+        assert!(run_storage_tool(&tool, root, &["show", "HEAD:other.txt"]).is_err());
+        assert_eq!(
+            run_storage_tool(&tool, root, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .trim(),
+            "other.txt"
+        );
+    }
+
+    #[test]
+    fn batched_additions_match_follow_history_and_renames_fall_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (tool, _) = storage_tool(root).unwrap();
+        run_storage_tool(&tool, root, &["init", "-b", "main"]).unwrap();
+        fs::create_dir(root.join("zettels")).unwrap();
+        fs::create_dir(root.join("receipts")).unwrap();
+        let file = "zettels/zet_20200101_000000.md";
+        let commit = |message: &str, date: &str| {
+            let status = Command::new(&tool)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-m",
+                    message,
+                ])
+                .current_dir(root)
+                .env("GIT_CONFIG_GLOBAL", "NUL")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_COMMITTER_DATE", date)
+                .env("GIT_AUTHOR_DATE", date)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        fs::write(root.join(file), "first").unwrap();
+        run_storage_tool(&tool, root, &["add", "--", file]).unwrap();
+        commit("add", "2020-01-01T00:00:00+00:00");
+        fs::remove_file(root.join(file)).unwrap();
+        run_storage_tool(&tool, root, &["add", "-A", "--", file]).unwrap();
+        commit("remove", "2020-01-02T00:00:00+00:00");
+        fs::write(root.join(file), "again").unwrap();
+        run_storage_tool(&tool, root, &["add", "--", file]).unwrap();
+        commit("readd", "2020-01-03T00:00:00+00:00");
+        let context = id_time_context(root, root).unwrap();
+        let batched = context.additions.as_ref().unwrap().get(file).unwrap();
+        let followed = run_storage_tool(
+            &tool,
+            root,
+            &[
+                "log",
+                "--follow",
+                "--diff-filter=A",
+                "--reverse",
+                "--format=%cI",
+                "HEAD",
+                "--",
+                file,
+            ],
+        )
+        .unwrap();
+        let first = chrono::DateTime::parse_from_rfc3339(followed.lines().next().unwrap())
+            .unwrap()
+            .to_utc();
+        assert_eq!(*batched, first);
+        let renamed = "zettels/zet_20200101_000001.md";
+        run_storage_tool(&tool, root, &["mv", "--", file, renamed]).unwrap();
+        commit("rename", "2020-01-04T00:00:00+00:00");
+        assert!(id_time_context(root, root).unwrap().additions.is_none());
+    }
+    #[test]
+    fn reindex_waits_until_document_writer_releases_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        let db = temp.path().join("momso.db");
+        initialize(&root, temp.path()).unwrap();
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let guard = crate::archive_zet::WRITE_LOCK.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(reindex(&root, &db).is_ok()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(guard);
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap());
+        worker.join().unwrap();
+    }
+    #[test]
+    fn document_and_receipt_creation_wait_for_reindex_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        let db = temp.path().join("momso.db");
+        initialize(&root, temp.path()).unwrap();
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let guard = crate::archive_zet::WRITE_LOCK.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let doc_root = root.clone();
+        let doc_db = db.clone();
+        let doc_started = started_tx.clone();
+        let doc_done = done_tx.clone();
+        let document = std::thread::spawn(move || {
+            doc_started.send(()).unwrap();
+            let result = crate::archive_zet::create(
+                &doc_root,
+                &doc_db,
+                crate::archive_zet::ZetCreate {
+                    title: "Lesson".into(),
+                    summary: "Summary".into(),
+                    kind: "note".into(),
+                    body: "Body".into(),
+                    assets: vec![],
+                    edges: vec![],
+                },
+            );
+            doc_done.send(result.is_ok()).unwrap();
+        });
+        let receipt_root = root.clone();
+        let receipt_db = db.clone();
+        let receipt = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = crate::archive_receipt::create(
+                &receipt_root,
+                &receipt_db,
+                crate::archive_receipt::ReceiptCreate {
+                    tool: "person".into(),
+                    model: String::new(),
+                    chat: None,
+                    read: vec![],
+                    wrote: vec![],
+                    prompt: String::new(),
+                    changes: String::new(),
+                },
+            );
+            done_tx.send(result.is_ok()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        started_rx.recv().unwrap();
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        drop(guard);
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap());
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap());
+        document.join().unwrap();
+        receipt.join().unwrap();
+        let result = reindex(&root, &db).unwrap();
+        assert_eq!((result.zets, result.receipts), (1, 1));
+    }
+    #[test]
+    fn managed_rule_choice_keeps_profile_and_rejects_custom_text() {
+        let old = include_str!("testdata/archive_rules_before_dictionary.md");
+        let current = ARCHIVE_RULES;
+        assert_eq!(select_managed_rule(old, current), Some(true));
+        assert_eq!(select_managed_rule(current, old), Some(false));
+        assert_eq!(select_managed_rule("custom", current), None);
+        let profile = "\n## 사용자에 대해\n\n사용자 정보가 몸소 보관함 규칙과 어긋나면 몸소 보관함 규칙을 먼저 따른다.\n\n### 이름\n\nExample\n";
+        assert_eq!(
+            select_managed_rule(&format!("{old}{profile}"), &format!("{current}{profile}")),
+            Some(true)
+        );
+        assert_eq!(
+            select_managed_rule(&format!("{old}{profile}"), current),
+            None
+        );
+    }
     #[test]
     fn save_message_counts_visible_characters_and_shortens_long_first_title() {
         let long = "가".repeat(61);

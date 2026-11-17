@@ -83,6 +83,86 @@ pub(crate) fn setup_request(
     }
 }
 
+pub(crate) fn browser_request(
+    chat_id: &str,
+    provider: &str,
+    site: &str,
+    action: &str,
+    effect: &str,
+    element_name: &str,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        chat_id: Some(chat_id.to_owned()),
+        provider: provider.to_owned(),
+        kind: "browser_action".into(),
+        description: format!("{action} · {element_name}"),
+        change: Some(ChangeKind::Edit),
+        targets: vec![ApprovalTarget {
+            path: site.to_owned(),
+            change: Some(ChangeKind::Edit),
+        }],
+        reason: Some(effect.to_owned()),
+        options: vec![
+            ApprovalChoice::AllowOnce,
+            ApprovalChoice::Deny,
+            ApprovalChoice::Cancel,
+        ],
+        setup: None,
+    }
+}
+
+pub(crate) fn browser_scope_request(
+    chat_id: &str,
+    provider: &str,
+    site: &str,
+    skill: &str,
+    action: &str,
+    description: &str,
+) -> ApprovalRequest {
+    let mut request = browser_request(chat_id, provider, site, skill, "scope", action);
+    request.kind = "browser_action_scope".into();
+    request.description = format!("{skill} · {action} · {description}");
+    request
+}
+
+pub(crate) fn dictionary_request(
+    chat_id: &str,
+    provider: &str,
+    description: String,
+) -> ApprovalRequest {
+    ApprovalRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        chat_id: Some(chat_id.to_owned()),
+        provider: provider.to_owned(),
+        kind: "dictionary_change".into(),
+        description,
+        change: Some(ChangeKind::Edit),
+        targets: vec![ApprovalTarget {
+            path: "dictionary/my-terms.json".into(),
+            change: Some(ChangeKind::Edit),
+        }],
+        reason: None,
+        options: vec![
+            ApprovalChoice::AllowOnce,
+            ApprovalChoice::Deny,
+            ApprovalChoice::Cancel,
+        ],
+        setup: None,
+    }
+}
+
+pub(crate) fn dictionary_delete_request(
+    chat_id: &str,
+    provider: &str,
+    description: String,
+) -> ApprovalRequest {
+    let mut request = dictionary_request(chat_id, provider, description);
+    request.change = Some(ChangeKind::Delete);
+    request.targets[0].change = Some(ChangeKind::Delete);
+    request
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApprovalClosed {
@@ -191,6 +271,39 @@ impl ApprovalBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dictionary_approval_is_bound_to_user_file_and_one_time_choices() {
+        let request = dictionary_request("chat", "claude", "가상 표기 추가".into());
+        assert_eq!(request.kind, "dictionary_change");
+        assert_eq!(request.targets[0].path, "dictionary/my-terms.json");
+        assert_eq!(
+            request.options,
+            vec![
+                ApprovalChoice::AllowOnce,
+                ApprovalChoice::Deny,
+                ApprovalChoice::Cancel
+            ]
+        );
+        assert!(request.description.contains("가상 표기"));
+    }
+
+    #[test]
+    fn dictionary_delete_approval_is_one_time_and_targets_user_file() {
+        let request = dictionary_delete_request("chat", "claude", "가상 용어 삭제".into());
+        assert_eq!(request.kind, "dictionary_change");
+        assert_eq!(request.change, Some(ChangeKind::Delete));
+        assert_eq!(request.targets[0].path, "dictionary/my-terms.json");
+        assert_eq!(request.targets[0].change, Some(ChangeKind::Delete));
+        assert_eq!(
+            request.options,
+            vec![
+                ApprovalChoice::AllowOnce,
+                ApprovalChoice::Deny,
+                ApprovalChoice::Cancel
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn setup_card_waits_for_one_user_response_and_cancel_closes_it() {

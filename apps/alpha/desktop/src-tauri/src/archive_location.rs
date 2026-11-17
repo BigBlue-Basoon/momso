@@ -170,6 +170,10 @@ impl ArchiveLocation {
                         "default location is not empty",
                     ));
                 }
+            } else {
+                // The first-run folder exists even before Git is installed.
+                // Its Git repository and managed files are initialized later.
+                fs::create_dir(&default)?;
             }
             let path = default.to_str().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid path encoding")
@@ -591,6 +595,8 @@ mod tests {
         conn.execute_batch("CREATE TABLE archive_location_settings(id INTEGER PRIMARY KEY, path TEXT NOT NULL, initialized INTEGER NOT NULL DEFAULT 0)").unwrap();
         let service = ArchiveLocation::load(db, temp.path(), vec![]).unwrap();
         assert_eq!(*service.current.read().await, temp.path().join("momso"));
+        assert!(temp.path().join("momso").is_dir());
+        assert_eq!(fs::read_dir(temp.path().join("momso")).unwrap().count(), 0);
         assert!(service.needs_initial_index);
         assert!(service.status().await.is_default);
     }

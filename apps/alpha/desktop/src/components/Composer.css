@@ -611,6 +611,8 @@
   cursor: pointer;
 }
 .slash-item.is-active { background: var(--surface-muted); color: var(--ink); }
+.slash-item.is-unavailable { cursor: default; }
+.slash-item.is-unavailable .slash-item-title, .slash-item.is-unavailable svg { color: var(--faint); }
 .slash-item-text { display: grid; min-width: 0; gap: 1px; }
 .slash-item-title { color: var(--ink); font-size: 12.5px; }
 .slash-item-description { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
@@ -648,3 +650,11 @@
 .composer-skill button:hover { background: rgba(40, 43, 42, 0.08); color: var(--ink); }
 
 .workbench-grid .slash-menu { right: var(--chat-gutter); left: var(--chat-gutter); }
+
+/* 모델 목록을 읽는 중·읽지 못했을 때의 한 줄(2026-11-17). */
+.composer-models-state { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.composer-models-retry { padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink-soft); font: inherit; font-size: 12px; cursor: pointer; }
+.composer-models-retry:hover { color: var(--ink); }
+/* 입력창이 좁으면(창 960, 패널 열림) 두 줄로 접어 넘치지 않게. */
+.composer-models-retry { flex: none; white-space: nowrap; }
+.composer-models-state.is-narrow .composer-models-text { max-width: 5.5em; overflow: hidden; text-overflow: ellipsis; }

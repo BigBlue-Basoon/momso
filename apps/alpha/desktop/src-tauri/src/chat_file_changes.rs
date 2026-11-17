@@ -118,7 +118,15 @@ pub(crate) fn reference(root: &Path, path: &str) -> Option<String> {
         ["zettels", file] => file
             .strip_suffix(".md")
             .filter(|id| crate::archive_zet::valid_zet_id(id))
-            .map(str::to_owned),
+            .map(str::to_owned)
+            .or_else(|| {
+                let candidate = format!("document-path:{file}");
+                crate::chat_recovery::valid_document_reference(&candidate).then_some(candidate)
+            }),
+        ["zettels", rest @ ..] if !rest.is_empty() => {
+            let candidate = format!("document-path:{}", rest.join("/"));
+            crate::chat_recovery::valid_document_reference(&candidate).then_some(candidate)
+        }
         ["objects", "sha256", prefix, hash]
             if hash.is_ascii() && hash.len() == 64 && *prefix == &hash[..2] =>
         {
@@ -134,13 +142,17 @@ pub(crate) fn capture(root: &Path) -> Result<Snapshot, String> {
     capture_unlocked(root)
 }
 pub(crate) fn capture_unlocked(root: &Path) -> Result<Snapshot, String> {
+    if !fs::metadata(root).map_err(|e| e.to_string())?.is_dir() {
+        return Err("invalid archive folder".into());
+    }
     let mut found = Snapshot::new();
     for folder in ["zettels", "objects"] {
         let base = root.join(folder);
-        if !base.exists() {
-            continue;
-        }
-        let meta = fs::symlink_metadata(&base).map_err(|e| e.to_string())?;
+        let meta = match fs::symlink_metadata(&base) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
         if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
             return Err("invalid archive folder".into());
         }
@@ -154,13 +166,31 @@ pub(crate) fn capture_unlocked(root: &Path) -> Result<Snapshot, String> {
                 .strip_prefix(&base)
                 .map_err(|e| e.to_string())?;
             let parts: Vec<_> = relative.components().collect();
-            let reference = if folder == "zettels" && parts.len() == 1 {
-                relative
-                    .file_name()
+            let reference = if folder == "zettels" {
+                let valid = (parts.len() == 1)
+                    .then(|| {
+                        relative
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .and_then(|s| s.strip_suffix(".md"))
+                            .filter(|id| crate::archive_zet::valid_zet_id(id))
+                            .map(str::to_owned)
+                    })
+                    .flatten();
+                if valid.is_some() {
+                    valid
+                } else if relative
+                    .extension()
                     .and_then(|s| s.to_str())
-                    .and_then(|s| s.strip_suffix(".md"))
-                    .filter(|id| crate::archive_zet::valid_zet_id(id))
-                    .map(str::to_owned)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("md"))
+                {
+                    Some(format!(
+                        "document-path:{}",
+                        relative.to_str().ok_or("unsafe_path")?.replace('\\', "/")
+                    ))
+                } else {
+                    None
+                }
             } else if folder == "objects" && parts.len() == 3 && parts[0].as_os_str() == "sha256" {
                 parts[2]
                     .as_os_str()
@@ -231,6 +261,28 @@ pub(crate) fn source_changes(before: &Snapshot, after: &Snapshot) -> BTreeMap<St
         .into_iter()
         .filter(|(id, action)| {
             (id.starts_with("sha256:") || id.starts_with("object-path:")) && action != "created"
+        })
+        .collect()
+}
+
+pub(crate) fn source_change_details(before: &Snapshot, after: &Snapshot) -> Vec<serde_json::Value> {
+    source_changes(before, after)
+        .into_iter()
+        .map(|(id, action)| {
+            let hash = before
+                .get(&id)
+                .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            let relative = id
+                .strip_prefix("object-path:")
+                .map(|path| path.replace('\\', "/"))
+                .or_else(|| {
+                    id.strip_prefix("sha256:").and_then(|digest| {
+                        digest
+                            .get(..2)
+                            .map(|prefix| format!("sha256/{prefix}/{digest}"))
+                    })
+                });
+            serde_json::json!({"id":id,"action":action,"relativePath":relative,"beforeSha256":hash})
         })
         .collect()
 }
@@ -618,6 +670,22 @@ mod tests {
             result.get("zet_20261115_120001").map(String::as_str),
             Some("created")
         );
+    }
+
+    #[test]
+    fn unavailable_archive_is_not_reported_as_an_unchanged_empty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive");
+        fs::create_dir(&archive).unwrap();
+        assert!(capture(&archive).unwrap().is_empty());
+        fs::remove_dir(&archive).unwrap();
+        assert!(capture(&archive).is_err());
+        fs::write(&archive, b"not a directory").unwrap();
+        assert!(capture(&archive).is_err());
+        fs::remove_file(&archive).unwrap();
+        fs::create_dir(&archive).unwrap();
+        fs::write(archive.join("objects"), b"not a directory").unwrap();
+        assert!(capture(&archive).is_err());
     }
 
     #[test]

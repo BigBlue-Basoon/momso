@@ -174,6 +174,9 @@ pub(crate) fn create(
         original_header: None,
     };
     validate(&sample)?;
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|_| "글을 저장하지 못했습니다".to_string())?;
     let (id, stamp, mut file) = crate::archive::allocate_file(&root.join("zettels"), "zet")?;
     let head = ZetHead {
         id: id.clone(),
@@ -391,6 +394,7 @@ pub(crate) struct LinkedZet {
 pub(crate) struct LinkedAsset {
     id: String,
     original_file_name: Option<String>,
+    deleted: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -446,12 +450,13 @@ pub(crate) fn linked(
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|_| "연결을 읽지 못했습니다".into())
     };
-    let mut stmt = conn.prepare("SELECT a.asset_id, s.original_file_name FROM archive_zets_assets a LEFT JOIN momso_source_assets s ON s.content_sha256=substr(a.asset_id,8) WHERE a.zet_id=?1 ORDER BY a.asset_id").map_err(|_| "연결을 읽지 못했습니다".to_string())?;
+    let mut stmt = conn.prepare("SELECT a.asset_id, s.original_file_name, EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id) FROM archive_zets_assets a LEFT JOIN momso_source_assets s ON s.content_sha256=substr(a.asset_id,8) WHERE a.zet_id=?1 ORDER BY a.asset_id").map_err(|_| "연결을 읽지 못했습니다".to_string())?;
     let assets = stmt
         .query_map([id], |r| {
             Ok(LinkedAsset {
                 id: r.get(0)?,
                 original_file_name: r.get(1)?,
+                deleted: r.get(2)?,
             })
         })
         .map_err(|_| "연결을 읽지 못했습니다".to_string())?

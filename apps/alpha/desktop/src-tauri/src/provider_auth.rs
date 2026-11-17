@@ -1,7 +1,8 @@
 use crate::{chat_claude, connections, credentials, gemini_access, process, usage_status};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Mutex, OnceLock},
     time::Duration,
 };
@@ -14,6 +15,244 @@ enum PendingOperation {
 }
 type Pending = Mutex<HashMap<String, PendingOperation>>;
 static PENDING: OnceLock<Pending> = OnceLock::new();
+
+#[derive(Clone)]
+struct KeyCheck {
+    fingerprint: [u8; 32],
+    generation: uuid::Uuid,
+    state: &'static str,
+}
+static KEY_CHECKS: OnceLock<Mutex<HashMap<String, KeyCheck>>> = OnceLock::new();
+static RETRY_MONITORS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn key_checks() -> &'static Mutex<HashMap<String, KeyCheck>> {
+    KEY_CHECKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn key_fingerprint(key: &str) -> [u8; 32] {
+    Sha256::digest(key.as_bytes()).into()
+}
+
+fn begin_key_check_if(
+    provider: &str,
+    key: &str,
+    still_current: impl FnOnce() -> bool,
+) -> Option<uuid::Uuid> {
+    let mut checks = key_checks().lock().ok()?;
+    if !still_current() {
+        return None;
+    }
+    let generation = uuid::Uuid::new_v4();
+    checks.insert(
+        provider.to_owned(),
+        KeyCheck {
+            fingerprint: key_fingerprint(key),
+            generation,
+            state: "verifying",
+        },
+    );
+    Some(generation)
+}
+
+#[cfg(test)]
+fn begin_key_check(provider: &str, key: &str) -> Option<uuid::Uuid> {
+    begin_key_check_if(provider, key, || true)
+}
+
+fn begin_stored_key_check(provider: &str, key: &str) -> Option<uuid::Uuid> {
+    begin_key_check_if(provider, key, || {
+        stored_key_matches(provider, key_fingerprint(key))
+    })
+}
+
+fn store_and_begin(
+    provider: &str,
+    key: &str,
+    save: impl FnOnce(&str) -> Result<(), ()>,
+) -> Result<uuid::Uuid, ()> {
+    let mut checks = key_checks().lock().map_err(|_| ())?;
+    save(key)?;
+    let generation = uuid::Uuid::new_v4();
+    checks.insert(
+        provider.to_owned(),
+        KeyCheck {
+            fingerprint: key_fingerprint(key.trim()),
+            generation,
+            state: "verifying",
+        },
+    );
+    Ok(generation)
+}
+
+fn finish_in_checks(
+    checks: &mut HashMap<String, KeyCheck>,
+    provider: &str,
+    generation: uuid::Uuid,
+    result: &str,
+) -> Option<&'static str> {
+    let check = checks.get_mut(provider)?;
+    if check.generation != generation {
+        return None;
+    }
+    check.state = match result {
+        "authenticated" => "verified",
+        "rejected" => "rejected",
+        "not_supported" => "notSupported",
+        _ => "unavailable",
+    };
+    Some(check.state)
+}
+
+#[cfg(test)]
+fn finish_key_check(provider: &str, generation: uuid::Uuid, result: &str) -> Option<&'static str> {
+    let mut checks = key_checks().lock().ok()?;
+    finish_in_checks(&mut checks, provider, generation, result)
+}
+
+fn finish_stored_key_check(
+    provider: &str,
+    fingerprint: [u8; 32],
+    generation: uuid::Uuid,
+    result: &str,
+) -> Option<&'static str> {
+    let mut checks = key_checks().lock().ok()?;
+    if !stored_key_matches(provider, fingerprint) {
+        return None;
+    }
+    finish_in_checks(&mut checks, provider, generation, result)
+}
+
+async fn key_verification(
+    provider: &str,
+    key: Option<String>,
+    retry_unavailable: bool,
+) -> &'static str {
+    let Some(key) = key else {
+        return "notConfigured";
+    };
+    let cached = key_checks()
+        .lock()
+        .ok()
+        .and_then(|checks| checks.get(provider).cloned());
+    if let Some(check) = cached.filter(|check| check.fingerprint == key_fingerprint(&key)) {
+        if !should_retry(check.state, retry_unavailable) {
+            return check.state;
+        }
+    }
+    let Some(generation) = begin_stored_key_check(provider, &key) else {
+        return "verifying";
+    };
+    let fingerprint = key_fingerprint(&key);
+    let result = connections::verify_api_key(key_provider(provider).unwrap_or(""), key).await;
+    finish_stored_key_check(provider, fingerprint, generation, result).unwrap_or("verifying")
+}
+
+fn should_retry(state: &str, retry_unavailable: bool) -> bool {
+    state == "unavailable" && retry_unavailable
+}
+
+pub(crate) fn key_can_be_used(saved: bool, verification: &str) -> bool {
+    saved && matches!(verification, "verified" | "notSupported")
+}
+
+pub(crate) fn key_matches_checked(checked: Option<[u8; 32]>, key: Option<&str>) -> bool {
+    match (checked, key) {
+        (Some(expected), Some(key)) => expected == key_fingerprint(key),
+        _ => false,
+    }
+}
+
+fn first_run_allowed(statuses: &[ProviderStatus]) -> bool {
+    statuses.iter().any(|status| {
+        status.runnable
+            && (status.state == "account"
+                || (status.api_key_saved
+                    && matches!(
+                        status.key_verification,
+                        "verified" | "unavailable" | "notSupported"
+                    )))
+    })
+}
+
+fn next_retry_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(Duration::from_secs(300))
+}
+
+fn start_retry_monitor(app: AppHandle, provider: &'static str) {
+    let monitors = RETRY_MONITORS.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut active) = monitors.lock() else {
+        return;
+    };
+    if !active.insert(provider.to_owned()) {
+        return;
+    }
+    drop(active);
+    tauri::async_runtime::spawn(async move {
+        let mut delay = Duration::from_secs(30);
+        loop {
+            tokio::time::sleep(delay).await;
+            let state = key_checks()
+                .lock()
+                .ok()
+                .and_then(|checks| checks.get(provider).map(|entry| entry.state));
+            match state {
+                Some("verifying") => continue,
+                Some("unavailable") => {}
+                _ => break,
+            }
+            let key = key_provider(provider)
+                .and_then(|name| credentials::ai_key_name(name).ok())
+                .and_then(|name| credentials::get_secret(name).ok().flatten());
+            if key.is_none() {
+                break;
+            }
+            notify(&app, provider, "verifying");
+            let state = key_verification(provider, key, true).await;
+            notify(&app, provider, state);
+            if state == "unavailable" {
+                delay = next_retry_delay(delay);
+            }
+        }
+        if let Ok(mut active) = RETRY_MONITORS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+        {
+            active.remove(provider);
+        }
+    });
+}
+
+pub(crate) fn ensure_key_retry(app: &AppHandle, status: &ProviderStatus) {
+    if status.api_key_saved && status.key_verification == "unavailable" {
+        start_retry_monitor(app.clone(), status.provider);
+    }
+}
+
+pub(crate) fn start_initial_key_rechecks(app: AppHandle) {
+    for provider in ["codex", "claude", "gemini"] {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let key = key_provider(provider)
+                .and_then(|name| credentials::ai_key_name(name).ok())
+                .and_then(|name| credentials::get_secret(name).ok().flatten());
+            if key.is_none() {
+                return;
+            }
+            let state = key_verification(provider, key, true).await;
+            notify(&app, provider, state);
+            if state == "unavailable" {
+                start_retry_monitor(app, provider);
+            }
+        });
+    }
+}
+
+fn stored_key_matches(provider: &str, fingerprint: [u8; 32]) -> bool {
+    key_provider(provider)
+        .and_then(|name| credentials::ai_key_name(name).ok())
+        .and_then(|name| credentials::get_secret(name).ok().flatten())
+        .is_some_and(|key| key_fingerprint(&key) == fingerprint)
+}
 
 fn pending() -> &'static Pending {
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
@@ -46,6 +285,37 @@ fn key_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
+fn static_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "gemini" => Some("gemini"),
+        _ => None,
+    }
+}
+
+pub(crate) fn reject_unverified_key(app: &AppHandle, provider: &str, fingerprint: [u8; 32]) {
+    let Ok(mut checks) = key_checks().lock() else {
+        return;
+    };
+    let Some(check) = checks.get_mut(provider) else {
+        return;
+    };
+    if !stored_key_matches(provider, fingerprint) || !reject_if_unsupported(check, fingerprint) {
+        return;
+    }
+    drop(checks);
+    notify(app, provider, "rejected");
+}
+
+fn reject_if_unsupported(check: &mut KeyCheck, fingerprint: [u8; 32]) -> bool {
+    if check.fingerprint != fingerprint || check.state != "notSupported" {
+        return false;
+    }
+    check.state = "rejected";
+    true
+}
+
 fn gemini_connection_state(installed: bool, key_saved: Option<bool>) -> &'static str {
     if !installed {
         return "unavailable";
@@ -57,6 +327,7 @@ fn gemini_connection_state(installed: bool, key_saved: Option<bool>) -> &'static
     }
 }
 
+#[cfg(test)]
 fn gemini_key_status(key: Option<&str>) -> (bool, Option<bool>) {
     match key {
         Some(value) => (true, Some(!value.trim().is_empty())),
@@ -82,10 +353,14 @@ fn claude_connection_state(success: bool, value: &serde_json::Value) -> &'static
 pub(crate) struct ProviderStatus {
     provider: &'static str,
     pub(crate) installed: bool,
+    pub(crate) runnable: bool,
     pub(crate) state: &'static str,
     account_label: Option<String>,
     plan_label: Option<String>,
     pub(crate) api_key_saved: bool,
+    pub(crate) key_verification: &'static str,
+    #[serde(skip)]
+    pub(crate) checked_key_fingerprint: Option<[u8; 32]>,
     methods: Vec<&'static str>,
     pub(crate) active: Option<&'static str>,
 }
@@ -95,7 +370,7 @@ pub(crate) fn chat_auth_method(
     installed: bool,
     state: &str,
     active: Option<&str>,
-    key_saved: bool,
+    key_verified: bool,
     requested: Option<&str>,
 ) -> Result<&'static str, &'static str> {
     if !installed {
@@ -103,20 +378,21 @@ pub(crate) fn chat_auth_method(
     }
     match provider {
         "gemini" => match requested {
-            None | Some("apiKey") => Ok("apiKey"),
+            None | Some("apiKey") if key_verified && state == "apiKey" => Ok("apiKey"),
+            None | Some("apiKey") => Err("not_connected"),
             _ => Err("unavailable"),
         },
         "claude" => match requested.or(active) {
             Some("account") if state == "account" => Ok("account"),
-            Some("apiKey") => Ok("apiKey"),
+            Some("apiKey") if key_verified => Ok("apiKey"),
+            Some("apiKey") => Err("not_connected"),
             None | Some("account") => Err("not_connected"),
             _ => Err("unavailable"),
         },
         "codex" => match (requested, active) {
             (None, Some("account")) | (Some("account"), Some("account")) => Ok("account"),
-            (None, Some("apiKey")) => Ok("apiKey"),
-            (Some("apiKey"), _) if key_saved => Ok("apiKey"),
-            (Some("apiKey"), _) => Err("not_connected"),
+            (None, Some("apiKey")) | (Some("apiKey"), _) if key_verified => Ok("apiKey"),
+            (None, Some("apiKey")) | (Some("apiKey"), _) => Err("not_connected"),
             (None | Some("account"), None) if state == "signedOut" => Err("not_connected"),
             _ => Err("unavailable"),
         },
@@ -152,31 +428,47 @@ async fn run_login_tool(
 }
 
 pub(crate) async fn read_status(provider: &'static str) -> ProviderStatus {
-    let installed = if provider == "gemini" {
-        gemini_access::executable().is_some()
+    read_status_inner(provider, false).await
+}
+
+pub(crate) async fn read_status_for_chat(provider: &'static str) -> ProviderStatus {
+    read_status_inner(provider, true).await
+}
+
+async fn read_status_inner(provider: &'static str, retry_unavailable: bool) -> ProviderStatus {
+    let executable = if provider == "gemini" {
+        gemini_access::executable()
     } else if provider == "claude" {
-        chat_claude::executable().is_some()
+        chat_claude::executable()
     } else {
-        process::resolve_interactive_tool(provider).is_some()
+        process::resolve_interactive_tool(provider)
     };
-    let (api_key_saved, key_usable) = if provider == "gemini" {
-        match credentials::ai_key_name("gemini").and_then(credentials::get_secret) {
-            Ok(key) => gemini_key_status(key.as_deref()),
-            Err(_) => (false, None),
+    let installed = executable.is_some();
+    let key = key_provider(provider)
+        .and_then(|p| credentials::ai_key_name(p).ok())
+        .map(credentials::get_secret);
+    let (api_key_saved, key_verification, checked_key_fingerprint) = match key {
+        Some(Ok(key)) => {
+            let saved = key.is_some();
+            let fingerprint = key.as_deref().map(key_fingerprint);
+            (
+                saved,
+                key_verification(provider, key, retry_unavailable).await,
+                fingerprint,
+            )
         }
-    } else {
-        let saved = key_provider(provider)
-            .and_then(|p| credentials::ai_key_name(p).ok())
-            .and_then(|name| credentials::has_secret(name).ok());
-        (saved == Some(true), saved)
+        _ => (false, "unavailable", None),
     };
     let mut status = ProviderStatus {
         provider,
         installed,
+        runnable: false,
         state: "unavailable",
         account_label: None,
         plan_label: None,
         api_key_saved,
+        key_verification,
+        checked_key_fingerprint,
         methods: if provider == "gemini" {
             vec!["apiKey"]
         } else {
@@ -184,8 +476,19 @@ pub(crate) async fn read_status(provider: &'static str) -> ProviderStatus {
         },
         active: None,
     };
+    if let Some(path) = executable {
+        if !crate::provider_install::executable_works(&path).await {
+            return status;
+        }
+        status.runnable = true;
+    }
     if provider == "gemini" {
-        status.state = gemini_connection_state(installed, key_usable);
+        let saved = if !api_key_saved && key_verification == "unavailable" {
+            None
+        } else {
+            Some(api_key_saved)
+        };
+        status.state = gemini_connection_state(installed, saved);
         return status;
     }
     if !installed {
@@ -194,7 +497,7 @@ pub(crate) async fn read_status(provider: &'static str) -> ProviderStatus {
     if provider == "codex" {
         let result = process::run_json_rpc_tool("codex", &["app-server"], None, &process::empty_environment(), process::JsonRpcRequest {
             initialize_params: serde_json::json!({"clientInfo": {"name":"momso", "title":"momso", "version":env!("CARGO_PKG_VERSION")}}),
-            method: "account/read", params: serde_json::json!({"refreshToken":false}),
+            method: "account/read", params: serde_json::json!({"refreshToken":true}),
         }, Duration::from_secs(12)).await;
         if let Ok(result) = result {
             match result.get("account") {
@@ -244,10 +547,7 @@ pub(crate) async fn read_status(provider: &'static str) -> ProviderStatus {
             }
         }
     }
-    if matches!(provider, "codex" | "claude")
-        && status.state == "signedOut"
-        && key_usable == Some(true)
-    {
+    if matches!(provider, "codex" | "claude") && status.state == "signedOut" && api_key_saved {
         status.state = "apiKey";
         status.active = Some("apiKey");
     }
@@ -255,13 +555,22 @@ pub(crate) async fn read_status(provider: &'static str) -> ProviderStatus {
 }
 
 #[tauri::command]
-pub(crate) async fn provider_auth_status() -> Vec<ProviderStatus> {
+pub(crate) async fn provider_auth_status(app: AppHandle) -> Vec<ProviderStatus> {
     let (codex, claude, gemini) = tokio::join!(
         read_status("codex"),
         read_status("claude"),
         read_status("gemini")
     );
-    vec![codex, claude, gemini]
+    let statuses = vec![codex, claude, gemini];
+    for status in &statuses {
+        ensure_key_retry(&app, status);
+    }
+    statuses
+}
+
+#[tauri::command]
+pub(crate) async fn provider_first_run_eligible(app: AppHandle) -> bool {
+    first_run_allowed(&provider_auth_status(app).await)
 }
 
 #[tauri::command]
@@ -362,15 +671,55 @@ pub(crate) fn provider_api_key_set(
     if !valid_api_key_shape(&api_key) {
         return "invalidKey";
     }
-    if connections::save_api_key(name, &api_key).is_err() {
+    let Ok(generation) = store_and_begin(&provider, &api_key, |key| {
+        connections::save_api_key(name, key).map_err(|_| ())
+    }) else {
+        notify(&app, &provider, "unavailable");
         return "unavailable";
-    }
-    notify(&app, &provider, "keySaved");
-    "keySaved"
+    };
+    notify(&app, &provider, "verifying");
+    tauri::async_runtime::spawn(async move {
+        let fingerprint = key_fingerprint(api_key.trim());
+        let result = connections::verify_api_key(name, api_key.trim().to_owned()).await;
+        if let Some(state) = finish_stored_key_check(&provider, fingerprint, generation, result) {
+            notify(&app, &provider, state);
+            if let ("unavailable", Some(provider)) = (state, static_provider(&provider)) {
+                start_retry_monitor(app.clone(), provider);
+            }
+        }
+    });
+    "verifying"
 }
 
 fn valid_api_key_shape(api_key: &str) -> bool {
-    api_key.trim().len() >= 20 && !api_key.trim().chars().any(char::is_whitespace)
+    !api_key.trim().is_empty()
+}
+
+#[tauri::command]
+pub(crate) fn provider_api_key_verify(app: AppHandle, provider: String) -> &'static str {
+    let Some(name) = key_provider(&provider) else {
+        return "notSupported";
+    };
+    let key = match credentials::ai_key_name(name).and_then(credentials::get_secret) {
+        Ok(Some(key)) => key,
+        Ok(None) => return "notConfigured",
+        Err(_) => return "unavailable",
+    };
+    let Some(generation) = begin_stored_key_check(&provider, &key) else {
+        return "unavailable";
+    };
+    notify(&app, &provider, "verifying");
+    tauri::async_runtime::spawn(async move {
+        let fingerprint = key_fingerprint(&key);
+        let result = connections::verify_api_key(name, key).await;
+        if let Some(state) = finish_stored_key_check(&provider, fingerprint, generation, result) {
+            notify(&app, &provider, state);
+            if let ("unavailable", Some(provider)) = (state, static_provider(&provider)) {
+                start_retry_monitor(app.clone(), provider);
+            }
+        }
+    });
+    "verifying"
 }
 
 #[tauri::command]
@@ -378,9 +727,14 @@ pub(crate) fn provider_api_key_clear(app: AppHandle, provider: String) -> &'stat
     let Some(name) = key_provider(&provider) else {
         return "unavailable";
     };
+    let Ok(mut checks) = key_checks().lock() else {
+        return "unavailable";
+    };
     if connections::delete_api_key(name).is_err() {
         return "unavailable";
     }
+    checks.remove(&provider);
+    drop(checks);
     notify(&app, &provider, "keyCleared");
     "keyCleared"
 }
@@ -388,14 +742,229 @@ pub(crate) fn provider_api_key_clear(app: AppHandle, provider: String) -> &'stat
 #[cfg(test)]
 mod tests {
     #[test]
+    fn first_run_and_retry_distinguish_offline_rejected_and_unsupported() {
+        use super::*;
+        let status = |saved, verification, state| ProviderStatus {
+            provider: "gemini",
+            installed: true,
+            runnable: true,
+            state,
+            account_label: None,
+            plan_label: None,
+            api_key_saved: saved,
+            key_verification: verification,
+            checked_key_fingerprint: None,
+            methods: vec!["apiKey"],
+            active: None,
+        };
+        for value in ["verified", "unavailable", "notSupported"] {
+            assert!(first_run_allowed(&[status(true, value, "apiKey")]));
+            let mut missing_tool = status(true, value, "apiKey");
+            missing_tool.installed = false;
+            missing_tool.runnable = false;
+            assert!(!first_run_allowed(&[missing_tool]));
+        }
+        for value in ["rejected", "notConfigured", "verifying"] {
+            assert!(!first_run_allowed(&[status(true, value, "apiKey")]));
+        }
+        assert!(!first_run_allowed(&[status(
+            false,
+            "unavailable",
+            "signedOut"
+        )]));
+        assert!(first_run_allowed(&[status(
+            false,
+            "notConfigured",
+            "account"
+        )]));
+        assert!(should_retry("unavailable", true));
+        assert!(!should_retry("unavailable", false));
+        assert!(!should_retry("verifying", true));
+        assert!(key_can_be_used(true, "notSupported"));
+        assert!(!key_can_be_used(true, "unavailable"));
+        assert!(!key_can_be_used(false, "notSupported"));
+        assert!(key_matches_checked(
+            Some(key_fingerprint("first-key")),
+            Some("first-key")
+        ));
+        assert!(!key_matches_checked(
+            Some(key_fingerprint("first-key")),
+            Some("replacement-key")
+        ));
+        assert_eq!(
+            next_retry_delay(Duration::from_secs(30)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            next_retry_delay(Duration::from_secs(240)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            next_retry_delay(Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
+        let fingerprint = key_fingerprint("fake-key");
+        let mut key = KeyCheck {
+            fingerprint,
+            generation: uuid::Uuid::new_v4(),
+            state: "notSupported",
+        };
+        assert!(!reject_if_unsupported(
+            &mut key,
+            key_fingerprint("different-key")
+        ));
+        assert!(reject_if_unsupported(&mut key, fingerprint));
+        assert_eq!(key.state, "rejected");
+    }
+
+    #[test]
+    fn offline_key_recheck_updates_state_after_connection_returns() {
+        use super::*;
+        let provider = "test-offline-retry";
+        let generation = begin_key_check(provider, "test-key").unwrap();
+        assert_eq!(
+            finish_key_check(provider, generation, "unavailable"),
+            Some("unavailable")
+        );
+        assert!(should_retry("unavailable", true));
+        let retry = begin_key_check(provider, "test-key").unwrap();
+        assert_eq!(
+            finish_key_check(provider, retry, "authenticated"),
+            Some("verified")
+        );
+        let retry = begin_key_check(provider, "test-key").unwrap();
+        assert_eq!(
+            finish_key_check(provider, retry, "rejected"),
+            Some("rejected")
+        );
+        assert!(!key_can_be_used(true, "rejected"));
+    }
+
+    #[test]
+    fn stale_retry_cannot_replace_the_new_key_check() {
+        use super::*;
+        let provider = "test-stale-retry";
+        let current = begin_key_check(provider, "new-key").unwrap();
+        assert_eq!(begin_key_check_if(provider, "old-key", || false), None);
+        assert_eq!(
+            finish_key_check(provider, current, "authenticated"),
+            Some("verified")
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn fake_login_child() {
+        if std::env::var_os("MOMSO_FAKE_LOGIN_TEST").is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            for (tool, args) in [
+                ("codex", &["login"][..]),
+                ("claude", &["auth", "login", "--claudeai"][..]),
+            ] {
+                let result =
+                    super::run_login_tool(tool, args, tokio_util::sync::CancellationToken::new())
+                        .await
+                        .unwrap();
+                assert!(result.success);
+                assert_eq!(result.stdout.trim(), "fake_browser_requested");
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fake_login_requests_browser_without_real_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let tools = temp.path().join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        for name in ["codex", "claude"] {
+            std::fs::write(
+                tools.join(format!("{name}.cmd")),
+                b"@echo off\r\necho fake_browser_requested\r\nexit /b 0\r\n",
+            )
+            .unwrap();
+        }
+        let windows = std::env::var_os("SystemRoot").unwrap();
+        let path =
+            std::env::join_paths([tools, std::path::PathBuf::from(&windows).join("System32")])
+                .unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "provider_auth::tests::fake_login_child"])
+            .current_dir(temp.path())
+            .env_clear()
+            .env("SystemRoot", &windows)
+            .env(
+                "COMSPEC",
+                std::path::PathBuf::from(&windows).join("System32/cmd.exe"),
+            )
+            .env("PATH", path)
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+            .env("USERPROFILE", temp.path())
+            .env("HOME", temp.path())
+            .env("APPDATA", temp.path())
+            .env("LOCALAPPDATA", temp.path())
+            .env("TEMP", temp.path())
+            .env("TMP", temp.path())
+            .env("MOMSO_FAKE_LOGIN_TEST", "1")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "fake login failed: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
     fn gemini_key_shape_rejects_invalid_without_contacting_provider() {
-        assert!(!super::valid_api_key_shape("fake-short"));
-        assert!(!super::valid_api_key_shape("fake-key-with a-space-123456"));
+        assert!(super::valid_api_key_shape("fake-short"));
+        assert!(super::valid_api_key_shape("fake-key-with a-space-123456"));
         assert!(super::valid_api_key_shape(
             "fake-key-invalid-but-long-enough"
         ));
     }
     use super::*;
+    #[test]
+    fn rejected_key_is_saved_but_never_connected() {
+        let mut saved = None;
+        let generation = store_and_begin("test-rejected", "wrong-key", |key| {
+            saved = Some(key.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(saved.as_deref(), Some("wrong-key"));
+        assert_eq!(
+            finish_key_check("test-rejected", generation, "rejected"),
+            Some("rejected")
+        );
+        for provider in ["codex", "claude", "gemini"] {
+            let active = if provider == "gemini" {
+                None
+            } else {
+                Some("apiKey")
+            };
+            assert_eq!(
+                chat_auth_method(provider, true, "apiKey", active, false, None),
+                Err("not_connected")
+            );
+            assert_eq!(
+                chat_auth_method(provider, true, "apiKey", active, true, None),
+                Ok("apiKey")
+            );
+        }
+        let newer = begin_key_check("test-rejected", "new-key").unwrap();
+        assert_eq!(
+            finish_key_check("test-rejected", generation, "authenticated"),
+            None
+        );
+        assert_eq!(
+            finish_key_check("test-rejected", newer, "unavailable"),
+            Some("unavailable")
+        );
+    }
     #[test]
     fn chat_auth_choices_and_absent_tools_have_consistent_states() {
         for provider in ["codex", "claude", "gemini"] {
@@ -435,6 +1004,10 @@ mod tests {
         );
         assert_eq!(
             chat_auth_method("gemini", true, "signedOut", None, false, None),
+            Err("not_connected")
+        );
+        assert_eq!(
+            chat_auth_method("gemini", true, "apiKey", None, true, None),
             Ok("apiKey")
         );
     }

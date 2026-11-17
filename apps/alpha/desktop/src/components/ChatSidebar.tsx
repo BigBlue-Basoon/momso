@@ -1,8 +1,9 @@
-import { type DragEvent, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { type DragEvent, memo, type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Archive, ChevronDown, ChevronRight, FolderPlus, MoreHorizontal, Pin, PinOff, SquarePen } from 'lucide-react'
 import type { ChatEntry, ChatGroup } from '../chats'
 import { GROUP_WORD, W } from '../words'
+import { progressPercent, type RestoreProgress } from '../restore-progress'
 import { ShortcutTip } from './ShortcutTip'
 import { QuestionDialog } from './ZetPanel'
 import './ChatSidebar.css'
@@ -18,6 +19,12 @@ type ChatSidebarProps = {
   selectedChatId: string | null
   /** 목록을 읽지 못했으면 그 까닭. */
   error: string | null
+  /** 아직 목록을 읽는 중(한 번도 읽지 않았다). */
+  loading?: boolean
+  /** 받은 채팅 사본을 되살리는 중이면 그 진행(목록 맨 위 한 줄과 막대). 끝나면 null. */
+  restoring?: RestoreProgress | null
+  /** 읽지 못했을 때 "다시 불러오기". */
+  onRetry?: () => void
   onNewChat: () => void
   onSelectChat: (id: string) => void
   /** 채팅방 묶음. null 이면 묶음 백엔드가 없다(묶음 만들기가 눌리지 않는다, 글 없음). */
@@ -42,15 +49,54 @@ function loadFolded(): Record<string, boolean> {
 }
 
 /**
+ * 앞의 목록과 그리는 데 쓰는 값이 같으면 다시 그리지 않는다(2026-11-17 많이 쌓였을 때 재기: 입력창에 글자를 칠 때마다
+ * 채팅방 500개 줄을 다시 그려 글자 하나에 0.1초 넘게 걸렸다). 손잡이(on…)는 아래 ChatSidebar 가 늘 같은 함수로 넘긴다.
+ */
+function sameSidebar(a: ChatSidebarProps, b: ChatSidebarProps) {
+  return a.chats === b.chats && a.groups === b.groups && a.selectedChatId === b.selectedChatId && a.error === b.error && Boolean(a.loading) === Boolean(b.loading) && a.restoring === b.restoring
+    && (a.busyChatId ?? null) === (b.busyChatId ?? null) && Boolean(a.onPinChat) === Boolean(b.onPinChat) && Boolean(a.onArchiveChat) === Boolean(b.onArchiveChat)
+    && (a.waitingChatIds ?? []).join('|') === (b.waitingChatIds ?? []).join('|')
+}
+
+/** 손잡이를 늘 같은 함수로 바꿔(부를 때는 가장 새 손잡이를 부른다) 목록이 쓸데없이 다시 그려지지 않게 한다. */
+export function ChatSidebar(props: ChatSidebarProps) {
+  const latest = useRef(props)
+  latest.current = props
+  const stable = useMemo(() => ({
+    onNewChat: () => latest.current.onNewChat(),
+    onSelectChat: (id: string) => latest.current.onSelectChat(id),
+    onCreateGroup: () => latest.current.onCreateGroup(),
+    onRenameGroup: (id: string, name: string) => latest.current.onRenameGroup(id, name),
+    onMoveGroup: (id: string, step: -1 | 1) => latest.current.onMoveGroup(id, step),
+    onRemoveGroup: (id: string) => latest.current.onRemoveGroup(id),
+    onSetGroup: (chatId: string, groupId: string | null) => latest.current.onSetGroup(chatId, groupId),
+    onPinChat: (chatId: string, pinned: boolean) => latest.current.onPinChat?.(chatId, pinned),
+    onArchiveChat: (chatId: string) => latest.current.onArchiveChat?.(chatId),
+    onRetry: () => latest.current.onRetry?.(),
+  }), [])
+  return (
+    <ChatSidebarList
+      {...props}
+      {...stable}
+      onPinChat={props.onPinChat ? stable.onPinChat : undefined}
+      onArchiveChat={props.onArchiveChat ? stable.onArchiveChat : undefined}
+    />
+  )
+}
+
+/**
  * 왼쪽 채팅방 목록. 맨 위에 "새 채팅방"과 묶음 만들기, 찾기. 그 아래 묶음마다 머리(접고 펴기)와 그 안의 채팅방,
  * 그 아래 묶이지 않은 채팅방(얇은 선으로 가름). 채팅방은 끌어서 묶음 머리에 놓거나 줄의 메뉴로 넣고 뺀다.
  * 찾기는 묶음과 상관없이 전부에서 찾고, 결과에 어느 묶음인지 보인다. 지우기는 목록에 없고, 보관한 채팅방을 설정에서 영구 삭제한다.
  */
-export function ChatSidebar({
+const ChatSidebarList = memo(function ChatSidebarList({
   chats,
   waitingChatIds = [],
   selectedChatId,
   error,
+  loading = false,
+  restoring = null,
+  onRetry,
   onNewChat,
   onSelectChat,
   groups,
@@ -75,7 +121,7 @@ export function ChatSidebar({
     })
   }
 
-  const orderedGroups = [...(groups ?? [])].sort((a, b) => a.order - b.order)
+  const orderedGroups = useMemo(() => [...(groups ?? [])].sort((a, b) => a.order - b.order), [groups])
   const groupIds = new Set(orderedGroups.map((group) => group.id))
   // 고정한 채팅방은 맨 위에만 그린다(같은 줄을 두 번 두지 않는다).
   const pinned = onPinChat ? chats.filter((chat) => chat.pinned).sort((a, b) => (a.pinnedOrder ?? 0) - (b.pinnedOrder ?? 0)) : []
@@ -135,8 +181,20 @@ export function ChatSidebar({
       </div>
 
       <div className="record-list chat-list" aria-live="polite">
+        {restoring && (
+          <div className="chat-restore" role="status">
+            <span>{restoring.total > 0 ? W.restoreProgress.chatRestoringCount(restoring.completed, restoring.total) : W.restoreProgress.chatRestoring}</span>
+            {progressPercent(restoring) !== null && <div className="app-update-progress"><span style={{ width: `${progressPercent(restoring)}%` }} /></div>}
+          </div>
+        )}
         {error ? (
-          <div className="empty-queue"><span>{error}</span></div>
+          <div className="empty-queue">
+            <span>{error}</span>
+            {/* 다시 해 볼 길(문서 화면의 "다시 불러오기"와 같은 글, 2026-11-17). */}
+            {onRetry && <button className="secondary-button" type="button" onClick={onRetry}>{W.zetPanel.text25}</button>}
+          </div>
+        ) : loading && chats.length === 0 ? (
+          <div className="empty-queue" role="status"><span>{W.chatSidebar.loading}</span></div>
         ) : (
           <>
             {pinned.length > 0 && (
@@ -197,10 +255,10 @@ export function ChatSidebar({
       )}
     </aside>
   )
-}
+}, sameSidebar)
 
 /** 줄 끝 "…" 단추가 여는 작은 메뉴. 단추 아래 오른쪽 끝에 맞춰 띄운다. */
-function RowMenu({ label, children }: { label: string; children: (close: () => void) => ReactNode }) {
+export function RowMenu({ label, children }: { label: string; children: (close: () => void) => ReactNode }) {
   const [open, setOpen] = useState(false)
   const button = useRef<HTMLButtonElement>(null)
   const menu = useRef<HTMLDivElement>(null)
@@ -227,6 +285,8 @@ function RowMenu({ label, children }: { label: string; children: (close: () => v
     }
     document.addEventListener('mousedown', close)
     document.addEventListener('keydown', escape)
+    // 키보드로 열면 메뉴는 문서 맨 끝에 붙어 Tab 으로 닿지 않는다: 첫 항목에 초점을 둔다(2026-11-17 키보드 점검).
+    window.requestAnimationFrame(() => menu.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus())
     return () => {
       document.removeEventListener('mousedown', close)
       document.removeEventListener('keydown', escape)
@@ -247,8 +307,31 @@ function RowMenu({ label, children }: { label: string; children: (close: () => v
         <MoreHorizontal size={15} aria-hidden />
       </button>
       {open && createPortal(
-        <div ref={menu} className="chat-menu" role="menu" aria-label={label} style={{ top: place.top, left: place.left }}>
-          {children(() => setOpen(false))}
+        <div
+          ref={menu}
+          className="chat-menu"
+          role="menu"
+          aria-label={label}
+          style={{ top: place.top, left: place.left }}
+          onKeyDown={(event) => {
+            // 위아래 화살표로 항목을 옮기고, Tab 은 메뉴를 닫고 메뉴 단추로 돌아간다.
+            const items = Array.from(menu.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? [])
+            const at = items.indexOf(document.activeElement as HTMLElement)
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault()
+              const next = event.key === 'ArrowDown' ? (at + 1) % items.length : (at - 1 + items.length) % items.length
+              items[next]?.focus()
+            } else if (event.key === 'Home' || event.key === 'End') {
+              event.preventDefault()
+              items[event.key === 'Home' ? 0 : items.length - 1]?.focus()
+            } else if (event.key === 'Tab') {
+              event.preventDefault()
+              setOpen(false)
+              button.current?.focus()
+            }
+          }}
+        >
+          {children(() => { setOpen(false); window.requestAnimationFrame(() => { if (document.activeElement === document.body) button.current?.focus() }) })}
         </div>,
         document.body,
       )}
@@ -256,7 +339,7 @@ function RowMenu({ label, children }: { label: string; children: (close: () => v
   )
 }
 
-function MenuItem({ children, onSelect, close }: { children: ReactNode; onSelect: () => void; close: () => void }) {
+export function MenuItem({ children, onSelect, close }: { children: ReactNode; onSelect: () => void; close: () => void }) {
   return (
     <button className="chat-menu-item" type="button" role="menuitem" onClick={() => { close(); onSelect() }}>
       {children}
@@ -341,7 +424,14 @@ function GroupHeader({
   )
 }
 
-function ChatRow({
+/**
+ * 줄 하나는 그 채팅방, 고른 것, 기다림, 묶음, 단추가 있는지가 같으면 다시 그리지 않는다(채팅방을 바꿀 때 500개 줄을 다 그리지 않게).
+ * 손잡이는 위 ChatSidebar 가 늘 같은 함수로 넘기고, 줄 안의 손잡이는 이 채팅방의 id 만 쓰므로 앞의 것을 그대로 써도 된다.
+ */
+const ChatRow = memo(ChatRowView, (a, b) => a.chat === b.chat && a.selected === b.selected && a.waiting === b.waiting && a.groups === b.groups
+  && Boolean(a.onPin) === Boolean(b.onPin) && Boolean(a.onArchive) === Boolean(b.onArchive))
+
+function ChatRowView({
   chat,
   selected,
   waiting,

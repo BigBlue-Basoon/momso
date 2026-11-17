@@ -19,14 +19,60 @@ pub(crate) fn set_local_ai_tools(path: PathBuf) {
     let _ = LOCAL_AI_TOOLS.set(path);
 }
 
-fn local_ai_tool(root: &Path, name: &str) -> Option<PathBuf> {
-    let prefix = root.join(name);
+pub(crate) fn local_ai_tool(root: &Path, name: &str) -> Option<PathBuf> {
+    let mut managed = std::fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let filename = entry.file_name().into_string().ok()?;
+            let prefix = format!(".momso-{name}-");
+            let suffix = filename.strip_prefix(&prefix)?;
+            let (time, id) = suffix.split_once('-')?;
+            if time.len() != 20
+                || !time.bytes().all(|b| b.is_ascii_digit())
+                || uuid::Uuid::parse_str(id).is_err()
+            {
+                return None;
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if !metadata.is_dir() || crate::archive_location::is_link_or_reparse(&metadata) {
+                return None;
+            }
+            let marker = path.join(".momso-provider");
+            let metadata = std::fs::symlink_metadata(&marker).ok()?;
+            if !metadata.is_file()
+                || crate::archive_location::is_link_or_reparse(&metadata)
+                || std::fs::read_to_string(marker).ok()?.trim() != name
+            {
+                return None;
+            }
+            Some((filename, path))
+        })
+        .collect::<Vec<_>>();
+    managed.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    managed
+        .into_iter()
+        .find_map(|(_, prefix)| local_ai_tool_at(&prefix, name))
+        .or_else(|| local_ai_tool_at(&root.join(name), name))
+}
+
+pub(crate) fn local_ai_tool_at(prefix: &Path, name: &str) -> Option<PathBuf> {
     let executable = match name {
         "codex" => npm_codex_binary(&prefix.join("codex.cmd"))?,
         "claude" => prefix.join("node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+        "gemini" => prefix.join("agy.exe"),
         _ => return None,
     };
     executable.is_file().then_some(executable)
+}
+
+pub(crate) fn managed_ai_tool(name: &str) -> Option<PathBuf> {
+    LOCAL_AI_TOOLS
+        .get()
+        .and_then(|root| local_ai_tool(root, name))
 }
 
 #[derive(Debug, Error)]
@@ -63,10 +109,7 @@ pub(crate) struct JsonRpcRequest<'a> {
 }
 
 pub(crate) fn resolve_tool(name: &str) -> Option<PathBuf> {
-    if let Some(path) = LOCAL_AI_TOOLS
-        .get()
-        .and_then(|root| local_ai_tool(root, name))
-    {
+    if let Some(path) = managed_ai_tool(name) {
         return Some(path);
     }
     let output = SyncCommand::new("where.exe").arg(name).output().ok()?;
@@ -188,7 +231,7 @@ pub(crate) async fn run_tool_cancellable(
     .await
 }
 
-async fn run_resolved_tool_cancellable(
+pub(crate) async fn run_resolved_tool_cancellable(
     executable: &Path,
     args: &[&str],
     cwd: Option<&Path>,
@@ -462,6 +505,27 @@ mod tests {
         std::fs::write(&claude, b"fixture").unwrap();
         assert_eq!(local_ai_tool(dir.path(), "claude"), Some(claude));
         assert_eq!(local_ai_tool(dir.path(), "other"), None);
+    }
+
+    #[test]
+    fn managed_provider_slot_wins_without_touching_unknown_legacy_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("gemini");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("user-file"), b"keep").unwrap();
+        let slot = dir
+            .path()
+            .join(format!(".momso-gemini-{:020}-{}", 1, uuid::Uuid::new_v4()));
+        std::fs::create_dir(&slot).unwrap();
+        std::fs::write(slot.join(".momso-provider"), "gemini").unwrap();
+        std::fs::write(slot.join("agy.exe"), b"fixture").unwrap();
+        assert_eq!(
+            local_ai_tool(dir.path(), "gemini"),
+            Some(slot.join("agy.exe"))
+        );
+        assert_eq!(std::fs::read(legacy.join("user-file")).unwrap(), b"keep");
+        std::fs::remove_file(slot.join(".momso-provider")).unwrap();
+        assert_eq!(local_ai_tool(dir.path(), "gemini"), None);
     }
 
     #[test]

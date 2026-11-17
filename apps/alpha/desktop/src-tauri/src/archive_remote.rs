@@ -6,10 +6,31 @@ use std::{
     process::{Command, Stdio},
     sync::Mutex,
 };
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 static REMOTE_LOCK: Mutex<()> = Mutex::new(());
 const REMOTE: &str = "momso";
+
+#[derive(Clone, Serialize)]
+struct FirstReceiveProgress {
+    completed: usize,
+    total: usize,
+    state: &'static str,
+    available: bool,
+}
+
+fn receive_progress(
+    state: &'static str,
+    completed: usize,
+    available: bool,
+) -> FirstReceiveProgress {
+    FirstReceiveProgress {
+        completed,
+        total: 3,
+        state,
+        available,
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -429,7 +450,9 @@ async fn create_internal(
             if connect_local(&tool, &root, &target).is_err() {
                 return result;
             }
-            if receive_connected(&tool, &root, &db, &target, branch).is_err() {
+            if receive_connected_with_progress(&tool, &root, &db, &target, branch, Some(&app))
+                .is_err()
+            {
                 return auto_result("unavailable", Some(remote.name_with_owner));
             }
             return auto_result("connected", Some(remote.name_with_owner));
@@ -453,6 +476,7 @@ fn hidden(command: &mut Command) -> &mut Command {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteStatus {
     state: &'static str,
+    chat_backup: &'static str,
     reason: Option<&'static str>,
     history_reason: Option<&'static str>,
     repo: Option<String>,
@@ -461,12 +485,16 @@ pub(crate) struct RemoteStatus {
     ahead: Option<u64>,
     behind: Option<u64>,
     signed_in_as: Option<String>,
+    auto_merged: bool,
+    preserved_documents: Vec<String>,
+    conflict_paths: Option<Vec<String>>,
 }
 
 impl RemoteStatus {
     fn new(state: &'static str, reason: Option<&'static str>) -> Self {
         Self {
             state,
+            chat_backup: "included",
             reason,
             history_reason: None,
             repo: None,
@@ -475,6 +503,9 @@ impl RemoteStatus {
             ahead: None,
             behind: None,
             signed_in_as: None,
+            auto_merged: false,
+            preserved_documents: Vec::new(),
+            conflict_paths: None,
         }
     }
 
@@ -531,9 +562,12 @@ fn valid_branch(branch: &str) -> bool {
 fn git_path(_resources: &Path) -> Option<PathBuf> {
     crate::git_tool::resolve().map(|(path, _)| path)
 }
-fn git_raw(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
-    let output = hidden(&mut Command::new(tool))
+fn git_output(tool: &Path, root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    hidden(&mut Command::new(tool))
         .current_dir(root)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("LANGUAGE", "C")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(
             "GIT_CONFIG_GLOBAL",
@@ -546,6 +580,9 @@ fn git_raw(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .args([
             "-c",
             "credential.helper=",
@@ -559,26 +596,321 @@ fn git_raw(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .map_err(|_| ())?;
+}
+
+fn git_raw(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
+    let output = git_output(tool, root, args).map_err(|_| ())?;
     if !output.status.success() {
         return Err(());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
+
+fn classify_remote_error(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("remote: error: gh001") || line.starts_with("remote: gh001")
+    }) || lower.contains("pack exceeds maximum allowed size")
+        || lower.contains("exceeds github's file size limit")
+    {
+        "size_limit"
+    } else if lower.contains("authentication failed")
+        || lower.contains("could not read username")
+        || lower.contains("bad credentials")
+        || lower.contains("http 401")
+        || lower.contains("returned error: 401")
+    {
+        "authentication_failed"
+    } else if lower.contains("permission to ") && lower.contains(" denied to ") {
+        "permission_denied"
+    } else if lower.contains("repository not found")
+        || (lower.contains("repository '") && lower.contains("' not found"))
+        || lower.contains("returned error: 404")
+        || lower.contains("http 404")
+    {
+        "repository_unavailable_or_denied"
+    } else if lower.contains("could not resolve host")
+        || lower.contains("failed to connect")
+        || lower.contains("error connecting to")
+        || lower.contains("connection timed out")
+        || lower.contains("connection reset by peer")
+    {
+        "connection_failed"
+    } else {
+        "remote_unavailable"
+    }
+}
+
+fn remote_git(tool: &Path, root: &Path, args: &[&str]) -> Result<String, &'static str> {
+    let output = git_output(tool, root, args).map_err(|_| "git_unavailable")?;
+    if !output.status.success() {
+        return Err(classify_remote_error(&String::from_utf8_lossy(
+            &output.stderr,
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
 pub(crate) fn git(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()> {
     git_raw(tool, root, args).map(|s| s.trim().to_owned())
 }
-fn gh(args: &[&str]) -> Result<String, ()> {
-    let result = hidden(&mut Command::new("gh"))
-        .env("GH_HOST", "github.com")
+
+fn git_index(tool: &Path, root: &Path, index: &Path, args: &[&str]) -> Result<String, ()> {
+    let output = hidden(&mut Command::new(tool))
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .args(args)
         .stdin(Stdio::null())
         .output()
         .map_err(|_| ())?;
-    if !result.status.success() {
+    if !output.status.success() {
         return Err(());
     }
-    Ok(String::from_utf8_lossy(&result.stdout).trim().to_owned())
+    String::from_utf8(output.stdout).map_err(|_| ())
+}
+
+fn git_hash_object(tool: &Path, root: &Path, content: &[u8]) -> Result<String, ()> {
+    use std::io::Write;
+    let mut child = hidden(&mut Command::new(tool))
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| ())?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or(())
+        .and_then(|mut input| input.write_all(content).map_err(|_| ()));
+    if written.is_err() {
+        let _ = child.wait();
+        return Err(());
+    }
+    let output = child.wait_with_output().map_err(|_| ())?;
+    if !output.status.success() {
+        return Err(());
+    }
+    Ok(String::from_utf8(output.stdout)
+        .map_err(|_| ())?
+        .trim()
+        .to_owned())
+}
+
+fn merge_added_terms(base: &str, local: &str, remote: &str) -> Result<Vec<u8>, ()> {
+    use std::collections::{BTreeMap, BTreeSet};
+    fn parse(
+        text: &str,
+    ) -> Result<
+        (
+            serde_json::Map<String, serde_json::Value>,
+            Vec<serde_json::Value>,
+        ),
+        (),
+    > {
+        let mut object = serde_json::from_str::<serde_json::Value>(text)
+            .map_err(|_| ())?
+            .as_object()
+            .cloned()
+            .ok_or(())?;
+        let terms = object
+            .remove("terms")
+            .and_then(|v| v.as_array().cloned())
+            .ok_or(())?;
+        Ok((object, terms))
+    }
+    fn index(terms: &[serde_json::Value]) -> Result<BTreeMap<String, &serde_json::Value>, ()> {
+        let mut map = BTreeMap::new();
+        for term in terms {
+            let id = term
+                .pointer("/term/id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or(())?;
+            if map.insert(id.to_owned(), term).is_some() {
+                return Err(());
+            }
+        }
+        Ok(map)
+    }
+    let (base_meta, base_terms) = parse(base)?;
+    let (local_meta, local_terms) = parse(local)?;
+    let (remote_meta, remote_terms) = parse(remote)?;
+    if base_meta != local_meta || base_meta != remote_meta {
+        return Err(());
+    }
+    let base_index = index(&base_terms)?;
+    let local_index = index(&local_terms)?;
+    let remote_index = index(&remote_terms)?;
+    if base_index
+        .iter()
+        .any(|(id, term)| local_index.get(id) != Some(term) || remote_index.get(id) != Some(term))
+    {
+        return Err(());
+    }
+    let preserves_order = |items: &[serde_json::Value]| {
+        items
+            .iter()
+            .filter(|entry| {
+                entry
+                    .pointer("/term/id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| base_index.contains_key(id))
+            })
+            .eq(base_terms.iter())
+    };
+    if !preserves_order(&local_terms) || !preserves_order(&remote_terms) {
+        return Err(());
+    }
+    let mut seen: BTreeSet<_> = base_index.keys().cloned().collect();
+    let mut merged = base_terms;
+    for term in local_terms.iter().chain(&remote_terms) {
+        let id = term
+            .pointer("/term/id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?;
+        if !seen.insert(id.to_owned()) {
+            if local_index.contains_key(id)
+                && remote_index.contains_key(id)
+                && local_index.get(id) != remote_index.get(id)
+            {
+                return Err(());
+            }
+            continue;
+        }
+        merged.push(term.clone());
+    }
+    let mut result = base_meta;
+    result.insert("terms".into(), serde_json::Value::Array(merged));
+    let mut bytes =
+        serde_json::to_vec_pretty(&serde_json::Value::Object(result)).map_err(|_| ())?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn merge_people(base: &str, local: &str, remote: &str) -> Result<(Vec<u8>, bool), ()> {
+    use std::collections::{BTreeMap, BTreeSet};
+    type PeopleData = (
+        serde_json::Map<String, serde_json::Value>,
+        BTreeMap<String, serde_json::Value>,
+    );
+    fn parse(text: &str) -> Result<PeopleData, ()> {
+        let mut obj = serde_json::from_str::<serde_json::Value>(text)
+            .map_err(|_| ())?
+            .as_object()
+            .cloned()
+            .ok_or(())?;
+        let people = obj
+            .remove("people")
+            .and_then(|v| v.as_array().cloned())
+            .ok_or(())?;
+        let mut indexed = BTreeMap::new();
+        for person in people {
+            let id = person
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or(())?
+                .to_owned();
+            if person
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .is_none()
+                || indexed.insert(id, person).is_some()
+            {
+                return Err(());
+            }
+        }
+        Ok((obj, indexed))
+    }
+    let (meta, old) = parse(base)?;
+    let (left_meta, left) = parse(local)?;
+    let (right_meta, right) = parse(remote)?;
+    if meta != left_meta || meta != right_meta {
+        return Err(());
+    }
+    let mut conflicts = false;
+    let ids: BTreeSet<_> = old
+        .keys()
+        .chain(left.keys())
+        .chain(right.keys())
+        .cloned()
+        .collect();
+    let mut people = Vec::new();
+    for id in ids {
+        let (before, a, b) = (old.get(&id), left.get(&id), right.get(&id));
+        let chosen = if a == b {
+            a
+        } else if a == before {
+            b
+        } else if b == before {
+            a
+        } else {
+            let (a, b) = (a.ok_or(())?, b.ok_or(())?);
+            let confirmed = |p: &serde_json::Value| {
+                p.get("confirmed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            };
+            match (confirmed(a), confirmed(b)) {
+                (true, false) => Some(a),
+                (false, true) => Some(b),
+                (true, true) => {
+                    conflicts = true;
+                    Some(b)
+                }
+                (false, false) => return Err(()),
+            }
+        };
+        if let Some(person) = chosen {
+            people.push(person.clone());
+        }
+    }
+    let mut result = meta;
+    result.insert("people".into(), serde_json::Value::Array(people));
+    let mut bytes =
+        serde_json::to_vec_pretty(&serde_json::Value::Object(result)).map_err(|_| ())?;
+    bytes.push(b'\n');
+    Ok((bytes, conflicts))
+}
+fn gh_output(args: &[&str]) -> std::io::Result<std::process::Output> {
+    hidden(&mut Command::new("gh"))
+        .env("GH_HOST", "github.com")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("LANGUAGE", "C")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
 }
 fn signed_in() -> Result<String, &'static str> {
     if hidden(&mut Command::new("gh"))
@@ -591,23 +923,64 @@ fn signed_in() -> Result<String, &'static str> {
     {
         return Err("gh_missing");
     }
-    gh(&["auth", "status", "--active", "--hostname", "github.com"]).map_err(|_| "signed_out")?;
-    gh(&["api", "--hostname", "github.com", "user", "--jq", ".login"])
-        .map_err(|_| "account_unavailable")
+    let auth = gh_output(&["auth", "status", "--active", "--hostname", "github.com"])
+        .map_err(|_| "gh_missing")?;
+    if !auth.status.success() {
+        let message = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&auth.stdout),
+            String::from_utf8_lossy(&auth.stderr)
+        )
+        .to_ascii_lowercase();
+        let classified = classify_remote_error(&message);
+        return Err(if classified == "connection_failed" {
+            classified
+        } else if message.contains("not logged into")
+            || message.contains("failed to log in")
+            || message.contains("token is invalid")
+        {
+            "signed_out"
+        } else {
+            "authentication_unavailable"
+        });
+    }
+    let user = gh_output(&["api", "--hostname", "github.com", "user", "--jq", ".login"])
+        .map_err(|_| "gh_missing")?;
+    if !user.status.success() {
+        let error = classify_remote_error(&String::from_utf8_lossy(&user.stderr));
+        return Err(
+            if error == "connection_failed" || error == "authentication_failed" {
+                error
+            } else {
+                "account_unavailable"
+            },
+        );
+    }
+    let login = String::from_utf8_lossy(&user.stdout).trim().to_owned();
+    if login.is_empty() {
+        return Err("account_unavailable");
+    }
+    Ok(login)
 }
 fn github(repo: &str) -> Result<(Repository, String), &'static str> {
     if !valid_repo(repo) {
         return Err("invalid_repository");
     }
     let user = signed_in()?;
-    let data = gh(&[
+    let result = gh_output(&[
         "repo",
         "view",
         repo,
         "--json",
         "nameWithOwner,isPrivate,defaultBranchRef",
     ])
-    .map_err(|_| "repository_unavailable")?;
+    .map_err(|_| "gh_missing")?;
+    if !result.status.success() {
+        return Err(classify_remote_error(&String::from_utf8_lossy(
+            &result.stderr,
+        )));
+    }
+    let data = String::from_utf8_lossy(&result.stdout);
     Ok((parse_private_repository(&data)?, user))
 }
 fn parse_private_repository(data: &str) -> Result<Repository, &'static str> {
@@ -642,6 +1015,7 @@ pub(crate) fn connect_local(tool: &Path, root: &Path, target: &str) -> Result<()
     git(tool, root, &["remote", "add", REMOTE, target]).map_err(|_| "git_unavailable")?;
     Ok(())
 }
+#[cfg(test)]
 pub(crate) fn receive_connected(
     tool: &Path,
     root: &Path,
@@ -649,8 +1023,24 @@ pub(crate) fn receive_connected(
     target: &str,
     branch: &str,
 ) -> Result<(), &'static str> {
+    receive_connected_with_progress(tool, root, db, target, branch, None)
+}
+
+fn receive_connected_with_progress(
+    tool: &Path,
+    root: &Path,
+    db: &Path,
+    target: &str,
+    branch: &str,
+    app: Option<&tauri::AppHandle>,
+) -> Result<(), &'static str> {
     transfer(tool, root, target, branch, "pull")?;
     crate::archive::reindex(root, db).map_err(|_| "reindex_failed")?;
+    if let Some(app) = app {
+        crate::chat_archive_store::restore_emitting(root, db, app)?;
+    } else {
+        crate::chat_archive_store::restore(root, db)?;
+    }
     Ok(())
 }
 fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static str> {
@@ -686,6 +1076,7 @@ fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static
                     | "profile.md"
             )
             || safe_skill_path(p)
+            || safe_chat_path(p)
             || crate::yoga_dictionary::is_path(p)
             || ((p.starts_with("zettels/") || p.starts_with("receipts/"))
                 && p.ends_with(".md")
@@ -696,6 +1087,11 @@ fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static
     } else {
         Err("unsafe_history")
     }
+}
+fn safe_chat_path(path: &str) -> bool {
+    path.strip_prefix("chats/")
+        .and_then(|name| name.strip_suffix(".json"))
+        .is_some_and(crate::archive_receipt::valid_chat_id)
 }
 fn safe_skill_path(path: &str) -> bool {
     ["skills/", ".agents/skills/", ".claude/skills/"]
@@ -710,6 +1106,349 @@ fn last_push(root: &Path, target: &str) -> Option<String> {
     let text = fs::read_to_string(root.join(".git/momso-last-push")).ok()?;
     let (saved_target, time) = text.split_once('\n')?;
     (saved_target == target && !time.trim().is_empty()).then(|| time.trim().to_owned())
+}
+
+fn preserved_documents(tool: &Path, root: &Path, revision: &str) -> Result<Vec<String>, ()> {
+    let parents = git(tool, root, &["rev-list", "--parents", "-n", "1", revision])?;
+    let parts: Vec<_> = parents.split_whitespace().collect();
+    if parts.len() != 3 {
+        return Err(());
+    }
+    let base = git(tool, root, &["merge-base", "--all", parts[1], parts[2]])?;
+    if base.lines().count() != 1 {
+        return Err(());
+    }
+    let left = git_raw(
+        tool,
+        root,
+        &["diff", "--name-only", "-z", "--no-renames", &base, parts[1]],
+    )?;
+    let right = git_raw(
+        tool,
+        root,
+        &["diff", "--name-only", "-z", "--no-renames", &base, parts[2]],
+    )?;
+    let right: std::collections::HashSet<_> = right.split('\0').collect();
+    let mut result = Vec::new();
+    for path in left.split('\0').filter(|path| right.contains(path)) {
+        let Some(id) = path
+            .strip_prefix("zettels/")
+            .and_then(|p| p.strip_suffix(".md"))
+            .filter(|id| crate::archive_zet::valid_zet_id(id))
+        else {
+            continue;
+        };
+        let local = git(
+            tool,
+            root,
+            &["rev-parse", "--verify", &format!("{}:{path}", parts[1])],
+        )?;
+        let remote = git(
+            tool,
+            root,
+            &["rev-parse", "--verify", &format!("{}:{path}", parts[2])],
+        )?;
+        if local != remote {
+            result.push(id.to_owned());
+        }
+    }
+    result.sort();
+    Ok(result)
+}
+
+fn merged_people_conflict(tool: &Path, root: &Path, revision: &str) -> Result<bool, ()> {
+    let parents = git(tool, root, &["rev-list", "--parents", "-n", "1", revision])?;
+    let parts: Vec<_> = parents.split_whitespace().collect();
+    if parts.len() != 3 {
+        return Err(());
+    }
+    let base = git(tool, root, &["merge-base", "--all", parts[1], parts[2]])?;
+    if base.lines().count() != 1 {
+        return Err(());
+    }
+    let path = "dictionary/people.json";
+    let changed = |side: &str| -> Result<bool, ()> {
+        Ok(git_raw(
+            tool,
+            root,
+            &["diff", "--name-only", "-z", "--no-renames", &base, side],
+        )?
+        .split('\0')
+        .any(|p| p == path))
+    };
+    if !changed(parts[1])? || !changed(parts[2])? {
+        return Ok(false);
+    }
+    let data = |rev: &str| git_raw(tool, root, &["show", &format!("{rev}:{path}")]);
+    let (_, conflicts) = merge_people(&data(&base)?, &data(parts[1])?, &data(parts[2])?)?;
+    Ok(conflicts)
+}
+
+fn conflicting_paths(tool: &Path, root: &Path) -> Result<Vec<String>, ()> {
+    let local = git(tool, root, &["rev-parse", "--verify", "HEAD"])?;
+    let remote = git(
+        tool,
+        root,
+        &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+    )?;
+    let base = git(tool, root, &["merge-base", "--all", &local, &remote])?;
+    if base.lines().count() != 1 {
+        return Err(());
+    }
+    let left = git_raw(
+        tool,
+        root,
+        &["diff", "--name-only", "-z", "--no-renames", &base, &local],
+    )?;
+    let right = git_raw(
+        tool,
+        root,
+        &["diff", "--name-only", "-z", "--no-renames", &base, &remote],
+    )?;
+    let right: std::collections::HashSet<_> = right.split('\0').collect();
+    let mut paths: Vec<String> = left
+        .split('\0')
+        .filter(|p| !p.is_empty() && right.contains(p))
+        .map(str::to_owned)
+        .collect();
+    for path in left
+        .split('\0')
+        .chain(right.iter().copied())
+        .filter(|p| p.starts_with("chats/"))
+    {
+        if !paths.iter().any(|saved| saved == path) {
+            paths.push(path.to_owned());
+        }
+    }
+    let mut unresolved = Vec::new();
+    for path in paths {
+        let left = git_raw(
+            tool,
+            root,
+            &["--literal-pathspecs", "ls-tree", "-z", &local, "--", &path],
+        )?;
+        let right = git_raw(
+            tool,
+            root,
+            &["--literal-pathspecs", "ls-tree", "-z", &remote, "--", &path],
+        )?;
+        if left != right {
+            unresolved.push(path);
+        }
+    }
+    unresolved.sort();
+    Ok(unresolved)
+}
+
+// Construct the merge commit in a temporary index before changing the working tree.
+fn merge_disjoint(tool: &Path, root: &Path) -> Result<String, &'static str> {
+    let _app_guard = crate::chat_file_changes::lock_app_write();
+    let _write_guard = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+    let _chat_guard = crate::chat_archive_store::lock_store().map_err(|_| "busy")?;
+    let clean = || -> Result<bool, &'static str> {
+        let status = git(
+            tool,
+            root,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .map_err(|_| "git_unavailable")?;
+        Ok(status
+            .lines()
+            .all(|line| safe_untracked_default(root, line)))
+    };
+    if !clean()? {
+        return Err("unsaved_changes");
+    }
+    let local =
+        git(tool, root, &["rev-parse", "--verify", "HEAD"]).map_err(|_| "git_unavailable")?;
+    let remote = git(
+        tool,
+        root,
+        &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+    )
+    .map_err(|_| "remote_unavailable")?;
+    safe_history(tool, root, &local)?;
+    safe_history(tool, root, &remote)?;
+    let base =
+        git(tool, root, &["merge-base", "--all", &local, &remote]).map_err(|_| "diverged")?;
+    if base.lines().count() != 1 {
+        return Err("diverged");
+    }
+    let paths = |revision: &str| -> Result<Vec<String>, &'static str> {
+        let data = git_raw(
+            tool,
+            root,
+            &["diff", "--name-only", "-z", "--no-renames", &base, revision],
+        )
+        .map_err(|_| "git_unavailable")?;
+        Ok(data
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect())
+    };
+    let left = paths(&local)?;
+    let right = paths(&remote)?;
+    if left
+        .iter()
+        .chain(&right)
+        .any(|path| path.starts_with("chats/") && !(left.contains(path) && right.contains(path)))
+    {
+        return Err("diverged");
+    }
+    let overlap: Vec<_> = left.iter().filter(|path| right.contains(path)).collect();
+    let tree = if overlap.is_empty() {
+        git(tool, root, &["merge-tree", "--write-tree", &local, &remote]).map_err(|_| "diverged")?
+    } else {
+        let temp = tempfile::tempdir().map_err(|_| "local_state_unavailable")?;
+        let index = temp.path().join("index");
+        git_index(
+            tool,
+            root,
+            &index,
+            &["read-tree", "-m", &base, &local, &remote],
+        )
+        .map_err(|_| "diverged")?;
+        for path in &overlap {
+            let blob = |revision: &str| -> Result<(String, String), &'static str> {
+                let entry =
+                    git(tool, root, &["ls-tree", revision, "--", path]).map_err(|_| "diverged")?;
+                let (metadata, actual_path) = entry.split_once('\t').ok_or("diverged")?;
+                let mut fields = metadata.split_whitespace();
+                if actual_path != *path
+                    || fields.next() != Some("100644")
+                    || fields.next() != Some("blob")
+                {
+                    return Err("diverged");
+                }
+                let oid = fields.next().ok_or("diverged")?.to_owned();
+                if fields.next().is_some() {
+                    return Err("diverged");
+                }
+                let object = format!("{revision}:{path}");
+                let text = git_raw(tool, root, &["show", &object]).map_err(|_| "diverged")?;
+                Ok((oid, text))
+            };
+            let (local_oid, local_text) = blob(&local)?;
+            let (remote_oid, remote_text) = blob(&remote)?;
+            let object_id = if local_oid == remote_oid {
+                local_oid
+            } else if let Some(id) = path
+                .strip_prefix("zettels/")
+                .and_then(|p| p.strip_suffix(".md"))
+                .filter(|id| crate::archive_zet::valid_zet_id(id))
+            {
+                for text in [&local_text, &remote_text] {
+                    let (head, _) = crate::archive_zet::parse(text).map_err(|_| "diverged")?;
+                    if head.id != id {
+                        return Err("diverged");
+                    }
+                }
+                remote_oid
+            } else if let Some(id) = path
+                .strip_prefix("chats/")
+                .and_then(|p| p.strip_suffix(".json"))
+            {
+                let a: serde_json::Value =
+                    serde_json::from_str(&local_text).map_err(|_| "diverged")?;
+                let b: serde_json::Value =
+                    serde_json::from_str(&remote_text).map_err(|_| "diverged")?;
+                if a.pointer("/room/id").and_then(|v| v.as_str()) != Some(id)
+                    || b.pointer("/room/id").and_then(|v| v.as_str()) != Some(id)
+                {
+                    return Err("diverged");
+                }
+                let merged = crate::chat_archive_snapshot::merge_snapshots(&a, &b)
+                    .map_err(|_| "diverged")?;
+                let bytes = serde_json::to_vec_pretty(&merged).map_err(|_| "diverged")?;
+                git_hash_object(tool, root, &bytes).map_err(|_| "git_unavailable")?
+            } else if path.as_str() == "dictionary/yoga.json" {
+                let left =
+                    crate::yoga_dictionary::known_bundle_version(&local_text).ok_or("diverged")?;
+                let right =
+                    crate::yoga_dictionary::known_bundle_version(&remote_text).ok_or("diverged")?;
+                if left > right {
+                    local_oid
+                } else {
+                    remote_oid
+                }
+            } else if ["AGENTS.md", "CLAUDE.md", "GEMINI.md"].contains(&path.as_str()) {
+                if crate::archive::select_managed_rule(&local_text, &remote_text)
+                    .ok_or("diverged")?
+                {
+                    remote_oid
+                } else {
+                    local_oid
+                }
+            } else if path.as_str() == "dictionary/my-terms.json" {
+                let (_, base_text) = blob(&base)?;
+                let combined = merge_added_terms(&base_text, &local_text, &remote_text)
+                    .map_err(|_| "diverged")?;
+                git_hash_object(tool, root, &combined).map_err(|_| "git_unavailable")?
+            } else if path.as_str() == "dictionary/people.json" {
+                let (_, base_text) = blob(&base)?;
+                let (combined, _) =
+                    merge_people(&base_text, &local_text, &remote_text).map_err(|_| "diverged")?;
+                git_hash_object(tool, root, &combined).map_err(|_| "git_unavailable")?
+            } else {
+                return Err("diverged");
+            };
+            let entry = format!("100644,{object_id},{path}");
+            git_index(
+                tool,
+                root,
+                &index,
+                &["update-index", "--add", "--cacheinfo", &entry],
+            )
+            .map_err(|_| "diverged")?;
+        }
+        if !git_index(tool, root, &index, &["ls-files", "-u"])
+            .map_err(|_| "diverged")?
+            .is_empty()
+        {
+            return Err("diverged");
+        }
+        git_index(tool, root, &index, &["write-tree"])
+            .map_err(|_| "diverged")?
+            .trim()
+            .to_owned()
+    };
+    if !(tree.len() == 40 || tree.len() == 64) || !tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("diverged");
+    }
+    let commit = git(
+        tool,
+        root,
+        &[
+            "-c",
+            "user.name=momso",
+            "-c",
+            "user.email=archive@momso.local",
+            "commit-tree",
+            &tree,
+            "-p",
+            &local,
+            "-p",
+            &remote,
+            "-m",
+            "momso archive sync",
+        ],
+    )
+    .map_err(|_| "git_unavailable")?;
+    safe_history(tool, root, &commit)?;
+    if git(tool, root, &["rev-parse", "--verify", "HEAD"]).as_deref() != Ok(local.as_str())
+        || !clean()?
+    {
+        return Err("unsaved_changes");
+    }
+    git(
+        tool,
+        root,
+        &["merge", "--ff-only", "--no-overwrite-ignore", &commit],
+    )
+    .map_err(|_| "fast_forward_failed")?;
+    crate::chat_file_changes::app_write(root, None);
+    Ok(commit)
 }
 fn relation(
     tool: &Path,
@@ -736,8 +1475,7 @@ fn relation(
         return Err("unsafe_git_configuration");
     }
     let remote_ref = format!("refs/heads/{branch}");
-    let remote = git(tool, root, &["ls-remote", "--heads", target, &remote_ref])
-        .map_err(|_| "remote_unavailable")?;
+    let remote = remote_git(tool, root, &["ls-remote", "--heads", target, &remote_ref])?;
     if remote.is_empty() {
         let count = git(tool, root, &["rev-list", "--count", "HEAD"])
             .ok()
@@ -746,8 +1484,7 @@ fn relation(
         return Ok((count, 0));
     }
     let fetch_ref = format!("+{remote_ref}:refs/remotes/momso/observed");
-    git(tool, root, &["fetch", "--no-tags", target, &fetch_ref])
-        .map_err(|_| "remote_unavailable")?;
+    remote_git(tool, root, &["fetch", "--no-tags", target, &fetch_ref])?;
     if git(tool, root, &["rev-parse", "--verify", "HEAD"]).is_err() {
         return Ok((0, 1));
     }
@@ -857,6 +1594,26 @@ fn default_skills_unchanged(root: &Path, folder: &str) -> bool {
             .is_ok_and(|meta| meta.is_file() && !crate::archive_location::is_link_or_reparse(&meta))
             && fs::read(file).is_ok_and(|bytes| bytes == content.as_bytes())
     })
+}
+
+fn safe_untracked_default(root: &Path, line: &str) -> bool {
+    if line == "?? .gitignore" {
+        return default_file_unchanged(&root.join(".gitignore"), ".gitignore");
+    }
+    let Some(path) = line.strip_prefix("?? ") else {
+        return false;
+    };
+    if !safe_skill_path(path) {
+        return false;
+    }
+    let folder = if path.starts_with("skills/") {
+        "skills"
+    } else if path.starts_with(".agents/") {
+        ".agents"
+    } else {
+        ".claude"
+    };
+    default_skills_unchanged(root, folder)
 }
 
 fn copy_recovery_if_absent(source: &Path, target: &Path) -> Result<(), &'static str> {
@@ -984,9 +1741,21 @@ fn first_receive_with_hook(
     revision: &str,
     after_check: impl FnOnce(),
 ) -> Result<(), &'static str> {
+    first_receive_with_hooks(tool, root, revision, after_check, || {})
+}
+
+fn first_receive_with_hooks(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+    after_check: impl FnOnce(),
+    mut after_move: impl FnMut(),
+) -> Result<(), &'static str> {
+    use std::io::Write;
     let _write = crate::archive_zet::WRITE_LOCK
         .lock()
         .map_err(|_| "unavailable")?;
+    let _chat_guard = crate::chat_archive_store::lock_store().map_err(|_| "busy")?;
     if !fresh_archive(tool, root) {
         return Err("unsaved_changes");
     }
@@ -997,6 +1766,29 @@ fn first_receive_with_hook(
         .join(".git")
         .join(format!("momso-first-pull-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&saved).map_err(|_| "local_state_unavailable")?;
+    let marker = root.join(".git/momso-first-receive-in-progress");
+    let mut marker_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "first_receive_interrupted"
+            } else {
+                "local_state_unavailable"
+            }
+        })?;
+    marker_file
+        .write_all(
+            saved
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or("local_state_unavailable")?
+                .as_bytes(),
+        )
+        .and_then(|_| marker_file.sync_all())
+        .map_err(|_| "local_state_unavailable")?;
+    drop(marker_file);
     let mut moved = Vec::new();
     let result = (|| {
         for name in [
@@ -1013,6 +1805,7 @@ fn first_receive_with_hook(
                 fs::rename(root.join(name), saved.join(name))
                     .map_err(|_| "local_state_unavailable")?;
                 moved.push(name);
+                after_move();
                 let unchanged = if name == crate::yoga_dictionary::DIRECTORY {
                     crate::yoga_dictionary::defaults_unchanged(&saved)
                 } else if ["skills", ".agents", ".claude"].contains(&name) {
@@ -1082,7 +1875,10 @@ fn first_receive_with_hook(
     if result.is_ok() {
         crate::yoga_dictionary::initialize(root).map_err(|_| "local_state_unavailable")?;
     }
-    let _ = fs::remove_dir(&saved);
+    let removed = fs::remove_dir(&saved).is_ok();
+    if result.is_ok() || removed {
+        fs::remove_file(marker).map_err(|_| "local_state_unavailable")?;
+    }
     result
 }
 
@@ -1093,21 +1889,95 @@ pub(crate) fn transfer(
     branch: &str,
     action: &str,
 ) -> Result<(), &'static str> {
+    transfer_report(tool, root, target, branch, action).map(|_| ())
+}
+
+fn recover_interrupted_first_receive(tool: &Path, root: &Path) -> Result<bool, &'static str> {
+    let marker = root.join(".git/momso-first-receive-in-progress");
+    let meta = match fs::symlink_metadata(&marker) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err("local_state_unavailable"),
+    };
+    if !meta.is_file() || crate::archive_location::is_link_or_reparse(&meta) || meta.len() > 128 {
+        return Err("first_receive_interrupted");
+    }
+    if git(tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok() {
+        return Err("first_receive_interrupted");
+    }
+    let name = fs::read_to_string(&marker).map_err(|_| "first_receive_interrupted")?;
+    let id = name
+        .strip_prefix("momso-first-pull-")
+        .ok_or("first_receive_interrupted")?;
+    uuid::Uuid::parse_str(id).map_err(|_| "first_receive_interrupted")?;
+    let saved = root.join(".git").join(name);
+    let meta = fs::symlink_metadata(&saved).map_err(|_| "first_receive_interrupted")?;
+    if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+        return Err("first_receive_interrupted");
+    }
+    let entries = fs::read_dir(&saved)
+        .map_err(|_| "first_receive_interrupted")?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "first_receive_interrupted")?;
+    for entry in &entries {
+        let name = entry.file_name();
+        let name = name.to_str().ok_or("first_receive_interrupted")?;
+        let meta = fs::symlink_metadata(entry.path()).map_err(|_| "first_receive_interrupted")?;
+        if ![".gitignore", "AGENTS.md", "CLAUDE.md", "GEMINI.md"].contains(&name)
+            || !meta.is_file()
+            || crate::archive_location::is_link_or_reparse(&meta)
+            || fs::symlink_metadata(root.join(name)).is_ok()
+        {
+            return Err("first_receive_interrupted");
+        }
+    }
+    for entry in entries {
+        let destination = root.join(entry.file_name());
+        fs::hard_link(entry.path(), destination).map_err(|_| "first_receive_interrupted")?;
+        fs::remove_file(entry.path()).map_err(|_| "first_receive_interrupted")?;
+    }
+    fs::remove_dir(&saved).map_err(|_| "first_receive_interrupted")?;
+    fs::remove_file(marker).map_err(|_| "first_receive_interrupted")?;
+    Ok(true)
+}
+
+fn transfer_report(
+    tool: &Path,
+    root: &Path,
+    target: &str,
+    branch: &str,
+    action: &str,
+) -> Result<bool, &'static str> {
+    let mut merge_revision = None;
+    transfer_with_merge_revision(tool, root, target, branch, action, &mut merge_revision)
+}
+
+fn transfer_with_merge_revision(
+    tool: &Path,
+    root: &Path,
+    target: &str,
+    branch: &str,
+    action: &str,
+    merge_revision: &mut Option<String>,
+) -> Result<bool, &'static str> {
+    let _write = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+    recover_interrupted_first_receive(tool, root)?;
+    drop(_write);
     let (ahead, behind) = relation(tool, root, target, branch)?;
+    let mut merged = false;
     if action == "push" {
         if behind > 0 {
-            return Err(if ahead > 0 {
-                "diverged"
-            } else {
-                "remote_ahead"
-            });
+            if ahead == 0 {
+                return Err("remote_ahead");
+            }
+            *merge_revision = Some(merge_disjoint(tool, root)?);
+            merged = true;
         }
         let revision =
             git(tool, root, &["rev-parse", "--verify", "HEAD"]).map_err(|_| "nothing_saved")?;
         safe_history(tool, root, &revision)?;
         let dest = format!("{revision}:refs/heads/{branch}");
-        git(tool, root, &["push", "--no-follow-tags", target, &dest])
-            .map_err(|_| "remote_unavailable")?;
+        remote_git(tool, root, &["push", "--no-follow-tags", target, &dest])?;
         fs::write(
             root.join(".git/momso-last-push"),
             format!("{target}\n{}", chrono::Utc::now().to_rfc3339()),
@@ -1124,7 +1994,7 @@ pub(crate) fn transfer(
             .map_err(|_| "remote_unavailable")?;
             safe_history(tool, root, &revision)?;
             let _guard = crate::chat_file_changes::lock_app_write();
-            return first_receive(tool, root, &revision);
+            return first_receive(tool, root, &revision).map(|_| false);
         }
         let dirty = git(
             tool,
@@ -1132,19 +2002,17 @@ pub(crate) fn transfer(
             &["status", "--porcelain", "--untracked-files=all"],
         )
         .map_err(|_| "git_unavailable")?;
-        let clean_except_default_ignore = dirty.lines().all(|line| {
-            line == "?? .gitignore"
-                && fs::read(root.join(".gitignore"))
-                    .is_ok_and(|contents| contents == b"objects/\n" || contents == b"objects/\r\n")
-        });
+        let clean_except_default_ignore =
+            dirty.lines().all(|line| safe_untracked_default(root, line));
         if !dirty.is_empty() && !clean_except_default_ignore {
             return Err("unsaved_changes");
         }
         if ahead > 0 && behind > 0 {
-            return Err("diverged");
+            *merge_revision = Some(merge_disjoint(tool, root)?);
+            return Ok(true);
         }
         if behind == 0 {
-            return Ok(());
+            return Ok(false);
         }
         let revision = git(
             tool,
@@ -1154,9 +2022,11 @@ pub(crate) fn transfer(
         .map_err(|_| "remote_unavailable")?;
         safe_history(tool, root, &revision)?;
         let _guard = crate::chat_file_changes::lock_app_write();
+        let _write_guard = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+        let _chat_guard = crate::chat_archive_store::lock_store().map_err(|_| "busy")?;
         if !crate::chat_file_changes::has_active(root) {
             return git(tool, root, &["merge", "--ff-only", &revision])
-                .map(|_| ())
+                .map(|_| false)
                 .map_err(|_| "fast_forward_failed");
         }
         let before = crate::chat_file_changes::capture_unlocked(root);
@@ -1171,8 +2041,18 @@ pub(crate) fn transfer(
         }
         result.map_err(|_| "fast_forward_failed")?;
     }
-    Ok(())
+    Ok(merged)
 }
+fn apply_relation(result: &mut RemoteStatus, tool: &Path, root: &Path, ahead: u64, behind: u64) {
+    result.state = "connected";
+    result.ahead = Some(ahead);
+    result.behind = Some(behind);
+    if ahead > 0 && behind > 0 {
+        result.reason = Some("diverged");
+        result.conflict_paths = conflicting_paths(tool, root).ok();
+    }
+}
+
 fn status(root: &Path, resources: &Path) -> RemoteStatus {
     let Some(tool) = git_path(resources) else {
         return RemoteStatus::new("unavailable", Some("git_missing"));
@@ -1205,16 +2085,14 @@ fn status(root: &Path, resources: &Path) -> RemoteStatus {
         .unwrap_or_else(|| "main".into());
     match relation(&tool, root, &url(&remote.name_with_owner), &branch) {
         Ok((ahead, behind)) => {
-            result.state = "connected";
-            result.ahead = Some(ahead);
-            result.behind = Some(behind)
+            apply_relation(&mut result, &tool, root, ahead, behind);
         }
         Err(e) => result.reason = Some(e),
     }
     result
 }
-async fn command_paths(
-    app: &tauri::AppHandle,
+async fn command_paths<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &State<'_, crate::AppState>,
 ) -> Result<(tokio::sync::OwnedRwLockReadGuard<PathBuf>, PathBuf, PathBuf), ()> {
     Ok((
@@ -1264,9 +2142,14 @@ async fn connect_impl(
                 .as_ref()
                 .map(|x| x.name.as_str())
                 .unwrap_or("main");
-            if let Err(e) =
-                receive_connected(&tool, &root, &db, &url(&remote.name_with_owner), branch)
-            {
+            if let Err(e) = receive_connected_with_progress(
+                &tool,
+                &root,
+                &db,
+                &url(&remote.name_with_owner),
+                branch,
+                Some(&app),
+            ) {
                 return RemoteStatus::transfer_error(e);
             }
         }
@@ -1275,25 +2158,67 @@ async fn connect_impl(
     .await
     .unwrap_or_else(|_| RemoteStatus::new("unavailable", Some("local_state_unavailable")))
 }
-async fn run_transfer(
-    app: tauri::AppHandle,
+#[cfg(test)]
+#[derive(Clone)]
+struct TestRemote {
+    tool: PathBuf,
+    target: String,
+}
+
+async fn run_transfer<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, crate::AppState>,
     action: &'static str,
 ) -> RemoteStatus {
     let Ok((root, resources, db)) = command_paths(&app, &state).await else {
         return RemoteStatus::new("unavailable", Some("local_state_unavailable"));
     };
+    let paths = state.paths.clone();
+    #[cfg(test)]
+    let test_remote = app
+        .try_state::<TestRemote>()
+        .map(|remote| remote.inner().clone());
+    let progress_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let Ok(_guard) = REMOTE_LOCK.lock() else {
             return RemoteStatus::new("unavailable", Some("busy"));
         };
-        let Some(tool) = git_path(&resources) else {
+        #[cfg(test)]
+        let tool = test_remote
+            .as_ref()
+            .map(|remote| remote.tool.clone())
+            .or_else(|| git_path(&resources));
+        #[cfg(not(test))]
+        let tool = git_path(&resources);
+        let Some(tool) = tool else {
             return RemoteStatus::new("unavailable", Some("git_missing"));
         };
-        let Some(repo) = configured(&tool, &root) else {
+        #[cfg(test)]
+        let repo = test_remote
+            .as_ref()
+            .map(|_| "fixture/repository".to_owned())
+            .or_else(|| configured(&tool, &root));
+        #[cfg(not(test))]
+        let repo = configured(&tool, &root);
+        let Some(repo) = repo else {
             return RemoteStatus::new("not_connected", None);
         };
-        let (remote, user) = match github(&repo) {
+        #[cfg(test)]
+        let remote_result = if test_remote.is_some() {
+            Ok((
+                Repository {
+                    name_with_owner: repo.clone(),
+                    is_private: true,
+                    default_branch_ref: None,
+                },
+                "fixture".to_owned(),
+            ))
+        } else {
+            github(&repo)
+        };
+        #[cfg(not(test))]
+        let remote_result = github(&repo);
+        let (remote, user) = match remote_result {
             Ok(x) => x,
             Err(e) => return RemoteStatus::new("unavailable", Some(e)),
         };
@@ -1301,32 +2226,140 @@ async fn run_transfer(
             .default_branch_ref
             .map(|x| x.name)
             .unwrap_or_else(|| "main".into());
-        if let Err(e) = transfer(&tool, &root, &url(&remote.name_with_owner), &branch, action) {
+        let retry = root.join(".git/momso-first-receive-in-progress").exists();
+        let first_receive = action == "pull"
+            && (retry || git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).is_err());
+        let progress = |state, completed, available| {
+            if first_receive {
+                let _ = progress_app.emit(
+                    "archive-first-receive-progress",
+                    receive_progress(state, completed, available),
+                );
+            }
+        };
+        if first_receive {
+            progress(if retry { "recovering" } else { "receiving" }, 0, false);
+        }
+        if action == "push" {
+            if let Err(e) = crate::chat_archive_store::save_pending(&root, &resources, &paths) {
+                return RemoteStatus::new("unavailable", Some(e));
+            }
+        }
+        #[cfg(test)]
+        let target = test_remote
+            .as_ref()
+            .map(|remote| remote.target.clone())
+            .unwrap_or_else(|| url(&remote.name_with_owner));
+        #[cfg(not(test))]
+        let target = url(&remote.name_with_owner);
+        let before = git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).ok();
+        let mut merge_revision = None;
+        let transfer_result = transfer_with_merge_revision(
+            &tool,
+            &root,
+            &target,
+            &branch,
+            action,
+            &mut merge_revision,
+        );
+        let after = git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).ok();
+        let changed = before != after;
+        let merged = merge_revision.is_some();
+        if transfer_result.is_ok() {
+            progress("indexing", 1, false);
+        }
+        let preserved_result = merge_revision
+            .as_deref()
+            .map(|revision| preserved_documents(&tool, &root, revision))
+            .transpose();
+        let people_conflict = merge_revision
+            .as_deref()
+            .map(|revision| merged_people_conflict(&tool, &root, revision))
+            .transpose();
+        let preserved = preserved_result
+            .as_ref()
+            .ok()
+            .and_then(|docs| docs.clone())
+            .unwrap_or_default();
+        if (merged || changed || (action == "pull" && transfer_result.is_ok()))
+            && crate::archive::reindex(&root, &db).is_err()
+        {
+            progress("failed", 1, false);
+            let mut status = RemoteStatus::new("unavailable", Some("reindex_failed"));
+            status.auto_merged = merged;
+            status.preserved_documents = preserved;
+            return status;
+        }
+        if preserved_result.is_err() || people_conflict.is_err() {
+            progress("failed", 1, false);
+            let mut status = RemoteStatus::new("unavailable", Some("merge_report_unavailable"));
+            status.auto_merged = merged;
+            return status;
+        }
+        if (action == "pull" && transfer_result.is_ok()) || merged {
+            progress("restoring", 2, false);
+            if let Err(e) = crate::chat_archive_store::restore_emitting(&root, &db, &app) {
+                progress("failed", 2, false);
+                return RemoteStatus::new("unavailable", Some(e));
+            }
+        }
+        if let Err(e) = transfer_result {
+            progress(
+                if e == "first_receive_interrupted" {
+                    "interrupted"
+                } else {
+                    "failed"
+                },
+                0,
+                false,
+            );
             let mut s = RemoteStatus::transfer_error(e);
+            s.auto_merged = merged;
+            s.preserved_documents = preserved;
+            if e == "diverged" {
+                s.conflict_paths = conflicting_paths(&tool, &root).ok();
+            } else if people_conflict == Ok(Some(true)) {
+                s.conflict_paths = Some(vec!["dictionary/people.json".to_owned()]);
+            }
             s.repo = Some(remote.name_with_owner.clone());
             s.visibility = Some("private".into());
             s.signed_in_as = Some(user);
-            s.last_pushed_at = last_push(&root, &url(&remote.name_with_owner));
+            s.last_pushed_at = last_push(&root, &target);
             return s;
         }
-        if action == "pull" && crate::archive::reindex(&root, &db).is_err() {
-            return RemoteStatus::new("unavailable", Some("reindex_failed"));
+        #[cfg(test)]
+        let mut result = if test_remote.is_some() {
+            RemoteStatus::new("connected", None)
+        } else {
+            status(&root, &resources)
+        };
+        #[cfg(not(test))]
+        let mut result = status(&root, &resources);
+        if after.is_some() {
+            progress("complete", 3, true);
+        } else {
+            progress("empty", 0, false);
         }
-        status(&root, &resources)
+        result.auto_merged = merged;
+        result.preserved_documents = preserved;
+        if people_conflict == Ok(Some(true)) {
+            result.conflict_paths = Some(vec!["dictionary/people.json".to_owned()]);
+        }
+        result
     })
     .await
     .unwrap_or_else(|_| RemoteStatus::new("unavailable", Some("local_state_unavailable")))
 }
 #[tauri::command]
-pub(crate) async fn archive_remote_push(
-    app: tauri::AppHandle,
+pub(crate) async fn archive_remote_push<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, crate::AppState>,
 ) -> Result<RemoteStatus, String> {
     Ok(run_transfer(app, state, "push").await)
 }
 #[tauri::command]
-pub(crate) async fn archive_remote_pull(
-    app: tauri::AppHandle,
+pub(crate) async fn archive_remote_pull<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, crate::AppState>,
 ) -> Result<RemoteStatus, String> {
     Ok(run_transfer(app, state, "pull").await)
@@ -1378,6 +2411,67 @@ pub(crate) async fn archive_remote_disconnect(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_receive_progress_matches_chat_restore_fields() {
+        let pending =
+            serde_json::to_value(super::receive_progress("recovering", 0, false)).unwrap();
+        assert_eq!(
+            pending,
+            serde_json::json!({"completed":0,"total":3,"state":"recovering","available":false})
+        );
+        let completed = serde_json::to_value(super::receive_progress("complete", 3, true)).unwrap();
+        assert_eq!(completed["available"], true);
+    }
+    #[test]
+    fn remote_error_categories_do_not_treat_ambiguous_http_as_proof() {
+        use super::classify_remote_error as classify;
+        assert_eq!(
+            classify("fatal: Authentication failed for 'https://example.invalid/'"),
+            "authentication_failed"
+        );
+        assert_eq!(
+            classify("remote: Permission to owner/repo denied to user."),
+            "permission_denied"
+        );
+        assert_eq!(
+            classify("fatal: unable to access: Could not resolve host: example.invalid"),
+            "connection_failed"
+        );
+        assert_eq!(
+            classify("remote: error: GH001: Large files detected"),
+            "size_limit"
+        );
+        assert_eq!(
+            classify("fatal: pack exceeds maximum allowed size"),
+            "size_limit"
+        );
+        assert_eq!(
+            classify("fatal: repository not found"),
+            "repository_unavailable_or_denied"
+        );
+        assert_eq!(classify("HTTP 404"), "repository_unavailable_or_denied");
+        assert_eq!(classify("HTTP 403"), "remote_unavailable");
+        assert_eq!(
+            classify("fatal: the remote end hung up unexpectedly"),
+            "remote_unavailable"
+        );
+    }
+    #[test]
+    fn chat_history_paths_accept_only_canonical_chat_json() {
+        assert!(super::safe_chat_path("chats/chat_20261115_120000.json"));
+        assert!(super::safe_chat_path(
+            "chats/chat_00000000-0000-0000-0000-000000000000.json"
+        ));
+        for path in [
+            "chats/../credentials.json",
+            "chats/chat_20261115_120000.json/extra",
+            "chats/chat_20261115_120000.db",
+            "chats/object.json",
+            "objects/chat_20261115_120000.json",
+        ] {
+            assert!(!super::safe_chat_path(path));
+        }
+    }
     use super::*;
 
     fn reply(code: i32, stdout: &str) -> Result<GhReply, ()> {
@@ -1783,6 +2877,467 @@ mod tests {
     }
 
     #[test]
+    fn ipc_divergence_preserves_versions_and_allows_local_work_and_retry() {
+        let f = Fixture::new();
+        crate::archive::initialize(&f.root, f._dir.path()).unwrap();
+        fs::remove_file(f.root.join("zettels/a.md")).unwrap();
+        let db = f._dir.path().join("momso.db");
+        let backups = f._dir.path().join("backups");
+        crate::storage::initialize(&db, &backups, "test").unwrap();
+        let now = chrono::Local::now();
+        let id = format!("zet_{}", now.format("%Y%m%d_%H%M%S"));
+        let timestamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let path = format!("zettels/{id}.md");
+        let document = |body: &str| {
+            format!("---\nid: {id}\ntitle: Lesson\nsummary: Summary\nkind: note\nstatus: draft\ncreated_at: '{timestamp}'\nupdated_at: '{timestamp}'\nassets: []\nedges: []\n---\n{body}\n")
+        };
+        fs::write(f.root.join(&path), document("base")).unwrap();
+        let profile =
+            |name: &str| format!("---\nname: {name}\nabout: ''\nstyle: ''\nupdatedAt: null\n---\n");
+        fs::write(f.root.join("profile.md"), profile("base")).unwrap();
+        git(&f.tool, &f.root, &["add", "--", "."]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let other = f._dir.path().join("other");
+        git(
+            &f.tool,
+            f._dir.path(),
+            &[
+                "clone",
+                "--branch",
+                "main",
+                f.remote(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        fs::write(other.join(&path), document("remote")).unwrap();
+        git(&f.tool, &other, &["add", "--", &path]).unwrap();
+        git(
+            &f.tool,
+            &other,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "remote edit",
+            ],
+        )
+        .unwrap();
+        git(&f.tool, &other, &["push", "origin", "main"]).unwrap();
+        fs::write(f.root.join(&path), document("local")).unwrap();
+        git(&f.tool, &f.root, &["add", "--", &path]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "local edit",
+            ],
+        )
+        .unwrap();
+        let location =
+            crate::archive_location::ArchiveLocation::load(db.clone(), f._dir.path(), vec![])
+                .unwrap();
+        *location.current.try_write().unwrap() = f.root.clone();
+        let paths = crate::runtime::RuntimePaths {
+            data_root: f._dir.path().to_owned(),
+            database_path: db,
+            objects_path: f.root.join("objects"),
+            exports_path: f._dir.path().join("exports"),
+            backups_path: backups,
+            logs_path: f._dir.path().join("logs"),
+            archive: location,
+            archive_lease: None,
+        };
+        let app = tauri::test::mock_builder()
+            .manage(crate::AppState {
+                paths,
+                approvals: Default::default(),
+                setup_secrets: Default::default(),
+                usage_monitor: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                usage_cache: Default::default(),
+                chat_active: Default::default(),
+                browser: Default::default(),
+            })
+            .manage(TestRemote {
+                tool: f.tool.clone(),
+                target: f.remote().to_owned(),
+            })
+            .invoke_handler(tauri::generate_handler![
+                archive_remote_push,
+                archive_remote_pull,
+                crate::zet_create,
+                crate::archive_save,
+                crate::chat_create
+            ])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let invoke = |cmd, body| crate::command_entry_tests::invoke(&window, cmd, body);
+        let pulled = invoke("archive_remote_pull", serde_json::json!({}));
+        assert_eq!(pulled["autoMerged"], true);
+        assert!(pulled["preservedDocuments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some(id.as_str())));
+        assert!(pulled["conflictPaths"].is_null());
+        assert_eq!(
+            fs::read_to_string(f.root.join(&path)).unwrap(),
+            document("remote")
+        );
+        invoke(
+            "zet_create",
+            serde_json::json!({"input":{"title":"New","summary":"Summary","kind":"note","body":"Body","assets":[],"edges":[]}}),
+        );
+        invoke("archive_save", serde_json::json!({}));
+        assert_eq!(
+            invoke("archive_remote_push", serde_json::json!({}))["state"],
+            "connected"
+        );
+        git(&f.tool, &other, &["pull", "--ff-only"]).unwrap();
+        fs::write(other.join("profile.md"), profile("remote")).unwrap();
+        git(&f.tool, &other, &["add", "--", "profile.md"]).unwrap();
+        git(
+            &f.tool,
+            &other,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "remote conflict",
+            ],
+        )
+        .unwrap();
+        git(&f.tool, &other, &["push", "origin", "main"]).unwrap();
+        fs::write(f.root.join("profile.md"), profile("local")).unwrap();
+        git(&f.tool, &f.root, &["add", "--", "profile.md"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "local conflict",
+            ],
+        )
+        .unwrap();
+        let conflict = invoke("archive_remote_push", serde_json::json!({}));
+        assert_eq!(conflict["reason"], "diverged");
+        assert!(conflict["conflictPaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "profile.md"));
+        invoke("chat_create", serde_json::json!({}));
+        invoke(
+            "zet_create",
+            serde_json::json!({"input":{"title":"Later","summary":"Summary","kind":"note","body":"Body","assets":[],"edges":[]}}),
+        );
+        invoke("archive_save", serde_json::json!({}));
+        let retried = invoke("archive_remote_push", serde_json::json!({}));
+        assert_eq!(retried["reason"], "diverged");
+        assert!(retried["conflictPaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "profile.md"));
+    }
+
+    #[test]
+    fn remote_rejection_does_not_change_head_and_retry_pushes() {
+        let f = Fixture::new();
+        f.push();
+        f.local_commit();
+        let before = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        let hook = f.bare.join("hooks/pre-receive");
+        fs::write(
+            &hook,
+            "#!/bin/sh\necho 'GH001: Large files detected' >&2\nexit 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "push"),
+            Err("size_limit")
+        );
+        assert_eq!(
+            git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap(),
+            before
+        );
+        fs::remove_file(&hook).unwrap();
+        transfer(&f.tool, &f.root, f.remote(), "main", "push").unwrap();
+        let remote_head = git(
+            &f.tool,
+            &f.root,
+            &["ls-remote", f.remote(), "refs/heads/main"],
+        )
+        .unwrap();
+        assert!(remote_head.starts_with(&before));
+    }
+
+    #[test]
+    fn actual_git_http_404_remains_ambiguous() {
+        use std::io::{Read, Write};
+        let f = Fixture::new();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let target = format!("http://{address}/fixture.git");
+        let result = remote_git(
+            &f.tool,
+            &f.root,
+            &["ls-remote", "--heads", &target, "refs/heads/main"],
+        );
+        worker.join().unwrap();
+        assert_eq!(result, Err("repository_unavailable_or_denied"));
+    }
+
+    #[test]
+    fn interrupted_remote_response_keeps_local_commit_and_retry_succeeds() {
+        use std::io::{Read, Write};
+        let f = Fixture::new();
+        f.push();
+        f.local_commit();
+        let before = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\nContent-Length: 9999\r\nConnection: close\r\n\r\n001e# service=git-upload-pack\n").unwrap();
+        });
+        let target = format!("http://{address}/fixture.git");
+        assert!(transfer(&f.tool, &f.root, &target, "main", "push").is_err());
+        worker.join().unwrap();
+        assert_eq!(
+            git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap(),
+            before
+        );
+        transfer(&f.tool, &f.root, f.remote(), "main", "push").unwrap();
+        assert!(git(
+            &f.tool,
+            &f.root,
+            &["ls-remote", f.remote(), "refs/heads/main"]
+        )
+        .unwrap()
+        .starts_with(&before));
+    }
+
+    #[test]
+    fn interrupted_push_during_remote_receive_can_be_retried() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let f = Fixture::new();
+        f.push();
+        f.local_commit();
+        let expected = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        let hook = f.bare.join("hooks/pre-receive");
+        fs::write(&hook, "#!/bin/sh\necho ready > momso-test-ready\nsleep 2\necho done > momso-test-done\nexit 0\n").unwrap();
+        let mut child = ChildGuard(
+            Command::new(&f.tool)
+                .current_dir(&f.root)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args([
+                    "push",
+                    "--no-follow-tags",
+                    f.remote(),
+                    "HEAD:refs/heads/main",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let start = std::time::Instant::now();
+        while !f.bare.join("momso-test-ready").exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "receive hook did not start"
+            );
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "push ended before interruption"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let start = std::time::Instant::now();
+        while !f.bare.join("momso-test-done").exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(15),
+                "receive hook did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::remove_file(hook).unwrap();
+        assert_eq!(
+            git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap(),
+            expected
+        );
+        transfer(&f.tool, &f.root, f.remote(), "main", "push").unwrap();
+        assert!(git(
+            &f.tool,
+            &f.root,
+            &["ls-remote", f.remote(), "refs/heads/main"]
+        )
+        .unwrap()
+        .starts_with(&expected));
+    }
+
+    #[test]
+    fn interrupted_first_receive_stops_retry_without_overwriting_user_files() {
+        let f = Fixture::new();
+        f.push();
+        let saved = f.root.join(".git/momso-first-pull-fixture");
+        fs::create_dir(&saved).unwrap();
+        fs::write(saved.join("AGENTS.md"), "original").unwrap();
+        fs::write(f.root.join("AGENTS.md"), "new user content").unwrap();
+        fs::write(
+            f.root.join(".git/momso-first-receive-in-progress"),
+            "momso-first-pull-fixture",
+        )
+        .unwrap();
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "pull"),
+            Err("first_receive_interrupted")
+        );
+        assert_eq!(
+            fs::read_to_string(saved.join("AGENTS.md")).unwrap(),
+            "original"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("AGENTS.md")).unwrap(),
+            "new user content"
+        );
+    }
+
+    #[test]
+    fn first_receive_crash_child() {
+        let Ok(root) = std::env::var("MOMSO_TEST_FIRST_RECEIVE_ROOT") else {
+            return;
+        };
+        let tool = std::env::var("MOMSO_TEST_FIRST_RECEIVE_GIT").unwrap();
+        let revision = std::env::var("MOMSO_TEST_FIRST_RECEIVE_REVISION").unwrap();
+        let _ = first_receive_with_hooks(
+            Path::new(&tool),
+            Path::new(&root),
+            &revision,
+            || {},
+            || std::process::exit(73),
+        );
+        panic!("expected interrupted process");
+    }
+
+    #[test]
+    fn abrupt_first_receive_exit_keeps_saved_original_and_new_user_file() {
+        let f = Fixture::new();
+        f.push();
+        let fresh = f._dir.path().join("fresh-crash");
+        fs::create_dir(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        let original = fs::read(fresh.join(".gitignore")).unwrap();
+        relation(&f.tool, &fresh, f.remote(), "main").unwrap();
+        let revision = git(
+            &f.tool,
+            &fresh,
+            &["rev-parse", "refs/remotes/momso/observed"],
+        )
+        .unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "archive_remote::tests::first_receive_crash_child",
+                "--nocapture",
+            ])
+            .env("MOMSO_TEST_FIRST_RECEIVE_ROOT", &fresh)
+            .env("MOMSO_TEST_FIRST_RECEIVE_GIT", &f.tool)
+            .env("MOMSO_TEST_FIRST_RECEIVE_REVISION", &revision)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(status.status.code(), Some(73));
+        let marker =
+            fs::read_to_string(fresh.join(".git/momso-first-receive-in-progress")).unwrap();
+        assert!(marker.starts_with("momso-first-pull-"));
+        let saved = fresh.join(".git").join(marker);
+        assert_eq!(fs::read(saved.join(".gitignore")).unwrap(), original);
+        fs::write(fresh.join(".gitignore"), "user data").unwrap();
+        assert_eq!(
+            transfer(&f.tool, &fresh, f.remote(), "main", "pull"),
+            Err("first_receive_interrupted")
+        );
+        assert_eq!(
+            fs::read_to_string(fresh.join(".gitignore")).unwrap(),
+            "user data"
+        );
+        assert_eq!(fs::read(saved.join(".gitignore")).unwrap(), original);
+        fs::remove_file(fresh.join(".gitignore")).unwrap();
+        transfer(&f.tool, &fresh, f.remote(), "main", "pull").unwrap();
+        assert_eq!(
+            fs::read_to_string(fresh.join("zettels/a.md")).unwrap(),
+            "initial"
+        );
+        assert!(!fresh.join(".git/momso-first-receive-in-progress").exists());
+    }
+
+    #[test]
     fn only_known_safe_ancestor_is_reported_as_matching() {
         let f = Fixture::new();
         let head = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
@@ -1851,6 +3406,53 @@ mod tests {
             fs::read_to_string(fresh.join("zettels/b.md")).unwrap(),
             "remote"
         );
+    }
+
+    #[test]
+    fn first_receive_keeps_missing_bundled_skills_when_remote_has_custom_skill() {
+        let f = Fixture::new();
+        let remote_skill = f.root.join("skills/custom/SKILL.md");
+        fs::create_dir_all(remote_skill.parent().unwrap()).unwrap();
+        fs::write(&remote_skill, "custom skill").unwrap();
+        let remote_default = f.root.join("skills/github-connect/SKILL.md");
+        fs::create_dir_all(remote_default.parent().unwrap()).unwrap();
+        fs::write(&remote_default, "user edited default").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "skills/"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "custom skill",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let fresh = f._dir.path().join("fresh-partial-skills");
+        fs::create_dir_all(&fresh).unwrap();
+        crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+        connect_local(&f.tool, &fresh, f.remote()).unwrap();
+        transfer(&f.tool, &fresh, f.remote(), "main", "pull").unwrap();
+        assert_eq!(
+            fs::read(fresh.join("skills/custom/SKILL.md")).unwrap(),
+            b"custom skill"
+        );
+        for (name, text) in crate::skills::BUNDLED_SKILLS {
+            let expected = if *name == "github-connect" {
+                b"user edited default".as_slice()
+            } else {
+                text.as_bytes()
+            };
+            assert_eq!(
+                fs::read(fresh.join("skills").join(name).join("SKILL.md")).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2286,19 +3888,760 @@ mod tests {
         );
     }
     #[test]
-    fn refuses_divergence() {
+    fn merges_disjoint_divergence_without_losing_either_parent() {
         let f = Fixture::new();
         f.push();
         f.clone_and_commit();
         f.local_commit();
         assert_eq!(
+            transfer_report(&f.tool, &f.root, f.remote(), "main", "push"),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/b.md")).unwrap(),
+            "remote"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/local.md")).unwrap(),
+            "local"
+        );
+        let parents = git(
+            &f.tool,
+            &f.root,
+            &["rev-list", "--parents", "-n", "1", "HEAD"],
+        )
+        .unwrap();
+        assert_eq!(parents.split_whitespace().count(), 3);
+    }
+    #[test]
+    fn overlapping_divergence_keeps_both_histories_unchanged() {
+        let f = Fixture::new();
+        f.push();
+        f.clone_and_commit();
+        fs::write(f.root.join("zettels/b.md"), "local").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "zettels/b.md"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "local",
+            ],
+        )
+        .unwrap();
+        let before = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
             transfer(&f.tool, &f.root, f.remote(), "main", "push"),
             Err("diverged")
         );
         assert_eq!(
-            transfer(&f.tool, &f.root, f.remote(), "main", "pull"),
+            git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/b.md")).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            conflicting_paths(&f.tool, &f.root).unwrap(),
+            vec!["zettels/b.md"]
+        );
+    }
+
+    #[test]
+    fn same_document_uses_remote_and_retains_local_version_in_history() {
+        let f = Fixture::new();
+        let id = "zet_20261115_143052";
+        let path = format!("zettels/{id}.md");
+        let document = |body: &str| {
+            format!("---\nid: {id}\ntitle: Lesson\nsummary: Summary\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\n{body}\n")
+        };
+        fs::write(f.root.join(&path), document("base")).unwrap();
+        git(&f.tool, &f.root, &["add", "--", &path]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+        f.push();
+        f.clone_and_commit();
+        let other = f._dir.path().join("other");
+        fs::write(other.join(&path), document("remote")).unwrap();
+        git(&f.tool, &other, &["add", "--", &path]).unwrap();
+        git(
+            &f.tool,
+            &other,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "remote edit",
+            ],
+        )
+        .unwrap();
+        git(&f.tool, &other, &["push", "origin", "main"]).unwrap();
+        fs::write(f.root.join(&path), document("local")).unwrap();
+        git(&f.tool, &f.root, &["add", "--", &path]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "local edit",
+            ],
+        )
+        .unwrap();
+        let local = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        let mut merged_revision = None;
+        assert_eq!(
+            transfer_with_merge_revision(
+                &f.tool,
+                &f.root,
+                f.remote(),
+                "main",
+                "pull",
+                &mut merged_revision
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join(&path)).unwrap(),
+            document("remote")
+        );
+        let merged_head = merged_revision.unwrap();
+        fs::write(f.root.join("zettels/after.md"), "later").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "zettels/after.md"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "later",
+            ],
+        )
+        .unwrap();
+        assert_ne!(
+            git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap(),
+            merged_head
+        );
+        assert_eq!(
+            preserved_documents(&f.tool, &f.root, &merged_head).unwrap(),
+            vec![id]
+        );
+        let versions = crate::archive::history(&f.root, f._dir.path(), id).unwrap();
+        let versions = serde_json::to_value(versions).unwrap();
+        assert!(versions
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["revision"] == local));
+        assert_eq!(
+            crate::archive::read_version(&f.root, f._dir.path(), id, &local).unwrap(),
+            document("local")
+        );
+    }
+
+    #[test]
+    fn same_document_previous_version_restores_through_archive_api() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        let bare = temp.path().join("remote.git");
+        let other = temp.path().join("other");
+        let db = temp.path().join("momso.db");
+        crate::archive::initialize(&root, temp.path()).unwrap();
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let id = crate::archive_zet::create(
+            &root,
+            &db,
+            crate::archive_zet::ZetCreate {
+                title: "Lesson".into(),
+                summary: "Summary".into(),
+                kind: "note".into(),
+                body: "base".into(),
+                assets: vec![],
+                edges: vec![],
+            },
+        )
+        .unwrap();
+        crate::archive::save(&root, temp.path(), &db).unwrap();
+        let tool = crate::process::resolve_tool("git.exe").unwrap();
+        git(
+            &tool,
+            temp.path(),
+            &["init", "--bare", bare.to_str().unwrap()],
+        )
+        .unwrap();
+        transfer(&tool, &root, bare.to_str().unwrap(), "main", "push").unwrap();
+        git(
+            &tool,
+            temp.path(),
+            &[
+                "clone",
+                "--branch",
+                "main",
+                bare.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let path = format!("zettels/{id}.md");
+        let base = fs::read_to_string(root.join(&path)).unwrap();
+        fs::write(other.join(&path), base.replace("base", "remote")).unwrap();
+        git(&tool, &other, &["add", "--", &path]).unwrap();
+        git(
+            &tool,
+            &other,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "remote",
+            ],
+        )
+        .unwrap();
+        git(&tool, &other, &["push", "origin", "main"]).unwrap();
+        fs::write(root.join(&path), base.replace("base", "local")).unwrap();
+        git(&tool, &root, &["add", "--", &path]).unwrap();
+        git(
+            &tool,
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "local",
+            ],
+        )
+        .unwrap();
+        let local = git(&tool, &root, &["rev-parse", "HEAD"]).unwrap();
+        let dirty = git(
+            &tool,
+            &root,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .unwrap();
+        assert!(
+            dirty.lines().all(|line| line == "?? .gitignore"
+                || line.strip_prefix("?? ").is_some_and(safe_skill_path)),
+            "unexpected test files: {dirty}"
+        );
+        assert_eq!(
+            transfer_report(&tool, &root, bare.to_str().unwrap(), "main", "pull"),
+            Ok(true)
+        );
+        assert!(fs::read_to_string(root.join(&path))
+            .unwrap()
+            .contains("remote"));
+        crate::archive::restore_version(&root, temp.path(), &db, &id, &local, false).unwrap();
+        assert!(fs::read_to_string(root.join(&path))
+            .unwrap()
+            .contains("local"));
+    }
+
+    #[test]
+    fn dictionary_additions_are_combined_but_changed_existing_terms_are_rejected() {
+        let base = r#"{"terms":[{"term":{"id":"base","meaning":"original"}}]}"#;
+        let local =
+            r#"{"terms":[{"term":{"id":"base","meaning":"original"}},{"term":{"id":"local"}}]}"#;
+        let remote =
+            r#"{"terms":[{"term":{"id":"base","meaning":"original"}},{"term":{"id":"remote"}}]}"#;
+        let merged: serde_json::Value =
+            serde_json::from_slice(&merge_added_terms(base, local, remote).unwrap()).unwrap();
+        let ids: Vec<_> = merged["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["term"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["base", "local", "remote"]);
+        let changed = r#"{"terms":[{"term":{"id":"base","meaning":"changed"}}]}"#;
+        assert!(merge_added_terms(base, local, changed).is_err());
+    }
+
+    #[test]
+    fn people_merge_prefers_confirmed_and_reports_two_confirmed_versions() {
+        let base = r#"{"people":[{"id":"one","name":"old","confirmed":false}]}"#;
+        let left = r#"{"people":[{"id":"one","name":"local","confirmed":true},{"id":"two","name":"added","confirmed":true}]}"#;
+        let right = r#"{"people":[{"id":"one","name":"remote","confirmed":false}]}"#;
+        let (merged, conflict) = merge_people(base, left, right).unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(data["people"][0]["name"], "local");
+        assert_eq!(data["people"][1]["id"], "two");
+        assert!(!conflict);
+        let confirmed = r#"{"people":[{"id":"one","name":"remote","confirmed":true}]}"#;
+        let (merged, conflict) = merge_people(base, left, confirmed).unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&merged).unwrap();
+        assert_eq!(data["people"][0]["name"], "remote");
+        assert!(conflict);
+        assert!(merge_people(r#"{"people":["legacy"]}"#, left, right).is_err());
+    }
+
+    #[test]
+    fn known_builtin_dictionary_versions_are_ordered_and_custom_is_not_trusted() {
+        let old = include_str!("../bundled-dictionary/yoga-v1.json");
+        let current = include_str!("../bundled-dictionary/yoga.json");
+        assert!(
+            crate::yoga_dictionary::known_bundle_version(old).unwrap()
+                < crate::yoga_dictionary::known_bundle_version(current).unwrap()
+        );
+        assert!(crate::yoga_dictionary::known_bundle_version("{\"bundleVersion\":999}").is_none());
+    }
+
+    #[test]
+    fn divergent_dictionary_additions_and_known_bundles_survive_real_git_merge() {
+        let f = Fixture::new();
+        let directory = f.root.join("dictionary");
+        fs::create_dir(&directory).unwrap();
+        let terms = |id: &str| {
+            format!(
+                r#"{{"terms":[{{"term":{{"id":"{id}","sanskrit":"test","korean":[],"koreanNames":[],"meaning":"test","sources":[]}},"baseMeaning":null}}]}}"#
+            )
+        };
+        fs::write(directory.join("my-terms.json"), r#"{"terms":[]}"#).unwrap();
+        fs::write(
+            directory.join("people.json"),
+            r#"{"people":[{"id":"person-1","name":"old","confirmed":false}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            f.root.join("AGENTS.md"),
+            include_str!("testdata/archive_rules_before_fragments.md"),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("yoga.json"),
+            include_str!("../bundled-dictionary/yoga-v1.json"),
+        )
+        .unwrap();
+        git(&f.tool, &f.root, &["add", "--", "dictionary/", "AGENTS.md"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "base dictionary",
+            ],
+        )
+        .unwrap();
+        f.push();
+        f.clone_and_commit();
+        let other = f._dir.path().join("other");
+        fs::write(other.join("AGENTS.md"), include_str!("archive_rules.md")).unwrap();
+        fs::write(other.join("dictionary/my-terms.json"), terms("remote")).unwrap();
+        fs::write(
+            other.join("dictionary/people.json"),
+            r#"{"people":[{"id":"person-1","name":"remote","confirmed":true}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            other.join("dictionary/yoga.json"),
+            include_str!("../bundled-dictionary/yoga.json"),
+        )
+        .unwrap();
+        git(&f.tool, &other, &["add", "--", "dictionary/", "AGENTS.md"]).unwrap();
+        git(
+            &f.tool,
+            &other,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "remote dictionary",
+            ],
+        )
+        .unwrap();
+        git(&f.tool, &other, &["push", "origin", "main"]).unwrap();
+        fs::write(directory.join("my-terms.json"), terms("local")).unwrap();
+        fs::write(
+            directory.join("people.json"),
+            r#"{"people":[{"id":"person-1","name":"local","confirmed":true}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            f.root.join("AGENTS.md"),
+            include_str!("testdata/archive_rules_before_dictionary.md"),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("yoga.json"),
+            include_str!("../bundled-dictionary/yoga-v2.json"),
+        )
+        .unwrap();
+        git(&f.tool, &f.root, &["add", "--", "dictionary/", "AGENTS.md"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "local dictionary",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            transfer_report(&f.tool, &f.root, f.remote(), "main", "pull"),
+            Ok(true)
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("my-terms.json")).unwrap()).unwrap();
+        let ids: Vec<_> = saved["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["term"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["local", "remote"]);
+        assert_eq!(
+            fs::read_to_string(directory.join("yoga.json")).unwrap(),
+            include_str!("../bundled-dictionary/yoga.json")
+        );
+        assert!(crate::yoga_dictionary::list(&f.root).is_ok());
+        let people: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("people.json")).unwrap()).unwrap();
+        assert_eq!(people["people"][0]["name"], "remote");
+        let head = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        assert!(merged_people_conflict(&f.tool, &f.root, &head).unwrap());
+        assert_eq!(
+            fs::read_to_string(f.root.join("AGENTS.md")).unwrap(),
+            include_str!("archive_rules.md")
+        );
+    }
+
+    #[test]
+    fn divergent_chat_snapshots_merge_through_bare_remote() {
+        let f = Fixture::new();
+        let first = f._dir.path().join("first.sqlite");
+        let second = f._dir.path().join("second.sqlite");
+        crate::storage::initialize(&first, &f._dir.path().join("first-backup"), "test").unwrap();
+        crate::storage::initialize(&second, &f._dir.path().join("second-backup"), "test").unwrap();
+        let id = serde_json::to_value(crate::chat::create(&first).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        crate::chat::rename(&first, &id, "shared chat").unwrap();
+        let initial = crate::chat_archive_snapshot::snapshot(&first, &id).unwrap();
+        crate::chat_archive_snapshot::restore_new(&second, &initial).unwrap();
+        let file = format!("chats/{id}.json");
+        fs::create_dir(f.root.join("chats")).unwrap();
+        fs::write(f.root.join(&file), serde_json::to_vec(&initial).unwrap()).unwrap();
+        git(&f.tool, &f.root, &["add", "--", &file]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "base chat",
+            ],
+        )
+        .unwrap();
+        f.push();
+        f.clone_and_commit();
+        let other = f._dir.path().join("other");
+        crate::chat::append(&first, &id, crate::chat::Role::User, "first", None, None).unwrap();
+        crate::chat::append(&second, &id, crate::chat::Role::User, "second", None, None).unwrap();
+        let left = crate::chat_archive_snapshot::snapshot(&first, &id).unwrap();
+        let right = crate::chat_archive_snapshot::snapshot(&second, &id).unwrap();
+        assert!(crate::chat_archive_snapshot::merge_snapshots(&left, &right).is_ok());
+        fs::write(f.root.join(&file), serde_json::to_vec(&left).unwrap()).unwrap();
+        git(&f.tool, &f.root, &["add", "--", &file]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "first chat",
+            ],
+        )
+        .unwrap();
+        fs::write(other.join(&file), serde_json::to_vec(&right).unwrap()).unwrap();
+        git(&f.tool, &other, &["add", "--", &file]).unwrap();
+        git(
+            &f.tool,
+            &other,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "second chat",
+            ],
+        )
+        .unwrap();
+        git(&f.tool, &other, &["push", "origin", "main"]).unwrap();
+        assert_eq!(
+            transfer_report(&f.tool, &f.root, f.remote(), "main", "pull"),
+            Ok(true)
+        );
+        crate::chat_archive_store::restore(&f.root, &first).unwrap();
+        let restored = serde_json::to_value(crate::chat::read(&first, &id).unwrap()).unwrap();
+        let messages = restored["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().any(|m| m["text"] == "first"));
+        assert!(messages.iter().any(|m| m["text"] == "second"));
+    }
+
+    #[test]
+    fn unresolved_profile_and_skill_keep_local_saves_and_retry() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.root.join("skills/custom")).unwrap();
+        for (path, text) in [("profile.md", "base"), ("skills/custom/SKILL.md", "base")] {
+            fs::write(f.root.join(path), text).unwrap();
+        }
+        git(
+            &f.tool,
+            &f.root,
+            &["add", "--", "profile.md", "skills/custom/SKILL.md"],
+        )
+        .unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+        )
+        .unwrap();
+        f.push();
+        f.clone_and_commit();
+        let other = f._dir.path().join("other");
+        for path in ["profile.md", "skills/custom/SKILL.md"] {
+            fs::write(other.join(path), "remote").unwrap();
+            fs::write(f.root.join(path), "local").unwrap();
+        }
+        for root in [&other, &f.root] {
+            git(
+                &f.tool,
+                root,
+                &["add", "--", "profile.md", "skills/custom/SKILL.md"],
+            )
+            .unwrap();
+            git(
+                &f.tool,
+                root,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    "edit",
+                ],
+            )
+            .unwrap();
+        }
+        git(&f.tool, &other, &["push", "origin", "main"]).unwrap();
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "push"),
             Err("diverged")
         );
+        let paths = conflicting_paths(&f.tool, &f.root).unwrap();
+        assert!(paths.contains(&"profile.md".to_owned()));
+        assert!(paths.contains(&"skills/custom/SKILL.md".to_owned()));
+        f.local_commit();
+        assert_eq!(
+            fs::read_to_string(f.root.join("profile.md")).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "push"),
+            Err("diverged")
+        );
+        for (index, path) in ["profile.md", "skills/custom/SKILL.md"].iter().enumerate() {
+            let mut read = RemoteStatus::new("unavailable", None);
+            let (ahead, behind) = relation(&f.tool, &f.root, f.remote(), "main").unwrap();
+            apply_relation(&mut read, &f.tool, &f.root, ahead, behind);
+            let serialized = serde_json::to_value(&read).unwrap();
+            assert_eq!(serialized["reason"], "diverged");
+            assert_eq!(
+                serialized["conflictPaths"].as_array().unwrap().len(),
+                2 - index
+            );
+            assert!(serialized["conflictPaths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p == path));
+            fs::write(f.root.join(path), "remote").unwrap();
+            git(&f.tool, &f.root, &["add", "--", path]).unwrap();
+            git(
+                &f.tool,
+                &f.root,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    "resolve",
+                ],
+            )
+            .unwrap();
+        }
+        let (ahead, behind) = relation(&f.tool, &f.root, f.remote(), "main").unwrap();
+        let mut read = RemoteStatus::new("unavailable", None);
+        apply_relation(&mut read, &f.tool, &f.root, ahead, behind);
+        assert_eq!(read.conflict_paths, Some(vec![]));
+        transfer(&f.tool, &f.root, f.remote(), "main", "push").unwrap();
+        assert_eq!(relation(&f.tool, &f.root, f.remote(), "main"), Ok((0, 0)));
+        let mut read = RemoteStatus::new("unavailable", None);
+        apply_relation(&mut read, &f.tool, &f.root, 0, 0);
+        assert_eq!(read.reason, None);
+        assert_eq!(read.conflict_paths, None);
+    }
+
+    #[test]
+    fn prepared_merge_can_be_retried_after_remote_unavailable() {
+        let f = Fixture::new();
+        f.push();
+        f.clone_and_commit();
+        f.local_commit();
+        assert_eq!(relation(&f.tool, &f.root, f.remote(), "main"), Ok((1, 1)));
+        merge_disjoint(&f.tool, &f.root).unwrap();
+        let missing = f._dir.path().join("no-such-remote.git");
+        assert_eq!(
+            transfer(&f.tool, &f.root, missing.to_str().unwrap(), "main", "push"),
+            Err("remote_unavailable")
+        );
+        transfer(&f.tool, &f.root, f.remote(), "main", "push").unwrap();
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/local.md")).unwrap(),
+            "local"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/b.md")).unwrap(),
+            "remote"
+        );
+    }
+    #[test]
+    fn diverged_push_never_overwrites_unsaved_local_work() {
+        let f = Fixture::new();
+        f.push();
+        f.clone_and_commit();
+        f.local_commit();
+        fs::write(f.root.join("zettels/a.md"), "unsaved").unwrap();
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "push"),
+            Err("unsaved_changes")
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/a.md")).unwrap(),
+            "unsaved"
+        );
+    }
+
+    #[test]
+    fn disjoint_divergence_can_be_received_without_losing_local_work() {
+        let f = Fixture::new();
+        f.push();
+        f.clone_and_commit();
+        f.local_commit();
+        assert_eq!(
+            transfer_report(&f.tool, &f.root, f.remote(), "main", "pull"),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/b.md")).unwrap(),
+            "remote"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/local.md")).unwrap(),
+            "local"
+        );
+    }
+
+    #[test]
+    fn divergent_chat_files_are_not_merged_automatically() {
+        let f = Fixture::new();
+        f.push();
+        f.clone_and_commit();
+        fs::create_dir(f.root.join("chats")).unwrap();
+        let path = "chats/chat_20261115_120000.json";
+        fs::write(f.root.join(path), "{}").unwrap();
+        git(&f.tool, &f.root, &["add", "--", path]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "chat",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "push"),
+            Err("diverged")
+        );
+        assert_eq!(fs::read_to_string(f.root.join(path)).unwrap(), "{}");
     }
     #[test]
     fn pulls_fast_forward() {

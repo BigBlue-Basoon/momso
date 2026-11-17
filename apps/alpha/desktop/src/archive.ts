@@ -239,6 +239,12 @@ export async function readReceipt(id: string) {
   return invoke<ReceiptDocument>('receipt_read', { id })
 }
 
+/** 작업 내역 지우기(2026-11-17 뒤쪽 2ef0fd2f): receipt_delete({ id }) → { state, id, chatId }. 파일은 몸소 폴더의 Git 안 지운 작업 내역 자리로 옮겨진다(되살리는 명령은 없다). */
+export async function deleteReceipt(id: string) {
+  requireArchive()
+  return invoke<{ state?: string; id?: string; chatId?: string | null }>('receipt_delete', { id })
+}
+
 export async function getArchiveStatus() {
   requireArchive()
   return invoke<ArchiveStatus>('archive_status')

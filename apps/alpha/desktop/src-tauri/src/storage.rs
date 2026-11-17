@@ -6,7 +6,7 @@ use std::{
 };
 use thiserror::Error;
 
-const LATEST_SCHEMA_VERSION: u32 = 85;
+const LATEST_SCHEMA_VERSION: u32 = 92;
 const MAX_AUTOMATED_BACKUPS: usize = 5;
 
 struct Migration {
@@ -53,33 +53,38 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 8,
-        description: "create rebuildable archive indexes",
-        sql: include_str!("../migrations/0008_archive_index.sql"),
+        description: "allow Gemini API usage events",
+        sql: include_str!("../migrations/0008_gemini_usage.sql"),
     },
     Migration {
         version: 9,
-        description: "create chat storage",
-        sql: include_str!("../migrations/0009_chats.sql"),
+        description: "create rebuildable archive indexes",
+        sql: include_str!("../migrations/0009_archive_index.sql"),
     },
     Migration {
         version: 10,
-        description: "add Codex chat thread",
-        sql: include_str!("../migrations/0010_chat_codex.sql"),
+        description: "create chat storage",
+        sql: include_str!("../migrations/0010_chats.sql"),
     },
     Migration {
         version: 11,
-        description: "add chat reasoning effort",
-        sql: include_str!("../migrations/0011_chat_effort.sql"),
+        description: "add Codex chat thread",
+        sql: include_str!("../migrations/0011_chat_codex.sql"),
     },
     Migration {
         version: 12,
-        description: "create chat groups",
-        sql: include_str!("../migrations/0012_chat_groups.sql"),
+        description: "add chat reasoning effort",
+        sql: include_str!("../migrations/0012_chat_effort.sql"),
     },
     Migration {
         version: 13,
+        description: "create chat groups",
+        sql: include_str!("../migrations/0013_chat_groups.sql"),
+    },
+    Migration {
+        version: 14,
         description: "store chat context usage",
-        sql: include_str!("../migrations/0013_chat_context.sql"),
+        sql: include_str!("../migrations/0014_chat_context.sql"),
     },
     Migration {
         version: 15,
@@ -150,6 +155,41 @@ const MIGRATIONS: &[Migration] = &[
         version: 85,
         description: "store reported chat fast state",
         sql: include_str!("../migrations/0085_chat_fast_state.sql"),
+    },
+    Migration {
+        version: 86,
+        description: "retain source integrity alerts",
+        sql: include_str!("../migrations/0086_source_integrity_events.sql"),
+    },
+    Migration {
+        version: 87,
+        description: "retain source deletion tombstones",
+        sql: include_str!("../migrations/0087_source_asset_deletions.sql"),
+    },
+    Migration {
+        version: 88,
+        description: "retain chat deletion tombstones",
+        sql: include_str!("../migrations/0088_chat_deletions.sql"),
+    },
+    Migration {
+        version: 89,
+        description: "index chat messages for exact substring search",
+        sql: include_str!("../migrations/0089_chat_search.sql"),
+    },
+    Migration {
+        version: 90,
+        description: "track chat archive changes atomically",
+        sql: include_str!("../migrations/0090_chat_archive_changes.sql"),
+    },
+    Migration {
+        version: 91,
+        description: "order paginated chat search",
+        sql: include_str!("../migrations/0091_chat_search_pages.sql"),
+    },
+    Migration {
+        version: 92,
+        description: "build chat search index in background",
+        sql: include_str!("../migrations/0092_chat_search_deferred.sql"),
     },
 ];
 
@@ -290,12 +330,129 @@ pub(crate) fn validate_snapshot_file(snapshot_path: &Path) -> Result<(), Storage
     check_integrity(&connection)
 }
 
+#[cfg(test)]
 pub(crate) fn restore_snapshot_file(
     snapshot_path: &Path,
     database_path: &Path,
     backups_path: &Path,
 ) -> Result<PathBuf, StorageError> {
     restore_snapshot_file_with_hook(snapshot_path, database_path, backups_path, || Ok(()))
+}
+
+// A restore must not silently undo an explicit deletion made after the
+// snapshot. Keep only the current deletion records, not unrelated new data.
+struct SourceDeletion {
+    id: String,
+    kind: String,
+    hash: String,
+    length: i64,
+    path: String,
+    name: String,
+    media: Option<String>,
+    captured_by: String,
+    created_at: String,
+    integrity: String,
+    issue: Option<String>,
+    quarantined_at: Option<String>,
+    quarantined_by: Option<String>,
+    operation: String,
+    state: String,
+    requested_at: String,
+    retain_until: String,
+    remote_plan: Option<String>,
+    remote_remaining: Option<String>,
+    local_remaining: Option<String>,
+}
+
+fn current_source_deletions(db: &Connection) -> Result<Vec<SourceDeletion>, StorageError> {
+    let present: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_asset_deletions')", [], |r| r.get(0))?;
+    if !present {
+        return Ok(Vec::new());
+    }
+    let mut statement = db.prepare("SELECT a.id,a.asset_kind,a.content_sha256,a.byte_length,a.storage_relative_path,a.original_file_name,a.media_type,a.captured_by,a.created_at,a.integrity_state,a.integrity_issue,a.quarantined_at,a.quarantined_by,d.operation_id,d.state,d.requested_at,d.retain_until,d.remote_plan_json,d.remote_remaining_json,d.local_remaining_json FROM momso_source_assets a JOIN source_asset_deletions d ON d.asset_id=a.id")?;
+    let rows = statement.query_map([], |r| {
+        Ok(SourceDeletion {
+            id: r.get(0)?,
+            kind: r.get(1)?,
+            hash: r.get(2)?,
+            length: r.get(3)?,
+            path: r.get(4)?,
+            name: r.get(5)?,
+            media: r.get(6)?,
+            captured_by: r.get(7)?,
+            created_at: r.get(8)?,
+            integrity: r.get(9)?,
+            issue: r.get(10)?,
+            quarantined_at: r.get(11)?,
+            quarantined_by: r.get(12)?,
+            operation: r.get(13)?,
+            state: r.get(14)?,
+            requested_at: r.get(15)?,
+            retain_until: r.get(16)?,
+            remote_plan: r.get(17)?,
+            remote_remaining: r.get(18)?,
+            local_remaining: r.get(19)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn preserve_source_deletions(
+    db: &mut Connection,
+    deletions: &[SourceDeletion],
+) -> Result<(), StorageError> {
+    let tx = db.transaction()?;
+    for item in deletions {
+        let existing: Option<(String,String,Option<String>)> = tx.query_row(
+            "SELECT id,integrity_state,integrity_issue FROM momso_source_assets WHERE content_sha256=?1",
+            [&item.hash], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).optional()?;
+        let id = if let Some((id, integrity, issue)) = existing {
+            // Do not clear a separate integrity quarantine from the snapshot.
+            if integrity != "quarantined" || issue.as_deref() == Some("user_deleted") {
+                tx.execute("UPDATE momso_source_assets SET integrity_state=?1,integrity_issue=?2,quarantined_at=?3,quarantined_by=?4 WHERE id=?5", rusqlite::params![item.integrity,item.issue,item.quarantined_at,item.quarantined_by,id])?;
+            }
+            id
+        } else {
+            tx.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,media_type,captured_by,created_at,integrity_state,integrity_issue,quarantined_at,quarantined_by) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", rusqlite::params![item.id,item.kind,item.hash,item.length,item.path,item.name,item.media,item.captured_by,item.created_at,item.integrity,item.issue,item.quarantined_at,item.quarantined_by])?;
+            item.id.clone()
+        };
+        if matches!(item.state.as_str(), "purge_pending" | "purged") {
+            tx.execute("UPDATE momso_source_assets SET original_file_name='deleted',media_type=NULL,captured_by='redacted' WHERE id=?1", [&id])?;
+        }
+        tx.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until,remote_plan_json,remote_remaining_json,local_remaining_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(asset_id) DO UPDATE SET operation_id=excluded.operation_id,state=excluded.state,requested_at=excluded.requested_at,retain_until=excluded.retain_until,remote_plan_json=excluded.remote_plan_json,remote_remaining_json=excluded.remote_remaining_json,local_remaining_json=excluded.local_remaining_json", rusqlite::params![id,item.operation,item.state,item.requested_at,item.retain_until,item.remote_plan,item.remote_remaining,item.local_remaining])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn current_chat_deletions(db: &Connection) -> Result<Vec<(String, String)>, StorageError> {
+    let present: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_deletions')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(Vec::new());
+    }
+    let mut statement =
+        db.prepare("SELECT chat_id,deleted_at FROM chat_deletions ORDER BY chat_id")?;
+    let entries = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    Ok(entries.collect::<Result<Vec<_>, _>>()?)
+}
+
+fn preserve_chat_deletions(
+    db: &mut Connection,
+    local: &[(String, String)],
+) -> Result<(), StorageError> {
+    let incoming = current_chat_deletions(db)?;
+    let tx = db.transaction()?;
+    for (id, deleted_at) in incoming.iter().chain(local) {
+        crate::chat::apply_deletion_in_transaction(&tx, id, deleted_at)
+            .map_err(StorageError::Integrity)?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 pub(crate) fn restore_snapshot_file_with_hook(
@@ -332,6 +489,8 @@ pub(crate) fn restore_snapshot_file_with_hook(
     ensure_supported_schema(&destination)?;
     check_integrity(&destination)?;
     configure_writable_storage(&destination)?;
+    let deletions = current_source_deletions(&destination)?;
+    let chat_deletions = current_chat_deletions(&destination)?;
     let safety_backup = create_backup(&destination, backups_path, "pre-restore")?;
 
     let restore_result = (|| -> Result<(), StorageError> {
@@ -339,6 +498,8 @@ pub(crate) fn restore_snapshot_file_with_hook(
             let backup = Backup::new(&source, &mut destination)?;
             backup.run_to_completion(128, Duration::from_millis(10), None)?;
         }
+        preserve_source_deletions(&mut destination, &deletions)?;
+        preserve_chat_deletions(&mut destination, &chat_deletions)?;
         after_replace()?;
         check_integrity(&destination)?;
         Ok(())
@@ -498,7 +659,11 @@ fn ensure_supported_schema(connection: &Connection) -> Result<u32, StorageError>
 fn apply_migration(connection: &mut Connection, migration: &Migration) -> Result<(), StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let previous_version = schema_version(&transaction)?;
-    transaction.execute_batch(migration.sql)?;
+    if migration.version == 89 {
+        transaction.execute_batch(include_str!("chat_search_deferred.sql"))?;
+    } else {
+        transaction.execute_batch(migration.sql)?;
+    }
     transaction.execute(
         "INSERT INTO app_schema_migrations (version, description) VALUES (?1, ?2)",
         (migration.version, migration.description),
@@ -653,6 +818,73 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn pending_chat_deletion_survives_upgrade_without_deleting_live_chat() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("momso.db");
+        let mut conn = open_connection(&db).unwrap();
+        configure_writable_storage(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 87) {
+            apply_migration(&mut conn, migration).unwrap();
+        }
+        let deleted = "chat_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let live = "chat_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        conn.execute(
+            "INSERT INTO chats(id,title,created_at,updated_at) VALUES (?1,'keep','x','x')",
+            [live],
+        )
+        .unwrap();
+        for id in [deleted, live] {
+            conn.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES(?1,'pending',CURRENT_TIMESTAMP)", [format!("chat_archive_delete:{id}")]).unwrap();
+        }
+        drop(conn);
+        initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let conn = open_connection(&db).unwrap();
+        let entries = current_chat_deletions(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, deleted);
+        assert!(chrono::DateTime::parse_from_rfc3339(&entries[0].1).is_ok());
+        let live_count: i64 = conn
+            .query_row("SELECT count(*) FROM chats WHERE id=?1", [live], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(live_count, 1);
+    }
+
+    #[test]
+    fn rejects_same_migration_number_with_different_description_without_changes() {
+        let temp = tempdir().unwrap();
+        let db = temp.path().join("momso.db");
+        let mut conn = open_connection(&db).unwrap();
+        configure_writable_storage(&conn).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 7) {
+            apply_migration(&mut conn, migration).unwrap();
+        }
+        let different = Migration {
+            version: 8,
+            description: "different eight",
+            sql: "CREATE TABLE preserved_marker(value TEXT)",
+        };
+        apply_migration(&mut conn, &different).unwrap();
+        conn.execute(
+            "INSERT INTO preserved_marker(value) VALUES ('untouched')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            initialize(&db, &temp.path().join("backups"), "test"),
+            Err(StorageError::Integrity(_))
+        ));
+        let conn = open_connection(&db).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 8);
+        let value: String = conn
+            .query_row("SELECT value FROM preserved_marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "untouched");
+    }
+
+    #[test]
     fn applies_missing_lower_migrations_without_rewinding_or_losing_claude_data() {
         let temp = tempdir().unwrap();
         let db = temp.path().join("momso.db");
@@ -661,7 +893,7 @@ mod tests {
         configure_writable_storage(&conn).unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|m| m.version <= 11 || m.version == 40)
+            .filter(|m| m.version <= 12 || m.version == 40)
         {
             apply_migration(&mut conn, migration).unwrap();
         }
@@ -707,7 +939,7 @@ mod tests {
         configure_writable_storage(&conn).unwrap();
         for migration in MIGRATIONS
             .iter()
-            .filter(|m| m.version <= 11 || m.version == 70)
+            .filter(|m| m.version <= 12 || m.version == 70)
         {
             apply_migration(&mut conn, migration).unwrap();
         }
@@ -728,39 +960,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(skill, "probe");
-    }
-
-    #[test]
-    fn rejects_same_migration_number_with_different_description_without_changes() {
-        let temp = tempdir().unwrap();
-        let db = temp.path().join("momso.db");
-        let mut conn = open_connection(&db).unwrap();
-        configure_writable_storage(&conn).unwrap();
-        for migration in MIGRATIONS.iter().filter(|m| m.version <= 7) {
-            apply_migration(&mut conn, migration).unwrap();
-        }
-        let different = Migration {
-            version: 8,
-            description: "different eight",
-            sql: "CREATE TABLE preserved_marker(value TEXT)",
-        };
-        apply_migration(&mut conn, &different).unwrap();
-        conn.execute(
-            "INSERT INTO preserved_marker(value) VALUES ('untouched')",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        assert!(matches!(
-            initialize(&db, &temp.path().join("backups"), "test"),
-            Err(StorageError::Integrity(_))
-        ));
-        let conn = open_connection(&db).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), 8);
-        let value: String = conn
-            .query_row("SELECT value FROM preserved_marker", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(value, "untouched");
     }
 
     #[test]
@@ -1054,6 +1253,117 @@ mod tests {
     }
 
     #[test]
+    fn restoring_schema_80_keeps_original_snapshot_and_chat() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("previous.db");
+        let mut connection = open_connection(&snapshot).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 80) {
+            apply_migration(&mut connection, migration).unwrap();
+        }
+        connection.execute("INSERT INTO chats(id,title,created_at,updated_at) VALUES('chat_test','old','x','x')", []).unwrap();
+        connection.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at) VALUES('message','chat_test','user','keep me','x')", []).unwrap();
+        drop(connection);
+        let original = fs::read(&snapshot).unwrap();
+        let current = temp.path().join("current.db");
+        let backups = temp.path().join("backups");
+        initialize(&current, &backups, "test").unwrap();
+        restore_snapshot_file(&snapshot, &current, &backups).unwrap();
+        assert_eq!(fs::read(&snapshot).unwrap(), original);
+        let connection = open_connection(&current).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), LATEST_SCHEMA_VERSION);
+        let text: String = connection
+            .query_row(
+                "SELECT text FROM chat_messages WHERE id='message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "keep me");
+    }
+
+    #[test]
+    fn legacy_record_bodies_survive_upgrade_and_snapshot() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("momso.db");
+        let backups = temp.path().join("backups");
+        let mut connection = open_connection(&database).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 71) {
+            apply_migration(&mut connection, migration).unwrap();
+        }
+        drop(connection);
+        crate::records::fixture_record(&database, "legacy", "original lesson", None).unwrap();
+        initialize(&database, &backups, "test").unwrap();
+        let snapshot = temp.path().join("snapshot.db");
+        create_snapshot_file(&database, &snapshot).unwrap();
+        sanitize_user_owned_backup_snapshot(&snapshot).unwrap();
+        for path in [&database, &snapshot] {
+            let connection = open_connection(path).unwrap();
+            let body: String = connection
+                .query_row("SELECT body FROM momso_record_bodies", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(body, "original lesson");
+        }
+    }
+
+    #[test]
+    fn restoring_schema_72_preserves_requested_effort_and_leaves_actual_unknown() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("old.db");
+        let mut old = open_connection(&snapshot).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 72) {
+            apply_migration(&mut old, migration).unwrap();
+        }
+        old.execute(
+            "INSERT INTO chats(id,title,created_at,updated_at) VALUES('c','t','x','x')",
+            [],
+        )
+        .unwrap();
+        old.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,effort) VALUES('m','c','assistant','answer','x','low')", []).unwrap();
+        drop(old);
+        let before = fs::read(&snapshot).unwrap();
+        let current = temp.path().join("current.db");
+        let backups = temp.path().join("backups");
+        initialize(&current, &backups, "test").unwrap();
+        restore_snapshot_file(&snapshot, &current, &backups).unwrap();
+        assert_eq!(fs::read(&snapshot).unwrap(), before);
+        let restored = open_connection(&current).unwrap();
+        let values: (String, Option<String>) = restored
+            .query_row(
+                "SELECT effort,actual_effort FROM chat_messages WHERE id='m'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(values, ("low".into(), None));
+    }
+
+    #[test]
+    fn migration_eight_preserves_existing_usage_and_accepts_gemini() {
+        let temp = tempdir().expect("tempdir");
+        let database = temp.path().join("momso.db");
+        let backups = temp.path().join("backups");
+        let mut connection = open_connection(&database).expect("open");
+        configure_writable_storage(&connection).expect("configure");
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 7) {
+            apply_migration(&mut connection, migration).expect("legacy migration");
+        }
+        connection.execute("INSERT INTO ai_usage_events (id, request_id, provider, auth_mode, input_tokens) VALUES ('old', 'old-request', 'codex', 'api_key', 123)", []).expect("old usage");
+        drop(connection);
+        initialize(&database, &backups, "test").expect("migrate");
+        let connection = open_connection(&database).expect("reopen");
+        let tokens: i64 = connection
+            .query_row(
+                "SELECT input_tokens FROM ai_usage_events WHERE id='old'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("old row");
+        assert_eq!(tokens, 123);
+        connection.execute("INSERT INTO ai_usage_events (id, request_id, provider, auth_mode) VALUES ('new', 'new-request', 'gemini', 'api_key')", []).expect("gemini row");
+        assert!(std::fs::read_dir(backups).unwrap().next().is_some());
+    }
+
+    #[test]
     fn initializes_a_new_database_with_runtime_metadata() {
         let temp = tempdir().expect("tempdir");
         let database_path = temp.path().join("momso.db");
@@ -1321,5 +1631,49 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("journal mode is readable");
         assert_eq!(journal_mode, "delete");
+    }
+
+    #[test]
+    fn source_alerts_survive_backfilled_chat_fast_state_migration() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("momso.db");
+        let backups = temp.path().join("backups");
+        let mut connection = Connection::open(&path).unwrap();
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version != 85)
+        {
+            apply_migration(&mut connection, migration).unwrap();
+        }
+        assert_eq!(schema_version(&connection).unwrap(), LATEST_SCHEMA_VERSION);
+        drop(connection);
+        crate::source_integrity::record(
+            &path,
+            "chat-test",
+            "codex",
+            "changed",
+            &[serde_json::json!({"relativePath":"original","beforeSha256":"a".repeat(64)})],
+        )
+        .unwrap();
+        initialize(&path, &backups, "test").unwrap();
+        let connection = open_connection(&path).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), LATEST_SCHEMA_VERSION);
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM source_integrity_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let applied: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM app_schema_migrations WHERE version=85",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 1);
+        connection
+            .prepare("SELECT fast_state FROM chat_messages")
+            .unwrap();
     }
 }

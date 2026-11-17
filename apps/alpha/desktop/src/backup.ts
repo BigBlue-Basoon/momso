@@ -22,6 +22,14 @@ export type RemoteStatus = {
   ahead: number | null
   behind: number | null
   signedInAs: string | null
+  /**
+   * 올리기·받기의 합치기 결과(2026-11-17, archive-backend-port-notes.md "GitHub 이력 합치기").
+   * autoMerged: 서로 다른 변경을 저절로 합쳤다(화면은 알리지 않는다). preservedDocuments: 양쪽에서 고친 같은 문서라 이 PC 의 것을 이전 버전으로 남긴 문서 번호.
+   * conflictPaths: 풀지 못해 남은 경로(reason diverged 와 함께). 계산하지 못했으면 null(수를 짐작하지 않는다).
+   */
+  autoMerged?: boolean
+  preservedDocuments?: string[]
+  conflictPaths?: string[] | null
 }
 
 export type StoreProvider = 'aws' | 'gcp' | 'cloudflare' | 'ncp'

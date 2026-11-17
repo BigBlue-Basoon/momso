@@ -9,7 +9,7 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import { Check, ChevronDown, CircleAlert, Gauge, Hand, Mic, Paperclip, Send, ShieldCheck, Square, Wand2, X, Zap, type LucideIcon } from 'lucide-react'
-import type { SkillEntry } from '../skills'
+import { skillUnavailableText, type SkillEntry } from '../skills'
 import {
   PROVIDER_NAME,
   PROVIDER_ORDER,
@@ -66,6 +66,9 @@ type ComposerProps = {
   /** 모델 목록. null 이면 읽지 못했다(이때는 설정의 AI 곳만 고를 수 있다). */
   models: ProviderModels[] | null
   /** 모델 목록을 읽지 못했을 때 고를 수 있는 곳(설정의 AI 연결). */
+  /** 모델 목록을 읽는 중이거나 읽지 못했으면 모델 자리에 한 줄(2026-11-17). */
+  modelsState?: 'loading' | 'ok' | 'failed'
+  onRetryModels?: () => void
   fallbackProviders: AiProvider[]
   /** 지금 보낼 수 있는 곳. 여기 없는 곳의 모델은 눌리지 않는다. */
   sendableProviders: AiProvider[]
@@ -102,6 +105,8 @@ export function Composer({
   onStop,
   onAttach,
   models,
+  modelsState = 'ok',
+  onRetryModels,
   fallbackProviders,
   sendableProviders,
   chosen,
@@ -150,11 +155,14 @@ export function Composer({
     const match = /(^|\s)\/([^\s/]*)$/.exec(value.slice(0, caret))
     if (!match) { setSlash(null); return }
     setSlash({ query: match[2], start: caret - match[2].length - 1 })
-    setSlashIndex(0)
+    // 처음 고른 칸은 쓸 수 있는 첫 스킬.
+    const first = skills.filter((item) => item.enabled && (item.title.includes(match[2]) || item.name.includes(match[2].toLowerCase()))).findIndex((item) => !skillUnavailableText(item))
+    setSlashIndex(Math.max(0, first))
   }
 
   function pickSkill(item: SkillEntry) {
-    if (!slash) return
+    // 쓸 수 없는 스킬은 목록에 까닭과 함께 보이지만 고를 수 없다.
+    if (!slash || skillUnavailableText(item)) return
     const caret = textarea.current?.selectionStart ?? prompt.length
     const next = prompt.slice(0, slash.start) + prompt.slice(caret)
     caretAfterPick.current = slash.start
@@ -194,7 +202,14 @@ export function Composer({
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
         event.preventDefault()
         const step = event.key === 'ArrowDown' ? 1 : -1
-        setSlashIndex((current) => (current + step + slashMatches.length) % slashMatches.length)
+        // 쓸 수 없는 스킬은 건너뛴다(고를 수 없으므로). 다 쓸 수 없으면 그대로.
+        setSlashIndex((current) => {
+          for (let move = 1; move <= slashMatches.length; move += 1) {
+            const next = (current + step * move + slashMatches.length * move) % slashMatches.length
+            if (!skillUnavailableText(slashMatches[next])) return next
+          }
+          return current
+        })
         return
       }
       if (event.key === 'Enter' || event.key === 'Tab') {
@@ -231,7 +246,8 @@ export function Composer({
               type="button"
               role="option"
               aria-selected={index === slashIndex}
-              className={index === slashIndex ? 'slash-item is-active' : 'slash-item'}
+              aria-disabled={skillUnavailableText(item) ? true : undefined}
+              className={`slash-item${index === slashIndex ? ' is-active' : ''}${skillUnavailableText(item) ? ' is-unavailable' : ''}`}
               onMouseDown={(event) => event.preventDefault()}
               onMouseEnter={() => setSlashIndex(index)}
               onClick={() => pickSkill(item)}
@@ -239,7 +255,9 @@ export function Composer({
               <Wand2 size={14} aria-hidden />
               <span className="slash-item-text">
                 <span className="slash-item-title">{item.title}</span>
-                {item.description && <span className="slash-item-description">{item.description}</span>}
+                {skillUnavailableText(item)
+                  ? <span className="slash-item-description">{skillUnavailableText(item)}</span>
+                  : item.description && <span className="slash-item-description">{item.description}</span>}
               </span>
               <span className="slash-item-name">/{item.name}</span>
             </button>
@@ -285,6 +303,17 @@ export function Composer({
           </div>
           <div className="composer-toolbar-end">
             <CompanyPicker models={models} fallbackProviders={fallbackProviders} sendableProviders={sendableProviders} chosen={chosen} onChoose={onChooseProvider} />
+            {modelsState === 'loading' && (
+              <span className={narrow ? 'composer-models-state is-narrow' : 'composer-models-state'} role="status">
+                <span className="composer-models-text" title={W.composer.modelsLoading}>{W.composer.modelsLoading}</span>
+              </span>
+            )}
+            {modelsState === 'failed' && (
+              <span className={narrow ? 'composer-models-state is-narrow' : 'composer-models-state'} role="alert">
+                <span className="composer-models-text" title={W.composer.modelsFailed}>{W.composer.modelsFailed}</span>
+                {onRetryModels && <button className="composer-models-retry" type="button" onClick={onRetryModels}>{W.firstRun.retry}</button>}
+              </span>
+            )}
             <FamilyPicker models={models} chosen={chosen} onChoose={onChooseModel} />
             <EffortPicker models={models} chosen={chosen} onChoose={onChooseEffort} />
             <FastToggle models={models} chosen={chosen} refused={fastRefused} onToggle={onToggleFast} />

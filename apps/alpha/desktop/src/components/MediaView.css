@@ -39,3 +39,6 @@
 @media (prefers-reduced-motion: reduce) {
   .media-view { animation: none; }
 }
+
+/* 읽는 동안·없을 때·읽지 못했을 때(2026-11-17, 문서 목록의 .zet-message 꼴). */
+.media-message { display: flex; min-height: 180px; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 13px; }

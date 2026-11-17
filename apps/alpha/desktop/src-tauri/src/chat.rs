@@ -28,6 +28,7 @@ pub(crate) struct ChatMessage {
     model: Option<String>,
     effort: Option<String>,
     actual_effort: Option<String>,
+    actual_special_effort: Option<String>,
     skill: Option<String>,
     fast: Option<bool>,
     fast_state: Option<String>,
@@ -141,11 +142,20 @@ fn delete_sessions(path: &Path, id: &str) -> Result<Option<(Option<String>, bool
         .optional().map_err(|_| "storage_error".to_owned())
 }
 
-fn delete_local(path: &Path, id: &str) -> Result<bool, String> {
-    let mut connection = db(path)?;
-    let tx = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| "storage_error".to_owned())?;
+pub(crate) fn apply_deletion_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    deleted_at: &str,
+) -> Result<(), String> {
+    if !crate::archive_receipt::valid_chat_id(id)
+        || chrono::DateTime::parse_from_rfc3339(deleted_at).is_err()
+    {
+        return Err("invalid_deletion".into());
+    }
+    tx.execute(
+        "INSERT INTO chat_deletions(chat_id,deleted_at) VALUES(?1,?2) ON CONFLICT(chat_id) DO UPDATE SET deleted_at=excluded.deleted_at",
+        params![id, deleted_at],
+    ).map_err(|_| "storage_error".to_owned())?;
     for table in [
         "chat_messages",
         "chat_claude_sessions",
@@ -156,11 +166,55 @@ fn delete_local(path: &Path, id: &str) -> Result<bool, String> {
         tx.execute(&format!("DELETE FROM {table} WHERE chat_id=?1"), [id])
             .map_err(|_| "storage_error".to_owned())?;
     }
-    let removed = tx
-        .execute("DELETE FROM chats WHERE id=?1", [id])
+    tx.execute("DELETE FROM chats WHERE id=?1", [id])
         .map_err(|_| "storage_error".to_owned())?;
+    tx.execute(
+        "DELETE FROM app_runtime_meta WHERE key=?1",
+        [format!("chat_archive_write:{id}")],
+    )
+    .map_err(|_| "storage_error".to_owned())?;
+    Ok(())
+}
+
+pub(crate) fn apply_archived_deletions_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    deletions: &[(String, String)],
+) -> Result<(), String> {
+    for (id, _) in deletions {
+        let conflict: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM chat_deletions WHERE chat_id=?1)",
+            [id], |row| row.get(0),
+        ).map_err(|_| "storage_error".to_owned())?;
+        if conflict {
+            return Err("chat_deletion_conflict".into());
+        }
+    }
+    for (id, deleted_at) in deletions {
+        apply_deletion_in_transaction(tx, id, deleted_at)?;
+    }
+    Ok(())
+}
+
+fn delete_local(path: &Path, id: &str) -> Result<bool, String> {
+    let _archive_guard = crate::chat_archive_store::lock_store().map_err(str::to_owned)?;
+    let mut connection = db(path)?;
+    let tx = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| "storage_error".to_owned())?;
+    let exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|_| "storage_error".to_owned())?;
+    if !exists {
+        return Ok(false);
+    }
+    apply_deletion_in_transaction(&tx, id, &chrono::Utc::now().to_rfc3339())?;
+    tx.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES(?1,'pending',CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value='pending',updated_at=CURRENT_TIMESTAMP", [format!("chat_archive_delete:{id}")]).map_err(|_| "storage_error".to_owned())?;
     tx.commit().map_err(|_| "storage_error".to_owned())?;
-    Ok(removed == 1)
+    Ok(true)
 }
 
 pub(crate) async fn delete_with<F, Fut>(
@@ -310,6 +364,7 @@ fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
         model: row.get(5)?,
         effort: row.get(6)?,
         actual_effort: row.get(10)?,
+        actual_special_effort: None,
         skill: row.get(7)?,
         fast: row.get(8)?,
         fast_state: row.get(13)?,
@@ -333,7 +388,7 @@ pub(crate) fn create(path: &Path) -> Result<ChatSummary, String> {
     let c = db(path)?;
     loop {
         let now = Local::now();
-        let id = format!("chat_{}", now.format("%Y%m%d_%H%M%S"));
+        let id = format!("chat_{}", Uuid::new_v4());
         let time = now.to_rfc3339_opts(SecondsFormat::Nanos, false);
         let n = c.execute("INSERT INTO chats(id,title,created_at,updated_at) VALUES (?1,'',?2,?2) ON CONFLICT(id) DO NOTHING", params![id,time]).map_err(|_| "채팅방을 만들지 못했습니다".to_string())?;
         if n == 1 {
@@ -581,6 +636,7 @@ fn append_internal(
         model,
         effort,
         actual_effort,
+        actual_special_effort: None,
         skill,
         fast: None,
         fast_state: None,
@@ -605,7 +661,7 @@ pub(crate) fn message_attachment_paths(
     message_id: &str,
 ) -> Result<Vec<MessageAttachment>, String> {
     let c = db(path)?;
-    let mut query = c.prepare("SELECT s.content_sha256,s.integrity_state,s.original_file_name,s.media_type FROM chat_attachments a JOIN momso_source_assets s ON s.id=a.asset_id WHERE a.chat_id=?1 AND a.message_id=?2 ORDER BY a.rowid").map_err(|_| "원자료를 읽지 못했습니다".to_string())?;
+    let mut query = c.prepare("SELECT s.content_sha256,s.integrity_state,s.original_file_name,s.media_type,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id) FROM chat_attachments a JOIN momso_source_assets s ON s.id=a.asset_id WHERE a.chat_id=?1 AND a.message_id=?2 ORDER BY a.rowid").map_err(|_| "원자료를 읽지 못했습니다".to_string())?;
     let entries = query
         .query_map(params![chat_id, message_id], |row| {
             Ok((
@@ -613,6 +669,7 @@ pub(crate) fn message_attachment_paths(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, bool>(4)?,
             ))
         })
         .map_err(|_| "원자료를 읽지 못했습니다".to_string())?;
@@ -622,9 +679,12 @@ pub(crate) fn message_attachment_paths(
         .map_err(|_| "원자료를 읽지 못했습니다".to_string())?;
     let mut paths = Vec::new();
     for entry in entries {
-        let (hash, state, name, media_type) =
+        let (hash, state, name, media_type, deleted) =
             entry.map_err(|_| "원자료를 읽지 못했습니다".to_string())?;
-        if state != "active" || !crate::archive_zet::valid_asset_id(&format!("sha256:{hash}")) {
+        if deleted
+            || state != "active"
+            || !crate::archive_zet::valid_asset_id(&format!("sha256:{hash}"))
+        {
             return Err("원자료를 읽지 못했습니다".into());
         }
         let relative = format!("objects/sha256/{}/{}", &hash[..2], hash);
@@ -763,12 +823,72 @@ pub(crate) fn rename(path: &Path, id: &str, title: &str) -> Result<(), String> {
 }
 pub(crate) fn search(path: &Path, query: &str) -> Result<Vec<ChatSearchResult>, String> {
     let c = db(path)?;
-    let sql="SELECT c.id,c.title,NULLIF(c.created_at,''),NULLIF(c.updated_at,''),(SELECT count(*) FROM chat_messages m WHERE m.chat_id=c.id),c.group_id,c.pinned_order,(SELECT source_provider FROM chat_imports i WHERE i.chat_id=c.id),(SELECT text FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0 ORDER BY m.rowid LIMIT 1) AS match_text FROM chats c WHERE c.archived_at IS NULL AND (instr(c.title,?1)>0 OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0)) ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC";
+    let characters: Vec<char> = query.chars().collect();
+    let mut grams = Vec::new();
+    if characters.len() >= 3 && !query.contains('\0') {
+        let last = characters.len() - 3;
+        grams = [0, last / 2, last]
+            .into_iter()
+            .map(|start| characters[start..start + 3].iter().collect::<String>())
+            .collect();
+        grams.sort();
+        grams.dedup();
+    }
+    let index_ready: bool = c
+        .query_row(
+            "SELECT ready FROM chat_search_index_state WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .unwrap_or(false);
+    let indexed = if grams.is_empty() || !index_ready {
+        false
+    } else {
+        let total: i64 = c
+            .query_row("SELECT count(*) FROM chat_message_search_map", [], |r| {
+                r.get(0)
+            })
+            .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
+        let mut least = total;
+        for gram in &grams {
+            let documents: Option<i64> = c
+                .query_row(
+                    "SELECT doc FROM chat_message_search_vocab WHERE term=?1",
+                    [gram],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
+            least = least.min(documents.unwrap_or(0));
+        }
+        total == 0 || least.saturating_mul(20) < total
+    };
+    let sql = if indexed {
+        "WITH matched AS MATERIALIZED (SELECT DISTINCT map.chat_id FROM chat_message_search JOIN chat_message_search_map map ON map.message_rowid=chat_message_search.rowid WHERE chat_message_search MATCH ?2) SELECT c.id,c.title,NULLIF(c.created_at,''),NULLIF(c.updated_at,''),(SELECT count(*) FROM chat_messages m WHERE m.chat_id=c.id),c.group_id,c.pinned_order,(SELECT source_provider FROM chat_imports i WHERE i.chat_id=c.id),(SELECT text FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0 ORDER BY m.rowid LIMIT 1) AS match_text FROM chats c LEFT JOIN matched ON matched.chat_id=c.id WHERE c.archived_at IS NULL AND (instr(c.title,?1)>0 OR (matched.chat_id IS NOT NULL AND EXISTS (SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0))) ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC"
+    } else {
+        "SELECT c.id,c.title,NULLIF(c.created_at,''),NULLIF(c.updated_at,''),(SELECT count(*) FROM chat_messages m WHERE m.chat_id=c.id),c.group_id,c.pinned_order,(SELECT source_provider FROM chat_imports i WHERE i.chat_id=c.id),(SELECT text FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0 ORDER BY m.rowid LIMIT 1) AS match_text FROM chats c WHERE c.archived_at IS NULL AND (instr(c.title,?1)>0 OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0)) ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC"
+    };
     let mut q = c
         .prepare(sql)
         .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
+    let phrase = if indexed {
+        grams
+            .into_iter()
+            .map(|gram| format!("\"{}\"", gram.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    } else {
+        String::new()
+    };
+    let params: Vec<&dyn rusqlite::ToSql> = if indexed {
+        vec![&query, &phrase]
+    } else {
+        vec![&query]
+    };
     let rows = q
-        .query_map([query], |row| {
+        .query_map(params.as_slice(), |row| {
             let text: Option<String> = row.get(8)?;
             let snippet = text.map(|s| {
                 s.lines()
@@ -784,6 +904,50 @@ pub(crate) fn search(path: &Path, query: &str) -> Result<Vec<ChatSearchResult>, 
         .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatSearchPage {
+    items: Vec<ChatSearchResult>,
+    has_more: bool,
+    next_offset: Option<u32>,
+}
+
+pub(crate) fn search_page(path: &Path, query: &str, offset: u32) -> Result<ChatSearchPage, String> {
+    const PAGE_SIZE: usize = 80;
+    let c = db(path)?;
+    let mut statement = c.prepare("WITH selected AS MATERIALIZED (SELECT c.id FROM chats c WHERE c.archived_at IS NULL AND (instr(c.title,?1)>0 OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0)) ORDER BY (c.pinned_order IS NULL),c.pinned_order,c.updated_at DESC,c.id DESC LIMIT 81 OFFSET ?2) SELECT c.id,c.title,NULLIF(c.created_at,''),NULLIF(c.updated_at,''),(SELECT count(*) FROM chat_messages m WHERE m.chat_id=c.id),c.group_id,c.pinned_order,(SELECT source_provider FROM chat_imports i WHERE i.chat_id=c.id),(SELECT text FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0 ORDER BY m.rowid LIMIT 1) FROM selected s JOIN chats c ON c.id=s.id ORDER BY (c.pinned_order IS NULL),c.pinned_order,c.updated_at DESC,c.id DESC").map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
+    let rows = statement
+        .query_map(params![query, offset], |row| {
+            let text: Option<String> = row.get(8)?;
+            let snippet = text.map(|s| {
+                s.lines()
+                    .find(|line| line.contains(query))
+                    .unwrap_or(&s)
+                    .replace(['\r', '\n'], " ")
+            });
+            Ok(ChatSearchResult {
+                chat: summary(row)?,
+                snippet,
+            })
+        })
+        .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
+    let mut items = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
+    let has_more = items.len() > PAGE_SIZE;
+    items.truncate(PAGE_SIZE);
+    let next_offset = if has_more {
+        offset.checked_add(PAGE_SIZE as u32)
+    } else {
+        None
+    };
+    Ok(ChatSearchPage {
+        items,
+        has_more,
+        next_offset,
+    })
 }
 pub(crate) fn automatic_title_event(
     id: &str,
@@ -943,13 +1107,13 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("test.db");
         let c = Connection::open(&p).unwrap();
-        c.execute_batch(include_str!("../migrations/0009_chats.sql"))
+        c.execute_batch(include_str!("../migrations/0010_chats.sql"))
             .unwrap();
-        c.execute_batch(include_str!("../migrations/0010_chat_codex.sql"))
+        c.execute_batch(include_str!("../migrations/0011_chat_codex.sql"))
             .unwrap();
-        c.execute_batch(include_str!("../migrations/0011_chat_effort.sql"))
+        c.execute_batch(include_str!("../migrations/0012_chat_effort.sql"))
             .unwrap();
-        c.execute_batch(include_str!("../migrations/0012_chat_groups.sql"))
+        c.execute_batch(include_str!("../migrations/0013_chat_groups.sql"))
             .unwrap();
         c.execute_batch(include_str!("../migrations/0070_chat_skill.sql"))
             .unwrap();
@@ -970,6 +1134,10 @@ mod tests {
         c.execute_batch(include_str!("../migrations/0084_chat_auth_method.sql"))
             .unwrap();
         c.execute_batch(include_str!("../migrations/0085_chat_fast_state.sql"))
+            .unwrap();
+        c.execute_batch(include_str!("../migrations/0089_chat_search.sql"))
+            .unwrap();
+        c.execute_batch(include_str!("../migrations/0091_chat_search_pages.sql"))
             .unwrap();
         (d, p)
     }
@@ -994,6 +1162,35 @@ mod tests {
         let saved = serde_json::to_value(read(&path, &id).unwrap()).unwrap();
         assert_eq!(saved["messages"][0]["authMethod"], "apiKey");
         assert!(set_auth_method(&path, &id, &message.id, "fake-secret").is_err());
+    }
+    #[test]
+    fn paged_search_returns_korean_matches_without_duplicates() {
+        let (_dir, path) = database();
+        let mut conn = Connection::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        for i in 0..100 {
+            let id = format!("chat-{i:03}");
+            tx.execute(
+                "INSERT INTO chats(id,title,created_at,updated_at) VALUES(?1,'test','2026','2026')",
+                [&id],
+            )
+            .unwrap();
+            tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at) VALUES(?1,?2,'user','수리아사나를 연습합니다','2026')", params![format!("message-{i}"),id]).unwrap();
+        }
+        tx.commit().unwrap();
+        let first = search_page(&path, "아사나를", 0).unwrap();
+        assert_eq!(first.items.len(), 80);
+        assert!(first.has_more);
+        let second = search_page(&path, "아사나를", first.next_offset.unwrap()).unwrap();
+        assert_eq!(second.items.len(), 20);
+        assert!(!second.has_more);
+        let ids: std::collections::HashSet<_> = first
+            .items
+            .iter()
+            .chain(&second.items)
+            .map(|item| &item.chat.id)
+            .collect();
+        assert_eq!(ids.len(), 100);
     }
     #[test]
     fn pin_archive_restore_and_search_preserve_messages_and_group() {
@@ -1070,6 +1267,16 @@ mod tests {
         assert!(c.id.starts_with("chat_"));
         assert_eq!(c.message_count, 0);
         assert_eq!(read(&p, &c.id).unwrap().messages.len(), 0);
+    }
+    #[test]
+    fn independent_databases_create_distinct_chat_ids() {
+        let (_first, first_db) = database();
+        let (_second, second_db) = database();
+        let first = create(&first_db).unwrap();
+        let second = create(&second_db).unwrap();
+        assert_ne!(first.id, second.id);
+        assert!(Uuid::parse_str(first.id.strip_prefix("chat_").unwrap()).is_ok());
+        assert!(Uuid::parse_str(second.id.strip_prefix("chat_").unwrap()).is_ok());
     }
     #[test]
     fn append_and_auto_title() {
@@ -1347,6 +1554,49 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].snippet.as_deref(), Some("골반 수업"));
         assert!(search(&p, "없는말").unwrap().is_empty());
+    }
+    #[test]
+    fn trigram_search_preserves_korean_substrings_and_updates() {
+        let (_dir, path) = database();
+        let room = create(&path).unwrap();
+        rename(&path, &room.id, "선생님수업").unwrap();
+        let message = append(
+            &path,
+            &room.id,
+            Role::User,
+            "할아사나자세에서 선생님께서 호흡합니다",
+            None,
+            None,
+        )
+        .unwrap();
+        for term in ["아사나", "선생님께", "수업", "자세에서", "호흡"] {
+            assert_eq!(search(&path, term).unwrap().len(), 1, "{term}");
+        }
+        assert!(search(&path, "없는자세").unwrap().is_empty());
+        assert!(search(&path, "아사나없는").unwrap().is_empty());
+        let connection = db(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE chat_messages SET text=?1 WHERE id=?2",
+                rusqlite::params!["다른자세로 바꿉니다", message.id],
+            )
+            .unwrap();
+        assert!(search(&path, "아사나").unwrap().is_empty());
+        assert_eq!(search(&path, "다른자세").unwrap().len(), 1);
+        let other = create(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE chat_messages SET chat_id=?1 WHERE id=?2",
+                rusqlite::params![other.id, message.id],
+            )
+            .unwrap();
+        let found = search(&path, "다른자세").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].chat.id, other.id);
+        connection
+            .execute("DELETE FROM chat_messages WHERE id=?1", [&message.id])
+            .unwrap();
+        assert!(search(&path, "다른자세").unwrap().is_empty());
     }
     #[test]
     fn missing_id_errors() {

@@ -1,5 +1,7 @@
 // 스킬. 계약: momso-desktop-backend/outputs/2026-11-16-momso-skills-contract.md (2026-11-16 이 화면 폴더에 옮겨짐)
-//   skill_list → [{ name, title, description, enabled, builtin, updatedAt, providers, syncState }]
+//   skill_list → [{ name, title, description, enabled, builtin, updatedAt, providers, syncState, available, unavailableReason }]
+//     enabled = 사용자가 켰는지, available = 이 기기에서 확인할 수 있는 조건으로 쓸 수 있는지(사이트·AI 회사 로그인까지는 보장하지 않음).
+//     unavailableReason: disabled | skill_conflict | policy_modified | policy_unavailable | browser_unavailable | null (desktop-screen-backend-contract.md "스킬")
 //   skill_read({ name }) → 목록 항목 + { body, contentHash }
 //   skill_create({ name, title, description, body }), skill_update({ name, changes, expectedHash }),
 //   skill_set_enabled({ name, enabled }), skill_remove({ name }) → { status: 'ok' } (고친 뒤 모양은 skill_read 로 다시 읽는다)
@@ -8,6 +10,7 @@
 // skill_list 가 없으면 입력 칸의 / 목록과 설정의 "스킬" 쪽을 그리지 않는다.
 import { invoke } from '@tauri-apps/api/core'
 import { isDesktopRuntime } from './runtime'
+import { W } from './words'
 
 export type SkillEntry = {
   name: string
@@ -19,6 +22,15 @@ export type SkillEntry = {
   providers?: string[] | null
   /** ok = 정본과 도구 사본이 같음, disabled = 꺼짐, conflict = 사본이 정본과 다름. */
   syncState?: 'ok' | 'disabled' | 'conflict' | null
+  available?: boolean
+  unavailableReason?: string | null
+}
+
+/** 쓸 수 없는 까닭의 쉬운 말(꺼 둔 것은 null: 켜고 끄기 단추가 이미 보인다). 값을 모르면 '쓸 수 없음'만. */
+export function skillUnavailableText(item: SkillEntry) {
+  if (item.available !== false || item.unavailableReason === 'disabled') return null
+  const reasons = W.skills.unavailableReason as Record<string, string>
+  return (item.unavailableReason && reasons[item.unavailableReason]) || W.skills.unavailableTag
 }
 
 export type SkillDocument = SkillEntry & { body: string; contentHash: string }

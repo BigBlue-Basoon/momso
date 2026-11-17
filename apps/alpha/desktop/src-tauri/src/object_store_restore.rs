@@ -20,6 +20,15 @@ pub(crate) struct RestoreResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RecoveredOriginal {
+    path: String,
+    relative_path: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Item {
     id: String,
     relative_path: String,
@@ -89,6 +98,16 @@ fn existing_matches(path: &Path, manifest: &transfer::Manifest) -> Result<bool, 
     }
 }
 
+fn make_readonly(path: &Path) -> Result<(), &'static str> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "local_read_failed")?;
+    if !metadata.is_file() || crate::archive_location::is_link_or_reparse(&metadata) {
+        return Err("unsafe_path");
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions).map_err(|_| "local_write_failed")
+}
+
 pub(crate) async fn download_verified(
     config: &object_store::Config,
     keys: &object_store::Keys,
@@ -151,7 +170,162 @@ pub(crate) async fn download_verified(
     Ok(result)
 }
 
-async fn restore_one(
+// Search only recovery-named directories and never change an existing file.
+// A matching name alone is not evidence: check its permissions, length and hash.
+fn verified_recovery_copy(
+    backups: &Path,
+    manifest: &transfer::Manifest,
+) -> Result<Option<RecoveredOriginal>, &'static str> {
+    let filename = Path::new(&manifest.relative_path)
+        .file_name()
+        .ok_or("unsafe_path")?;
+    for entry in fs::read_dir(backups).map_err(|_| "local_read_failed")? {
+        let entry = entry.map_err(|_| "local_read_failed")?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("momso-source-recovery-")
+        {
+            continue;
+        }
+        let meta = fs::symlink_metadata(entry.path()).map_err(|_| "local_read_failed")?;
+        if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+            continue;
+        }
+        let candidate = entry.path().join(filename);
+        let meta = match fs::symlink_metadata(&candidate) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("local_read_failed"),
+        };
+        if !meta.is_file()
+            || crate::archive_location::is_link_or_reparse(&meta)
+            || !meta.permissions().readonly()
+            || meta.len() != manifest.size
+        {
+            continue;
+        }
+        let (hash, size) = transfer::hash_file(&candidate)?;
+        if hash == manifest.sha256 && size == manifest.size {
+            let path = candidate.to_str().ok_or("unsafe_path")?.to_owned();
+            return Ok(Some(RecoveredOriginal {
+                path,
+                relative_path: manifest.relative_path.clone(),
+                sha256: hash,
+                size,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+// This command writes a separate recovery copy; it never replaces the local
+// conflicting file. The caller must supply the pre-change hash explicitly.
+async fn recover_original_copy(
+    config: &object_store::Config,
+    keys: &object_store::Keys,
+    identity: &x25519::Identity,
+    manifest: &transfer::Manifest,
+    backups: &Path,
+) -> Result<RecoveredOriginal, &'static str> {
+    let relative = Path::new(&manifest.relative_path);
+    if manifest.kind != "object" || !transfer::safe_relative(relative) {
+        return Err("unsafe_path");
+    }
+    let metadata = fs::symlink_metadata(backups).map_err(|_| "local_read_failed")?;
+    if !metadata.is_dir() || crate::archive_location::is_link_or_reparse(&metadata) {
+        return Err("unsafe_path");
+    }
+    if let Some(existing) = verified_recovery_copy(backups, manifest)? {
+        return Ok(existing);
+    }
+    let destination_dir = tempfile::Builder::new()
+        .prefix("momso-source-recovery-")
+        .tempdir_in(backups)
+        .map_err(|_| "local_write_failed")?;
+    let downloaded =
+        download_verified(config, keys, identity, manifest, destination_dir.path()).await?;
+    let filename = relative.file_name().ok_or("unsafe_path")?;
+    let destination = destination_dir.path().join(filename);
+    let path = destination.to_str().ok_or("unsafe_path")?.to_owned();
+    downloaded
+        .persist_noclobber(&destination)
+        .map_err(|_| "local_write_failed")?;
+    make_readonly(&destination)?;
+    let _directory = destination_dir.keep();
+    Ok(RecoveredOriginal {
+        path,
+        relative_path: manifest.relative_path.clone(),
+        sha256: manifest.sha256.clone(),
+        size: manifest.size,
+    })
+}
+
+fn validate_recovery_request(
+    relative_path: &str,
+    expected_sha256: &str,
+) -> Result<(), &'static str> {
+    if !transfer::safe_relative(Path::new(&relative_path))
+        || expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("invalid_id");
+    }
+    Ok(())
+}
+
+fn select_recovery_manifest(
+    catalog: Vec<transfer::Manifest>,
+    relative_path: &str,
+    expected_sha256: &str,
+) -> Result<transfer::Manifest, &'static str> {
+    validate_recovery_request(relative_path, expected_sha256)?;
+    catalog
+        .into_iter()
+        .filter(|item| {
+            item.kind == "object"
+                && item.relative_path == relative_path
+                && item.sha256 == expected_sha256
+        })
+        .max_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.upload_id.cmp(&b.upload_id))
+        })
+        .ok_or("remote_missing")
+}
+
+#[tauri::command]
+pub(crate) async fn object_store_recover_original_copy(
+    state: State<'_, AppState>,
+    relative_path: String,
+    expected_sha256: String,
+) -> Result<RecoveredOriginal, &'static str> {
+    validate_recovery_request(&relative_path, &expected_sha256)?;
+    let paths = state.paths.scoped().await;
+    let _guard = object_store::CONNECTION_LOCK.lock().await;
+    {
+        let conn =
+            storage::open_writable_connection(&paths.database_path).map_err(|_| "unavailable")?;
+        let purging: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE a.content_sha256=?1 AND d.state IN ('purge_pending','purged'))", [&expected_sha256], |r| r.get(0)).map_err(|_| "unavailable")?;
+        if purging {
+            return Err("source_deleted");
+        }
+    }
+    let config = object_store::load_config(&paths.data_root)?.ok_or("not_connected")?;
+    let keys = object_store::load_keys(&config)?;
+    let identity = transfer::identity(&paths.database_path)?;
+    let manifest = select_recovery_manifest(
+        transfer::catalog(&config, &keys, &identity).await?,
+        &relative_path,
+        &expected_sha256,
+    )?;
+    recover_original_copy(&config, &keys, &identity, &manifest, &paths.backups_path).await
+}
+
+pub(crate) async fn restore_one(
     config: &object_store::Config,
     keys: &object_store::Keys,
     identity: &x25519::Identity,
@@ -162,8 +336,10 @@ async fn restore_one(
     if !transfer::safe_relative(relative) {
         return Err("unsafe_path");
     }
+    transfer::validate_content_address(&manifest.relative_path, &manifest.sha256)?;
     let destination = safe_parent(objects, relative)?;
     if existing_matches(&destination, manifest)? {
+        make_readonly(&destination)?;
         return Ok(false);
     }
     // Keep the verified temporary file on the archive's volume so that the
@@ -178,6 +354,10 @@ async fn restore_one(
     let destination = safe_parent(objects, relative)?;
     match fs::hard_link(temp.path(), &destination) {
         Ok(()) => {
+            // Remove the temporary link before setting the shared file attribute;
+            // Windows cannot always remove a read-only temporary file.
+            temp.close().map_err(|_| "local_write_failed")?;
+            make_readonly(&destination)?;
             if let Some(root) = objects.parent() {
                 crate::chat_file_changes::app_write(
                     root,
@@ -188,6 +368,7 @@ async fn restore_one(
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             if existing_matches(&destination, manifest)? {
+                make_readonly(&destination)?;
                 Ok(false)
             } else {
                 Err("local_write_failed")
@@ -201,7 +382,8 @@ fn selected_hashes(database: &Path, ids: Vec<String>) -> Result<HashSet<String>,
     let connection = storage::open_writable_connection(database).map_err(|_| "unavailable")?;
     let mut hashes = HashSet::new();
     for id in ids {
-        let hash = connection.query_row("SELECT content_sha256 FROM momso_source_assets WHERE id = ?1 OR content_sha256 = ?1", [&id], |row| row.get::<_, String>(0)).optional().map_err(|_| "unavailable")?.ok_or("unknown_id")?;
+        let lookup = crate::source_assets::reference_lookup(&id).ok_or("unknown_id")?;
+        let hash = connection.query_row("SELECT content_sha256 FROM momso_source_assets WHERE id = ?1 OR content_sha256 = ?2", rusqlite::params![id, lookup], |row| row.get::<_, String>(0)).optional().map_err(|_| "unavailable")?.ok_or("unknown_id")?;
         hashes.insert(hash);
     }
     Ok(hashes)
@@ -230,15 +412,34 @@ pub(crate) async fn restore_selected(
     paths: &crate::runtime::RuntimePaths,
     selected: Option<HashSet<String>>,
 ) -> Result<RestoreResult, &'static str> {
+    let deleted: HashSet<String> = {
+        let database =
+            storage::open_writable_connection(&paths.database_path).map_err(|_| "unavailable")?;
+        let mut statement = database.prepare("SELECT a.content_sha256 FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id").map_err(|_| "unavailable")?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .map_err(|_| "unavailable")?
+            .collect::<Result<_, _>>()
+            .map_err(|_| "unavailable")?;
+        rows
+    };
+    if selected
+        .as_ref()
+        .is_some_and(|hashes| hashes.iter().any(|hash| deleted.contains(hash)))
+    {
+        return Err("source_deleted");
+    }
     let mut latest: BTreeMap<String, transfer::Manifest> = BTreeMap::new();
     for manifest in transfer::catalog(config, keys, identity).await? {
         if manifest.kind != "object"
+            || deleted.contains(&manifest.sha256)
             || selected
                 .as_ref()
                 .is_some_and(|v| !v.contains(&manifest.sha256))
         {
             continue;
         }
+        transfer::validate_content_address(&manifest.relative_path, &manifest.sha256)?;
         let replace = latest
             .get(&manifest.relative_path)
             .is_none_or(|existing| existing.created_at < manifest.created_at);
@@ -358,9 +559,113 @@ mod tests {
     };
     use uuid::Uuid;
 
+    fn make_test_file_writable(path: &Path) {
+        #[cfg(windows)]
+        crate::source_assets::clear_readonly_attribute(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(permissions.mode() | 0o200);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    #[test]
+    fn selected_restore_accepts_all_asset_reference_forms() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
+        let hash = "a".repeat(64);
+        let connection = storage::open_writable_connection(&database).unwrap();
+        connection.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset-1','other',?1,1,'sha256/aa/file','note.txt','test','now')", [&hash]).unwrap();
+        drop(connection);
+        for id in ["asset-1".to_owned(), hash.clone(), format!("sha256:{hash}")] {
+            assert_eq!(
+                selected_hashes(&database, vec![id]).unwrap(),
+                HashSet::from([hash.clone()])
+            );
+        }
+        assert!(matches!(
+            selected_hashes(&database, vec!["sha256:invalid".into()]),
+            Err("unknown_id")
+        ));
+    }
+
+    #[test]
+    fn existing_recovery_copy_requires_matching_content_and_recovery_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = transfer::Manifest {
+            version: 1,
+            kind: "object".into(),
+            relative_path: "nested/original.txt".into(),
+            sha256: object_store::digest(b"good"),
+            size: 4,
+            upload_id: Uuid::new_v4().to_string(),
+            chunks: vec!["a".repeat(64)],
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let unowned = temp.path().join("other");
+        fs::create_dir(&unowned).unwrap();
+        fs::write(unowned.join("original.txt"), b"good").unwrap();
+        let owned = temp.path().join("momso-source-recovery-fixture");
+        fs::create_dir(&owned).unwrap();
+        let path = owned.join("original.txt");
+        fs::write(&path, b"evil").unwrap();
+        assert!(verified_recovery_copy(temp.path(), &manifest)
+            .unwrap()
+            .is_none());
+        fs::write(&path, b"good").unwrap();
+        assert!(verified_recovery_copy(temp.path(), &manifest)
+            .unwrap()
+            .is_none());
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        let recovered = verified_recovery_copy(temp.path(), &manifest)
+            .unwrap()
+            .unwrap();
+        assert_eq!(Path::new(&recovered.path), path);
+        assert!(fs::metadata(&path).unwrap().permissions().readonly());
+        make_test_file_writable(&path);
+        assert_eq!(fs::read(unowned.join("original.txt")).unwrap(), b"good");
+    }
+
+    #[test]
+    fn recovery_selects_only_matching_original_path_and_hash() {
+        let manifest = transfer::Manifest {
+            version: 1,
+            kind: "object".into(),
+            relative_path: "folder/original".into(),
+            sha256: "a".repeat(64),
+            size: 1,
+            upload_id: Uuid::new_v4().to_string(),
+            chunks: vec!["b".repeat(64)],
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        assert!(select_recovery_manifest(
+            vec![manifest.clone()],
+            "folder/original",
+            &"a".repeat(64)
+        )
+        .is_ok());
+        assert!(matches!(
+            select_recovery_manifest(vec![manifest.clone()], "folder/other", &"a".repeat(64)),
+            Err("remote_missing")
+        ));
+        assert!(matches!(
+            select_recovery_manifest(vec![manifest.clone()], "folder/original", &"c".repeat(64)),
+            Err("remote_missing")
+        ));
+        assert!(matches!(
+            select_recovery_manifest(vec![manifest], "../original", &"a".repeat(64)),
+            Err("invalid_id")
+        ));
+    }
+
     #[cfg(windows)]
     #[tokio::test]
-    async fn shell_bypass_is_detected_and_only_deleted_object_can_be_restored() {
+    async fn shell_bypass_is_detected_and_verified_originals_are_recovered_safely() {
         let temp = tempfile::tempdir().unwrap();
         let objects = temp.path().join("objects");
         fs::create_dir(&objects).unwrap();
@@ -387,23 +692,25 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                let n = stream.read(&mut buffer).unwrap();
-                assert_ne!(n, 0);
-                request.extend_from_slice(&buffer[..n]);
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    encrypted.len()
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                stream.write_all(&encrypted).unwrap();
             }
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                encrypted.len()
-            );
-            stream.write_all(header.as_bytes()).unwrap();
-            stream.write_all(&encrypted).unwrap();
         });
         let config = object_store::Config {
             provider: "s3_compatible".into(),
@@ -435,17 +742,69 @@ mod tests {
             changes.get("object-path:deleted.txt").map(String::as_str),
             Some("deleted")
         );
+        let details = crate::chat_file_changes::source_change_details(&before, &after);
+        let overwritten_details = details
+            .iter()
+            .find(|item| item["id"] == "object-path:overwritten.txt")
+            .unwrap();
+        assert_eq!(overwritten_details["relativePath"], "overwritten.txt");
+        assert_eq!(
+            overwritten_details["beforeSha256"],
+            object_store::digest(original)
+        );
+        let database = temp.path().join("momso.db");
+        crate::storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
+        crate::source_integrity::record(&database, "chat-test", "codex", "changed", &details)
+            .unwrap();
+        let saved = serde_json::to_value(
+            crate::source_integrity::list(&database, Some("chat-test"), None).unwrap(),
+        )
+        .unwrap();
+        let saved_change = saved[0]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "object-path:overwritten.txt")
+            .unwrap();
         let mut overwritten = manifest.clone();
         overwritten.relative_path = "overwritten.txt".into();
         assert!(matches!(
             restore_one(&config, &keys, &identity, &overwritten, &objects).await,
             Err("local_conflict")
         ));
-        assert_ne!(fs::read(objects.join("overwritten.txt")).unwrap(), original);
+        let changed = fs::read(objects.join("overwritten.txt")).unwrap();
+        assert_ne!(changed, original);
+        let selected = select_recovery_manifest(
+            vec![overwritten],
+            saved_change["relativePath"].as_str().unwrap(),
+            saved_change["beforeSha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        let recovered = recover_original_copy(&config, &keys, &identity, &selected, temp.path())
+            .await
+            .unwrap();
+        let recovered_again =
+            recover_original_copy(&config, &keys, &identity, &selected, temp.path())
+                .await
+                .unwrap();
+        assert_eq!(recovered_again.path, recovered.path);
+        let recovered_path = Path::new(&recovered.path);
+        assert_eq!(fs::read(recovered_path).unwrap(), original);
+        assert!(fs::metadata(recovered_path)
+            .unwrap()
+            .permissions()
+            .readonly());
+        assert_eq!(fs::read(objects.join("overwritten.txt")).unwrap(), changed);
         assert!(restore_one(&config, &keys, &identity, &manifest, &objects)
             .await
             .unwrap());
         assert_eq!(fs::read(objects.join("deleted.txt")).unwrap(), original);
+        assert!(fs::metadata(objects.join("deleted.txt"))
+            .unwrap()
+            .permissions()
+            .readonly());
+        make_test_file_writable(&objects.join("deleted.txt"));
+        make_test_file_writable(recovered_path);
         server.join().unwrap();
     }
 
@@ -470,7 +829,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            for index in 0..2 {
+            for index in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -483,7 +842,7 @@ mod tests {
                     request.extend_from_slice(&buffer[..n]);
                 }
                 let mut bytes = encrypted.clone();
-                if index == 1 {
+                if index > 0 {
                     bytes[0] ^= 1;
                 }
                 let header = format!(
@@ -507,14 +866,23 @@ mod tests {
             access_key_id: "TEST".into(),
             secret_access_key: "test".into(),
         };
+        let mut corrupted = manifest.clone();
+        corrupted.relative_path = format!("sha256/aa/{}", "a".repeat(64));
+        assert!(matches!(
+            restore_one(&config, &keys, &identity, &corrupted, &objects).await,
+            Err("source_integrity_mismatch")
+        ));
+        assert!(!objects.join(&corrupted.relative_path).exists());
         assert!(restore_one(&config, &keys, &identity, &manifest, &objects)
             .await
             .unwrap());
         let destination = objects.join(&manifest.relative_path);
         assert_eq!(fs::read(&destination).unwrap(), original);
+        assert!(fs::metadata(&destination).unwrap().permissions().readonly());
         assert!(!restore_one(&config, &keys, &identity, &manifest, &objects)
             .await
             .unwrap());
+        make_test_file_writable(&destination);
         fs::write(&destination, b"existing local data").unwrap();
         assert!(matches!(
             restore_one(&config, &keys, &identity, &manifest, &objects).await,
@@ -528,6 +896,15 @@ mod tests {
             Err("hash_mismatch")
         ));
         assert!(!other.join(&manifest.relative_path).exists());
+        assert!(matches!(
+            recover_original_copy(&config, &keys, &identity, &manifest, temp.path()).await,
+            Err("hash_mismatch")
+        ));
+        assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("momso-source-recovery-")));
         assert!(fs::read_dir(temp.path()).unwrap().all(|entry| !entry
             .unwrap()
             .file_name()

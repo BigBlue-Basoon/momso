@@ -72,6 +72,26 @@ fn classify(bytes: &[u8]) -> Option<(&'static str, Option<(u32, u32)>)> {
     None
 }
 
+type MediaInfo = (&'static str, Option<(u32, u32)>);
+
+pub(crate) fn classify_file(file: &mut fs::File) -> Result<Option<MediaInfo>, String> {
+    file.seek(SeekFrom::Start(0)).map_err(|_| "unavailable")?;
+    let mut bytes = [0; 4096];
+    let count = file.read(&mut bytes).map_err(|_| "unavailable")?;
+    Ok(classify(&bytes[..count]).or_else(|| {
+        is_mp4_handler(file, &bytes[..count], b"vide")
+            .ok()
+            .filter(|found| *found)
+            .map(|_| ("video", None))
+            .or_else(|| {
+                is_mp4_handler(file, &bytes[..count], b"soun")
+                    .ok()
+                    .filter(|found| *found)
+                    .map(|_| ("audio", None))
+            })
+    }))
+}
+
 fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let kind = bytes.get(12..16)?;
     if kind == b"VP8X" {
@@ -275,23 +295,21 @@ pub(crate) fn collect(
         if !path.starts_with(&root) {
             continue;
         }
-        let mut bytes = [0; 4096];
+        let info: Option<(String, String, String, bool)> = match &db {
+            Some(conn) => conn.query_row(
+                "SELECT a.original_file_name, a.created_at, a.integrity_state, EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=a.id) FROM momso_source_assets a WHERE a.content_sha256 = ?1 ORDER BY a.created_at, a.id LIMIT 1",
+                [hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .optional().map_err(|_| "unavailable".to_string())?,
+            None => None,
+        };
+        if info
+            .as_ref()
+            .is_some_and(|(_, _, state, deleted)| state != "active" || *deleted)
+        {
+            continue;
+        }
         let mut file = fs::File::open(&path).map_err(|_| "unavailable".to_string())?;
-        let count = file
-            .read(&mut bytes)
-            .map_err(|_| "unavailable".to_string())?;
-        let classification = classify(&bytes[..count]).or_else(|| {
-            is_mp4_handler(&mut file, &bytes[..count], b"vide")
-                .ok()
-                .filter(|found| *found)
-                .map(|_| ("video", None))
-                .or_else(|| {
-                    is_mp4_handler(&mut file, &bytes[..count], b"soun")
-                        .ok()
-                        .filter(|found| *found)
-                        .map(|_| ("audio", None))
-                })
-        });
+        let classification = classify_file(&mut file)?;
         let Some((detected, dimensions)) = classification else {
             continue;
         };
@@ -303,19 +321,9 @@ pub(crate) fn collect(
             Ok(time) => time.into(),
             Err(_) => continue,
         };
-        let info: Option<(String, String, String)> = match &db {
-            Some(conn) => conn.query_row(
-                "SELECT original_file_name, created_at, integrity_state FROM momso_source_assets WHERE content_sha256 = ?1 ORDER BY created_at, id LIMIT 1",
-                [hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .optional().map_err(|_| "unavailable".to_string())?,
-            None => None,
-        };
-        if info.as_ref().is_some_and(|(_, _, state)| state != "active") {
-            continue;
-        }
         let timestamp = info
             .as_ref()
-            .and_then(|(_, date, _)| {
+            .and_then(|(_, date, _, _)| {
                 DateTime::parse_from_rfc3339(date)
                     .ok()
                     .map(|d| d.with_timezone(&Utc))
@@ -481,7 +489,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let db = t.path().join("index.sqlite");
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch("CREATE TABLE momso_source_assets (id TEXT, content_sha256 TEXT, original_file_name TEXT, created_at TEXT, integrity_state TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE momso_source_assets (id TEXT, content_sha256 TEXT, original_file_name TEXT, created_at TEXT, integrity_state TEXT); CREATE TABLE source_asset_deletions (asset_id TEXT);").unwrap();
         fixture(t.path(), 1, b"\xff\xd8\xffjpeg");
         let hash = format!("{:064x}", 1);
         conn.execute("INSERT INTO momso_source_assets VALUES ('id', ?1, 'photo.jpg', '2026-01-01T00:00:00Z', 'quarantined')", [&hash]).unwrap();
@@ -491,6 +499,12 @@ mod tests {
             [],
         )
         .unwrap();
+        assert_eq!(collect(t.path(), &db, None, None, 4).unwrap().len(), 1);
+        conn.execute("INSERT INTO source_asset_deletions VALUES ('id')", [])
+            .unwrap();
+        assert!(collect(t.path(), &db, None, None, 4).unwrap().is_empty());
+        conn.execute("DELETE FROM source_asset_deletions", [])
+            .unwrap();
         assert_eq!(collect(t.path(), &db, None, None, 4).unwrap().len(), 1);
         conn.execute_batch("DROP TABLE momso_source_assets;")
             .unwrap();

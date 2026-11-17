@@ -9,6 +9,8 @@
 .first-run-input:focus { outline: none; border-color: var(--ink-soft); }
 .first-run-input[aria-invalid='true'] { border-color: var(--coral); }
 .first-run-error { margin: -8px 0 0; color: var(--coral); font-size: 12px; }
+/* 이름 칸 아래 한 줄(이 이름이 어디에 쓰이는지). 틀렸을 때의 줄과 같은 자리·같은 크기. */
+.first-run-hint { margin: -8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; word-break: keep-all; }
 .first-run-checking { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 12.5px; }
 .first-run-problem { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .first-run-problem p { margin: 0; color: var(--ink-soft); font-size: 13px; }
@@ -18,3 +20,6 @@
 .first-run-primary, .first-run-secondary { height: 38px; min-width: 96px; padding: 0 18px; font-size: 13px; }
 @keyframes first-run-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .first-run-step { animation: none; } }
+
+/* 단계가 바뀔 때 초점을 받는 제목(읽어 주기용). 테두리는 그리지 않는다. */
+.first-run-head h1:focus { outline: none; }

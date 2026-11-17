@@ -1,0 +1,85 @@
+name: Desktop release (disabled until renamed)
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (for example v0.1.1)
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  release:
+    if: github.repository == 'BigBlue-Basoon/momso' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check tag and signing secrets
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY -or -not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) { throw 'Signing secrets are required.' }
+          $version = (Get-Content -Raw apps/alpha/desktop/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          if ($version -notmatch '^\d+\.\d+\.\d+$' -or $env:RELEASE_TAG -cne "v$version") { throw 'Tag must match the stable application version.' }
+          $tagCommit = git rev-parse --verify "refs/tags/$($env:RELEASE_TAG)^{commit}"
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -cne (git rev-parse HEAD)) { throw 'Checkout must match the existing release tag.' }
+          git merge-base --is-ancestor $tagCommit origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag must identify a commit already on main.' }
+      - run: npm ci
+      - run: npm run desktop:version:check
+      - name: Build and sign updater artifact
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          CARGO_BUILD_JOBS: 2
+        run: |
+          npm run desktop:build -- --updater
+          if ($LASTEXITCODE -ne 0) { throw 'Signed build failed.' }
+      - name: Verify the signature against the app public key
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem 'apps/alpha/desktop/src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe')
+          if ($installers.Count -ne 1 -or -not (Test-Path -LiteralPath ($installers[0].FullName + '.sig'))) { throw 'Signed installer is missing.' }
+          $env:MOMSO_RELEASE_FILE = $installers[0].FullName
+          cargo test --manifest-path apps/alpha/desktop/src-tauri/Cargo.toml verify_release_signature -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Installer signature does not match the app public key.' }
+      - name: Create update manifest and publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content -Raw apps/alpha/desktop/src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $dir = 'apps/alpha/desktop/src-tauri/target/release/bundle/nsis'
+          $installers = @(Get-ChildItem $dir -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw 'Expected exactly one installer.' }
+          $installer = $installers[0]
+          $sigPath = $installer.FullName + '.sig'
+          if (-not (Test-Path -LiteralPath $sigPath)) { throw 'Signed updater artifact is missing.' }
+          $signature = (Get-Content -Raw -LiteralPath $sigPath).Trim()
+          if (-not $signature) { throw 'Updater signature is empty.' }
+          $url = "https://github.com/BigBlue-Basoon/momso/releases/download/$env:RELEASE_TAG/$($installer.Name)"
+          $manifest = @{ version = $version; pub_date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); platforms = @{ 'windows-x86_64' = @{ url = $url; signature = $signature } } }
+          $manifestPath = Join-Path $dir 'latest.json'
+          [IO.File]::WriteAllText((Join-Path (Get-Location) $manifestPath), ($manifest | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+          gh release create $env:RELEASE_TAG $installer.FullName $sigPath $manifestPath --verify-tag --draft --title "momso $version"
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed.' }
+          gh release edit $env:RELEASE_TAG --draft=false
+          if ($LASTEXITCODE -ne 0) { throw 'Publishing the draft failed.' }

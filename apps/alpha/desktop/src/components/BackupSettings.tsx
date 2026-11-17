@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { Database, GitBranch, Info, LoaderCircle } from 'lucide-react'
 import {
   errorState,
@@ -28,8 +28,12 @@ import {
 } from '../backup'
 import { confirmBackupRecoveryKey, exportBackupRecoveryKey, getUserOwnedBackupOverview, importBackupRecoveryKey } from '../runtime'
 import { getUsername } from '../first-run'
+import { isMissingCommand } from '../ai-models'
 import { W } from '../words'
 import { QuestionDialog } from './ZetPanel'
+import { readZet } from '../archive'
+import { chatArchiveFailure, chatArchiveSyncStatus, subscribeChatArchive } from '../chat-archive-status'
+import { listenFirstReceiveProgress, progressPercent, type RestoreProgress } from '../restore-progress'
 
 const B = W.backup
 const dateFormat = new Intl.DateTimeFormat('ko-KR', { month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })
@@ -43,7 +47,21 @@ function size(bytes: number | null) {
 const message = (state: string | null) => (state && B.reason[state]) || B.failed
 // GitHub 의 까닭 한 줄. 예전에는 이력이 막힌 까닭이 사용자 정보("나에 대해")면 따로 적었지만, 2026-11-16 그가 사용자 정보도 올린다고 정해
 // 뒤쪽은 historyReason 을 늘 비워 준다(archive_remote.rs). 그래서 그 갈래와 글을 지웠다.
-const remoteMessage = (status: RemoteStatus) => message(status.reason)
+// 풀지 못한 것이 남았으면(diverged) "멈췄다"가 아니라 몇 개가 남았는지. 경로 목록을 계산하지 못했으면(null) 수 없이(2026-11-17).
+const remoteMessage = (status: RemoteStatus) => (
+  status.reason === 'diverged' && Array.isArray(status.conflictPaths) && status.conflictPaths.length > 0
+    ? B.conflictsLeft(status.conflictPaths.length)
+    : message(status.reason)
+)
+
+/** 양쪽에서 고친 같은 문서라 이 PC 의 것을 이전 버전으로 남긴 문서. 제목을 읽지 못한 것은 "이름 없는 문서". 서로 다른 파일이 저절로 합쳐진 것(autoMerged)은 알리지 않는다. */
+async function preservedMessage(status: RemoteStatus) {
+  const ids = Array.isArray(status.preservedDocuments) ? status.preservedDocuments : []
+  if (ids.length === 0) return null
+  const titles = await Promise.all(ids.map((id) => readZet(id).then((doc) => doc.head.title).catch(() => W.sourceDelete.unnamedDocument)))
+  const shown = titles.length > 3 ? [...titles.slice(0, 3), W.sourceDelete.more(titles.length - 3)] : titles
+  return titles.length === 1 ? B.preservedOne(titles[0]) : B.preservedMany(titles.length, shown.join(', '))
+}
 
 /**
  * 설정 "연결과 백업": (가) GitHub — 문서와 고친 이력을 내 비공개 저장소에, (나) 오브젝트 스토리지 — 원자료를 고른 회사(AWS·GCP·Cloudflare·NCP)에.
@@ -59,15 +77,24 @@ export function BackupSettings() {
   )
 }
 
-/** 첫 실행에서 받은 영어 username(GitHub 저장소와 원자료 버킷 이름 momso-<username> 에 쓴다). 없거나 읽지 못하면 null. */
-function useUsername() {
-  const [name, setName] = useState<string | null>(null)
+/**
+ * 첫 실행에서 받은 영어 username(GitHub 저장소와 원자료 버킷 이름 momso-<username> 에 쓴다). 없거나 읽지 못하면 name 은 null.
+ * state: loading(읽는 중) | ok | failed(명령은 있는데 읽지 못함). 읽는 중·읽지 못함일 때 "사용자 이름이 있어야…"(없다는 까닭)를 보이지 않는다(2026-11-17).
+ */
+function useUsernameState() {
+  const [value, setValue] = useState<{ name: string | null; state: 'loading' | 'ok' | 'failed' }>({ name: null, state: 'loading' })
+  const [tries, setTries] = useState(0)
   useEffect(() => {
     let alive = true
-    getUsername().then((result) => { if (alive) setName(result.state === 'ok' ? result.username : null) }).catch(() => {})
+    getUsername()
+      .then((result) => { if (alive) setValue({ name: result.state === 'ok' ? result.username || null : null, state: 'ok' }) })
+      .catch((error) => { if (alive) setValue({ name: null, state: isMissingCommand(error) ? 'ok' : 'failed' }) })
     return () => { alive = false }
-  }, [])
-  return name
+  }, [tries])
+  return { ...value, reload: () => { setValue({ name: null, state: 'loading' }); setTries((n) => n + 1) } }
+}
+function useUsername() {
+  return useUsernameState().name
 }
 
 function GithubBackup() {
@@ -76,9 +103,36 @@ function GithubBackup() {
   const [working, setWorking] = useState(false)
   const [note, setNote] = useState<string | null>(null)
   const [asking, setAsking] = useState<'disconnect' | 'create' | false>(false)
-  const username = useUsername()
-  const refresh = useCallback(() => { remoteStatus().then(setStatus).catch(() => setStatus(null)) }, [])
+  const usernameState = useUsernameState()
+  const username = usernameState.name
+  // 읽는 데 2초쯤 걸린다(2026-11-17 실제 앱). 그동안 "불러오는 중", 명령은 있는데 읽지 못했으면 그 줄과 다시 시도(명령이 없는 옛 뒤쪽은 글 없이 막기만).
+  const [statusFailed, setStatusFailed] = useState(false)
+  const refresh = useCallback(() => {
+    remoteStatus().then((value) => { setStatus(value); setStatusFailed(false) }).catch((error) => { setStatus(null); setStatusFailed(!isMissingCommand(error)) })
+  }, [])
   useEffect(() => { refresh() }, [refresh])
+  // 채팅방 사본 쓰기 실패(chat-archive-changed unavailable): 까닭 줄과 같은 자리·같은 꼴의 한 줄. 까닭을 모르면(앱을 다시 켬) 남은 쓰기 수로.
+  const copyFailure = useSyncExternalStore(subscribeChatArchive, chatArchiveFailure, () => null)
+  const [copyPending, setCopyPending] = useState(0)
+  useEffect(() => {
+    let alive = true
+    chatArchiveSyncStatus().then((value) => { if (alive) setCopyPending(value && value.state === 'pending' ? value.pendingWrites : 0) }).catch(() => {})
+    return () => { alive = false }
+  }, [copyFailure])
+  const copyLine = copyFailure ? `${B.chatCopy[copyFailure] ?? B.chatCopy.other}. ${B.chatCopyRetry}` : copyPending > 0 ? B.chatCopyPending(copyPending) : null
+  // 새 PC 에서 처음 받아 오는 동안의 진행(archive-first-receive-progress, 받기를 눌렀을 때만 온다). 끝나거나 실패하면 거둔다(실패 까닭은 받기 결과의 줄).
+  const [receiving, setReceiving] = useState<RestoreProgress | null>(null)
+  const [receiveEmpty, setReceiveEmpty] = useState(false)
+  useEffect(() => {
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenFirstReceiveProgress((value) => {
+      if (!value.available && W.restoreProgress.receive[value.state]) { setReceiving(value); setReceiveEmpty(false); return }
+      setReceiving(null)
+      setReceiveEmpty(value.state === 'empty')
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [])
   // 저장소 만들기(archive_remote_create)는 username 이 있을 때만 누를 수 있다. 명령이 없으면 눌리지 않는다(누른 뒤 알게 되면 막는다).
   const [createAvailable, setCreateAvailable] = useState(true)
   const newRepoName = username ? `momso-${username}` : null
@@ -110,7 +164,9 @@ function GithubBackup() {
     try {
       const next = await action()
       setStatus(next)
-      setNote(next.reason ? remoteMessage(next) : B.done)
+      const preserved = await preservedMessage(next)
+      setNote([next.reason ? remoteMessage(next) : preserved ? null : B.done, preserved].filter(Boolean).join('. ') || B.done)
+      setReceiving(null)
     } catch (error) { setNote(message(errorState(error))) }
     setWorking(false)
   }
@@ -144,7 +200,14 @@ function GithubBackup() {
           <p className="backup-notice"><Info size={14} aria-hidden />{B.githubNotice}</p>
           {/* 저장소를 미리 만들지 않아도 된다: momso-<username> 비공개 저장소를 만들어 연결한다. 이미 있는 저장소는 아래 칸에 적어 연결한다. */}
           <div className="backup-row backup-create">
-            <span className="backup-create-text">{newRepoName ? B.createWhat(newRepoName) : B.createNeedsName}</span>
+            <span className="backup-create-text" role={usernameState.state === 'failed' ? 'alert' : undefined}>
+              {usernameState.state === 'loading' ? B.usernameLoading
+                : usernameState.state === 'failed' ? B.usernameFailed
+                  : newRepoName ? B.createWhat(newRepoName) : B.createNeedsName}
+              {usernameState.state === 'failed' && (
+                <button className="secondary-button backup-inline-retry" type="button" onClick={usernameState.reload}>{W.firstRun.retry}</button>
+              )}
+            </span>
             <button className="secondary-button" type="button" disabled={!supported || working || !newRepoName || !createAvailable} onClick={() => setAsking('create')}>{B.createRepo}</button>
           </div>
           <form className="backup-row" onSubmit={(event) => { event.preventDefault(); if (repo.trim()) void run(() => remoteConnect(repo.trim())) }}>
@@ -156,8 +219,23 @@ function GithubBackup() {
           </form>
         </>
       )}
+      {receiving && (
+        <div className="backup-receive" role="status">
+          <span>{W.restoreProgress.receive[receiving.state]} · {W.restoreProgress.receiveWait}</span>
+          {progressPercent(receiving) !== null && <div className="app-update-progress"><span style={{ width: `${progressPercent(receiving)}%` }} /></div>}
+        </div>
+      )}
+      {!receiving && receiveEmpty && !note && <p className="backup-note" role="status">{W.restoreProgress.receiveEmpty}</p>}
+      {status === undefined && <p className="backup-note" role="status">{B.githubLoading}</p>}
+      {statusFailed && (
+        <p className="backup-note" role="alert">
+          {B.githubFailed}
+          <button className="secondary-button backup-inline-retry" type="button" onClick={() => { setStatus(undefined); setStatusFailed(false); refresh() }}>{W.firstRun.retry}</button>
+        </p>
+      )}
       {gitMissing && <GitInstallRow onInstalled={refresh} />}
       {(note ?? standing) && <p className="backup-note" role="status">{note ?? standing}</p>}
+      {copyLine && <p className="backup-note" role="status">{copyLine}</p>}
       {asking === 'disconnect' && (
         <QuestionDialog
           title={B.githubDisconnectTitle}
@@ -286,10 +364,10 @@ function providerUsable(_provider: StoreProvider, status: StoreStatus | null | u
 }
 
 /**
- * 앱 상태 되살리기(app_state_restore)를 이 앱에서 쓸 수 있는지. 지금 화면 폴더의 뒤쪽은 몸소 폴더 위치 이관과 잠금이 아직 없어
- * unavailable 만 돌려주고, 백엔드 노트가 "그 전에는 화면에서 앱 상태 복원 단추를 비활성화한다"고 정했다. 위치 작업이 옮겨지면 true.
+ * 앱 상태 되살리기(app_state_restore)를 이 앱에서 쓸 수 있는지. 예전에는 화면 폴더 뒤쪽에 몸소 폴더 위치 이관과 잠금이 없어 꺼 두었다.
+ * 2026-11-17 화면 폴더 뒤쪽을 통합(3c57745d)과 똑같이 맞춘 뒤 본부가 켜라고 정했다. 실패 값 restore_failed·restore_rollback_failed 는 까닭 줄로.
  */
-const APP_STATE_RESTORE_READY = false as boolean
+const APP_STATE_RESTORE_READY = true as boolean
 
 function StoreBackup() {
   const [status, setStatus] = useState<StoreStatus | null | undefined>(undefined)
@@ -301,7 +379,10 @@ function StoreBackup() {
   const [progress, setProgress] = useState<StoreProgress | null>(null)
   const [note, setNote] = useState<string | null>(null)
   const [asking, setAsking] = useState<'disconnect' | 'restore' | null>(null)
-  const refresh = useCallback(() => { storeStatus().then(setStatus).catch(() => setStatus(null)) }, [])
+  const [statusFailed, setStatusFailed] = useState(false)
+  const refresh = useCallback(() => {
+    storeStatus().then((value) => { setStatus(value); setStatusFailed(false) }).catch((error) => { setStatus(null); setStatusFailed(!isMissingCommand(error)) })
+  }, [])
   useEffect(() => {
     refresh()
     let stop: (() => void) | undefined
@@ -371,7 +452,24 @@ function StoreBackup() {
         </>
       ) : (
         <form className="backup-form" onSubmit={(event) => { event.preventDefault(); if (ready) void connect() }}>
-          <div className="backup-providers" role="radiogroup" aria-label={B.provider}>
+          <div
+            className="backup-providers"
+            role="radiogroup"
+            aria-label={B.provider}
+            onKeyDown={(event) => {
+              // 라디오 묶음: 좌우·위아래 화살표로 쓸 수 있는 다음 회사를 고른다(2026-11-17 키보드 점검).
+              if (!['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp'].includes(event.key)) return
+              const usable = PROVIDERS.filter((item) => supported && providerUsable(item.id, status))
+              if (usable.length === 0) return
+              event.preventDefault()
+              const at = usable.findIndex((item) => item.id === provider)
+              const step = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : -1
+              const next = usable[(at + step + usable.length) % usable.length]
+              const group = event.currentTarget
+              setProvider(next.id)
+              window.requestAnimationFrame(() => group.querySelector<HTMLElement>(`[data-provider="${next.id}"]`)?.focus())
+            }}
+          >
             {PROVIDERS.map((item) => {
               const usable = supported && providerUsable(item.id, status)
               return (
@@ -379,7 +477,9 @@ function StoreBackup() {
                   key={item.id}
                   type="button"
                   role="radio"
+                  data-provider={item.id}
                   aria-checked={provider === item.id}
+                  tabIndex={provider === item.id ? 0 : -1}
                   className={provider === item.id ? 'is-active' : undefined}
                   disabled={!usable}
                   onClick={() => setProvider(item.id)}
@@ -406,6 +506,12 @@ function StoreBackup() {
             <button className="secondary-button" type="submit" disabled={!ready || working}>{B.connect}</button>
           </div>
         </form>
+      )}
+      {statusFailed && (
+        <p className="backup-note" role="alert">
+          {B.storeFailed}
+          <button className="secondary-button backup-inline-retry" type="button" onClick={() => { setStatusFailed(false); refresh() }}>{W.firstRun.retry}</button>
+        </p>
       )}
       {note && <p className="backup-note" role="status">{note}</p>}
       {asking === 'disconnect' && (

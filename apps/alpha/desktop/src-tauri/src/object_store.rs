@@ -14,14 +14,6 @@ type HmacSha256 = Hmac<Sha256>;
 pub(crate) const PREFIX: &str = "momso/object-store/v1";
 pub(crate) static CONNECTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn r2_test_target(provider: &str, bucket: &str) -> bool {
-    provider == "cloudflare" && bucket == "momso-basoon"
-}
-
-fn r2_test_connect(provider: &str, automatic: bool, bucket: &str) -> bool {
-    automatic && r2_test_target(provider, bucket)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum WriteSafety {
@@ -70,6 +62,7 @@ pub(crate) struct StoreStatus {
     pending_count: Option<u64>,
     pending_bytes: Option<u64>,
     write_safety: Option<WriteSafety>,
+    backup_readiness: Option<&'static str>,
 }
 
 fn status(state: &'static str, config: Option<Config>) -> StoreStatus {
@@ -81,7 +74,16 @@ fn status(state: &'static str, config: Option<Config>) -> StoreStatus {
         pending_count: None,
         pending_bytes: None,
         write_safety: config.and_then(|c| c.write_safety),
+        backup_readiness: None,
     }
+}
+
+fn set_backup_identity_error(status: &mut StoreStatus, error: &str) {
+    status.backup_readiness = Some(match error {
+        "recovery_key_missing" => "recovery_key_missing",
+        "recovery_key_unconfirmed" => "recovery_key_unconfirmed",
+        _ => "unavailable",
+    });
 }
 
 fn config_path(root: &Path) -> std::path::PathBuf {
@@ -93,7 +95,7 @@ pub(crate) fn load_config(root: &Path) -> Result<Option<Config>, &'static str> {
         Ok(data) => {
             let config: Config = serde_json::from_slice(&data).map_err(|_| "unavailable")?;
             if crate::runtime::r2_test_enabled()
-                && !r2_test_target(&config.provider, &config.bucket)
+                && !crate::runtime::r2_test_target(&config.provider, &config.bucket)
             {
                 return Err("invalid_bucket");
             }
@@ -131,6 +133,12 @@ fn key_name(config: &Config) -> String {
 }
 
 pub(crate) fn load_keys(config: &Config) -> Result<Keys, &'static str> {
+    if crate::r2_oauth::uses_oauth(config) {
+        return Ok(Keys {
+            access_key_id: "wrangler-oauth".into(),
+            secret_access_key: String::new(),
+        });
+    }
     let secret = credentials::get_secret(&key_name(config))
         .map_err(|_| "unavailable")?
         .ok_or("unavailable")?;
@@ -245,6 +253,19 @@ fn sign(
     body: &[u8],
     now: DateTime<Utc>,
 ) -> Result<SignedRequest, &'static str> {
+    sign_with_condition(config, keys, method, object, query, (body, now), None)
+}
+
+fn sign_with_condition(
+    config: &Config,
+    keys: &Keys,
+    method: &str,
+    object: &str,
+    query: &[(&str, &str)],
+    body_and_time: (&[u8], DateTime<Utc>),
+    condition: Option<(&str, &str)>,
+) -> Result<SignedRequest, &'static str> {
+    let (body, now) = body_and_time;
     let endpoint = reqwest::Url::parse(&config.endpoint).map_err(|_| "invalid_endpoint")?;
     let host = match endpoint.port() {
         Some(port) => format!("{}:{port}", endpoint.host_str().ok_or("invalid_endpoint")?),
@@ -277,22 +298,21 @@ fn sign(
     let prefix = if google { "goog" } else { "amz" };
     let google_condition =
         method == "PUT" && google && config.write_safety == Some(WriteSafety::Conditional);
-    let headers = format!(
-        "host:{host}\nx-{prefix}-content-sha256:{payload_hash}\nx-{prefix}-date:{date}\n{}",
-        if google_condition {
-            "x-goog-if-generation-match:0\n"
-        } else {
-            ""
-        }
-    );
-    let signed_headers = format!(
-        "host;x-{prefix}-content-sha256;x-{prefix}-date{}",
-        if google_condition {
-            ";x-goog-if-generation-match"
-        } else {
-            ""
-        }
-    );
+    let mut parts = std::collections::BTreeMap::new();
+    parts.insert("host".to_owned(), host.clone());
+    parts.insert(format!("x-{prefix}-content-sha256"), payload_hash.clone());
+    parts.insert(format!("x-{prefix}-date"), date.clone());
+    if google_condition {
+        parts.insert("x-goog-if-generation-match".into(), "0".into());
+    }
+    if let Some((name, value)) = condition {
+        parts.insert(name.to_owned(), value.to_owned());
+    }
+    let headers = parts
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}\n"))
+        .collect::<String>();
+    let signed_headers = parts.keys().cloned().collect::<Vec<_>>().join(";");
     let canonical =
         format!("{method}\n{path}\n{query}\n{headers}\n{signed_headers}\n{payload_hash}");
     let (algorithm, key_prefix, service, terminator) = if google {
@@ -335,6 +355,68 @@ fn sign(
         payload_hash,
         authorization,
     })
+}
+
+pub(crate) async fn conditional_delete(
+    config: &Config,
+    keys: &Keys,
+    object: &str,
+    condition: &str,
+) -> Result<reqwest::Response, &'static str> {
+    if !write_safety_known(config) || crate::r2_oauth::uses_oauth(config) {
+        return Err("delete_condition_unverified");
+    }
+    let name = match config.provider.as_str() {
+        "aws"
+            if condition.len() >= 2
+                && condition.len() <= 256
+                && condition.starts_with('"')
+                && condition.ends_with('"')
+                && condition.as_bytes()[1..condition.len() - 1]
+                    .iter()
+                    .all(|b| b.is_ascii_graphic() && !matches!(*b, b'\\' | b'"' | b',')) =>
+        {
+            "if-match"
+        }
+        "gcp"
+            if !condition.is_empty()
+                && condition.len() <= 20
+                && condition.bytes().all(|b| b.is_ascii_digit())
+                && condition.parse::<u64>().is_ok_and(|value| value > 0) =>
+        {
+            "x-goog-if-generation-match"
+        }
+        _ => return Err("delete_condition_unverified"),
+    };
+    let signed = sign_with_condition(
+        config,
+        keys,
+        "DELETE",
+        object,
+        &[],
+        (&[], Utc::now()),
+        Some((name, condition)),
+    )?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|_| "unavailable")?;
+    let mut builder = client
+        .delete(signed.url)
+        .header("host", signed.host)
+        .header("authorization", signed.authorization)
+        .header(name, condition);
+    builder = if config.provider == "gcp" {
+        builder
+            .header("x-goog-date", signed.date)
+            .header("x-goog-content-sha256", signed.payload_hash)
+    } else {
+        builder
+            .header("x-amz-date", signed.date)
+            .header("x-amz-content-sha256", signed.payload_hash)
+    };
+    builder.send().await.map_err(|_| "invalid_endpoint")
 }
 
 #[cfg(windows)]
@@ -398,6 +480,9 @@ pub(crate) async fn request(
     query: &[(&str, &str)],
     body: Vec<u8>,
 ) -> Result<reqwest::Response, &'static str> {
+    if crate::r2_oauth::uses_oauth(config) {
+        return crate::r2_oauth::request(config, keys, method, object, query, body).await;
+    }
     if config.provider == "cloudflare" && config.bucket.is_empty() {
         return Err("invalid_bucket");
     }
@@ -586,7 +671,9 @@ pub(crate) async fn object_store_connect(
     } else {
         requested_bucket
     };
-    if crate::runtime::r2_test_enabled() && !r2_test_connect(&provider, automatic, &bucket) {
+    if crate::runtime::r2_test_enabled()
+        && !crate::runtime::r2_test_connect(&provider, automatic, &bucket)
+    {
         return Err("invalid_bucket");
     }
     let input = ConnectInput {
@@ -756,25 +843,30 @@ pub(crate) async fn object_store_status(
             {
                 Ok(response) if response.status().is_success() => {
                     let mut result = status("connected", Some(config.clone()));
-                    if let Ok(identity) =
-                        crate::object_store_transfer::identity(&paths.database_path)
-                    {
-                        if let Ok(pending) = crate::object_store_transfer::pending_files(
+                    match crate::object_store_transfer::identity(&paths.database_path) {
+                        Ok(identity) => match crate::object_store_transfer::pending_files(
                             &config,
                             &keys,
                             &identity,
+                            &paths.database_path,
                             &paths.objects_path,
                             |_| {},
                         )
                         .await
                         {
-                            result.pending_count = Some(pending.len() as u64);
-                            result.pending_bytes = pending
-                                .iter()
-                                .try_fold(0u64, |sum, item| sum.checked_add(item.2));
-                        } else {
-                            result.state = "unavailable";
-                        }
+                            Ok(pending) => {
+                                result.backup_readiness = Some("ready");
+                                result.pending_count = Some(pending.len() as u64);
+                                result.pending_bytes = pending
+                                    .iter()
+                                    .try_fold(0u64, |sum, item| sum.checked_add(item.2));
+                            }
+                            Err(_) => {
+                                result.state = "unavailable";
+                                result.backup_readiness = Some("unavailable");
+                            }
+                        },
+                        Err(error) => set_backup_identity_error(&mut result, error),
                     }
                     result
                 }
@@ -795,7 +887,9 @@ pub(crate) async fn object_store_disconnect(
     let root = &paths.data_root;
     if let Some(config) = load_config(root)? {
         fs::remove_file(config_path(root)).map_err(|_| "unavailable")?;
-        credentials::delete_secret(&key_name(&config)).map_err(|_| "unavailable")?;
+        if !crate::r2_oauth::uses_oauth(&config) {
+            credentials::delete_secret(&key_name(&config)).map_err(|_| "unavailable")?;
+        }
     }
     Ok(())
 }
@@ -803,6 +897,32 @@ pub(crate) async fn object_store_disconnect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_distinguishes_missing_and_unconfirmed_recovery_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("state.db");
+        crate::storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
+        let mut result = status("connected", None);
+        let error = crate::object_store_transfer::identity(&database)
+            .err()
+            .unwrap();
+        set_backup_identity_error(&mut result, error);
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["backupReadiness"],
+            "recovery_key_missing"
+        );
+        crate::backup_profile::ensure(&database).unwrap();
+        let error = crate::object_store_transfer::identity(&database)
+            .err()
+            .unwrap();
+        set_backup_identity_error(&mut result, error);
+        assert_eq!(
+            serde_json::to_value(&result).unwrap()["backupReadiness"],
+            "recovery_key_unconfirmed"
+        );
+        assert_eq!(serde_json::to_value(&result).unwrap()["state"], "connected");
+    }
 
     #[cfg(windows)]
     #[tokio::test]
@@ -852,19 +972,31 @@ mod tests {
     }
 
     #[test]
-    fn live_test_only_allows_the_automatic_basoon_bucket() {
-        assert!(r2_test_connect("cloudflare", true, "momso-basoon"));
-        assert!(!r2_test_connect("cloudflare", false, "momso-basoon"));
-        assert!(!r2_test_connect("cloudflare", true, "momso-other"));
-        assert!(!r2_test_connect("aws", true, "momso-basoon"));
-        assert!(r2_test_target("cloudflare", "momso-basoon"));
-        assert!(!r2_test_target(
+    fn live_test_only_allows_the_configured_bucket() {
+        let target = |provider, bucket| {
+            crate::runtime::r2_test_target_matches(provider, bucket, Some("momso-fixture"))
+        };
+        assert!(target("cloudflare", "momso-fixture"));
+        assert!(!target("cloudflare", "momso-other"));
+        assert!(!target("aws", "momso-fixture"));
+        assert!(!target("cloudflare", "someone-elses-private-bucket"));
+        assert!(!target("cloudflare", "someone-elses-archive-bucket"));
+        assert!(!crate::runtime::r2_test_target_matches(
             "cloudflare",
-            "someone-elses-private-bucket"
+            "momso-fixture",
+            None
         ));
-        assert!(!r2_test_target(
+        assert!(crate::runtime::r2_test_connect_matches(
             "cloudflare",
-            "someone-elses-archive-bucket"
+            true,
+            "momso-fixture",
+            Some("momso-fixture")
+        ));
+        assert!(!crate::runtime::r2_test_connect_matches(
+            "cloudflare",
+            false,
+            "momso-fixture",
+            Some("momso-fixture")
         ));
     }
     use chrono::TimeZone;
@@ -880,10 +1012,10 @@ mod tests {
             Err("username_required")
         );
         let connection = rusqlite::Connection::open(&db).unwrap();
-        connection.execute("INSERT INTO app_runtime_meta(key, value, updated_at) VALUES('momso_username', 'basoon', 'now')", []).unwrap();
+        connection.execute("INSERT INTO app_runtime_meta(key, value, updated_at) VALUES('momso_username', 'fixture', 'now')", []).unwrap();
         assert_eq!(
             stored_automatic_name(&db, "cloudflare").unwrap(),
-            "momso-basoon"
+            "momso-fixture"
         );
     }
 

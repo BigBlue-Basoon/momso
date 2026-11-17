@@ -502,7 +502,12 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
             assert_eq!(done["chatId"], id);
             assert!(done["messageId"].is_string());
             assert_eq!(done["finishReason"], "completed");
-            for field in ["actualEffort", "fastState", "stopReason"] {
+            for field in [
+                "actualEffort",
+                "actualSpecialEffort",
+                "fastState",
+                "stopReason",
+            ] {
                 assert!(done.get(field).is_some(), "{provider}: missing {field}");
                 let expected = match (provider, scene, field) {
                     ("claude", "reported", "actualEffort") => Value::String("high".into()),
@@ -527,6 +532,7 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
             let detail = serde_json::to_value(chat::read(&db, &id).unwrap()).unwrap();
             assert_eq!(detail["title"], "manual-title");
             let reply = detail["messages"].as_array().unwrap().last().unwrap();
+            assert_eq!(reply.get("actualSpecialEffort"), Some(&Value::Null));
             assert_eq!(reply["text"], "hello");
             assert_eq!(reply["finishReason"], "completed");
             if provider == "claude" && scene == "reported" {

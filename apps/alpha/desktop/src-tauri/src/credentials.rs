@@ -4,6 +4,22 @@ use thiserror::Error;
 
 const SERVICE: &str = "app.momso.desktop";
 static ENTRY_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static SECRET_CHANGE_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+fn fake_store() -> Option<&'static Mutex<std::collections::HashMap<String, String>>> {
+    use std::sync::OnceLock;
+    static STORE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    std::env::var_os("MOMSO_TEST_FAKE_CREDENTIAL_STORE")
+        .map(|_| STORE.get_or_init(|| Mutex::new(std::collections::HashMap::new())))
+}
+
+pub(crate) fn prevent_secret_changes() -> Result<std::sync::MutexGuard<'static, ()>, CredentialError>
+{
+    SECRET_CHANGE_LOCK
+        .lock()
+        .map_err(|_| CredentialError::StoreUnavailable)
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum CredentialError {
@@ -38,6 +54,13 @@ fn entry(name: &str) -> Result<keyring::Entry, CredentialError> {
 }
 
 pub(crate) fn has_secret(name: &str) -> Result<bool, CredentialError> {
+    #[cfg(test)]
+    if let Some(store) = fake_store() {
+        return Ok(store
+            .lock()
+            .map_err(|_| CredentialError::ReadFailed)?
+            .contains_key(name));
+    }
     match entry(name)?.get_password() {
         Ok(_) => Ok(true),
         Err(keyring::Error::NoEntry) => Ok(false),
@@ -46,6 +69,14 @@ pub(crate) fn has_secret(name: &str) -> Result<bool, CredentialError> {
 }
 
 pub(crate) fn get_secret(name: &str) -> Result<Option<String>, CredentialError> {
+    #[cfg(test)]
+    if let Some(store) = fake_store() {
+        return Ok(store
+            .lock()
+            .map_err(|_| CredentialError::ReadFailed)?
+            .get(name)
+            .cloned());
+    }
     match entry(name)?.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -54,12 +85,30 @@ pub(crate) fn get_secret(name: &str) -> Result<Option<String>, CredentialError> 
 }
 
 pub(crate) fn set_secret(name: &str, secret: &str) -> Result<(), CredentialError> {
+    let _guard = prevent_secret_changes()?;
+    #[cfg(test)]
+    if let Some(store) = fake_store() {
+        store
+            .lock()
+            .map_err(|_| CredentialError::WriteFailed)?
+            .insert(name.to_owned(), secret.to_owned());
+        return Ok(());
+    }
     entry(name)?
         .set_password(secret)
         .map_err(|_| CredentialError::WriteFailed)
 }
 
 pub(crate) fn delete_secret(name: &str) -> Result<(), CredentialError> {
+    let _guard = prevent_secret_changes()?;
+    #[cfg(test)]
+    if let Some(store) = fake_store() {
+        store
+            .lock()
+            .map_err(|_| CredentialError::DeleteFailed)?
+            .remove(name);
+        return Ok(());
+    }
     match entry(name)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(_) => Err(CredentialError::DeleteFailed),
@@ -70,6 +119,7 @@ pub(crate) fn ai_key_name(provider: &str) -> Result<&'static str, CredentialErro
     match provider {
         "openai" => Ok("ai:openai:api-key"),
         "anthropic" => Ok("ai:anthropic:api-key"),
+        "gemini" => Ok("ai:gemini:api-key"),
         _ => Err(CredentialError::StoreUnavailable),
     }
 }
@@ -137,6 +187,11 @@ mod tests {
     #[test]
     fn credential_names_do_not_contain_secret_material() {
         assert_eq!(ai_key_name("openai").expect("openai"), "ai:openai:api-key");
+        assert_eq!(
+            ai_key_name("anthropic").expect("anthropic"),
+            "ai:anthropic:api-key"
+        );
+        assert_eq!(ai_key_name("gemini").expect("gemini"), "ai:gemini:api-key");
         assert_eq!(
             recovery_key_name("workspace-123"),
             "backup:workspace-123:age-identity"

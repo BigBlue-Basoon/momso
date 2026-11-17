@@ -5,7 +5,7 @@
   "scripts": {
     "desktop:dev": "npm run tauri dev --workspace @momso/alpha-desktop",
     "desktop:ui": "npm run dev --workspace @momso/alpha-desktop",
-    "desktop:build": "npm run tauri build --workspace @momso/alpha-desktop",
+    "desktop:build": "node apps/alpha/desktop/scripts/build-desktop.mjs",
     "desktop:ui:build": "npm run build --workspace @momso/alpha-desktop",
     "desktop:version:check": "node scripts/check-desktop-version.mjs",
     "desktop:artifact:metadata": "node scripts/create-desktop-artifact-metadata.mjs",

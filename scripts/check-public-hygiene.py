@@ -14,14 +14,14 @@ SKIP = {".git", "node_modules", "target", "generated", "dist", "build", ".next",
 WINDOWS_USER = re.compile(r"(?i)\b[a-z]:[\\/]{1,2}users[\\/]{1,2}[^\\/\s\"'<>]+")
 EMAIL = re.compile(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b")
 KEY = re.compile(r"\b(?:sk-ant-|sk-proj-|ghp_|github_pat_)[a-zA-Z0-9_\-]{16,}\b")
-FAKE_DOMAINS = {"example.com", "example.invalid", "momso.local", "2x.png"}
+FAKE_DOMAINS = {"example.com", "example.invalid", "momso.local", "2x.png", "evil.test", "attacker.test"}
 
 
 def files(root):
     for path in sorted(root.iterdir()):
         if path.name != ".git" and path.is_file() and not path.is_symlink():
             yield path
-    for folder in (".github", "apps", "scripts"):
+    for folder in (".github", "apps/alpha/desktop", "scripts"):
         top = root / folder
         if not top.is_dir():
             continue

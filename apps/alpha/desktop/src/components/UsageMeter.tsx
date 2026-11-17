@@ -18,6 +18,7 @@ import {
 import { ProviderMark, useProviderMarkHover, type ProviderMarkId } from './ProviderMark'
 import { W } from '../words'
 import { ModelName } from './ModelName'
+import { isConnected, keyProblem, type ProviderAuth } from '../provider-auth'
 import './UsageMeter.css'
 
 const PROVIDERS: Array<{ id: UsageProvider; mark: ProviderMarkId; name: string }> = [
@@ -95,7 +96,17 @@ function knownWindows(usage: ProviderUsage | undefined) {
  * 누르면 그 곳의 것만 펼쳐진다(이름, 요금제, 기간별 남은 양, 다시 차는 때). 한 번에 하나만.
  * 숫자가 없는 곳은 로고만 보이고 눌리지 않는다(글로 까닭을 알리지 않는다, SCREEN_RULES 1절).
  */
-export function UsageMeter() {
+/**
+ * 뒤쪽 사용량의 까닭이 "API 키로 쓰는 중"(api_key, 제미나이는 no_quota_api)이어도, 그 키가 아직 확인되지 않았거나 틀렸거나
+ * 확인하지 못했으면 연결로 치지 않는다(2026-11-17 계약 "AI 연결 확인": 사용량 단추도 같은 조건). 그때는 까닭을 바꿔 보인다.
+ */
+function withKeyState(usage: ProviderUsage | undefined, auth: ProviderAuth | undefined) {
+  if (!usage || !auth || isConnected(auth)) return usage
+  if (usage.reason !== 'api_key' && usage.reason !== 'no_quota_api') return usage
+  return { ...usage, reason: keyProblem(auth) === 'verifying' ? 'key_verifying' : 'not_connected' }
+}
+
+export function UsageMeter({ auth }: { auth?: ProviderAuth[] | null }) {
   const [usage, setUsage] = useState<ProviderUsage[] | null>(null)
   // 마지막으로 확인한 실제 값(이 기기에 적어 둔 것). 지금 읽지 못한 곳은 이것으로 그린다.
   const [last, setLast] = useState(loadLastUsage)
@@ -237,7 +248,7 @@ export function UsageMeter() {
             buttonRef={(element) => { buttons.current[provider.id] = element }}
             name={provider.name}
             mark={provider.mark}
-            usage={byProvider.get(provider.id)}
+            usage={withKeyState(byProvider.get(provider.id), Array.isArray(auth) ? auth.find((item) => item.provider === provider.id) : undefined)}
             open={openId === provider.id}
             reading={Boolean(reading[provider.id])}
             onHover={() => readOnHover(provider.id)}

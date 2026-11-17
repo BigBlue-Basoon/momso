@@ -104,7 +104,7 @@ pub(crate) fn start(
         let (read, mut write) = tokio::io::split(pipe);
         let mut lines = BufReader::new(read).lines();
         loop {
-            let line = tokio::select! { _ = worker.cancel.cancelled() => break, v = lines.next_line() => match v { Ok(Some(v)) if v.len() <= 4096 => v, _ => break } };
+            let line = tokio::select! { _ = worker.cancel.cancelled() => break, v = lines.next_line() => match v { Ok(Some(v)) if v.len() <= 65_536 => v, _ => break } };
             let result = match serde_json::from_str::<serde_json::Value>(&line) {
                 Ok(v) => {
                     tokio::select! { _ = worker.cancel.cancelled() => break, result = handler(v) => result }
@@ -190,9 +190,9 @@ mod tests {
                     Some("object_store_r2_connect") => {
                         assert_eq!(
                             value,
-                            serde_json::json!({"method":"object_store_r2_connect", "account":"0123456789abcdef0123456789abcdef"})
+                            serde_json::json!({"method":"object_store_r2_connect"})
                         );
-                        serde_json::json!({"status":"cancelled"})
+                        serde_json::json!({"status":"denied"})
                     }
                     Some("import_conversations") => {
                         assert_eq!(
@@ -200,6 +200,20 @@ mod tests {
                             serde_json::json!({"method":"import_conversations","provider":"claude"})
                         );
                         serde_json::json!({"status":"success","imported":2,"duplicate":1,"contents":"private conversation","path":"private path"})
+                    }
+                    Some("browser_read") => {
+                        serde_json::json!({"status":"page","origin":"https://example.test","title":"수업","text":"x".repeat(8000),"elements":[{"id":"a","role":"button","name":"게시","kind":"normal"}]})
+                    }
+                    Some("yoga_term_add") => {
+                        assert_eq!(
+                            value,
+                            serde_json::json!({"method":"yoga_term_add","term":"가상 표기","baseId":"yoga-036"})
+                        );
+                        serde_json::json!({"status":"denied"})
+                    }
+                    Some("yoga_term_delete") => {
+                        assert_eq!(value.as_object().unwrap().len(), 2);
+                        serde_json::json!({"status":"denied"})
                     }
                     _ => panic!("unexpected setup request"),
                 }
@@ -218,18 +232,28 @@ mod tests {
             assert!(!bad.to_string().contains(secret));
             let bad_storage = crate::momso_mcp::test_response(&serde_json::json!({"id":3,"method":"tools/call","params":{"name":"momso_object_store_r2_connect","arguments":{"account":"0123456789abcdef0123456789abcdef","secret":secret}}}), &mut ready, &mut client).unwrap();
             assert!(!bad_storage.to_string().contains(secret));
+            let r2 = crate::momso_mcp::test_response(&serde_json::json!({"id":4,"method":"tools/call","params":{"name":"momso_object_store_r2_connect","arguments":{}}}), &mut ready, &mut client).unwrap();
+            assert!(r2.to_string().contains("denied"));
             let reply = crate::momso_mcp::test_response(&serde_json::json!({"id":2,"method":"tools/call","params":{"name":"momso_github_connect","arguments":{}}}), &mut ready, &mut client).unwrap();
             assert!(reply.to_string().contains("denied"));
-            let cancelled = crate::momso_mcp::test_response(&serde_json::json!({"id":4,"method":"tools/call","params":{"name":"momso_object_store_r2_connect","arguments":{"account":"0123456789abcdef0123456789abcdef"}}}), &mut ready, &mut client).unwrap();
-            assert_eq!(cancelled["result"]["content"][0]["text"], "{\"status\":\"cancelled\"}");
-            assert!(!cancelled.to_string().contains(secret));
             let invalid = crate::momso_mcp::test_response(&serde_json::json!({"id":5,"method":"tools/call","params":{"name":"momso_import_conversations","arguments":{"provider":"claude","path":"private path"}}}), &mut ready, &mut client).unwrap();
             assert!(invalid.get("error").is_some());
             let imported = crate::momso_mcp::test_response(&serde_json::json!({"id":6,"method":"tools/call","params":{"name":"momso_import_conversations","arguments":{"provider":"claude"}}}), &mut ready, &mut client).unwrap();
             let output = imported.to_string();
             assert!(output.contains("imported"));
             assert!(!output.contains("private conversation") && !output.contains("private path"));
+            let widened = crate::momso_mcp::test_response(&serde_json::json!({"id":7,"method":"tools/call","params":{"name":"browser_open","arguments":{"origins":["https://evil.test"]}}}), &mut ready, &mut client).unwrap();
+            assert!(widened.get("error").is_some());
+            let page = crate::momso_mcp::test_response(&serde_json::json!({"id":8,"method":"tools/call","params":{"name":"browser_read","arguments":{}}}), &mut ready, &mut client).unwrap();
+            let body = page["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(body.contains("untrusted_page_data") && body.contains("https://example.test") && body.len() > 8000);
+            let bad_term = crate::momso_mcp::test_response(&serde_json::json!({"id":9,"method":"tools/call","params":{"name":"momso_yoga_term_add","arguments":{"term":"가상 표기","confirmedByUser":true}}}), &mut ready, &mut client).unwrap();
+            assert!(bad_term.get("error").is_some());
+            let deletion = crate::momso_mcp::test_response(&serde_json::json!({"id":10,"method":"tools/call","params":{"name":"momso_yoga_term_delete","arguments":{"id":"user-fake"}}}), &mut ready, &mut client).unwrap();
+            assert!(deletion.to_string().contains("denied"));
+            let term = crate::momso_mcp::test_response(&serde_json::json!({"id":10,"method":"tools/call","params":{"name":"momso_yoga_term_add","arguments":{"term":"가상 표기","baseId":"yoga-036"}}}), &mut ready, &mut client).unwrap();
+            assert_eq!(term["result"]["content"][0]["text"], "{\"status\":\"denied\"}");
         }).await.unwrap();
-        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert_eq!(count.load(Ordering::SeqCst), 6);
     }
 }
