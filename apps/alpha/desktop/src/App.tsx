@@ -589,10 +589,21 @@ function App() {
         rememberChatModel(created.id, chosen)
         void refreshChats()
       }
+      // 폴더를 놓으면 뒤쪽이 그 경로만 source_folder_not_allowed 로 거절한다(2026-11-17). 폴더는 건너뛰고 파일은 계속 붙인다.
       const names: string[] = []
-      for (const path of paths) names.push(await attachFileToChat(chatId, path))
-      refreshChatItems(chatId, true)
-      showToast(names.length === 1 ? W.attach.done(names[0]) : W.attach.doneMany(names.length))
+      let folders = 0
+      for (const path of paths) {
+        try {
+          names.push(await attachFileToChat(chatId, path))
+        } catch (error) {
+          if (!String(error instanceof Error ? error.message : error).includes('source_folder_not_allowed')) throw error
+          folders += 1
+        }
+      }
+      if (names.length > 0) refreshChatItems(chatId, true)
+      // 붙인 것과 폴더를 한 줄에 함께(둘 다 알 수 있게).
+      const done = names.length === 0 ? null : names.length === 1 ? W.attach.done(names[0]) : W.attach.doneMany(names.length)
+      showToast([done, folders > 0 ? W.attach.folderNotAllowed : null].filter(Boolean).join('. '))
     } catch (error) {
       // 고른 지 5분이 지나 뒤쪽이 거절하면(selection_required) 다시 고르라는 한 줄.
       showToast(isSelectionExpired(error) ? W.selectAgain : archiveErrorMessage(error, W.attach.failed))

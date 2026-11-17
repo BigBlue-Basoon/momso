@@ -323,6 +323,8 @@ const ko = {
     done: (name: string) => `${name}${josa(name, '을', '를')} 첨부했습니다`,
     doneMany: (n: number) => `파일 ${n}개를 첨부했습니다`,
     failed: '파일을 첨부하지 못했습니다',
+    /** 폴더를 끌어 놓았을 때(source_folder_not_allowed). 2026-11-17 새로 씀, 그의 확인 전. */
+    folderNotAllowed: '폴더는 첨부할 수 없습니다. 파일을 놓아 주세요',
   },
   // ---- 채팅방 고정·보관(왼쪽 목록)과 설정의 보관된 채팅방. 2026-11-16 새로 쓴 글(그가 아직 정하지 않음, 낱말 목록에 올림). ----
   chatKeep: {
