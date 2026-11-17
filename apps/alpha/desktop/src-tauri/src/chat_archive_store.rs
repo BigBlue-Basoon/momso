@@ -586,12 +586,32 @@ pub(crate) fn save_pending(
     resources: &Path,
     paths: &crate::runtime::RuntimePaths,
 ) -> Result<(), &'static str> {
+    save_pending_inner(root, resources, paths, false)
+}
+
+pub(crate) fn save_pending_for_push(
+    root: &Path,
+    resources: &Path,
+    paths: &crate::runtime::RuntimePaths,
+) -> Result<(), &'static str> {
+    save_pending_inner(root, resources, paths, true)
+}
+
+fn save_pending_inner(
+    root: &Path,
+    resources: &Path,
+    paths: &crate::runtime::RuntimePaths,
+    wait_for_credentials: bool,
+) -> Result<(), &'static str> {
     static SAVE_LOCK: Mutex<()> = Mutex::new(());
     let _save = SAVE_LOCK.lock().map_err(|_| "unavailable")?;
     crate::chat_archive_tracking::ensure_tracking(&paths.database_path)?;
     let proof_key = crate::chat_archive_tracking::proof_key()?;
-    let _credentials =
-        crate::credentials::try_prevent_secret_changes().map_err(|_| "redaction_pending")?;
+    let _credentials = if wait_for_credentials {
+        crate::credentials::prevent_secret_changes().map_err(|_| "credentials_unavailable")?
+    } else {
+        crate::credentials::try_prevent_secret_changes().map_err(|_| "redaction_pending")?
+    };
     let known = known_values(&paths.data_root, &paths.database_path)?;
     let proof = crate::chat_archive_tracking::proof(root, &known, &proof_key)?;
     let changes = crate::chat_archive_tracking::changes(&paths.database_path)?;
@@ -667,7 +687,7 @@ pub(crate) fn redaction_pending_with_key(root: &Path, db: &Path, key: &str) -> b
 pub(crate) fn redaction_pending(root: &Path, db: &Path) -> Result<bool, &'static str> {
     let key = crate::chat_archive_tracking::proof_key()?;
     let _guard =
-        crate::credentials::try_prevent_secret_changes().map_err(|_| "credentials_busy")?;
+        crate::credentials::prevent_secret_changes().map_err(|_| "credentials_unavailable")?;
     let data_root = db.parent().ok_or("storage_error")?;
     let known = known_values(data_root, db)?;
     redaction_pending_known(root, db, &key, &known)
@@ -972,6 +992,23 @@ pub(crate) fn restore_with_progress(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_credentials_wait_for_short_lock_contention() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "fixture").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = crate::credentials::prevent_secret_changes().unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+        ready_rx.recv().unwrap();
+        let pending = redaction_pending(temp.path(), &db);
+        holder.join().unwrap();
+        assert_eq!(pending, Ok(false));
+    }
 
     #[test]
     fn missing_proof_without_keys_does_not_block_but_errors_remain_errors() {

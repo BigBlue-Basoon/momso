@@ -56,7 +56,15 @@ fn entry(name: &str) -> Result<keyring::Entry, CredentialError> {
     let _guard = ENTRY_CREATION_LOCK
         .lock()
         .map_err(|_| CredentialError::StoreUnavailable)?;
+    #[cfg(not(test))]
     let service = service_name(crate::runtime::r2_test_enabled());
+    #[cfg(test)]
+    let service = {
+        static TEST_SERVICE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        TEST_SERVICE
+            .get_or_init(|| format!("app.momso.desktop.unit-test.{}", uuid::Uuid::new_v4()))
+            .as_str()
+    };
     keyring::Entry::new(service, name).map_err(|_| CredentialError::StoreUnavailable)
 }
 

@@ -3840,7 +3840,7 @@ async fn run_transfer<R: tauri::Runtime>(
             }
         };
         if action == "push" {
-            if let Err(e) = crate::chat_archive_store::save_pending(&root, &resources, &paths) {
+            if let Err(e) = crate::chat_archive_store::save_pending_for_push(&root, &resources, &paths) {
                 if e == "redaction_pending" { return RemoteStatus::new("redactionPending", None); }
                 return RemoteStatus::new("unavailable", Some(e));
             }
@@ -4727,11 +4727,19 @@ mod tests {
                 serde_json::json!({}),
             );
             assert_eq!(status["state"], "saved");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = crate::credentials::prevent_secret_changes().unwrap();
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            ready_rx.recv().unwrap();
             let push = crate::command_entry_tests::invoke(
                 &window,
                 "archive_remote_push",
                 serde_json::json!({}),
             );
+            holder.join().unwrap();
             assert_eq!(push["state"], "connected", "{push}");
             assert!(crate::chat_archive_tracking::stored_proof(&db)
                 .unwrap()

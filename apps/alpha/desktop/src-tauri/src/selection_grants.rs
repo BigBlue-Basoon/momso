@@ -22,6 +22,7 @@ struct Grant {
     expiry: Instant,
     id: uuid::Uuid,
     in_use: bool,
+    dropped_folder: bool,
 }
 
 pub(crate) struct SelectionUse {
@@ -72,10 +73,14 @@ impl Selections {
 
     pub(crate) fn record_drop(&self, event: &tauri::DragDropEvent) {
         if let tauri::DragDropEvent::Drop { paths, .. } = event {
-            self.remember(paths, Purpose::Source);
+            self.remember_inner(paths, Purpose::Source, true);
         }
     }
     pub(crate) fn remember(&self, paths: &[PathBuf], purpose: Purpose) {
+        self.remember_inner(paths, purpose, false);
+    }
+
+    fn remember_inner(&self, paths: &[PathBuf], purpose: Purpose, record_folders: bool) {
         let Ok(mut grants) = self.0.lock() else {
             return;
         };
@@ -88,7 +93,8 @@ impl Selections {
                 } else {
                     canonical.is_file()
                 };
-                if correct_type {
+                let dropped_folder = record_folders && canonical.is_dir();
+                if correct_type || dropped_folder {
                     grants.insert(
                         (path_key(path), purpose),
                         Grant {
@@ -96,6 +102,7 @@ impl Selections {
                             expiry: now + Duration::from_secs(300),
                             id: uuid::Uuid::new_v4(),
                             in_use: false,
+                            dropped_folder,
                         },
                     );
                 }
@@ -115,10 +122,25 @@ impl Selections {
             grants.remove(&key);
             return Err("selection_required".into());
         }
+        if grant.dropped_folder {
+            return Err("source_folder_not_allowed".into());
+        }
         if consume {
             grants.remove(&key);
         }
         Ok(())
+    }
+
+    pub(crate) async fn check_source_wait(&self, path: &str) -> Result<(), String> {
+        for attempt in 0..=10 {
+            match self.check(path, Purpose::Source, false) {
+                Err(error) if error == "selection_required" && attempt < 10 => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!()
     }
 
     pub(crate) fn begin(&self, path: &str, purpose: Purpose) -> Result<SelectionUse, String> {
@@ -315,6 +337,60 @@ mod tests {
         selections.record_window_event(&event);
         assert!(selections
             .check(file.to_str().unwrap(), Purpose::Source, true)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn delayed_drop_is_accepted_and_missing_selection_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("drop.txt");
+        std::fs::write(&file, "fixture").unwrap();
+        let selections = Selections::default();
+        let later = selections.clone();
+        let dropped = file.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            later.record_drop(&tauri::DragDropEvent::Drop {
+                paths: vec![dropped],
+                position: tauri::PhysicalPosition::new(0.0, 0.0),
+            });
+        });
+        assert!(selections
+            .check_source_wait(file.to_str().unwrap())
+            .await
+            .is_ok());
+        task.await.unwrap();
+        let missing = temp.path().join("missing.txt");
+        assert_eq!(
+            selections
+                .check_source_wait(missing.to_str().unwrap())
+                .await,
+            Err("selection_required".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_drop_allows_file_and_reports_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file.txt");
+        let folder = temp.path().join("folder");
+        std::fs::write(&file, "fixture").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let selections = Selections::default();
+        selections.record_drop(&tauri::DragDropEvent::Drop {
+            paths: vec![file.clone(), folder.clone()],
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+        });
+        assert_eq!(
+            selections.check_source_wait(folder.to_str().unwrap()).await,
+            Err("source_folder_not_allowed".into())
+        );
+        assert!(selections
+            .check_source_wait(file.to_str().unwrap())
+            .await
+            .is_ok());
+        assert!(selections
+            .begin(file.to_str().unwrap(), Purpose::Source)
             .is_ok());
     }
 }

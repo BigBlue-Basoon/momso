@@ -2344,11 +2344,10 @@ async fn plan_source_asset_import(
     state: State<'_, AppState>,
     proposal: source_assets::SourceAssetImportProposal,
 ) -> Result<source_assets::SourceAssetImportPlan, String> {
-    state.selections.check(
-        &proposal.source_path,
-        selection_grants::Purpose::Source,
-        false,
-    )?;
+    state
+        .selections
+        .check_source_wait(&proposal.source_path)
+        .await?;
     let database_path = state.paths.database_path.clone();
     let root = state.paths.archive.current.clone().read_owned().await;
     run_source_asset_task(move || {
@@ -2362,6 +2361,10 @@ async fn apply_source_asset_import(
     state: State<'_, AppState>,
     input: source_assets::ApplySourceAssetImportInput,
 ) -> Result<source_assets::SourceAsset, String> {
+    state
+        .selections
+        .check_source_wait(&input.proposal.source_path)
+        .await?;
     let selection = state.selections.begin(
         &input.proposal.source_path,
         selection_grants::Purpose::Source,
