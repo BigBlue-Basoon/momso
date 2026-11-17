@@ -3,7 +3,8 @@ import { W } from './words'
 //   이벤트 agent-approval-request: { requestId, chatId, provider, kind, description, change, targets, reason, options }
 //     change: create / edit / overwrite / delete / null. 대상마다 종류가 다르면 null 이고 targets 의 각 change 를 읽는다.
 //     코덱스는 값이 없으면 change null, targets []. null 이면 종류를 짐작해 적지 않는다.
-//   이벤트 agent-approval-closed:  { requestId, chatId }
+//   이벤트 agent-approval-closed:  { requestId, chatId, reason }
+//     reason(2026-11-17): responded(답함) / timeout(5분 동안 답 없음) / provider_cancelled(AI 쪽이 거둠·대화 멈춤) / auto_declined(몸소가 받치지 않는 코덱스 요청을 스스로 거절). 옛 값은 없음.
 //   명령 agent_approval_respond:   { requestId, choice } → null
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
@@ -24,7 +25,7 @@ export function isBrowserApproval(request?: ApprovalRequest) {
  *   kind 'setup_change', setup { action:'create_and_connect', service:'github'|'cloudflare'|'gcp'|'aws', account, region, resourceName,
  *   visibility:'private', cost:'possible' }, targets 에 만들 이름과 change 'create', options allow_once·deny·cancel,
  *   답은 지금과 같은 agent_approval_respond({ requestId, choice }).
- * 화면은 "이번만 허락"과 "거절"만 보인다(2026-11-16 본부): "이 채팅방에서 항상 허락"과 "그만두기"는 options 에 와도 두지 않는다.
+ * 화면은 "이번만 허락"과 "거절"만 보인다(2026-11-16 본부): "이 채팅방에서 계속 허락"(allow_session)과 "그만두기"는 options 에 와도 두지 않는다.
  */
 export type SetupAction = {
   action: 'create_and_connect' | string
@@ -86,7 +87,7 @@ export const CHOICE_DONE: Record<ApprovalChoice, string> = {
 const CHOICE_ORDER: ApprovalChoice[] = ['allow_once', 'allow_session', 'deny', 'cancel']
 
 export function orderedChoices(options: ApprovalChoice[], request?: ApprovalRequest) {
-  // 설정 승인과 브라우저 승인은 한 번 한 번 묻는 일이다: "이 채팅방에서 항상 허락"과 "그만두기"는 와도 두지 않는다.
+  // 설정 승인과 브라우저 승인은 한 번 한 번 묻는 일이다: "이 채팅방에서 계속 허락"(allow_session)과 "그만두기"는 와도 두지 않는다.
   const once = request?.kind === 'setup_change' || isBrowserApproval(request)
   return CHOICE_ORDER.filter((choice) => options.includes(choice) && !(once && (choice === 'allow_session' || choice === 'cancel')))
 }
@@ -98,12 +99,12 @@ export async function respondApproval(requestId: string, choice: ApprovalChoice)
 
 export async function listenApprovals(handlers: {
   onRequest: (request: ApprovalRequest) => void
-  onClosed: (requestId: string) => void
+  onClosed: (requestId: string, reason: string | null) => void
 }) {
   if (!isDesktopRuntime()) return () => {}
   const stops = await Promise.all([
     listen<ApprovalRequest>('agent-approval-request', (event) => handlers.onRequest(event.payload)),
-    listen<{ requestId: string }>('agent-approval-closed', (event) => handlers.onClosed(event.payload.requestId)),
+    listen<{ requestId: string; reason?: string | null }>('agent-approval-closed', (event) => handlers.onClosed(event.payload.requestId, typeof event.payload.reason === 'string' ? event.payload.reason : null)),
   ])
   return () => stops.forEach((stop) => stop())
 }

@@ -113,11 +113,11 @@ pub(crate) struct SetupPermit {
 }
 impl SetupPermit {
     pub(crate) fn consume(self, chat_id: &str) -> Result<SetupApproval, &'static str> {
-        if self.chat_id != chat_id
-            || std::time::Instant::now() >= self.expires
-            || self.cancellation.is_cancelled()
-        {
+        if self.chat_id != chat_id || self.cancellation.is_cancelled() {
             return Err("unavailable");
+        }
+        if std::time::Instant::now() >= self.expires {
+            return Err("approval_expired");
         }
         Ok(self.plan.details)
     }
@@ -177,5 +177,15 @@ mod tests {
             .unwrap();
         cancel.cancel();
         assert!(permit.consume("chat-1").is_err());
+        let mut permit = SetupPlan::new("github", "teacher", "owner", None)
+            .unwrap()
+            .decide(
+                ApprovalChoice::AllowOnce,
+                "chat-1",
+                CancellationToken::new(),
+            )
+            .unwrap();
+        permit.expires = std::time::Instant::now();
+        assert!(matches!(permit.consume("chat-1"), Err("approval_expired")));
     }
 }

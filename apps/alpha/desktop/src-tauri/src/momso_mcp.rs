@@ -98,17 +98,7 @@ impl BridgeClient {
                 return Err(io::ErrorKind::InvalidData.into());
             }
             let value: Value = serde_json::from_str(&line)?;
-            let status = value
-                .get("status")
-                .and_then(Value::as_str)
-                .ok_or(io::ErrorKind::InvalidData)?;
-            let mut safe = json!({"status":status});
-            for key in ["imported", "duplicate", "skipped"] {
-                if let Some(n) = value.get(key).and_then(Value::as_u64) {
-                    safe[key] = json!(n);
-                }
-            }
-            Ok(safe)
+            safe_bridge_result(&value)
         })();
         result.unwrap_or_else(|_| json!({"status":"unavailable"}))
     }
@@ -204,6 +194,39 @@ impl BridgeClient {
         })();
         result.unwrap_or_else(|_| json!({"status":"unavailable"}))
     }
+}
+
+fn safe_bridge_result(value: &Value) -> io::Result<Value> {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or(io::ErrorKind::InvalidData)?;
+    let mut safe = json!({"status":status});
+    if value.get("reason").and_then(Value::as_str) == Some("approval_expired") {
+        safe["reason"] = json!("approval_expired");
+    }
+    for key in ["imported", "duplicate", "skipped"] {
+        if let Some(n) = value.get(key).and_then(Value::as_u64) {
+            safe[key] = json!(n);
+        }
+    }
+    Ok(safe)
+}
+
+#[cfg(test)]
+#[test]
+fn bridge_keeps_only_safe_approval_expiration_reason() {
+    assert_eq!(
+        safe_bridge_result(
+            &json!({"status":"failure","reason":"approval_expired","secret":"fixture"})
+        )
+        .unwrap(),
+        json!({"status":"failure","reason":"approval_expired"})
+    );
+    assert_eq!(
+        safe_bridge_result(&json!({"status":"failure","reason":"fixture-secret"})).unwrap(),
+        json!({"status":"failure"})
+    );
 }
 
 #[cfg(test)]

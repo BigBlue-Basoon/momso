@@ -143,15 +143,16 @@ export function AssistantPanel({
   }, [shownFrom])
 
   // 답한 물음은 물음이 왔던 자리(그때까지의 말 뒤)에 한 줄로 남고, 답을 기다리는 물음은 대화 끝에 뜬다.
-  const answeredAt = (index: number) => approvals.filter((item) => item.status === 'answered' && Math.min(item.at, messages.length) === index)
-  const pendingApprovals = approvals.filter((item) => item.status !== 'answered')
+  // 답하기 전에 닫힌 물음(closed)도 답한 물음처럼 그 자리에 한 줄로 남는다.
+  const answeredAt = (index: number) => approvals.filter((item) => (item.status === 'answered' || item.status === 'closed') && Math.min(item.at, messages.length) === index)
+  const pendingApprovals = approvals.filter((item) => item.status !== 'answered' && item.status !== 'closed')
   const noticesAt = (index: number) => notices.filter((item) => Math.min(item.at, messages.length) === index)
   const renderNotice = (item: { id: string; text: string }) => <p key={item.id} className="message-notice" role="note">{item.text}</p>
   const renderApproval = (item: ApprovalItem) => (
     <ApprovalCard key={item.request.requestId} item={item} onAnswer={(choice) => onAnswerApproval(item.request.requestId, choice)} />
   )
   // 키 넣기: 끝난 것은 물음이 온 자리에 한 줄로, 기다리는 것은 대화 끝에.
-  const secretsDoneAt = (index: number) => secretRequests.filter((item) => (item.status === 'saved' || item.status === 'cancelled') && Math.min(item.at, messages.length) === index)
+  const secretsDoneAt = (index: number) => secretRequests.filter((item) => (item.status === 'saved' || item.status === 'cancelled' || item.status === 'closed') && Math.min(item.at, messages.length) === index)
   const pendingSecrets = secretRequests.filter((item) => item.status === 'pending' || item.status === 'sending')
   const renderSecret = (item: SecretItem) => (
     <SecretRequestCard

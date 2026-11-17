@@ -103,9 +103,10 @@ export function keyProblem(item: ProviderAuth): 'verifying' | 'rejected' | 'unav
   return null
 }
 
-export async function listenProviderAuth(onChange: (provider: AiProvider, state: string | null) => void) {
+// provider-auth-changed 에 reason 이 붙을 수 있다(2026-11-17): 로그인이 시간 안에 끝나지 않으면 state unavailable + reason timeout.
+export async function listenProviderAuth(onChange: (provider: AiProvider, state: string | null, reason: string | null) => void) {
   if (!isDesktopRuntime()) return () => {}
-  return listen<{ provider?: AiProvider; state?: string }>('provider-auth-changed', (event) => {
-    if (event.payload?.provider) onChange(event.payload.provider, event.payload.state ?? null)
+  return listen<{ provider?: AiProvider; state?: string; reason?: string | null }>('provider-auth-changed', (event) => {
+    if (event.payload?.provider) onChange(event.payload.provider, event.payload.state ?? null, typeof event.payload.reason === 'string' ? event.payload.reason : null)
   })
 }

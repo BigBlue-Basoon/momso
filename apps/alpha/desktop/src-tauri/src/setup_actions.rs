@@ -23,6 +23,7 @@ fn storage_tool_result(outcome: &Value) -> Value {
     match outcome.get("status").and_then(Value::as_str) {
         Some("connected") => json!({"status":"success"}),
         Some("cancelled") => json!({"status":"cancelled"}),
+        Some("approval_expired") => json!({"status":"failure", "reason":"approval_expired"}),
         _ => json!({"status":"failure"}),
     }
 }
@@ -89,8 +90,14 @@ pub(crate) async fn dispatch(
     if input.as_object().is_some_and(|v| {
         v.len() == 1 && v.get("method").and_then(Value::as_str) == Some("object_store_r2_connect")
     }) {
-        let status = r2_tool_status(connect_r2_oauth(app, &chat_id, &ai_provider, cancel).await);
-        return json!({"status":status});
+        let outcome = connect_r2_oauth(app, &chat_id, &ai_provider, cancel).await;
+        let expired = matches!(outcome, Err("approval_expired"));
+        let status = r2_tool_status(outcome);
+        return if expired {
+            json!({"status":status,"reason":"approval_expired"})
+        } else {
+            json!({"status":status})
+        };
     }
     if input.get("method").and_then(Value::as_str) == Some("yoga_term_delete") {
         let Some(object) = input.as_object().filter(|object| object.len() == 2) else {
@@ -327,6 +334,9 @@ pub(crate) async fn dispatch(
     let result =
         crate::archive_remote::create_approved(app.clone(), app.state(), &chat_id, permit, cancel)
             .await;
+    if matches!(&result, Err(error) if error == "approval_expired") {
+        return json!({"status":"unavailable", "reason":"approval_expired"});
+    }
     match result
         .ok()
         .and_then(|v| serde_json::to_value(v).ok())
@@ -514,6 +524,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_setup_approval_is_exposed_without_changing_failure_status() {
+        assert_eq!(
+            storage_tool_result(&json!({"status":"approval_expired"})),
+            json!({"status":"failure","reason":"approval_expired"})
+        );
+        assert_eq!(r2_tool_status(Err("approval_expired")), "unavailable");
+    }
 
     #[test]
     fn r2_creation_outcomes_distinguish_unknown_from_confirmed_creation() {

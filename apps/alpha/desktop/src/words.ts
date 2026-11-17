@@ -253,6 +253,10 @@ const ko = {
     clearText: '삭제한 키는 다시 볼 수 없습니다. 다시 쓰려면 키를 새로 넣어야 합니다.',
     invalidKey: '키 모양이 맞지 않습니다. 다시 확인해 주세요.',
     loginFailed: '로그인을 시작하지 못했습니다',
+    /** 로그인하는 중이던 것이 끝나지 않고 멈췄을 때(provider-auth-changed 가 account·cancelled 가 아닌 값, 5분 지남도 여기). 2026-11-17 새로 씀, 그의 확인 전. */
+    loginUnfinished: '로그인이 끝나지 않았습니다. 다시 시도해 주세요',
+    /** 로그인이 시간 안에 끝나지 않았을 때(reason timeout, 5분). 2026-11-17 새로 씀, 그의 확인 전. */
+    loginTimeout: '로그인이 시간 안에 끝나지 않았습니다. 다시 시도해 주세요',
     logoutFailed: '로그아웃하지 못했습니다',
     keySaveFailed: '키를 저장하지 못했습니다',
     keyClearFailed: '키를 삭제하지 못했습니다',
@@ -292,7 +296,8 @@ const ko = {
     remove: '삭제',
     back: '스킬 목록',
     removeTitle: (a: unknown) => `“${a}” 스킬을 삭제할까요?`,
-    removeText: '삭제한 스킬은 되돌릴 수 없습니다.',
+    /** 2026-11-17 본부 결정으로 고침(뒤쪽 대조 desktop-promise-audit 7): 앱에 되돌리는 단추가 없다는 뜻. 작업 내역의 글과 같은 말. */
+    removeText: '삭제한 스킬은 몸소에서는 되돌릴 수 없습니다.',
     saved: '저장했습니다',
     saveFailed: '저장하지 못했습니다',
     invalidName: '호출 이름은 영어 소문자, 숫자, 붙임표(-)로 적어 주세요.',
@@ -345,7 +350,8 @@ const ko = {
     restoreFailed: '되돌리지 못했습니다',
     remove: '영구 삭제',
     removeTitle: (a: unknown) => `“${a}” 채팅방을 영구 삭제할까요?`,
-    removeText: '이 컴퓨터에서 지워지며 되돌릴 수 없습니다.',
+    /** 2026-11-17 본부 결정으로 고침(뒤쪽 대조 3): 삭제는 GitHub 백업으로 다른 컴퓨터에도 가고, 예전에 올린 기록에는 남을 수 있다. */
+    removeText: '삭제하면 되돌릴 수 없습니다. GitHub에 백업하고 있으면 다른 컴퓨터에서도 지워지고, 예전에 업로드한 기록에는 남아 있을 수 있습니다.',
     removeFailed: '영구 삭제하지 못했습니다',
     cancel: '그만두기',
   },
@@ -541,13 +547,20 @@ const ko = {
   approvals: {
     text1: '이번만 허락',
     // 2026-11-16 김성균 개발자가 정함("이 채팅방에서 항상 허락 이렇게").
-    text2: '이 채팅방에서 항상 허락',
+    // 2026-11-17 본부 결정으로 고침(뒤쪽 대조 9): 코덱스가 주는 "이번 세션 동안 허락"을 전할 뿐 몸소가 저장하지 않는다. "항상"이 아니다.
+    text2: '이 채팅방에서 계속 허락',
     text3: '거절',
     text4: '그만두기',
     text5: '이번만 허락했습니다',
-    text6: '이 채팅방에서 항상 허락했습니다',
+    text6: '이 채팅방에서 계속 허락했습니다. 앱을 다시 켜거나 AI를 바꾸면 다시 묻습니다',
     text7: '거절했습니다',
     text8: '그만두었습니다',
+    /** 답하기 전에 뒤쪽이 물음을 닫았을 때(agent-approval-closed: 5분 지남이나 대화 멈춤, 뒤쪽 값으로는 둘을 가르지 못함). 2026-11-17 새로 씀, 그의 확인 전. */
+    closed: '답하기 전에 요청이 닫혔습니다',
+    /** 5분 동안 답하지 않아 닫혔을 때(reason timeout). 2026-11-17 새로 씀, 그의 확인 전. */
+    closedTimeout: '답이 없어 요청이 닫혔습니다. 다시 하려면 AI에게 다시 말해 주세요',
+    /** AI 쪽이 요청을 거두었을 때(reason provider_cancelled, 선생님이 멈춤을 누른 때는 빼고). 키 넣는 카드도 같은 글. 2026-11-17 새로 씀, 그의 확인 전. */
+    closedByAi: 'AI가 요청을 거두었습니다',
   },
   // ---- archive.ts ----
   archive: {
@@ -637,6 +650,10 @@ const ko = {
     cancel: '그만두기',
     saved: '키를 저장했습니다',
     cancelled: '키 넣기를 그만두었습니다',
+    /** 키를 넣기 전에 뒤쪽이 요청을 닫았을 때(agent-setup-secret-closed: 5분 지남이나 대화 멈춤). 2026-11-17 새로 씀, 그의 확인 전. */
+    closed: '키를 넣기 전에 요청이 닫혔습니다',
+    /** 5분 동안 키를 넣지 않아 닫혔을 때(reason timeout). 2026-11-17 새로 씀, 그의 확인 전. */
+    closedTimeout: '키를 넣지 않아 요청이 닫혔습니다. 다시 하려면 AI에게 다시 말해 주세요',
     /** 2026-11-16 새로 씀(그의 확인 전): 그만두기(agent_setup_secret_cancel)가 실패했을 때. */
     cancelFailed: '그만두지 못했습니다',
     failed: '키를 저장하지 못했습니다',
@@ -829,13 +846,15 @@ const ko = {
     unconfirmed: '확인 안 됨',
     confirm: '확인됨으로 바꾸기',
     removePersonTitle: (a: unknown) => `“${a}” 이름을 삭제할까요?`,
-    removePersonText: '삭제한 이름은 되돌릴 수 없습니다.',
+    /** 2026-11-17 본부 결정으로 고침(뒤쪽 대조 desktop-promise-audit 7): 앱에 되돌리는 단추가 없다는 뜻. 작업 내역의 글과 같은 말. */
+    removePersonText: '삭제한 이름은 몸소에서는 되돌릴 수 없습니다.',
     // 2026-11-17 용어 삭제와 새 용어의 갈래. 새로 씀, 그의 확인 전.
     fieldCategory: '갈래',
     categoryNone: '고르지 않음',
     deleteTerm: '용어 삭제',
     removeTermTitle: (a: unknown) => `“${a}” 용어를 삭제할까요?`,
-    removeTermText: '삭제한 용어는 되돌릴 수 없습니다.',
+    /** 2026-11-17 본부 결정으로 고침(뒤쪽 대조 desktop-promise-audit 7): 앱에 되돌리는 단추가 없다는 뜻. 작업 내역의 글과 같은 말. */
+    removeTermText: '삭제한 용어는 몸소에서는 되돌릴 수 없습니다.',
     baseTerm: '기본 용어는 삭제할 수 없습니다. 끄기만 할 수 있습니다.',
   },
   /** 고른 지 5분이 지나 뒤쪽이 거절했을 때(selection_required). 첨부·대화 가져오기·몸소 폴더가 같은 글을 쓴다. 2026-11-17 새로 씀, 그의 확인 전. */
@@ -975,6 +994,10 @@ const ko = {
     } as Record<string, string>,
     text1: '5시간',
     text2: '1주',
+    /** 2026-11-17 본부 결정: 회사가 기간을 알려 주지 않은 창(코덱스 primary·secondary, 클로드 session)은 기간을 지어내지 않는다. 새로 씀, 그의 확인 전. */
+    windowFirst: '첫째 한도',
+    windowSecond: '둘째 한도',
+    windowSession: '사용 한도',
     text3: '하루',
     text4: '한 달',
     text5: '일',

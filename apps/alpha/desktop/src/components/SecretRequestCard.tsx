@@ -2,14 +2,19 @@ import { useRef, useState } from 'react'
 import { Check, LockKeyhole } from 'lucide-react'
 import type { SecretRequest } from '../setup-secrets'
 import { W } from '../words'
-import { serviceName } from './ApprovalCard'
+import { closedText, serviceName } from './ApprovalCard'
 import './ApprovalCard.css'
 
 export type SecretItem = {
   request: SecretRequest
   /** 물음이 왔을 때 그 채팅방의 말 수(끝난 뒤 남는 한 줄을 그 자리에 둔다). */
   at: number
-  status: 'pending' | 'sending' | 'saved' | 'cancelled'
+  /** closed: 키를 넣기 전에 뒤쪽이 요청을 닫음(agent-setup-secret-closed). 그 자리에 한 줄로 남는다. */
+  status: 'pending' | 'sending' | 'saved' | 'cancelled' | 'closed'
+  /** 닫힌 까닭(timeout·provider_cancelled, 옛 값이면 null). */
+  closedReason?: string | null
+  /** 선생님이 이 채팅방의 답을 멈췄다(승인 카드와 같음). */
+  stopping?: boolean
   error?: string | null
 }
 
@@ -32,11 +37,11 @@ export function SecretRequestCard({ item, onSubmit, onCancel }: {
   // 채운 칸 수만 센다(값은 담지 않는다). 모두 채우면 저장이 눌린다.
   const [filled, setFilled] = useState(0)
 
-  if (item.status === 'saved' || item.status === 'cancelled') {
+  if (item.status === 'saved' || item.status === 'cancelled' || item.status === 'closed') {
     return (
       <p className="approval-done">
-        <Check size={13} aria-hidden />
-        <span>{item.status === 'saved' ? words.saved : words.cancelled}</span>
+        {item.status !== 'closed' && <Check size={13} aria-hidden />}
+        <span>{item.status === 'saved' ? words.saved : item.status === 'cancelled' ? words.cancelled : closedText(item.closedReason, words.closed, words.closedTimeout)}</span>
         <span className="approval-done-subject">{request.resourceName ? `${where} ${request.resourceName}` : where}</span>
       </p>
     )

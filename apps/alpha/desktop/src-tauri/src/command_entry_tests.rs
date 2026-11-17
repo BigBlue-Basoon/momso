@@ -22,6 +22,70 @@ pub(crate) fn invoke(window: &tauri::WebviewWindow<MockRuntime>, cmd: &str, body
 }
 
 #[test]
+fn disconnect_object_store_keeps_local_and_remote_fixture() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let database_path = root.join("momso.db");
+    let backups_path = root.join("backups");
+    std::fs::create_dir_all(&backups_path).unwrap();
+    storage::initialize(&database_path, &backups_path, "test").unwrap();
+    let archive =
+        archive_location::ArchiveLocation::load(database_path.clone(), root, vec![]).unwrap();
+    let archive_root = root.join("momso");
+    std::fs::create_dir_all(archive_root.join("objects")).unwrap();
+    let local = archive_root.join("objects/source");
+    let remote = root.join("remote-fixture");
+    std::fs::write(&local, b"local fixture").unwrap();
+    std::fs::write(&remote, b"remote fixture").unwrap();
+    object_store::save_config(
+        root,
+        &object_store::Config {
+            provider: "cloudflare".into(),
+            endpoint: "https://fixture.r2.cloudflarestorage.com".into(),
+            region: "wrangleroauth".into(),
+            bucket: "momso-fixture".into(),
+            credential_id: uuid::Uuid::new_v4().to_string(),
+            last_backup_at: None,
+            write_safety: Some(object_store::WriteSafety::CheckThenWrite),
+        },
+    )
+    .unwrap();
+    let paths = RuntimePaths {
+        data_root: root.to_path_buf(),
+        database_path,
+        objects_path: archive_root.join("objects"),
+        exports_path: root.join("exports"),
+        backups_path,
+        logs_path: root.join("logs"),
+        archive,
+        archive_lease: None,
+    };
+    let app = mock_builder()
+        .manage(AppState {
+            paths,
+            approvals: Default::default(),
+            setup_secrets: Default::default(),
+            usage_monitor: Default::default(),
+            usage_cache: Default::default(),
+            chat_active: Default::default(),
+            browser: Default::default(),
+            selections: Default::default(),
+        })
+        .invoke_handler(tauri::generate_handler![
+            object_store::object_store_disconnect
+        ])
+        .build(mock_context(noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    invoke(&window, "object_store_disconnect", json!({}));
+    assert!(!root.join("object-store.json").exists());
+    assert_eq!(std::fs::read(local).unwrap(), b"local fixture");
+    assert_eq!(std::fs::read(remote).unwrap(), b"remote fixture");
+}
+
+#[test]
 fn oauth_r2_commands_import_backup_purge_and_retry() {
     use std::{
         collections::BTreeMap,

@@ -94,7 +94,8 @@ fn emit_declined_request<F: FnMut(&str, Value)>(
     }
     Some(closed)
 }
-fn emit_declined_closed<F: FnMut(&str, Value)>(closed: ApprovalClosed, emit: &mut F) {
+fn emit_declined_closed<F: FnMut(&str, Value)>(mut closed: ApprovalClosed, emit: &mut F) {
+    closed.reason = "auto_declined";
     if let Ok(payload) = serde_json::to_value(closed) {
         emit("agent-approval-closed", payload);
     }
@@ -146,7 +147,9 @@ fn interactive_approval(chat_id: &str, method: &str, params: &Value) -> Option<A
     request.options = choices
         .into_iter()
         .filter_map(|(wire, choice)| {
-            if advertised.is_none_or(|list| list.iter().any(|item| item.as_str() == Some(wire))) {
+            if advertised.map_or(choice != ApprovalChoice::AllowSession, |list| {
+                list.iter().any(|item| item.as_str() == Some(wire))
+            }) {
                 Some(choice)
             } else {
                 None
@@ -1031,6 +1034,20 @@ switch ($env:MOMSO_FAKE_RESULT) {
         );
         assert_eq!(approval_wire(ApprovalChoice::AllowOnce), "accept");
         assert_eq!(approval_wire(ApprovalChoice::Deny), "decline");
+        let missing = interactive_approval(
+            "chat_123",
+            "item/commandExecution/requestApproval",
+            &json!({"command":"pwd"}),
+        )
+        .unwrap();
+        assert_eq!(
+            missing.options,
+            vec![
+                ApprovalChoice::AllowOnce,
+                ApprovalChoice::Deny,
+                ApprovalChoice::Cancel
+            ]
+        );
         assert!(
             interactive_approval("chat_123", "item/permissions/requestApproval", &json!({}))
                 .is_none()
