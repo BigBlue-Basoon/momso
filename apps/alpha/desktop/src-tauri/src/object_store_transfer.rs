@@ -311,14 +311,15 @@ fn r2_list_response(body: &str, prefix: &str) -> Result<ListResponse, &'static s
         .get("result_info")
         .and_then(|v| v.as_object())
         .ok_or("remote_list_failed")?;
-    let truncated = info
-        .get("is_truncated")
-        .and_then(|v| v.as_bool())
-        .ok_or("remote_list_failed")?;
-    let next = info
-        .get("cursor")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
+    let next = match info.get("cursor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.as_str().ok_or("remote_list_failed")?.to_owned()),
+    };
+    let truncated = match info.get("is_truncated") {
+        Some(value) => value.as_bool().ok_or("remote_list_failed")?,
+        None if next.as_deref().is_some_and(|value| !value.is_empty()) => true,
+        None => return Err("remote_list_failed"),
+    };
     Ok(ListResponse {
         contents,
         truncated,
@@ -335,6 +336,11 @@ pub(crate) async fn get_bytes(
     let response =
         object_store::request(config, keys, reqwest::Method::GET, key, &[], vec![]).await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
+        if crate::r2_oauth::uses_oauth(config) {
+            read_bounded(response, 64 * 1024)
+                .await
+                .map_err(|_| "remote_read_failed")?;
+        }
         return Ok(None);
     }
     if !response.status().is_success() {
@@ -346,7 +352,7 @@ pub(crate) async fn get_bytes(
     Ok(Some(read_bounded(response, max).await?))
 }
 
-async fn read_bounded(
+pub(crate) async fn read_bounded(
     mut response: reqwest::Response,
     max: usize,
 ) -> Result<Vec<u8>, &'static str> {
@@ -390,6 +396,9 @@ pub(crate) async fn put_once(
             if !response.status().is_success() {
                 return Err("remote_write_failed");
             }
+            read_bounded(response, 64 * 1024)
+                .await
+                .map_err(|_| "remote_write_failed")?;
             return match get_bytes(config, keys, key, bytes.len()).await? {
                 Some(existing)
                     if existing.len() == bytes.len()
@@ -1223,8 +1232,8 @@ async fn cleanup_completed(
 }
 
 #[tauri::command]
-pub(crate) async fn object_store_backup(
-    app: tauri::AppHandle,
+pub(crate) async fn object_store_backup<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
 ) -> Result<BackupProgress, &'static str> {
     let paths = state.paths.scoped().await;
@@ -1247,6 +1256,8 @@ pub(crate) async fn object_store_backup(
             None
         };
         let work: Result<BackupProgress, &'static str> = async {
+            crate::source_delete::retry_pending_for_backup(&paths, &config, &keys, &identity)
+                .await?;
             let stage = paths
                 .data_root
                 .join("object-store-staging")
@@ -1618,6 +1629,69 @@ mod tests {
         assert_eq!(page.contents.len(), 1);
         assert!(page.truncated);
         assert_eq!(page.next.as_deref(), Some("next"));
+    }
+
+    #[tokio::test]
+    async fn oauth_listing_follows_cursor_without_truncation_flag_but_rejects_unknown_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let pages = [
+                r#"{"success":true,"result":[{"key":"momso/object-store/v1/manifests/a.age"}],"result_info":{"cursor":"next"}}"#,
+                r#"{"success":true,"result":[{"key":"momso/object-store/v1/manifests/b.age"}],"result_info":{"is_truncated":false}}"#,
+                r#"{"success":true,"result":[],"result_info":{}}"#,
+            ];
+            for (index, body) in pages.iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = [0u8; 8192];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.contains("/r2/buckets/momso-fixture/objects?"));
+                if index == 1 {
+                    assert!(request.contains("cursor=next"));
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+        let config = object_store::Config {
+            provider: "cloudflare".into(),
+            endpoint: format!("http://{address}"),
+            region: "wrangleroauth".into(),
+            bucket: "momso-fixture".into(),
+            credential_id: "test".into(),
+            last_backup_at: None,
+            write_safety: Some(object_store::WriteSafety::CheckThenWrite),
+        };
+        let keys = object_store::Keys {
+            access_key_id: "test".into(),
+            secret_access_key: "test-token".into(),
+        };
+        let prefix = "momso/object-store/v1/manifests/";
+        assert_eq!(
+            list_keys(&config, &keys, prefix).await.unwrap(),
+            vec![format!("{prefix}a.age"), format!("{prefix}b.age")]
+        );
+        assert!(matches!(
+            list_keys(&config, &keys, prefix).await,
+            Err("remote_list_failed")
+        ));
+        server.join().unwrap();
+        for body in [
+            r#"{"success":true,"result":[],"result_info":{"cursor":""}}"#,
+            r#"{"success":true,"result":[],"result_info":{"cursor":123}}"#,
+            r#"{"success":true,"result":[],"result_info":{"cursor":"next","is_truncated":null}}"#,
+        ] {
+            assert!(r2_list_response(body, prefix).is_err());
+        }
     }
 
     #[test]
