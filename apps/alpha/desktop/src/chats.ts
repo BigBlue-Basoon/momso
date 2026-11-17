@@ -87,16 +87,6 @@ export type ChatImportCounts = {
   conflicts: number
 }
 
-export async function importChatExport(path: string, provider: ChatImportSource) {
-  requireChats()
-  const value = await invoke<Partial<ChatImportCounts> | null>('chat_import_export', { path, provider })
-  const n = (key: keyof ChatImportCounts) => (typeof value?.[key] === 'number' ? value[key] as number : 0)
-  return {
-    imported: n('imported'), duplicate: n('duplicate'), skipped: n('skipped'), omittedNonTextMessages: n('omittedNonTextMessages'),
-    omittedAttachments: n('omittedAttachments'), updated: n('updated'), addedMessages: n('addedMessages'), conflicts: n('conflicts'),
-  } as ChatImportCounts
-}
-
 /**
  * 가져오기 전에 세기, 진행, 그만두기(desktop-screen-backend-contract.md "다른 AI의 대화 가져오기", chat-export-import-contract.md).
  *   chat_import_export_preview({ path, provider }) → { conversations, alreadyImported, unreadable, oldest, newest } (날짜는 UTC 글 또는 null, 저장하지 않음)
@@ -145,6 +135,30 @@ export async function chatRedactionCount(chatId: string) {
 export async function listenChatArchiveChanged(onChanged: (chatId: string | null, state: string | null) => void) {
   if (!isDesktopRuntime()) return () => {}
   return listen<{ chatId?: string | null; state?: string | null }>('chat-archive-changed', (event) => onChanged(event.payload?.chatId ?? null, event.payload?.state ?? null))
+}
+
+/**
+ * 채팅방 목록 쪽 나눔(2026-11-17 뒤쪽 fdce0939). chat_list_page({ offset }) → { items, hasMore, nextOffset }, 한 쪽 80개.
+ * 차례는 chat_list 와 같다(고정한 것 먼저, 최근에 고친 순). 보관한 채팅방은 빠진다.
+ * 명령이 없는 뒤쪽이면 옛 chat_list 전체를 한 쪽으로 돌려준다(한 번 없다고 알면 다시 묻지 않는다).
+ */
+export type ChatListPage = { items: ChatEntry[]; hasMore: boolean; nextOffset: number | null }
+let listPageMissing = false
+export async function listChatsPage(offset = 0): Promise<ChatListPage> {
+  requireChats()
+  if (!listPageMissing) {
+    try {
+      const value = await invoke<Partial<ChatListPage> | null>('chat_list_page', offset ? { offset } : {})
+      const items = Array.isArray(value?.items) ? value.items : []
+      const nextOffset = typeof value?.nextOffset === 'number' ? value.nextOffset : null
+      return { items, hasMore: value?.hasMore === true && nextOffset !== null, nextOffset }
+    } catch (error) {
+      if (!isMissingCommand(error)) throw error
+      listPageMissing = true
+    }
+  }
+  if (offset) return { items: [], hasMore: false, nextOffset: null }
+  return { items: await listChats(), hasMore: false, nextOffset: null }
 }
 
 export async function createChat() {

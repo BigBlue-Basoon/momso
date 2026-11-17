@@ -99,6 +99,7 @@ Write-Host "Snapshot: $sha"
 Write-Host "Isolated copy: $copy"
 Push-Location $copy
 try {
+    Run-Step 'public hygiene' $python @('-B', 'scripts/check-public-hygiene.py')
     Run-Step 'npm ci' $npm @('ci')
     Run-Step 'production dependency audit' $npm @('audit', '--omit=dev', '--audit-level=high')
     Run-Step 'desktop version' $npm @('run', 'desktop:version:check')

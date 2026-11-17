@@ -1,5 +1,29 @@
 use std::{fs, path::PathBuf};
+use tauri::Emitter;
 use tauri::Manager;
+
+static STARTUP_PROGRESS: std::sync::Mutex<crate::storage::StartupProgress> =
+    std::sync::Mutex::new(crate::storage::StartupProgress {
+        state: "checking",
+        completed: 0,
+        total: 4,
+        available: false,
+    });
+
+pub(crate) fn publish_startup(app: &tauri::AppHandle, progress: crate::storage::StartupProgress) {
+    if let Ok(mut current) = STARTUP_PROGRESS.lock() {
+        *current = progress.clone();
+    }
+    let _ = app.emit("runtime-startup-progress", progress);
+}
+
+#[tauri::command]
+pub(crate) fn runtime_startup_status() -> Result<crate::storage::StartupProgress, &'static str> {
+    STARTUP_PROGRESS
+        .lock()
+        .map(|current| current.clone())
+        .map_err(|_| "unavailable")
+}
 
 const R2_TEST_IDENTIFIER: &str = "app.momso.desktop.r2-test";
 #[cfg(debug_assertions)]
@@ -144,10 +168,13 @@ impl RuntimePaths {
             fs::create_dir_all(directory)?;
         }
         let database_path = data_root.join("momso.db");
-        let storage = crate::storage::initialize(
+        let storage = crate::storage::initialize_with_progress(
             &database_path,
             &backups_path,
             &app.package_info().version.to_string(),
+            |progress| {
+                publish_startup(app, progress);
+            },
         )
         .map_err(std::io::Error::other)?;
         let home = test_root
@@ -208,6 +235,15 @@ impl RuntimePaths {
 #[cfg(test)]
 mod isolation_tests {
     use super::*;
+
+    #[test]
+    fn startup_status_returns_latest_progress_shape() {
+        let state = serde_json::to_value(runtime_startup_status().unwrap()).unwrap();
+        assert!(state["state"].is_string());
+        assert!(state["completed"].is_u64());
+        assert_eq!(state["total"], 4);
+        assert!(state["available"].is_boolean());
+    }
 
     #[test]
     fn isolated_root_requires_debug_and_distinct_identifier() {

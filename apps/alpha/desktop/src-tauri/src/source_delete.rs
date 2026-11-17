@@ -701,6 +701,16 @@ fn exists_valid(path: &Path, expected_hash: &str) -> Result<bool, String> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn trash_for_test(
+    root: &Path,
+    database: &Path,
+    asset_id: &str,
+    expected_digest: &str,
+) -> Result<(), String> {
+    trash(root, database, asset_id, expected_digest).map(|_| ())
+}
+
 fn trash(
     root: &Path,
     database: &Path,

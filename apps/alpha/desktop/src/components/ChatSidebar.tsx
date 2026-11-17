@@ -21,6 +21,10 @@ type ChatSidebarProps = {
   error: string | null
   /** 아직 목록을 읽는 중(한 번도 읽지 않았다). */
   loading?: boolean
+  /** 앱 시작 단계(DB 꼴이 바뀌는 날 몇 초 걸릴 때). 있으면 "불러오는 중" 뒤에 붙인다. */
+  loadingDetail?: string | null
+  /** 목록 끝까지 내리면 다음 쪽을 받는다(chat_list_page). */
+  onLoadMore?: () => void
   /** 받은 채팅 사본을 되살리는 중이면 그 진행(목록 맨 위 한 줄과 막대). 끝나면 null. */
   restoring?: RestoreProgress | null
   /** 읽지 못했을 때 "다시 불러오기". */
@@ -53,7 +57,7 @@ function loadFolded(): Record<string, boolean> {
  * 채팅방 500개 줄을 다시 그려 글자 하나에 0.1초 넘게 걸렸다). 손잡이(on…)는 아래 ChatSidebar 가 늘 같은 함수로 넘긴다.
  */
 function sameSidebar(a: ChatSidebarProps, b: ChatSidebarProps) {
-  return a.chats === b.chats && a.groups === b.groups && a.selectedChatId === b.selectedChatId && a.error === b.error && Boolean(a.loading) === Boolean(b.loading) && a.restoring === b.restoring
+  return a.chats === b.chats && a.groups === b.groups && a.selectedChatId === b.selectedChatId && a.error === b.error && Boolean(a.loading) === Boolean(b.loading) && a.loadingDetail === b.loadingDetail && a.restoring === b.restoring
     && (a.busyChatId ?? null) === (b.busyChatId ?? null) && Boolean(a.onPinChat) === Boolean(b.onPinChat) && Boolean(a.onArchiveChat) === Boolean(b.onArchiveChat)
     && (a.waitingChatIds ?? []).join('|') === (b.waitingChatIds ?? []).join('|')
 }
@@ -73,6 +77,7 @@ export function ChatSidebar(props: ChatSidebarProps) {
     onPinChat: (chatId: string, pinned: boolean) => latest.current.onPinChat?.(chatId, pinned),
     onArchiveChat: (chatId: string) => latest.current.onArchiveChat?.(chatId),
     onRetry: () => latest.current.onRetry?.(),
+    onLoadMore: () => latest.current.onLoadMore?.(),
   }), [])
   return (
     <ChatSidebarList
@@ -95,6 +100,8 @@ const ChatSidebarList = memo(function ChatSidebarList({
   selectedChatId,
   error,
   loading = false,
+  loadingDetail = null,
+  onLoadMore,
   restoring = null,
   onRetry,
   onNewChat,
@@ -180,7 +187,11 @@ const ChatSidebarList = memo(function ChatSidebarList({
         {/* 검색은 창 맨 위 왼쪽의 돋보기로 옮겼다(2026-11-16 그의 말). 같은 것을 두 번 두지 않는다. */}
       </div>
 
-      <div className="record-list chat-list" aria-live="polite">
+      <div
+        className="record-list chat-list"
+        aria-live="polite"
+        onScroll={(event) => { const el = event.currentTarget; if (el.scrollTop + el.clientHeight >= el.scrollHeight - 240) onLoadMore?.() }}
+      >
         {restoring && (
           <div className="chat-restore" role="status">
             <span>{restoring.total > 0 ? W.restoreProgress.chatRestoringCount(restoring.completed, restoring.total) : W.restoreProgress.chatRestoring}</span>
@@ -194,7 +205,7 @@ const ChatSidebarList = memo(function ChatSidebarList({
             {onRetry && <button className="secondary-button" type="button" onClick={onRetry}>{W.zetPanel.text25}</button>}
           </div>
         ) : loading && chats.length === 0 ? (
-          <div className="empty-queue" role="status"><span>{W.chatSidebar.loading}</span></div>
+          <div className="empty-queue" role="status"><span>{loadingDetail ? `${W.chatSidebar.loading} · ${loadingDetail}` : W.chatSidebar.loading}</span></div>
         ) : (
           <>
             {pinned.length > 0 && (

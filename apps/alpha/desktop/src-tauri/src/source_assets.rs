@@ -119,7 +119,7 @@ pub(crate) struct SourceAssetRecordLinkInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SourceAssetImportProposal {
-    source_path: String,
+    pub(crate) source_path: String,
     asset_kind: SourceAssetKind,
     media_type: Option<String>,
     record_link: Option<SourceAssetRecordLinkInput>,
@@ -142,7 +142,7 @@ pub(crate) struct SourceAssetImportPlan {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ApplySourceAssetImportInput {
-    proposal: SourceAssetImportProposal,
+    pub(crate) proposal: SourceAssetImportProposal,
     plan_digest: String,
     import_confirmed: bool,
 }

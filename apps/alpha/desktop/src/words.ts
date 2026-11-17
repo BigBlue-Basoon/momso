@@ -184,6 +184,9 @@ const ko = {
       other: '채팅방 사본을 쓰지 못했습니다',
     } as Record<string, string>,
     chatCopyRetry: '업로드할 때 다시 시도합니다',
+    /** 옛 키 다시 가리기(2026-11-17). 새로 씀, 그의 확인 전. */
+    redactionWait: '바꾼 키를 채팅방 사본에서 가리는 중입니다. 끝나면 업로드합니다',
+    keyLeftWarning: '예전에 업로드한 채팅 기록에 키가 남아 있을 수 있습니다. 그 키를 발급한 곳에서 새 키를 받아 넣어 주세요',
     chatCopyPending: (a: unknown) => `채팅방 사본 ${a}개를 아직 쓰지 못했습니다. 업로드할 때 다시 시도합니다`,
     /** 두 PC 에서 고쳤을 때(2026-11-17). 새로 씀, 그의 확인 전. */
     conflictsLeft: (a: unknown) => `GitHub와 합치지 못한 파일이 ${a}개 남았습니다. 이 PC에서는 계속 쓸 수 있습니다`,
@@ -320,6 +323,8 @@ const ko = {
     done: (name: string) => `${name}${josa(name, '을', '를')} 첨부했습니다`,
     doneMany: (n: number) => `파일 ${n}개를 첨부했습니다`,
     failed: '파일을 첨부하지 못했습니다',
+    /** 폴더를 끌어 놓았을 때(source_folder_not_allowed). 2026-11-17 새로 씀, 그의 확인 전. */
+    folderNotAllowed: '폴더는 첨부할 수 없습니다. 파일을 놓아 주세요',
   },
   // ---- 채팅방 고정·보관(왼쪽 목록)과 설정의 보관된 채팅방. 2026-11-16 새로 쓴 글(그가 아직 정하지 않음, 낱말 목록에 올림). ----
   chatKeep: {
@@ -392,6 +397,8 @@ const ko = {
     receiveEmpty: 'GitHub에 받아 올 내용이 없습니다',
     /** 받아 오는 동안 못 하는 일(계약: 끝나야 받은 문서와 채팅방을 쓸 수 있다). */
     receiveWait: '다 받을 때까지 받아 온 채팅방은 쓸 수 없습니다',
+    /** 같은 이름의 파일이 있어 처음 받아 오기를 멈췄을 때(first_receive_conflict + conflictPaths). 2026-11-17 새로 씀, 그의 확인 전. */
+    receiveConflict: (a: unknown, b: unknown) => `몸소 폴더에 같은 이름의 파일 ${a}개가 있어 처음 받아 오기를 멈췄습니다. 이 파일을 옮기거나 이름을 바꾼 뒤 다운로드를 다시 눌러 주세요: ${b}`,
     /** 받아 오는 동안 문서를 고치거나 되돌리려 할 때(채팅방을 막을 때와 같은 알림 줄). */
     docBusy: 'GitHub에서 받아 오는 동안에는 문서를 고칠 수 없습니다',
   },
@@ -469,6 +476,12 @@ const ko = {
     retryUnavailable: '이 말은 다시 보낼 수 없어 입력창에 다시 넣었습니다.',
     /** 앱을 켤 때(runtime_info) 실패했고 뒤쪽 글이 한글이 아닐 때(2026-11-17 본부 결정). 알림에 "다시 시도"와 함께. */
     runtimeFailed: '몸소를 준비하지 못했습니다',
+    /** 앱 시작 단계(runtime-startup-progress 의 state). 왼쪽 목록의 "불러오는 중" 뒤에 붙는다. 2026-11-17 새로 씀, 그의 확인 전. */
+    startup: {
+      checking: '자료를 확인하는 중',
+      backup: '바꾸기 전 자료를 백업하는 중',
+      migrating: '자료를 새 형식으로 바꾸는 중',
+    } as Record<string, string>,
     /** 채팅방 GitHub 사본에서 가린 수(chat_archive_redaction_count)가 0 보다 클 때 그 채팅방 끝의 한 줄. 2026-11-16 새로 씀, 그의 확인 전. */
     chatRedacted: (n: number) => `이 채팅방에서 비밀값으로 보이는 값 ${n}개는 GitHub에 올리지 않았습니다.`,
     text1: '채팅방 목록을 읽지 못했습니다',
@@ -823,15 +836,18 @@ const ko = {
     removeTermText: '삭제한 용어는 되돌릴 수 없습니다.',
     baseTerm: '기본 용어는 삭제할 수 없습니다. 끄기만 할 수 있습니다.',
   },
+  /** 고른 지 5분이 지나 뒤쪽이 거절했을 때(selection_required). 첨부·대화 가져오기·몸소 폴더가 같은 글을 쓴다. 2026-11-17 새로 씀, 그의 확인 전. */
+  selectAgain: '선택한 지 오래되어 진행하지 못했습니다. 파일을 다시 선택해 주세요',
   // ---- components/ChatImportSettings.tsx: 다른 AI 에서 내보낸 대화 가져오기. 2026-11-16 새로 씀(그가 보고 고친다, 낱말 목록에 올림). ----
   chatImport: {
     title: '다른 AI의 대화 가져오기',
-    intro: 'ChatGPT나 클로드에서 내보낸 파일을 선택하면, 그 대화가 왼쪽 목록에 채팅방으로 생깁니다.',
+    intro: 'ChatGPT, 클로드, 제미나이에서 내보낸 파일을 선택하면, 그 대화가 왼쪽 목록에 채팅방으로 생깁니다.',
     name: { chatgpt: 'ChatGPT', claude: '클로드', gemini: '제미나이' } as Record<string, string>,
     hint: {
       chatgpt: 'ChatGPT 설정의 데이터 내보내기로 받은 파일(zip)을 선택합니다.',
       claude: '클로드 설정의 데이터 내보내기로 받은 파일(zip)을 선택합니다.',
-      gemini: '아직 가져올 수 없습니다.',
+      // 2026-11-17 제미나이 가져오기가 생김. 새로 씀, 그의 확인 전.
+      gemini: '구글 데이터 내보내기로 받은 제미나이 파일(zip 또는 JSON)을 선택합니다.',
     } as Record<string, string>,
     pick: '파일 선택',
     fileKind: '내보낸 대화 파일',
@@ -858,6 +874,9 @@ const ko = {
       unsupported_format: '이 파일에서 대화를 찾지 못했습니다. 내보내기로 받은 파일인지 확인해 주세요.',
       archive_limit: '파일이 너무 커서 가져오지 못했습니다.',
       file_error: '파일을 열지 못했습니다.',
+      // 2026-11-17 제미나이. 새로 씀, 그의 확인 전.
+      gemini_json_required: 'HTML 파일은 가져올 수 없습니다. 구글에서 내보낼 때 형식을 JSON 으로 골라 주세요.',
+      gemini_file_too_large: '파일이 64MB보다 커서 가져오지 못했습니다.',
     } as Record<string, string>,
   },
   // ---- components/FirstLaunch.tsx ----

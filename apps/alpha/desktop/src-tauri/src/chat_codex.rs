@@ -77,9 +77,17 @@ fn emit_declined_request<F: FnMut(&str, Value)>(
     chat_id: &str,
     method: &str,
     params: &Value,
+    known: Option<&[&str]>,
     emit: &mut F,
 ) -> Option<ApprovalClosed> {
-    let request = declined_approval(chat_id, method, params)?;
+    let mut request = declined_approval(chat_id, method, params)?;
+    if let Some(known) = known {
+        request.redact_sensitive(known);
+    } else {
+        request.description.clear();
+        request.targets.clear();
+        request.reason = None;
+    }
     let closed = request.closed();
     if let Ok(payload) = serde_json::to_value(&request) {
         emit("agent-approval-request", payload);
@@ -89,6 +97,26 @@ fn emit_declined_request<F: FnMut(&str, Value)>(
 fn emit_declined_closed<F: FnMut(&str, Value)>(closed: ApprovalClosed, emit: &mut F) {
     if let Ok(payload) = serde_json::to_value(closed) {
         emit("agent-approval-closed", payload);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn declined_approval_event_never_exposes_known_secrets() {
+    let secret = "fixture-secret-without-a-recognizable-key-shape";
+    for known in [Some(&[secret][..]), None] {
+        let mut events = Vec::new();
+        let mut emit = |_: &str, payload: Value| events.push(payload);
+        let params = json!({"command":secret,"reason":secret});
+        assert!(emit_declined_request(
+            "chat",
+            "item/commandExecution/requestApproval",
+            &params,
+            known,
+            &mut emit
+        )
+        .is_some());
+        assert!(!events[0].to_string().contains(secret));
     }
 }
 pub(crate) type ApprovalChannel = Box<
@@ -384,6 +412,7 @@ where
 }
 
 fn apply_api_key_environment(command: &mut Command, api_key: Option<&str>) {
+    crate::process::remove_inherited_ai_secrets(command);
     command
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
@@ -452,7 +481,11 @@ where
                     if let (Some(channel), Some(request)) = (&approvals, interactive_approval(chat_id, method, &approval_params)) {
                         let choice = channel(request, cancel.clone()).await?;
                         send(&mut input, json!({"id":id,"result":{"decision":approval_wire(choice)}})).await?;
-                    } else if let Some(closed) = emit_declined_request(chat_id, method, &approval_params, &mut emit) {
+                    } else if let Some(closed) = {
+                        let known = db.parent().and_then(|root| crate::chat_archive_store::known_values(root, db).ok());
+                        let refs = known.as_ref().map(|values| values.iter().map(String::as_str).collect::<Vec<_>>());
+                        emit_declined_request(chat_id, method, &approval_params, refs.as_deref(), &mut emit)
+                    } {
                         let result = if method == "item/permissions/requestApproval" {
                             send(&mut input, json!({"id":id,"result":{"permissions":{}}})).await
                         } else {
@@ -638,6 +671,70 @@ mod tests {
         assert!(!is_unauthorized(
             &json!({"params":{"turn":{"error":{"message":"unauthorized"}}}})
         ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn imported_chatgpt_history_is_sent_to_codex() {
+        let d = tempfile::tempdir().unwrap();
+        let db = d.path().join("db.sqlite");
+        crate::storage::initialize(&db, &d.path().join("backups"), "test").unwrap();
+        let export = d.path().join("conversations.json");
+        std::fs::write(&export, json!([{"id":"fixture","current_node":"b","mapping":{"a":{"parent":null,"message":{"author":{"role":"user"},"content":{"parts":["previous-question"]}}},"b":{"parent":"a","message":{"author":{"role":"assistant"},"content":{"parts":["previous-answer"]}}}}}]).to_string()).unwrap();
+        crate::chat_export_import::import(&db, &export, "chatgpt").unwrap();
+        let rooms = serde_json::to_value(chat::list(&db).unwrap()).unwrap();
+        let id = rooms[0]["id"].as_str().unwrap();
+        let handoff =
+            crate::chat_handoff::prepare(&db, id, "codex", false, "next-question").unwrap();
+        let script = d.path().join("fake-codex.ps1");
+        std::fs::write(&script, r#"
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"id":1,"result":{}}')
+$null = [Console]::In.ReadLine()
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"id":2,"result":{"thread":{"id":"fixture-thread"},"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"},"modelProvider":"openai","model":"fixture-model","reasoningEffort":"low"}}')
+$request = [Console]::In.ReadLine() | ConvertFrom-Json
+$text = $request.params.input[0].text
+if (-not $text.Contains('previous-question') -or -not $text.Contains('previous-answer') -or -not $text.Contains('next-question')) { exit 9 }
+[Console]::WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"continued"}}')
+[Console]::WriteLine('{"method":"turn/completed","params":{"turn":{"status":"completed"}}}')
+"#).unwrap();
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-File"])
+            .arg(&script)
+            .current_dir(d.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .creation_flags(0x08000000);
+        run_command(
+            command,
+            &db,
+            d.path(),
+            id,
+            &handoff.prompt,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::permission_modes::codex_settings("Ask for approval").unwrap(),
+            None,
+            CancellationToken::new(),
+            None,
+            Some("openai"),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        let detail = serde_json::to_value(chat::read(&db, id).unwrap()).unwrap();
+        assert!(detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "continued" && m["provider"] == "codex"));
     }
 
     #[cfg(windows)]
@@ -892,9 +989,14 @@ switch ($env:MOMSO_FAKE_RESULT) {
         ] {
             let mut events = Vec::new();
             let mut emit = |name: &str, payload: Value| events.push((name.to_owned(), payload));
-            let closed =
-                emit_declined_request("chat_123", method, &json!({"command":"ls"}), &mut emit)
-                    .unwrap();
+            let closed = emit_declined_request(
+                "chat_123",
+                method,
+                &json!({"command":"ls"}),
+                Some(&[]),
+                &mut emit,
+            )
+            .unwrap();
             emit_declined_closed(closed, &mut emit);
             assert_eq!(events[0].0, "agent-approval-request");
             assert_eq!(events[1].0, "agent-approval-closed");

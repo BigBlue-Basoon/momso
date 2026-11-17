@@ -97,7 +97,45 @@ pub(crate) fn identity(database: &Path) -> Result<x25519::Identity, &'static str
 }
 
 pub(crate) fn safe_relative(path: &Path) -> bool {
-    !path.as_os_str().is_empty() && path.components().all(|c| matches!(c, Component::Normal(_)))
+    let Some(raw) = path.to_str() else {
+        return false;
+    };
+    if raw.is_empty() || raw.encode_utf16().count() > 32_000 {
+        return false;
+    }
+    path.components().all(|component| {
+        let Component::Normal(part) = component else {
+            return false;
+        };
+        let Some(name) = part.to_str() else {
+            return false;
+        };
+        if name.is_empty()
+            || name.encode_utf16().count() > 255
+            || name.ends_with(['.', ' '])
+            || name
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            return false;
+        }
+        let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+        if matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) {
+            return false;
+        }
+        let device_suffix = stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"));
+        !device_suffix.is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 // Legacy objects can have arbitrary names. Only the reserved, canonical
@@ -1333,6 +1371,31 @@ mod tests {
         },
         time::Duration,
     };
+
+    #[test]
+    fn object_relative_paths_reject_windows_devices_and_unsafe_names() {
+        for value in [
+            "../outside",
+            "/outside",
+            "C:/outside",
+            "file:stream",
+            "a/NUL.txt",
+            "a/con",
+            "a/COM1.log",
+            "a/lpt²",
+            "a/trailing.",
+            "a/trailing ",
+            "a/question?",
+            "a/pipe|name",
+        ] {
+            assert!(!safe_relative(Path::new(value)), "{value}");
+        }
+        assert!(!safe_relative(Path::new(&format!("a/{}", "x".repeat(256)))));
+        assert!(safe_relative(Path::new("sha256/ab/abcdef")));
+        assert!(safe_relative(Path::new("legacy/lesson.txt")));
+        #[cfg(windows)]
+        assert!(!safe_relative(Path::new(r"\\server\share\outside")));
+    }
 
     #[test]
     fn corrupted_content_address_is_not_staged_for_backup() {

@@ -10,22 +10,98 @@ fn has_known_secret(value: &Value) -> bool {
     match value {
         Value::String(s) => crate::chat_archive_redact::redact(s).count != 0,
         Value::Array(items) => items.iter().any(has_known_secret),
-        Value::Object(items) => items.values().any(has_known_secret),
+        Value::Object(items) => items.iter().any(|(key, value)| {
+            crate::chat_archive_redact::redact(key).count != 0 || has_known_secret(value)
+        }),
         _ => false,
     }
 }
 
-fn contains_stored_secret(value: &Value, known: &[&str]) -> bool {
+pub(crate) fn contains_stored_secret(value: &Value, known: &[&str]) -> bool {
     match value {
         Value::String(s) => known
             .iter()
             .any(|secret| !secret.is_empty() && s.contains(secret)),
         Value::Array(items) => items.iter().any(|item| contains_stored_secret(item, known)),
-        Value::Object(items) => items
-            .values()
-            .any(|item| contains_stored_secret(item, known)),
+        Value::Object(items) => items.iter().any(|(key, item)| {
+            known
+                .iter()
+                .any(|secret| !secret.is_empty() && key.contains(secret))
+                || contains_stored_secret(item, known)
+        }),
         _ => false,
     }
+}
+
+/// Re-redact a historical copy without changing identity metadata or local originals.
+pub(crate) fn redact_historical_snapshot(
+    value: &Value,
+    known: &[&str],
+) -> Result<Value, &'static str> {
+    if value.get("version").and_then(Value::as_u64) != Some(1)
+        || value.pointer("/room/id").and_then(Value::as_str).is_none()
+    {
+        return Err("invalid_snapshot");
+    }
+    let mut result = value.clone();
+    if result.get("deleted").and_then(Value::as_bool) == Some(true) {
+        return if contains_stored_secret(&result, known) || has_known_secret(&result) {
+            Err("sensitive_metadata")
+        } else {
+            Ok(result)
+        };
+    }
+    let mut count = 0_u64;
+    let mut masked_ids = Vec::new();
+    let mut redact_field = |object: &mut Value, name: &str| {
+        if let Some(field) = object.get_mut(name) {
+            if let Some(text) = field.as_str() {
+                let redacted = crate::chat_archive_redact::redact_with_known(text, known);
+                count += redacted.count as u64;
+                *field = Value::String(redacted.text);
+                return redacted.count > 0;
+            }
+        }
+        false
+    };
+    redact_field(result.get_mut("room").ok_or("invalid_snapshot")?, "title");
+    for message in result
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or("invalid_snapshot")?
+    {
+        if redact_field(message, "text") {
+            masked_ids.push(message.get("id").cloned().ok_or("invalid_snapshot")?);
+        }
+    }
+    for group in result
+        .get_mut("groups")
+        .and_then(Value::as_array_mut)
+        .ok_or("invalid_snapshot")?
+    {
+        redact_field(group, "name");
+    }
+    for entry in result
+        .get_mut("importMessages")
+        .and_then(Value::as_array_mut)
+        .ok_or("invalid_snapshot")?
+    {
+        if entry
+            .get("message_id")
+            .is_some_and(|id| masked_ids.contains(id))
+        {
+            entry["fingerprint"] = Value::String("redacted-v1".into());
+        }
+    }
+    let previous = result
+        .get("redactions")
+        .and_then(Value::as_u64)
+        .ok_or("invalid_snapshot")?;
+    result["redactions"] = Value::from(previous.saturating_add(count));
+    if contains_stored_secret(&result, known) || has_known_secret(&result) {
+        return Err("sensitive_metadata");
+    }
+    Ok(result)
 }
 
 fn merge_rows(
@@ -54,6 +130,10 @@ fn merge_rows(
 
 fn message_from_value(value: &Value) -> Result<crate::chat_archive_merge::Message, &'static str> {
     let mut object = value.as_object().ok_or("invalid_snapshot")?.clone();
+    if let Some(provider) = object.get_mut("provider") {
+        *provider = crate::chat::canonical_provider(provider.as_str())
+            .map_or(Value::Null, |s| Value::String(s.to_owned()));
+    }
     let mut take = |name: &str| {
         object
             .remove(name)
@@ -227,6 +307,12 @@ pub(crate) fn snapshot_connection_with_known(
         return Err("not_found");
     }
     let mut messages = rows(db, "SELECT id,chat_id,role,text,created_at,provider,model,effort,skill,fast,not_handed_over,retryable_fast,actual_effort,finish_reason,auth_method,fast_state FROM chat_messages WHERE chat_id=?1 ORDER BY rowid", id)?;
+    for message in &mut messages {
+        if let Some(provider) = message.get_mut("provider") {
+            *provider = crate::chat::canonical_provider(provider.as_str())
+                .map_or(Value::Null, |s| Value::String(s.to_owned()));
+        }
+    }
     let mut groups = rows(db, "SELECT id,name,position,created_at FROM chat_groups WHERE id=(SELECT group_id FROM chats WHERE id=?1)", id)?;
     let imports = rows(
         db,
@@ -270,19 +356,49 @@ pub(crate) fn snapshot_connection_with_known(
         }
     }
     let mut redactions = 0;
-    for (collection, field) in [
-        (&mut room, "title"),
-        (&mut messages, "text"),
-        (&mut groups, "name"),
+    let mut preserved_message_ids = Vec::new();
+    for (collection, field, kind) in [
+        (&mut room, "title", "room"),
+        (&mut messages, "text", "message"),
+        (&mut groups, "name", "group"),
     ] {
         for item in collection {
+            let field_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("storage_error")?
+                .to_owned();
             if let Some(value) = item.get_mut(field) {
                 if let Some(text) = value.as_str() {
-                    let redacted = crate::chat_archive_redact::redact_with_known(text, known);
+                    let preserved: Option<(String, String, i64)> = db.query_row(
+                        "SELECT source_hash,safe_text,redaction_count FROM chat_redaction_preserved WHERE chat_id=?1 AND field_kind=?2 AND field_id=?3",
+                        rusqlite::params![id,kind,field_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+                    ).optional().map_err(|_| "storage_error")?;
+                    let source = if let Some((_, safe, count)) = preserved.filter(|(hash, _, _)| {
+                        crate::chat_archive_tracking::text_fingerprint(text) == *hash
+                    }) {
+                        if kind == "message" {
+                            preserved_message_ids.push(field_id);
+                        }
+                        redactions += usize::try_from(count).map_err(|_| "storage_error")?;
+                        safe
+                    } else {
+                        text.to_owned()
+                    };
+                    let redacted = crate::chat_archive_redact::redact_with_known(&source, known);
                     redactions += redacted.count;
                     *value = Value::String(redacted.text);
                 }
             }
+        }
+    }
+    for entry in &mut import_messages {
+        if entry
+            .get("message_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| preserved_message_ids.iter().any(|saved| saved == id))
+        {
+            entry["fingerprint"] = Value::String("redacted-v1".to_owned());
         }
     }
     let result = serde_json::json!({"version":1,"room":room.remove(0),"messages":messages,"groups":groups,"imports":imports,"importMessages":import_messages,"attachments":attachments,"redactions":redactions});
@@ -290,6 +406,76 @@ pub(crate) fn snapshot_connection_with_known(
         return Err("sensitive_metadata");
     }
     Ok(result)
+}
+
+/// Save only already-masked text and a portable digest of its local source.
+pub(crate) fn preserve_masked_fields(
+    path: &Path,
+    id: &str,
+    data: &Value,
+    known: &[&str],
+) -> Result<(), &'static str> {
+    let mut db = crate::storage::open_writable_connection(path).map_err(|_| "storage_error")?;
+    let tx = db.transaction().map_err(|_| "storage_error")?;
+    for (collection, field, kind, sql) in [
+        (
+            "room",
+            "title",
+            "room",
+            "SELECT title FROM chats WHERE id=?1",
+        ),
+        (
+            "messages",
+            "text",
+            "message",
+            "SELECT text FROM chat_messages WHERE id=?1",
+        ),
+        (
+            "groups",
+            "name",
+            "group",
+            "SELECT name FROM chat_groups WHERE id=?1",
+        ),
+    ] {
+        let items: Vec<&Value> = if collection == "room" {
+            vec![data.get(collection).ok_or("invalid_snapshot")?]
+        } else {
+            data.get(collection)
+                .and_then(Value::as_array)
+                .ok_or("invalid_snapshot")?
+                .iter()
+                .collect()
+        };
+        for item in items {
+            let field_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("invalid_snapshot")?;
+            let safe = match item.get(field).and_then(Value::as_str) {
+                Some(value) => value,
+                None => continue,
+            };
+            let original: String = tx
+                .query_row(sql, [field_id], |row| row.get(0))
+                .map_err(|_| "storage_error")?;
+            if original != safe {
+                let mac = crate::chat_archive_tracking::text_fingerprint(&original);
+                let old: Option<(String,String,i64)> = tx.query_row("SELECT source_hash,safe_text,redaction_count FROM chat_redaction_preserved WHERE chat_id=?1 AND field_kind=?2 AND field_id=?3", rusqlite::params![id,kind,field_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(|_| "storage_error")?;
+                let count = match old {
+                    Some((hash, previous, count)) if hash == mac => {
+                        usize::try_from(count).map_err(|_| "storage_error")?
+                            + crate::chat_archive_redact::redact_with_known(&previous, known).count
+                    }
+                    _ => crate::chat_archive_redact::redact_with_known(&original, known).count,
+                };
+                let count = i64::try_from(count).map_err(|_| "storage_error")?;
+                tx.execute("INSERT INTO chat_redaction_preserved(chat_id,field_kind,field_id,source_hash,safe_text,redaction_count) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(chat_id,field_kind,field_id) DO UPDATE SET source_hash=excluded.source_hash,safe_text=excluded.safe_text,redaction_count=excluded.redaction_count", rusqlite::params![id,kind,field_id,mac,safe,count]).map_err(|_| "storage_error")?;
+            } else {
+                tx.execute("DELETE FROM chat_redaction_preserved WHERE chat_id=?1 AND field_kind=?2 AND field_id=?3", rusqlite::params![id,kind,field_id]).map_err(|_| "storage_error")?;
+            }
+        }
+    }
+    tx.commit().map_err(|_| "storage_error")
 }
 
 fn insert_rows(
@@ -878,6 +1064,33 @@ pub(crate) fn resolve_pending_in_transaction(tx: &Transaction<'_>) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_copy_masks_newly_known_value_and_keeps_identity() {
+        let secret = "fixture-opaque-personal-value";
+        let input = serde_json::json!({"version":1,"room":{"id":"chat_fixture","title":format!("class {secret}")},"messages":[{"id":"m1","text":format!("lesson {secret}")}],"groups":[],"imports":[],"importMessages":[{"message_id":"m1","fingerprint":"old"}],"attachments":[],"redactions":0});
+        let output = redact_historical_snapshot(&input, &[secret]).unwrap();
+        assert!(!output.to_string().contains(secret));
+        assert_eq!(output["room"]["id"], "chat_fixture");
+        assert_eq!(output["messages"][0]["id"], "m1");
+        assert_eq!(output["importMessages"][0]["fingerprint"], "redacted-v1");
+        assert_eq!(output["redactions"], 2);
+        let mut invalid = input;
+        invalid["room"]["id"] = Value::String(secret.into());
+        assert_eq!(
+            redact_historical_snapshot(&invalid, &[secret]),
+            Err("sensitive_metadata")
+        );
+        let mut key_in_field = output;
+        key_in_field
+            .as_object_mut()
+            .unwrap()
+            .insert(secret.into(), Value::Null);
+        assert_eq!(
+            redact_historical_snapshot(&key_in_field, &[secret]),
+            Err("sensitive_metadata")
+        );
+    }
     #[test]
     fn imported_redacted_message_does_not_export_original_fingerprint() {
         let dir = tempfile::tempdir().unwrap();

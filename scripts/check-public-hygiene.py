@@ -15,6 +15,12 @@ WINDOWS_USER = re.compile(r"(?i)\b[a-z]:[\\/]{1,2}users[\\/]{1,2}[^\\/\s\"'<>]+"
 EMAIL = re.compile(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b")
 KEY = re.compile(r"\b(?:sk-ant-|sk-proj-|ghp_|github_pat_)[a-zA-Z0-9_\-]{16,}\b")
 FAKE_DOMAINS = {"example.com", "example.invalid", "momso.local", "2x.png", "evil.test", "attacker.test"}
+LICENSE_EMAILS = {
+    "apps/alpha/desktop/third-party/ego-tree-0.10.0-LICENSE": {"june" + "@" + "causal.agency"},
+    "apps/alpha/desktop/third-party/scraper-0.24.0-LICENSE": {
+        "june" + "@" + "causal.agency", "yoursvivek" + "@" + "gmail.com",
+    },
+}
 
 
 def files(root):
@@ -47,7 +53,8 @@ def findings(root, terms):
             kinds = []
             if WINDOWS_USER.search(line):
                 kinds.append("user_path")
-            if any(m.group().rsplit("@", 1)[1].lower() not in FAKE_DOMAINS for m in EMAIL.finditer(line)):
+            allowed_emails = LICENSE_EMAILS.get(path.relative_to(root).as_posix(), set())
+            if any(m.group().lower() not in allowed_emails and m.group().rsplit("@", 1)[1].lower() not in FAKE_DOMAINS for m in EMAIL.finditer(line)):
                 kinds.append("email")
             if KEY.search(line):
                 kinds.append("key")

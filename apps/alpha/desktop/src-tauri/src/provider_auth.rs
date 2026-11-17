@@ -1145,10 +1145,8 @@ mod tests {
         let archive = root.path().join("archive");
         std::fs::create_dir_all(&app).unwrap();
         std::fs::create_dir_all(&archive).unwrap();
-        rusqlite::Connection::open(app.join("test.sqlite"))
-            .unwrap()
-            .execute("CREATE TABLE test_data (value TEXT)", [])
-            .unwrap();
+        let database = app.join("test.sqlite");
+        crate::storage::initialize(&database, &app.join("backups"), "test").unwrap();
         std::fs::write(app.join("test.log"), "test log\n").unwrap();
         std::fs::write(archive.join("test.md"), "test document\n").unwrap();
         let name = format!("test:provider-auth:{}", uuid::Uuid::new_v4());
@@ -1162,6 +1160,38 @@ mod tests {
         let secret = format!("test-only-{}", uuid::Uuid::new_v4());
         credentials::set_secret(&entry.0, &secret).unwrap();
         assert!(credentials::get_secret(&entry.0).unwrap().as_deref() == Some(secret.as_str()));
+        let room = serde_json::to_value(crate::chat::create(&database).unwrap()).unwrap();
+        let id = room["id"].as_str().unwrap();
+        crate::chat::append(
+            &database,
+            id,
+            crate::chat::Role::User,
+            "synthetic message",
+            None,
+            None,
+        )
+        .unwrap();
+        crate::chat_archive_store::write_known(&archive, &database, id, &[&secret]).unwrap();
+        let safe_error = crate::chat_archive_redact::redact_with_known(
+            &format!("fixture error {secret}"),
+            &[&secret],
+        )
+        .text;
+        assert!(!safe_error.contains(&secret));
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .env("MOMSO_TEST_FIXTURE_KEY", &secret)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!output
+            .stdout
+            .windows(secret.len())
+            .any(|v| v == secret.as_bytes()));
+        assert!(!output
+            .stderr
+            .windows(secret.len())
+            .any(|v| v == secret.as_bytes()));
         for item in walkdir::WalkDir::new(root.path()) {
             let item = item.unwrap();
             if item.file_type().is_file() {

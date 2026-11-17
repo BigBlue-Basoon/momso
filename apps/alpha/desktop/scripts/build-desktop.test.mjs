@@ -21,7 +21,7 @@ test('reports the longest fully qualified staged source path', () => {
 });
 
 test('uses the build drive when the temporary directory is on another drive', () => {
-  assert.equal(selectStageParent('C:\\Users\\runner\\Temp', 'D:\\a\\momso\\src-tauri', path.win32), 'D:\\a\\momso\\src-tauri\\target');
+  assert.equal(selectStageParent('C:\\Temp\\elsewhere', 'D:\\a\\momso\\src-tauri', path.win32), 'D:\\a\\momso\\src-tauri\\target');
   assert.equal(selectStageParent('C:\\Temp', 'c:\\work\\src-tauri', path.win32), 'C:\\Temp');
   assert.throws(() => selectStageParent('relative', 'D:\\work', path.win32), /Absolute/);
 });

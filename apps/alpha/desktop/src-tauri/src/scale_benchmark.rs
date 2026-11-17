@@ -32,7 +32,12 @@ fn size(path: &Path) -> u64 {
 fn measure_large_search(db_path: &Path, room_count: usize, short: &str, long: &str, time: &str) {
     let mut db = rusqlite::Connection::open(db_path).unwrap();
     let tx = db.transaction().unwrap();
-    for n in room_count..5000 {
+    let target = std::env::var("MOMSO_SCALE_TARGET_ROOMS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= room_count && *v <= 5000)
+        .unwrap_or(5000);
+    for n in room_count..target {
         if n % 500 == 0 {
             println!("BENCH generating_rooms={n}");
         }
@@ -64,28 +69,83 @@ fn measure_large_search(db_path: &Path, room_count: usize, short: &str, long: &s
             "BENCH previous_synchronous_index_ms={}",
             start.elapsed().as_millis()
         );
-        db.execute_batch("DROP TRIGGER chat_message_search_delete; DROP TRIGGER chat_message_search_move; DROP TRIGGER chat_message_search_update; DROP TABLE chat_message_search_vocab; DROP TABLE chat_message_search; DROP TABLE chat_message_search_map; DROP TABLE chat_search_index_state; DELETE FROM app_schema_migrations WHERE version IN (89,92); PRAGMA user_version=88;").unwrap();
+        if std::env::var_os("MOMSO_SCALE_LEGACY_UPGRADE").is_some() {
+            db.execute_batch("DROP TRIGGER chat_message_search_delete; DROP TRIGGER chat_message_search_move; DROP TRIGGER chat_message_search_update; DROP TABLE chat_message_search_vocab; DROP TABLE chat_message_search; DROP TABLE chat_message_search_map; DROP TABLE chat_search_index_state; DELETE FROM app_schema_migrations WHERE version IN (89,92); PRAGMA user_version=88;").unwrap();
+            drop(db);
+            let start = Instant::now();
+            crate::storage::initialize(
+                db_path,
+                &db_path.parent().unwrap().join("upgrade-backups"),
+                "fixture",
+            )
+            .unwrap();
+            println!(
+                "BENCH deferred_upgrade_start_ms={}",
+                start.elapsed().as_millis()
+            );
+            let db = rusqlite::Connection::open(db_path).unwrap();
+            let (ready, count): (bool,i64) = db.query_row("SELECT ready,(SELECT count(*) FROM chat_message_search_map) FROM chat_search_index_state WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert!(!ready);
+            assert_eq!(count, 0);
+            drop(db);
+            let start = Instant::now();
+            assert!(!crate::chat_search_index::batch(db_path, 128).unwrap());
+            println!(
+                "BENCH deferred_first_batch_ms={}",
+                start.elapsed().as_millis()
+            );
+            return;
+        }
         drop(db);
+        let start = Instant::now();
+        let rooms = crate::chat::list(db_path).unwrap();
+        println!(
+            "BENCH list_{target}_ms={} count={}",
+            start.elapsed().as_millis(),
+            rooms.len()
+        );
+        let first = "chat_00000000-0000-4000-8000-000000000000";
+        let start = Instant::now();
+        let _ = crate::chat::read(db_path, first).unwrap();
+        println!("BENCH read_{target}_ms={}", start.elapsed().as_millis());
+        let start = Instant::now();
+        let _ = crate::chat::search_page(db_path, "detailed instruction", 0).unwrap();
+        println!("BENCH search_{target}_ms={}", start.elapsed().as_millis());
+        let start = Instant::now();
+        let _ = crate::archive_zet::list(db_path, None, None).unwrap();
+        println!("BENCH archive_{target}_ms={}", start.elapsed().as_millis());
         let start = Instant::now();
         crate::storage::initialize(
             db_path,
-            &db_path.parent().unwrap().join("upgrade-backups"),
+            &db_path.parent().unwrap().join("normal-backups"),
             "fixture",
         )
         .unwrap();
         println!(
-            "BENCH deferred_upgrade_start_ms={}",
+            "BENCH normal_indexed_start_ms={}",
             start.elapsed().as_millis()
         );
         let db = rusqlite::Connection::open(db_path).unwrap();
-        let (ready, count): (bool,i64) = db.query_row("SELECT ready,(SELECT count(*) FROM chat_message_search_map) FROM chat_search_index_state WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert!(!ready);
-        assert_eq!(count, 0);
+        db.execute_batch("DROP TABLE chat_redaction_preserved; DELETE FROM app_schema_migrations WHERE version=93; PRAGMA user_version=92;").unwrap();
         drop(db);
         let start = Instant::now();
-        assert!(!crate::chat_search_index::batch(db_path, 128).unwrap());
+        let mut previous = Instant::now();
+        crate::storage::initialize_with_progress(
+            db_path,
+            &db_path.parent().unwrap().join("upgrade-backups"),
+            "fixture",
+            |progress| {
+                println!(
+                    "BENCH upgrade_to_{}_ms={}",
+                    progress.state,
+                    previous.elapsed().as_millis()
+                );
+                previous = Instant::now();
+            },
+        )
+        .unwrap();
         println!(
-            "BENCH deferred_first_batch_ms={}",
+            "BENCH version_93_upgrade_start_ms={}",
             start.elapsed().as_millis()
         );
         return;
@@ -218,6 +278,9 @@ fn synthetic_year_capacity() {
     }
     let short = "synthetic lesson context ".repeat(12);
     let long = "synthetic detailed instruction and explanation ".repeat(90);
+    let uniform_messages = std::env::var("MOMSO_SCALE_UNIFORM_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
     for n in 0..room_count {
         let id = format!("chat_{n:08x}-0000-4000-8000-{n:012x}");
         tx.execute(
@@ -225,7 +288,8 @@ fn synthetic_year_capacity() {
             rusqlite::params![id, format!("fixture room {n}"), time],
         )
         .unwrap();
-        for m in 0..if n == 0 { 1000 } else { 200 } {
+        let messages = uniform_messages.unwrap_or(if n == 0 { 1000 } else { 200 });
+        for m in 0..messages {
             tx.execute(
                 "INSERT INTO chat_messages(id,chat_id,role,text,created_at) VALUES(?1,?2,?3,?4,?5)",
                 rusqlite::params![
@@ -241,7 +305,7 @@ fn synthetic_year_capacity() {
     }
     tx.commit().unwrap();
     drop(db);
-    println!("BENCH dataset rooms={room_count} messages={} documents={document_count} asset_ids={asset_count} terms={term_count}", (room_count - 1) * 200 + 1000);
+    println!("BENCH dataset rooms={room_count} messages={} documents={document_count} asset_ids={asset_count} terms={term_count}", uniform_messages.map_or((room_count - 1) * 200 + 1000, |messages| room_count * messages));
     if std::env::var_os("MOMSO_SCALE_SEARCH_ONLY").is_some() {
         measure_large_search(&db_path, room_count, &short, &long, time);
         return;

@@ -195,7 +195,12 @@ fn deletion_marker<'a>(
     Ok(deleted_at)
 }
 
-fn write_deletion(root: &Path, db: &Path, id: &str, deleted_at: &str) -> Result<(), &'static str> {
+pub(crate) fn write_deletion(
+    root: &Path,
+    db: &Path,
+    id: &str,
+    deleted_at: &str,
+) -> Result<(), &'static str> {
     let _guard = WRITE_LOCK.lock().map_err(|_| "unavailable")?;
     write_deletion_unlocked(root, db, id, deleted_at)
 }
@@ -250,7 +255,7 @@ fn write_deletion_unlocked(
     Ok(())
 }
 
-fn deleted_at(database: &Path, id: &str) -> Result<Option<String>, &'static str> {
+pub(crate) fn deleted_at(database: &Path, id: &str) -> Result<Option<String>, &'static str> {
     use rusqlite::OptionalExtension;
     let db =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -264,7 +269,12 @@ fn deleted_at(database: &Path, id: &str) -> Result<Option<String>, &'static str>
     .map_err(|_| "storage_error")
 }
 
-fn write_known(root: &Path, db: &Path, id: &str, known: &[&str]) -> Result<(), &'static str> {
+pub(crate) fn write_known(
+    root: &Path,
+    db: &Path,
+    id: &str,
+    known: &[&str],
+) -> Result<(), &'static str> {
     let _guard = lock_store()?;
     if deleted_at(db, id)?.is_some() {
         return Err("chat_deleted");
@@ -288,9 +298,10 @@ fn write_known(root: &Path, db: &Path, id: &str, known: &[&str]) -> Result<(), &
             if data.pointer("/room/id").and_then(serde_json::Value::as_str) != Some(id) {
                 return Err("invalid_snapshot");
             }
-            crate::chat_archive_snapshot::restore_append(db, &data)?;
+            let safe = crate::chat_archive_snapshot::redact_historical_snapshot(&data, known)?;
+            crate::chat_archive_snapshot::restore_append(db, &safe)?;
             existing = Some(bytes);
-            Some(data)
+            Some(safe)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(io_failure("file", &error)),
@@ -320,17 +331,39 @@ fn write_known(root: &Path, db: &Path, id: &str, known: &[&str]) -> Result<(), &
                     .map(|id| (id, message))
             })
             .collect();
-        let keys = ["id", "chat_id", "role", "text", "created_at"];
-        if incoming.iter().any(|message| {
-            message
+        let keys = ["id", "chat_id", "role", "created_at"];
+        let conn =
+            rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|_| "storage_error")?;
+        for message in incoming {
+            use rusqlite::OptionalExtension;
+            let message_id = message
                 .get("id")
                 .and_then(serde_json::Value::as_str)
-                .and_then(|id| indexed.get(id))
-                .is_none_or(|local| keys.iter().any(|key| local.get(*key) != message.get(*key)))
-        }) {
-            return Err("restore_conflict");
+                .ok_or("invalid_snapshot")?;
+            let local = indexed.get(message_id).ok_or("restore_conflict")?;
+            if keys.iter().any(|key| local.get(*key) != message.get(*key)) {
+                return Err("restore_conflict");
+            }
+            if local.get("text") == message.get("text") {
+                continue;
+            }
+            let previous: Option<(String, String, String)> = conn.query_row("SELECT p.source_hash,p.safe_text,m.text FROM chat_redaction_preserved p JOIN chat_messages m ON m.id=p.field_id AND m.chat_id=p.chat_id WHERE p.chat_id=?1 AND p.field_kind='message' AND p.field_id=?2", rusqlite::params![id,message_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(|_| "storage_error")?;
+            let safe_change = previous.is_some_and(|(hash, previous, original)| {
+                hash != crate::chat_archive_tracking::text_fingerprint(&original)
+                    && message.get("text").and_then(serde_json::Value::as_str)
+                        == Some(
+                            crate::chat_archive_redact::redact_with_known(&previous, known)
+                                .text
+                                .as_str(),
+                        )
+            });
+            if !safe_change {
+                return Err("restore_conflict");
+            }
         }
     }
+    crate::chat_archive_snapshot::preserve_masked_fields(db, id, &data, known)?;
     let bytes = serde_json::to_vec(&data).map_err(|_| "file_other")?;
     if existing.as_deref() == Some(bytes.as_slice()) {
         return remember_snapshot(db, id, &bytes);
@@ -383,11 +416,16 @@ fn known_values_with(
             known.push(value);
         }
     }
+    let waiting = crate::redaction_wait::material_with(&|name| {
+        get_secret(name).map_err(|_| crate::credentials::CredentialError::ReadFailed)
+    })
+    .map_err(|_| "credentials_unavailable")?;
+    known.extend(waiting);
     Ok(known)
 }
 
 #[cfg(not(test))]
-fn known_values(data_root: &Path, database: &Path) -> Result<Vec<String>, &'static str> {
+pub(crate) fn known_values(data_root: &Path, database: &Path) -> Result<Vec<String>, &'static str> {
     known_values_with(
         data_root,
         database,
@@ -401,7 +439,7 @@ fn known_values(data_root: &Path, database: &Path) -> Result<Vec<String>, &'stat
 }
 
 #[cfg(test)]
-fn known_values(data_root: &Path, database: &Path) -> Result<Vec<String>, &'static str> {
+pub(crate) fn known_values(data_root: &Path, database: &Path) -> Result<Vec<String>, &'static str> {
     known_values_with(data_root, database, |_| Ok(None), |_| Err("unavailable"))
 }
 
@@ -420,18 +458,44 @@ pub(crate) fn write(
 }
 
 pub(crate) fn validate(root: &Path, database: &Path) -> Result<(), &'static str> {
-    let _guard = WRITE_LOCK.lock().map_err(|_| "unavailable")?;
+    validate_inner(root, database, false)
+}
+
+pub(crate) fn validate_inner(
+    root: &Path,
+    database: &Path,
+    per_file: bool,
+) -> Result<(), &'static str> {
+    let known = known_values(database.parent().ok_or("unavailable")?, database)?;
+    validate_with_known(root, database, per_file, &known)
+}
+
+pub(crate) fn validate_with_known(
+    root: &Path,
+    database: &Path,
+    per_file: bool,
+    known: &[String],
+) -> Result<(), &'static str> {
+    let _all = if per_file {
+        None
+    } else {
+        Some(WRITE_LOCK.lock().map_err(|_| "unavailable")?)
+    };
     let dir = root.join("chats");
     if !dir.exists() {
         return Ok(());
     }
     let dir = directory(root)?;
-    let known = known_values(database.parent().ok_or("unavailable")?, database)?;
     let refs: Vec<&str> = known.iter().map(String::as_str).collect();
     let db =
         rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|_| "storage_error")?;
     for entry in fs::read_dir(dir).map_err(|_| "unavailable")? {
+        let _guard = if per_file {
+            Some(WRITE_LOCK.lock().map_err(|_| "unavailable")?)
+        } else {
+            None
+        };
         let entry = entry.map_err(|_| "unavailable")?;
         let name = entry
             .file_name()
@@ -522,17 +586,40 @@ pub(crate) fn save_pending(
     resources: &Path,
     paths: &crate::runtime::RuntimePaths,
 ) -> Result<(), &'static str> {
+    save_pending_inner(root, resources, paths, false)
+}
+
+pub(crate) fn save_pending_for_push(
+    root: &Path,
+    resources: &Path,
+    paths: &crate::runtime::RuntimePaths,
+) -> Result<(), &'static str> {
+    save_pending_inner(root, resources, paths, true)
+}
+
+fn save_pending_inner(
+    root: &Path,
+    resources: &Path,
+    paths: &crate::runtime::RuntimePaths,
+    wait_for_credentials: bool,
+) -> Result<(), &'static str> {
     static SAVE_LOCK: Mutex<()> = Mutex::new(());
     let _save = SAVE_LOCK.lock().map_err(|_| "unavailable")?;
     crate::chat_archive_tracking::ensure_tracking(&paths.database_path)?;
     let proof_key = crate::chat_archive_tracking::proof_key()?;
-    let _credentials =
-        crate::credentials::prevent_secret_changes().map_err(|_| "credentials_unavailable")?;
+    let _credentials = if wait_for_credentials {
+        crate::credentials::prevent_secret_changes().map_err(|_| "credentials_unavailable")?
+    } else {
+        crate::credentials::try_prevent_secret_changes().map_err(|_| "redaction_pending")?
+    };
     let known = known_values(&paths.data_root, &paths.database_path)?;
     let proof = crate::chat_archive_tracking::proof(root, &known, &proof_key)?;
     let changes = crate::chat_archive_tracking::changes(&paths.database_path)?;
     let (git, _) = crate::git_tool::resolve().ok_or("git_missing")?;
     let saved_proof = crate::chat_archive_tracking::stored_proof(&paths.database_path)?;
+    if !known.is_empty() && saved_proof.as_deref() != Some(proof.as_str()) {
+        return Err("redaction_pending");
+    }
     let mut other_paths = vec![
         "zettels/",
         "receipts/",
@@ -551,54 +638,59 @@ pub(crate) fn save_pending(
             "git_not_repository"
         }
     })?;
-    if saved_proof.as_deref() != Some(proof.as_str())
-        || changes.len() > 64
-        || !other_changes.is_empty()
-        || crate::chat_archive_tracking::requires_full_retry(&paths.database_path)?
-    {
-        return save_pending_full(root, resources, paths, &git, &changes, &proof, &proof_key);
-    }
-    if changes.is_empty() {
-        return Ok(());
-    }
-    save_pending_changes(root, paths, &git, &changes, &known, &proof, &proof_key)
-}
-
-fn save_pending_full(
-    root: &Path,
-    resources: &Path,
-    paths: &crate::runtime::RuntimePaths,
-    git: &Path,
-    changes: &[(String, i64)],
-    proof: &str,
-    proof_key: &str,
-) -> Result<(), &'static str> {
-    write_all(root, paths)?;
-    let changed = crate::archive_remote::git(
-        git,
-        root,
-        &[
-            "status",
-            "--porcelain",
-            "--untracked-files=all",
-            "--",
-            "chats/",
-        ],
-    )
-    .map_err(|_| {
-        if root.join(".git").exists() {
-            "git_unavailable"
-        } else {
-            "git_not_repository"
+    if crate::chat_archive_tracking::requires_full_retry(&paths.database_path)? {
+        if !known.is_empty() {
+            return Err("redaction_pending");
         }
-    })?;
-    if !changed.is_empty() {
+        write_all(root, paths)?;
+        if crate::chat_archive_tracking::requires_full_retry(&paths.database_path)? {
+            return Err("unavailable");
+        }
+    }
+    if !other_changes.is_empty() {
         crate::archive::save(root, resources, &paths.database_path)
             .map_err(|_| "chat_archive_save_failed")?;
-    } else {
-        validate(root, &paths.database_path)?;
     }
-    verify_proof_and_finish(root, paths, changes, proof, proof_key)
+    for chunk in changes.chunks(32) {
+        save_pending_changes(root, paths, &git, chunk, &known)?;
+    }
+    verify_proof_and_finish(root, paths, &changes, &proof, &proof_key)
+}
+
+fn redaction_pending_known(
+    root: &Path,
+    db: &Path,
+    key: &str,
+    known: &[String],
+) -> Result<bool, &'static str> {
+    let saved = crate::chat_archive_tracking::stored_proof(db)?;
+    if known.is_empty() {
+        return Ok(false);
+    }
+    let proof = crate::chat_archive_tracking::proof(root, known, key)?;
+    Ok(saved.as_deref() != Some(proof.as_str()))
+}
+
+pub(crate) fn redaction_pending_with_key(root: &Path, db: &Path, key: &str) -> bool {
+    let Some(data_root) = db.parent() else {
+        return true;
+    };
+    let Ok(known) = known_values(data_root, db) else {
+        return true;
+    };
+    let Ok(proof) = crate::chat_archive_tracking::proof(root, &known, key) else {
+        return true;
+    };
+    !matches!(crate::chat_archive_tracking::stored_proof(db), Ok(Some(saved)) if saved == proof)
+}
+
+pub(crate) fn redaction_pending(root: &Path, db: &Path) -> Result<bool, &'static str> {
+    let key = crate::chat_archive_tracking::proof_key()?;
+    let _guard =
+        crate::credentials::prevent_secret_changes().map_err(|_| "credentials_unavailable")?;
+    let data_root = db.parent().ok_or("storage_error")?;
+    let known = known_values(data_root, db)?;
+    redaction_pending_known(root, db, &key, &known)
 }
 
 fn verify_proof_and_finish(
@@ -625,8 +717,6 @@ fn save_pending_changes(
     git: &Path,
     changes: &[(String, i64)],
     known: &[String],
-    proof: &str,
-    proof_key: &str,
 ) -> Result<(), &'static str> {
     #[cfg(test)]
     let mut redaction_time = std::time::Duration::ZERO;
@@ -705,13 +795,17 @@ fn save_pending_changes(
             }
         }
     }
-    verify_proof_and_finish(root, paths, changes, proof, proof_key)
+    Ok(())
 }
 
 pub(crate) fn remove(root: &Path, database: &Path, id: &str) -> Result<(), &'static str> {
     let deleted_at = deleted_at(database, id)?.ok_or("storage_error")?;
     write_deletion(root, database, id, &deleted_at)?;
-    set_pending(database, &format!("chat_archive_delete:{id}"), false)
+    if crate::archive_remote::first_receive_pending(root, database) {
+        Ok(())
+    } else {
+        set_pending(database, &format!("chat_archive_delete:{id}"), false)
+    }
 }
 
 pub(crate) fn restore(root: &Path, db: &Path) -> Result<(), &'static str> {
@@ -738,6 +832,11 @@ pub(crate) struct RestoreProgress {
     pub(crate) available: bool,
 }
 
+fn message_is_represented(local: &str, incoming: &str, known: &[&str]) -> bool {
+    local == incoming
+        || crate::chat_archive_redact::redact_with_known(local, known).text == incoming
+}
+
 pub(crate) fn restore_with_progress(
     root: &Path,
     db: &Path,
@@ -747,6 +846,11 @@ pub(crate) fn restore_with_progress(
     let mut completed = 0;
     let result = (|| {
         retry_deletions(root, db)?;
+        let known = db
+            .parent()
+            .and_then(|parent| known_values(parent, db).ok())
+            .unwrap_or_default();
+        let known_refs: Vec<&str> = known.iter().map(String::as_str).collect();
         let _guard = WRITE_LOCK.lock().map_err(|_| "unavailable")?;
         let root_meta = fs::symlink_metadata(root).map_err(|_| "unavailable")?;
         if !root_meta.is_dir() || crate::archive_location::is_link_or_reparse(&root_meta) {
@@ -798,9 +902,9 @@ pub(crate) fn restore_with_progress(
             {
                 return Err("invalid_snapshot");
             }
+            let bytes = fs::read(entry.path()).map_err(|_| "unavailable")?;
             let data: serde_json::Value =
-                serde_json::from_slice(&fs::read(entry.path()).map_err(|_| "unavailable")?)
-                    .map_err(|_| "invalid_snapshot")?;
+                serde_json::from_slice(&bytes).map_err(|_| "invalid_snapshot")?;
             if let Some(deleted_at) = deletion_marker(&data, id)? {
                 deletions.push((id.to_owned(), deleted_at.to_owned()));
                 completed += 1;
@@ -816,6 +920,48 @@ pub(crate) fn restore_with_progress(
                 return Err("invalid_snapshot");
             }
             crate::chat_archive_snapshot::restore_append_in_transaction(&tx, &data)?;
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1)",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "storage_error")?;
+            if !exists {
+                tx.execute(
+                    "DELETE FROM app_runtime_meta WHERE key=?1",
+                    [snapshot_hash_key(id)],
+                )
+                .map_err(|_| "storage_error")?;
+            }
+            let mut represented = exists;
+            for message in data["messages"]
+                .as_array()
+                .ok_or("invalid_snapshot")?
+                .iter()
+                .filter(|_| exists)
+            {
+                let message_id = message["id"].as_str().ok_or("invalid_snapshot")?;
+                let incoming = message["text"].as_str().ok_or("invalid_snapshot")?;
+                let local: String = tx
+                    .query_row(
+                        "SELECT text FROM chat_messages WHERE id=?1 AND chat_id=?2",
+                        rusqlite::params![message_id, id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| "storage_error")?;
+                if !message_is_represented(&local, incoming, &known_refs) {
+                    represented = false;
+                    break;
+                }
+            }
+            if represented {
+                tx.execute(
+                    "INSERT INTO app_runtime_meta(key,value,updated_at) VALUES(?1,?2,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP",
+                    rusqlite::params![snapshot_hash_key(id), crate::object_store::digest(&bytes)],
+                )
+                .map_err(|_| "storage_error")?;
+            }
             completed += 1;
             progress(RestoreProgress {
                 completed,
@@ -848,6 +994,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_credentials_wait_for_short_lock_contention() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "fixture").unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = crate::credentials::prevent_secret_changes().unwrap();
+            ready_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
+        ready_rx.recv().unwrap();
+        let pending = redaction_pending(temp.path(), &db);
+        holder.join().unwrap();
+        assert_eq!(pending, Ok(false));
+    }
+
+    #[test]
+    fn missing_proof_without_keys_does_not_block_but_errors_remain_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "fixture").unwrap();
+        assert_eq!(
+            redaction_pending_known(temp.path(), &db, "fixture-key", &[]),
+            Ok(false)
+        );
+        assert_eq!(
+            redaction_pending_known(temp.path(), &db, "fixture-key", &["fixture-secret".into()]),
+            Ok(true)
+        );
+        assert_eq!(
+            redaction_pending_known(
+                temp.path(),
+                &temp.path().join("missing.db"),
+                "fixture-key",
+                &[]
+            ),
+            Err("storage_error")
+        );
+    }
+
+    #[test]
+    fn received_known_secret_matches_only_after_redaction() {
+        let original = "lesson fixture-private-value";
+        let masked =
+            crate::chat_archive_redact::redact_with_known(original, &["fixture-private-value"])
+                .text;
+        assert!(message_is_represented(
+            original,
+            &masked,
+            &["fixture-private-value"]
+        ));
+        assert!(!message_is_represented(original, &masked, &[]));
+        assert!(!message_is_represented(
+            "different text",
+            &masked,
+            &["fixture-private-value"]
+        ));
+    }
+
+    #[test]
     fn incremental_save_tracks_only_changed_room_and_preserves_unrelated_staging() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -875,6 +1081,10 @@ mod tests {
         crate::chat::append(&db, id2, crate::chat::Role::User, "second", None, None).unwrap();
         write_all(&archive, &paths).unwrap();
         crate::archive::save(&archive, root, &db).unwrap();
+        while !crate::chat_redaction_recheck::step(&archive, &paths)
+            .unwrap()
+            .available
+        {}
         save_pending(&archive, root, &paths).unwrap();
         assert!(crate::chat_archive_tracking::changes(&db)
             .unwrap()
@@ -891,11 +1101,23 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        assert_eq!(
-            save_pending(&archive, root, &paths),
-            Err("invalid_snapshot")
-        );
+        let mut found_error = None;
+        for _ in 0..3 {
+            match crate::chat_redaction_recheck::step(&archive, &paths) {
+                Ok(progress) if progress.available => break,
+                Ok(_) => {}
+                Err(error) => {
+                    found_error = Some(error);
+                    break;
+                }
+            }
+        }
+        assert_eq!(found_error, Some("invalid_snapshot"));
         fs::write(&untouched, &original).unwrap();
+        while !crate::chat_redaction_recheck::step(&archive, &paths)
+            .unwrap()
+            .available
+        {}
         save_pending(&archive, root, &paths).unwrap();
         assert!(!fs::read_to_string(&untouched).unwrap().contains(&fake_key));
         fs::write(archive.join("outside-stage"), "fixture").unwrap();
@@ -1104,6 +1326,95 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    #[tokio::test]
+    async fn received_snapshot_can_be_deleted_without_rewriting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let remote = root.join("remote.db");
+        let local = root.join("local.db");
+        crate::storage::initialize(&remote, &root.join("remote-backups"), "test").unwrap();
+        crate::storage::initialize(&local, &root.join("local-backups"), "test").unwrap();
+        let archive = root.join("momso");
+        fs::create_dir(&archive).unwrap();
+        let room = serde_json::to_value(crate::chat::create(&remote).unwrap()).unwrap();
+        let id = room["id"].as_str().unwrap();
+        write_known(&archive, &remote, id, &[]).unwrap();
+        restore(&archive, &local).unwrap();
+        crate::chat::append(&remote, id, crate::chat::Role::User, "received", None, None).unwrap();
+        write_known(&archive, &remote, id, &[]).unwrap();
+        restore(&archive, &local).unwrap();
+        assert_eq!(
+            serde_json::to_value(crate::chat::read(&local, id).unwrap()).unwrap()["messages"][0]
+                ["text"],
+            "received"
+        );
+        let deleted =
+            crate::chat::delete_with(&local, &Default::default(), id, |_| async { Ok(()) }).await;
+        assert_eq!(serde_json::to_value(deleted).unwrap()["state"], "deleted");
+        remove(&archive, &local, id).unwrap();
+        let marker: serde_json::Value = serde_json::from_slice(
+            &fs::read(archive.join("chats").join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn changed_message_with_same_id_is_not_acknowledged_for_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let remote = root.join("remote.db");
+        let local = root.join("local.db");
+        crate::storage::initialize(&remote, &root.join("remote-backups"), "test").unwrap();
+        crate::storage::initialize(&local, &root.join("local-backups"), "test").unwrap();
+        let archive = root.join("momso");
+        fs::create_dir(&archive).unwrap();
+        let room = serde_json::to_value(crate::chat::create(&remote).unwrap()).unwrap();
+        let id = room["id"].as_str().unwrap();
+        crate::chat::append(&remote, id, crate::chat::Role::User, "original", None, None).unwrap();
+        write_known(&archive, &remote, id, &[]).unwrap();
+        restore(&archive, &local).unwrap();
+        let copy = archive.join("chats").join(format!("{id}.json"));
+        let mut incoming: serde_json::Value =
+            serde_json::from_slice(&fs::read(&copy).unwrap()).unwrap();
+        incoming["messages"][0]["text"] = serde_json::json!("different remote text");
+        let bytes = serde_json::to_vec(&incoming).unwrap();
+        fs::write(&copy, &bytes).unwrap();
+        restore(&archive, &local).unwrap();
+        let deleted =
+            crate::chat::delete_with(&local, &Default::default(), id, |_| async { Ok(()) }).await;
+        assert_eq!(serde_json::to_value(deleted).unwrap()["state"], "deleted");
+        assert_eq!(remove(&archive, &local, id), Err("chat_deletion_conflict"));
+        assert_eq!(fs::read(&copy).unwrap(), bytes);
+    }
+
+    #[test]
+    fn received_room_can_be_renamed_pinned_and_archived() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let remote = root.join("remote.db");
+        let local = root.join("local.db");
+        crate::storage::initialize(&remote, &root.join("remote-backups"), "test").unwrap();
+        crate::storage::initialize(&local, &root.join("local-backups"), "test").unwrap();
+        let archive = root.join("momso");
+        fs::create_dir(&archive).unwrap();
+        let room = serde_json::to_value(crate::chat::create(&remote).unwrap()).unwrap();
+        let id = room["id"].as_str().unwrap();
+        write_known(&archive, &remote, id, &[]).unwrap();
+        restore(&archive, &local).unwrap();
+        crate::chat::rename(&local, id, "renamed").unwrap();
+        assert_eq!(crate::chat::set_pinned(&local, id, true).state, "ok");
+        assert_eq!(crate::chat::set_archived(&local, id, true).state, "ok");
+        write_known(&archive, &local, id, &[]).unwrap();
+        let copy: serde_json::Value = serde_json::from_slice(
+            &fs::read(archive.join("chats").join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(copy["room"]["title"], "renamed");
+        assert!(!copy["room"]["pinned_order"].is_null());
+        assert!(!copy["room"]["archived_at"].is_null());
+    }
+
     #[test]
     fn failed_restore_keeps_received_snapshot_until_successful_retry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1218,6 +1529,42 @@ mod tests {
             (event.completed, event.total, event.state, event.available),
             (1, 1, "complete", true)
         );
+    }
+
+    #[test]
+    fn changed_redacted_source_uses_current_keys_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fixture.sqlite");
+        crate::storage::initialize(&db, &dir.path().join("backups"), "test").unwrap();
+        let room = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
+        let id = room["id"].as_str().unwrap();
+        let old = "fixture-opaque-old-value";
+        let current = "fixture-opaque-current-value";
+        let message = serde_json::to_value(
+            crate::chat::append(&db, id, crate::chat::Role::User, old, None, None).unwrap(),
+        )
+        .unwrap();
+        let message_id = message["id"].as_str().unwrap();
+        write_known(dir.path(), &db, id, &[old]).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE chat_messages SET text=?1 WHERE id=?2",
+            rusqlite::params![format!("changed {old} {current}"), message_id],
+        )
+        .unwrap();
+        write_known(dir.path(), &db, id, &[old, current]).unwrap();
+        let path = dir.path().join("chats").join(format!("{id}.json"));
+        let copy = fs::read_to_string(&path).unwrap();
+        assert!(!copy.contains(old) && !copy.contains(current));
+        conn.execute(
+            "UPDATE chat_messages SET text=?1 WHERE id=?2",
+            rusqlite::params![format!("changed again {old} {current}"), message_id],
+        )
+        .unwrap();
+        write_known(dir.path(), &db, id, &[current]).unwrap();
+        let copy = fs::read_to_string(path).unwrap();
+        assert!(copy.contains(old));
+        assert!(!copy.contains(current));
     }
 
     #[test]

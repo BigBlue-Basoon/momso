@@ -19,8 +19,10 @@ $cargoCache = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $origina
 $rustupCache = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $originalProfile '.rustup' }
 Push-Location $root
 try {
-    $dirty = & $git status --porcelain=v1 --untracked-files=no
-    if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Commit or preserve workspace changes before testing HEAD.' }
+    & $git diff --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Commit or preserve workspace changes before testing HEAD.' }
+    & $git diff --cached --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Commit or preserve staged changes before testing HEAD.' }
     $head = & $git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read the commit.' }
     New-Item -ItemType Directory -Path $copy | Out-Null

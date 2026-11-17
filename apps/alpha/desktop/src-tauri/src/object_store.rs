@@ -160,6 +160,7 @@ fn validate(input: &ConnectInput) -> Result<Config, &'static str> {
         || url.query().is_some()
         || url.fragment().is_some()
         || url.path() != "/"
+        || !public_literal_host(&url)
     {
         return Err("invalid_endpoint");
     }
@@ -205,6 +206,49 @@ fn validate(input: &ConnectInput) -> Result<Config, &'static str> {
         return Err("invalid_endpoint");
     }
     Ok(config)
+}
+
+pub(crate) fn public_literal_host(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return false;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let [a, b, _, _] = ip.octets();
+            !(ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || a == 0
+                || (a == 100 && (64..=127).contains(&b)))
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return public_literal_host(
+                    &reqwest::Url::parse(&format!("https://{mapped}/")).expect("IPv4 URL"),
+                );
+            }
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local())
+        }
+        Err(_) => true,
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1106,6 +1150,43 @@ mod tests {
         assert!(!json.contains("secret-example"));
         input.endpoint = "https://user:password@example.com".into();
         assert!(matches!(validate(&input), Err("invalid_endpoint")));
+    }
+
+    #[test]
+    fn custom_endpoint_rejects_local_literals_and_embedded_credentials() {
+        let mut input = ConnectInput {
+            provider: "s3_compatible".into(),
+            endpoint: "https://storage.example.test".into(),
+            region: "auto".into(),
+            bucket: "fixture-bucket".into(),
+            access_key_id: "fixture-id".into(),
+            secret_access_key: "fixture-secret".into(),
+        };
+        assert!(validate(&input).is_ok());
+        for address in [
+            "http://example.test",
+            "file:///tmp/file",
+            "javascript:alert(1)",
+            "https://localhost",
+            "https://LOCALHOST.",
+            "https://service.localhost",
+            "https://127.0.0.1",
+            "https://127.1",
+            "https://169.254.169.254",
+            "https://10.1.2.3",
+            "https://192.168.0.2",
+            "https://100.64.1.2",
+            "https://[::1]",
+            "https://[::ffff:127.0.0.1]",
+            "https://[fe80::1]",
+            "https://user:pass@example.com",
+        ] {
+            input.endpoint = address.into();
+            assert!(
+                matches!(validate(&input), Err("invalid_endpoint")),
+                "{address}"
+            );
+        }
     }
 
     #[test]

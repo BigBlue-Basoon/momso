@@ -9,14 +9,176 @@ use std::{
 use tauri::{Emitter, Manager, State};
 
 static REMOTE_LOCK: Mutex<()> = Mutex::new(());
+static FIRST_RECEIVE_PROGRESS: Mutex<Vec<(PathBuf, PathBuf, FirstReceiveProgress)>> =
+    Mutex::new(Vec::new());
 const REMOTE: &str = "momso";
+pub(crate) const FIRST_RECEIVE_JOURNAL: &str = "first_receive_v1";
+
+pub(crate) fn lock_remote_for_restore() -> Result<std::sync::MutexGuard<'static, ()>, &'static str>
+{
+    REMOTE_LOCK.lock().map_err(|_| "busy")
+}
+
+pub(crate) fn lock_first_receive(db: &Path) -> Result<fs::File, &'static str> {
+    let lock_path = db
+        .parent()
+        .ok_or("local_state_unavailable")?
+        .join(".momso-first-receive.lock");
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path) {
+        if !metadata.file_type().is_file() {
+            return Err("local_state_unavailable");
+        }
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|_| "local_state_unavailable")?;
+    file.try_lock().map_err(|_| "busy")?;
+    Ok(file)
+}
+
+fn receive_marker_present(root: &Path) -> bool {
+    !matches!(fs::symlink_metadata(root.join(".git/momso-first-receive-in-progress")), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiveJournal {
+    root: PathBuf,
+    target: String,
+    branch: String,
+    phase: String,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    has_defaults: Option<bool>,
+    #[serde(default)]
+    restore_intents: Vec<String>,
+    #[serde(default)]
+    restore_done: Vec<String>,
+    #[serde(default)]
+    deleted_chats: Vec<String>,
+}
+
+fn read_receive_journal(db: &Path) -> Result<Option<ReceiveJournal>, &'static str> {
+    let conn = Connection::open(db).map_err(|_| "local_state_unavailable")?;
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_runtime_meta WHERE key=?1",
+            [FIRST_RECEIVE_JOURNAL],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| "local_state_unavailable")?;
+    value
+        .map(|value| serde_json::from_str(&value).map_err(|_| "first_receive_interrupted"))
+        .transpose()
+}
+
+fn write_receive_journal(db: &Path, journal: &ReceiveJournal) -> Result<(), &'static str> {
+    let value = serde_json::to_string(journal).map_err(|_| "local_state_unavailable")?;
+    Connection::open(db).and_then(|conn| conn.execute(
+        "INSERT INTO app_runtime_meta(key,value,updated_at) VALUES(?1,?2,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+        rusqlite::params![FIRST_RECEIVE_JOURNAL, value],
+    )).map_err(|_| "local_state_unavailable")?;
+    Ok(())
+}
+
+fn remember_chat_deletions(db: &Path, journal: &mut ReceiveJournal) -> Result<(), &'static str> {
+    let connection = Connection::open(db).map_err(|_| "local_state_unavailable")?;
+    let mut statement = connection
+        .prepare(
+            "SELECT substr(key,21) FROM app_runtime_meta WHERE key GLOB 'chat_archive_delete:*'",
+        )
+        .map_err(|_| "local_state_unavailable")?;
+    let ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| "local_state_unavailable")?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "local_state_unavailable")?;
+    drop(statement);
+    drop(connection);
+    let mut changed = false;
+    for id in ids {
+        if !crate::archive_receipt::valid_chat_id(&id) {
+            return Err("first_receive_interrupted");
+        }
+        if !journal.deleted_chats.contains(&id) {
+            journal.deleted_chats.push(id);
+            changed = true;
+        }
+    }
+    if changed {
+        write_receive_journal(db, journal)?;
+    }
+    Ok(())
+}
+
+fn finish_receive_journal(db: &Path) -> Result<(), &'static str> {
+    Connection::open(db)
+        .and_then(|conn| {
+            conn.execute(
+                "DELETE FROM app_runtime_meta WHERE key=?1",
+                [FIRST_RECEIVE_JOURNAL],
+            )
+        })
+        .map_err(|_| "local_state_unavailable")?;
+    Ok(())
+}
+
+fn begin_receive_journal(
+    db: &Path,
+    root: &Path,
+    target: &str,
+    branch: &str,
+) -> Result<ReceiveJournal, &'static str> {
+    if let Some(mut journal) = read_receive_journal(db)? {
+        if journal.root != root || journal.target != target {
+            return Err("first_receive_interrupted");
+        }
+        if journal.phase == "discovering" && journal.branch.is_empty() {
+            journal.branch = branch.to_owned();
+            journal.phase = "receiving".to_owned();
+            write_receive_journal(db, &journal)?;
+        }
+        if journal.branch != branch {
+            return Err("first_receive_interrupted");
+        }
+        if !matches!(
+            journal.phase.as_str(),
+            "receiving" | "checkout" | "indexing" | "restoring"
+        ) {
+            return Err("first_receive_interrupted");
+        }
+        return Ok(journal);
+    }
+    let journal = ReceiveJournal {
+        root: root.to_path_buf(),
+        target: target.to_owned(),
+        branch: branch.to_owned(),
+        phase: "receiving".to_owned(),
+        revision: None,
+        has_defaults: None,
+        restore_intents: Vec::new(),
+        restore_done: Vec::new(),
+        deleted_chats: Vec::new(),
+    };
+    write_receive_journal(db, &journal)?;
+    Ok(journal)
+}
 
 #[derive(Clone, Serialize)]
-struct FirstReceiveProgress {
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FirstReceiveProgress {
     completed: usize,
     total: usize,
     state: &'static str,
     available: bool,
+    reason: Option<&'static str>,
+    conflict_paths: Vec<String>,
 }
 
 fn receive_progress(
@@ -29,7 +191,126 @@ fn receive_progress(
         total: 3,
         state,
         available,
+        reason: None,
+        conflict_paths: Vec::new(),
     }
+}
+
+fn remember_receive_progress(root: &Path, db: &Path, progress: &FirstReceiveProgress) {
+    if let Ok(mut states) = FIRST_RECEIVE_PROGRESS.lock() {
+        states.retain(|(stored_root, stored_db, _)| stored_root != root || stored_db != db);
+        states.push((root.to_path_buf(), db.to_path_buf(), progress.clone()));
+    }
+}
+
+fn files_equal(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut left = fs::File::open(left)?;
+    let mut right = fs::File::open(right)?;
+    if left.metadata()?.len() != right.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut a = [0_u8; 16384];
+    let mut b = [0_u8; 16384];
+    loop {
+        let count = left.read(&mut a)?;
+        right.read_exact(&mut b[..count])?;
+        if a[..count] != b[..count] {
+            return Ok(false);
+        }
+        if count == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+// Only inspect the already validated recovery directory. Never move or remove
+// the user's file while reporting a collision.
+fn saved_default_conflicts(root: &Path) -> Vec<String> {
+    let marker = root.join(".git/momso-first-receive-in-progress");
+    let Ok(meta) = fs::symlink_metadata(&marker) else {
+        return Vec::new();
+    };
+    if !meta.is_file() || crate::archive_location::is_link_or_reparse(&meta) || meta.len() > 128 {
+        return Vec::new();
+    }
+    let Ok(name) = fs::read_to_string(marker) else {
+        return Vec::new();
+    };
+    let Some(id) = name.strip_prefix("momso-first-pull-") else {
+        return Vec::new();
+    };
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Vec::new();
+    }
+    let saved = root.join(".git").join(name);
+    if !fs::symlink_metadata(&saved)
+        .is_ok_and(|m| m.is_dir() && !crate::archive_location::is_link_or_reparse(&m))
+    {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(&saved)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(&saved) else {
+            continue;
+        };
+        let mut ancestor = root.to_path_buf();
+        let mut unsafe_parent = false;
+        if let Some(parent) = relative.parent() {
+            for part in parent.components() {
+                ancestor.push(part.as_os_str());
+                if fs::symlink_metadata(&ancestor)
+                    .is_ok_and(|m| crate::archive_location::is_link_or_reparse(&m))
+                {
+                    unsafe_parent = true;
+                    break;
+                }
+            }
+        }
+        if unsafe_parent {
+            paths.push(relative.to_string_lossy().replace('\\', "/"));
+            continue;
+        }
+        let destination = root.join(relative);
+        let Ok(meta) = fs::symlink_metadata(&destination) else {
+            continue;
+        };
+        if !meta.is_file()
+            || crate::archive_location::is_link_or_reparse(&meta)
+            || !files_equal(entry.path(), &destination).unwrap_or(false)
+        {
+            paths.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn receive_failure_progress(root: &Path, error: &'static str) -> FirstReceiveProgress {
+    let mut value = receive_progress(
+        if error == "first_receive_interrupted" {
+            "interrupted"
+        } else {
+            "failed"
+        },
+        0,
+        false,
+    );
+    if error == "first_receive_interrupted" {
+        value.conflict_paths = saved_default_conflicts(root);
+        if !value.conflict_paths.is_empty() {
+            value.reason = Some("first_receive_conflict");
+        }
+    }
+    value
 }
 
 #[derive(Debug, Serialize)]
@@ -488,6 +769,8 @@ pub(crate) struct RemoteStatus {
     auto_merged: bool,
     preserved_documents: Vec<String>,
     conflict_paths: Option<Vec<String>>,
+    uploaded_key_found: Option<bool>,
+    expired_key_warning: Option<bool>,
 }
 
 impl RemoteStatus {
@@ -506,10 +789,17 @@ impl RemoteStatus {
             auto_merged: false,
             preserved_documents: Vec::new(),
             conflict_paths: None,
+            uploaded_key_found: None,
+            expired_key_warning: crate::redaction_wait::counts()
+                .ok()
+                .map(|(_, expired)| expired > 0),
         }
     }
 
     fn transfer_error(error: &'static str) -> Self {
+        if error == "redaction_required" {
+            return Self::new("redactionRequired", Some(error));
+        }
         let state = if matches!(
             error,
             "remote_ahead" | "diverged" | "unsaved_changes" | "unsafe_history"
@@ -683,6 +973,10 @@ fn git_index(tool: &Path, root: &Path, index: &Path, args: &[&str]) -> Result<St
 }
 
 fn git_hash_object(tool: &Path, root: &Path, content: &[u8]) -> Result<String, ()> {
+    git_hash_typed(tool, root, "blob", content)
+}
+
+fn git_hash_typed(tool: &Path, root: &Path, kind: &str, content: &[u8]) -> Result<String, ()> {
     use std::io::Write;
     let mut child = hidden(&mut Command::new(tool))
         .current_dir(root)
@@ -698,7 +992,7 @@ fn git_hash_object(tool: &Path, root: &Path, content: &[u8]) -> Result<String, (
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .args(["hash-object", "-w", "--stdin"])
+        .args(["hash-object", "-t", kind, "-w", "--stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1023,25 +1317,476 @@ pub(crate) fn receive_connected(
     target: &str,
     branch: &str,
 ) -> Result<(), &'static str> {
-    receive_connected_with_progress(tool, root, db, target, branch, None)
+    receive_connected_with_progress::<tauri::test::MockRuntime>(
+        tool, root, db, target, branch, None,
+    )
 }
 
-fn receive_connected_with_progress(
+fn receive_connected_with_progress<R: tauri::Runtime>(
     tool: &Path,
     root: &Path,
     db: &Path,
     target: &str,
     branch: &str,
-    app: Option<&tauri::AppHandle>,
+    app: Option<&tauri::AppHandle<R>>,
 ) -> Result<(), &'static str> {
+    let pending = read_receive_journal(db)?;
+    let first = pending.is_some() || git(tool, root, &["rev-parse", "--verify", "HEAD"]).is_err();
+    if first {
+        let result = receive_first_with_progress(
+            tool,
+            root,
+            db,
+            target,
+            branch,
+            |progress| {
+                if let Some(app) = app {
+                    let _ = app.emit("archive-first-receive-progress", progress);
+                }
+            },
+            || {
+                if let Some(app) = app {
+                    crate::chat_archive_store::restore_emitting(root, db, app)
+                } else {
+                    crate::chat_archive_store::restore(root, db)
+                }
+            },
+        );
+        if let Err(error) = result {
+            let value = receive_failure_progress(root, error);
+            remember_receive_progress(root, db, &value);
+            if let Some(app) = app {
+                let _ = app.emit("archive-first-receive-progress", value);
+            }
+        }
+        return result;
+    }
     transfer(tool, root, target, branch, "pull")?;
     crate::archive::reindex(root, db).map_err(|_| "reindex_failed")?;
     if let Some(app) = app {
-        crate::chat_archive_store::restore_emitting(root, db, app)?;
+        crate::chat_archive_store::restore_emitting(root, db, app)
     } else {
-        crate::chat_archive_store::restore(root, db)?;
+        crate::chat_archive_store::restore(root, db)
     }
+}
+
+fn receive_first_with_progress(
+    tool: &Path,
+    root: &Path,
+    db: &Path,
+    target: &str,
+    branch: &str,
+    progress: impl FnMut(FirstReceiveProgress),
+    restore: impl FnMut() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let _lock = lock_first_receive(db)?;
+    receive_first_locked(tool, root, db, target, branch, progress, restore)
+}
+
+fn receive_first_locked(
+    tool: &Path,
+    root: &Path,
+    db: &Path,
+    target: &str,
+    branch: &str,
+    mut progress: impl FnMut(FirstReceiveProgress),
+    mut restore: impl FnMut() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let mut report = |value: FirstReceiveProgress| {
+        remember_receive_progress(root, db, &value);
+        progress(value);
+    };
+    let mut journal = {
+        let _app_guard = crate::chat_file_changes::lock_app_write();
+        let _write_guard = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+        if crate::chat_file_changes::has_active(root) {
+            return Err("busy");
+        }
+        begin_receive_journal(db, root, target, branch)?
+    };
+    remember_chat_deletions(db, &mut journal)?;
+    let resumed = journal.phase != "receiving" || receive_marker_present(root);
+    report(receive_progress(
+        if resumed { "recovering" } else { "receiving" },
+        0,
+        false,
+    ));
+    // C28 could persist the indexing phase without its checkout revision.
+    // The observed remote ref identifies it only if it still equals HEAD.
+    if journal.revision.is_none() && matches!(journal.phase.as_str(), "indexing" | "restoring") {
+        let head = git(tool, root, &["rev-parse", "--verify", "HEAD"])
+            .map_err(|_| "first_receive_interrupted")?;
+        if git(
+            tool,
+            root,
+            &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+        )
+        .as_deref()
+            != Ok(head.as_str())
+        {
+            return Err("first_receive_interrupted");
+        }
+        journal.revision = Some(head);
+        write_receive_journal(db, &journal)?;
+    }
+    if let Some(revision) = journal.revision.as_deref() {
+        if matches!(
+            journal.phase.as_str(),
+            "checkout" | "indexing" | "restoring"
+        ) {
+            let head = git(tool, root, &["rev-parse", "--verify", "HEAD"]);
+            let observed = git(
+                tool,
+                root,
+                &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+            );
+            if head.as_deref() == Ok(revision) && observed.as_deref() == Ok(revision) {
+                let _app_write = crate::chat_file_changes::lock_app_write();
+                let _write = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+                restore_missing_received_files(tool, root, revision, &journal.deleted_chats)?;
+            } else if head.is_ok() || journal.phase != "checkout" {
+                return Err("first_receive_interrupted");
+            }
+        }
+    }
+    if matches!(journal.phase.as_str(), "receiving" | "checkout") {
+        let head = git(tool, root, &["rev-parse", "--verify", "HEAD"]).ok();
+        let transfer_result = if let Some(head) = head {
+            // A completed checkout can be followed by local edits.  Do not
+            // pull again or discard them; only accept the exact fetched head.
+            if (journal.phase == "checkout" && journal.revision.as_deref() != Some(head.as_str()))
+                || git(
+                    tool,
+                    root,
+                    &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+                )
+                .as_deref()
+                    != Ok(head.as_str())
+            {
+                Err("first_receive_interrupted")
+            } else if receive_marker_present(root) {
+                recover_completed_checkout(tool, root, db, &journal)
+            } else {
+                Ok(())
+            }
+        } else {
+            let mut ignored_merge = None;
+            transfer_with_merge_revision(
+                tool,
+                root,
+                target,
+                branch,
+                "pull",
+                &mut ignored_merge,
+                Some(db),
+            )
+            .map(|_| ())
+        };
+        if let Err(error) = transfer_result {
+            report(receive_failure_progress(root, error));
+            return Err(error);
+        }
+        if git(tool, root, &["rev-parse", "--verify", "HEAD"]).is_err() {
+            finish_receive_journal(db)?;
+            report(receive_progress("empty", 0, false));
+            return Ok(());
+        }
+        // Checkout records its exact revision in the same journal. Do not
+        // replace that durable update with the older in-memory receiving copy.
+        journal = read_receive_journal(db)?.ok_or("first_receive_interrupted")?;
+        journal.phase = "indexing".to_owned();
+        write_receive_journal(db, &journal)?;
+    }
+    // Rebuilding the index is transactional and reads the current files.  On
+    // restart repeat it even if the preceding attempt already committed.
+    report(receive_progress("indexing", 1, false));
+    if crate::archive::reindex(root, db).is_err() {
+        report(receive_progress("failed", 1, false));
+        return Err("reindex_failed");
+    }
+    journal.phase = "restoring".to_owned();
+    remember_chat_deletions(db, &mut journal)?;
+    write_receive_journal(db, &journal)?;
+    report(receive_progress("restoring", 2, false));
+    if let Err(error) = restore() {
+        report(receive_progress("failed", 2, false));
+        return Err(error);
+    }
+    finish_receive_journal(db)?;
+    report(receive_progress("complete", 3, true));
     Ok(())
+}
+
+pub(crate) fn first_receive_pending(root: &Path, db: &Path) -> bool {
+    receive_marker_present(root) || !matches!(read_receive_journal(db), Ok(None))
+}
+
+pub(crate) fn ensure_document_write_allowed(root: &Path, db: &Path) -> Result<(), String> {
+    if first_receive_pending(root, db) {
+        Err("first_receive_in_progress".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub(crate) async fn archive_first_receive_status(
+    state: State<'_, crate::AppState>,
+) -> Result<FirstReceiveProgress, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    Ok(current_first_receive_progress(
+        &root,
+        &state.paths.database_path,
+    ))
+}
+
+fn current_first_receive_progress(root: &Path, db: &Path) -> FirstReceiveProgress {
+    let journal = read_receive_journal(db);
+    if journal.is_err() || matches!(&journal, Ok(Some(saved)) if saved.root != root) {
+        return receive_progress("interrupted", 0, false);
+    }
+    let pending = receive_marker_present(root) || !matches!(&journal, Ok(None));
+    let collision = receive_failure_progress(root, "first_receive_interrupted");
+    if !collision.conflict_paths.is_empty() {
+        return collision;
+    }
+    if let Ok(states) = FIRST_RECEIVE_PROGRESS.lock() {
+        if let Some((_, _, progress)) = states
+            .iter()
+            .find(|(stored_root, stored_db, _)| stored_root == root && stored_db == db)
+        {
+            if !(pending && progress.available) {
+                return progress.clone();
+            }
+        }
+    }
+    match journal {
+        Ok(Some(journal)) if journal.root == root => match journal.phase.as_str() {
+            "discovering" | "receiving" | "checkout" => receive_progress("recovering", 0, false),
+            "indexing" => receive_progress("indexing", 1, false),
+            "restoring" => receive_progress("restoring", 2, false),
+            _ => receive_progress("interrupted", 0, false),
+        },
+        Ok(None) if !receive_marker_present(root) => receive_progress("idle", 0, true),
+        _ => receive_progress("interrupted", 0, false),
+    }
+}
+
+pub(crate) fn start_first_receive_recovery<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    paths: crate::runtime::RuntimePaths,
+    resources: PathBuf,
+) {
+    #[cfg(test)]
+    let test_remote = app
+        .try_state::<TestRemote>()
+        .map(|remote| remote.inner().clone());
+    tauri::async_runtime::spawn(async move {
+        let mut delay = std::time::Duration::from_secs(30);
+        loop {
+            let root = paths.archive.current.clone().read_owned().await;
+            let db = paths.database_path.clone();
+            let report_root = root.to_path_buf();
+            let report_db = db.clone();
+            let resources = resources.clone();
+            let task_app = app.clone();
+            #[cfg(test)]
+            let test_remote = test_remote.clone();
+            let outcome = tauri::async_runtime::spawn_blocking(move || {
+                let _guard = REMOTE_LOCK.lock().map_err(|_| "busy")?;
+                let _receive_lock = lock_first_receive(&db)?;
+                let mut pending = read_receive_journal(&db)?;
+                let internal = receive_marker_present(&root);
+                #[cfg(test)]
+                let tool_path = test_remote
+                    .as_ref()
+                    .map(|remote| remote.tool.clone())
+                    .or_else(|| git_path(&resources));
+                #[cfg(not(test))]
+                let tool_path = git_path(&resources);
+                let tool = match tool_path {
+                    Some(tool) => tool,
+                    None if pending.is_none() && !internal => return Ok(()),
+                    None => return Err("git_unavailable"),
+                };
+                if pending.is_none()
+                    && !internal
+                    && git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).is_ok()
+                {
+                    return Ok(());
+                }
+                #[cfg(test)]
+                let configured_repo = test_remote
+                    .as_ref()
+                    .map(|_| "fixture/repository".to_owned())
+                    .or_else(|| configured(&tool, &root));
+                #[cfg(not(test))]
+                let configured_repo = configured(&tool, &root);
+                let repo = match configured_repo {
+                    Some(repo) => repo,
+                    None if pending.is_none() && !internal => return Ok(()),
+                    None => return Err("first_receive_interrupted"),
+                };
+                #[cfg(test)]
+                let target = test_remote
+                    .as_ref()
+                    .map(|remote| remote.target.clone())
+                    .unwrap_or_else(|| url(&repo));
+                #[cfg(not(test))]
+                let target = url(&repo);
+                if pending.is_some() || internal {
+                    let value = receive_progress("recovering", 0, false);
+                    remember_receive_progress(&root, &db, &value);
+                    let _ = task_app.emit("archive-first-receive-progress", value);
+                }
+                if internal && git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).is_err() {
+                    let _app_write = crate::chat_file_changes::lock_app_write();
+                    let _write = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+                    if crate::chat_file_changes::has_active(&root) {
+                        return Err("busy");
+                    }
+                    recover_interrupted_first_receive(&tool, &root)?;
+                }
+                if pending.is_none() {
+                    if !internal && !fresh_archive(&tool, &root) {
+                        return Ok(());
+                    }
+                    let journal = ReceiveJournal {
+                        root: root.to_path_buf(),
+                        target: target.clone(),
+                        branch: String::new(),
+                        phase: "discovering".into(),
+                        revision: None,
+                        has_defaults: None,
+                        restore_intents: Vec::new(),
+                        restore_done: Vec::new(),
+                        deleted_chats: Vec::new(),
+                    };
+                    {
+                        let _app_write = crate::chat_file_changes::lock_app_write();
+                        let _write = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+                        if crate::chat_file_changes::has_active(&root) {
+                            return Err("busy");
+                        }
+                        write_receive_journal(&db, &journal)?;
+                    }
+                    pending = Some(journal);
+                    let value = receive_progress("recovering", 0, false);
+                    remember_receive_progress(&root, &db, &value);
+                    let _ = task_app.emit("archive-first-receive-progress", value);
+                }
+                let mut remote_verified = false;
+                let branch = if let Some(journal) = pending.as_mut() {
+                    if journal.root != *root || journal.target != target {
+                        return Err("first_receive_interrupted");
+                    }
+                    if journal.phase == "discovering" {
+                        #[cfg(test)]
+                        let remote = if test_remote.is_some() {
+                            Repository {
+                                name_with_owner: repo.clone(),
+                                is_private: true,
+                                default_branch_ref: None,
+                            }
+                        } else {
+                            github(&repo)?.0
+                        };
+                        #[cfg(not(test))]
+                        let remote = github(&repo)?.0;
+                        remote_verified = true;
+                        journal.branch = remote
+                            .default_branch_ref
+                            .map(|b| b.name)
+                            .unwrap_or_else(|| "main".into());
+                        journal.phase = "receiving".into();
+                        write_receive_journal(&db, journal)?;
+                    }
+                    journal.branch.clone()
+                } else {
+                    return Err("first_receive_interrupted");
+                };
+                let checkout_local = pending.as_ref().is_some_and(|journal| {
+                    journal.phase == "checkout"
+                        && journal.revision.as_deref().is_some_and(|revision| {
+                            git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).as_deref()
+                                == Ok(revision)
+                                && git(
+                                    &tool,
+                                    &root,
+                                    &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+                                )
+                                .as_deref()
+                                    == Ok(revision)
+                        })
+                });
+                if !remote_verified
+                    && !checkout_local
+                    && pending
+                        .as_ref()
+                        .is_none_or(|j| matches!(j.phase.as_str(), "receiving" | "checkout"))
+                {
+                    #[cfg(test)]
+                    let remote = if test_remote.is_some() {
+                        Repository {
+                            name_with_owner: repo.clone(),
+                            is_private: true,
+                            default_branch_ref: None,
+                        }
+                    } else {
+                        github(&repo)?.0
+                    };
+                    #[cfg(not(test))]
+                    let remote = github(&repo)?.0;
+                    let actual = remote
+                        .default_branch_ref
+                        .map(|b| b.name)
+                        .unwrap_or_else(|| "main".into());
+                    if actual != branch {
+                        return Err("first_receive_interrupted");
+                    }
+                }
+                receive_first_locked(
+                    &tool,
+                    &root,
+                    &db,
+                    &target,
+                    &branch,
+                    |value| {
+                        let _ = task_app.emit("archive-first-receive-progress", value);
+                    },
+                    || crate::chat_archive_store::restore_emitting(&root, &db, &task_app),
+                )
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => break,
+                Ok(Err(
+                    "connection_failed"
+                    | "remote_unavailable"
+                    | "authentication_unavailable"
+                    | "account_unavailable"
+                    | "signed_out"
+                    | "authentication_failed"
+                    | "git_unavailable"
+                    | "busy",
+                )) => {
+                    let progress = receive_progress("failed", 0, false);
+                    remember_receive_progress(&report_root, &report_db, &progress);
+                    let _ = app.emit("archive-first-receive-progress", progress);
+                    tokio::time::sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(300));
+                }
+                _ => {
+                    let progress = receive_progress("interrupted", 0, false);
+                    remember_receive_progress(&report_root, &report_db, &progress);
+                    let _ = app.emit("archive-first-receive-progress", progress);
+                    break;
+                }
+            }
+        }
+    });
 }
 fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static str> {
     if git(tool, root, &["rev-parse", "--is-shallow-repository"]).as_deref() != Ok("false") {
@@ -1087,6 +1832,269 @@ fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static
     } else {
         Err("unsafe_history")
     }
+}
+
+/// Inspect committed chat snapshots in memory only; no key is passed to Git or logged.
+fn chat_snapshot_at(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+    path: &str,
+) -> Result<Option<serde_json::Value>, &'static str> {
+    if !safe_chat_path(path) {
+        return Err("unsafe_history");
+    }
+    let entry =
+        git_raw(tool, root, &["ls-tree", revision, "--", path]).map_err(|_| "git_unavailable")?;
+    if entry.is_empty() {
+        return Ok(None);
+    }
+    let (meta, actual) = entry
+        .trim_end_matches('\n')
+        .split_once('\t')
+        .ok_or("unsafe_history")?;
+    let mut parts = meta.split_whitespace();
+    if parts.next() != Some("100644") || parts.next() != Some("blob") || actual != path {
+        return Err("unsafe_history");
+    }
+    let oid = parts.next().ok_or("unsafe_history")?;
+    if parts.next().is_some() || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("unsafe_history");
+    }
+    let size: usize = git(tool, root, &["cat-file", "-s", oid])
+        .map_err(|_| "git_unavailable")?
+        .parse()
+        .map_err(|_| "unsafe_history")?;
+    if size > 32 * 1024 * 1024 {
+        return Err("unsafe_history");
+    }
+    let content = git_raw(tool, root, &["cat-file", "blob", oid]).map_err(|_| "git_unavailable")?;
+    let snapshot = serde_json::from_str(&content).map_err(|_| "unsafe_history")?;
+    Ok(Some(snapshot))
+}
+
+fn uploaded_chat_contains_key(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+    known: &[&str],
+) -> Result<bool, &'static str> {
+    if known.is_empty() {
+        return Ok(false);
+    }
+    let names = git_raw(
+        tool,
+        root,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "-z",
+            revision,
+            "--",
+            "chats/",
+        ],
+    )
+    .map_err(|_| "git_unavailable")?;
+    for path in names.split('\0').filter(|p| !p.is_empty()) {
+        let snapshot = chat_snapshot_at(tool, root, revision, path)?.ok_or("unsafe_history")?;
+        if crate::chat_archive_snapshot::contains_stored_secret(&snapshot, known) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn specific_uploaded_key_found(any_uploaded: bool, known: &[&str]) -> Option<bool> {
+    if !any_uploaded {
+        return Some(false);
+    }
+    let distinct: std::collections::HashSet<_> = known
+        .iter()
+        .copied()
+        .filter(|key| !key.is_empty())
+        .collect();
+    if distinct.len() == 1 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn unpushed_chat_needs_redaction(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+    base: Option<&str>,
+    known: &[&str],
+) -> Result<bool, &'static str> {
+    if known.is_empty() {
+        return Ok(false);
+    }
+    let mut args = vec!["rev-list", "--reverse", revision];
+    let exclude = base.map(|base| format!("^{base}"));
+    if let Some(exclude) = exclude.as_deref() {
+        args.push(exclude);
+    }
+    let commits = git_raw(tool, root, &args).map_err(|_| "git_unavailable")?;
+    let mut checked = std::collections::HashSet::new();
+    for commit in commits.lines() {
+        if !(commit.len() == 40 || commit.len() == 64)
+            || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err("unsafe_history");
+        }
+        let entries = git_raw(tool, root, &["ls-tree", "-r", "-z", commit, "--", "chats/"])
+            .map_err(|_| "git_unavailable")?;
+        for entry in entries.split('\0').filter(|entry| !entry.is_empty()) {
+            let (metadata, path) = entry.split_once('\t').ok_or("unsafe_history")?;
+            let mut fields = metadata.split_whitespace();
+            if fields.next() != Some("100644")
+                || fields.next() != Some("blob")
+                || !safe_chat_path(path)
+            {
+                return Err("unsafe_history");
+            }
+            let oid = fields.next().ok_or("unsafe_history")?;
+            if fields.next().is_some() || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("unsafe_history");
+            }
+            if !checked.insert(oid.to_owned()) {
+                continue;
+            }
+            let snapshot = chat_snapshot_at(tool, root, commit, path)?.ok_or("unsafe_history")?;
+            match crate::chat_archive_snapshot::redact_historical_snapshot(&snapshot, known) {
+                Ok(clean) if clean == snapshot => {}
+                Ok(_) | Err("sensitive_metadata") => return Ok(true),
+                Err(_) => return Err("unsafe_history"),
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Build replacement commits in a private temporary index without moving any ref.
+/// Document trees and original commit metadata are kept; only chat blobs are redacted.
+fn redacted_history_candidate(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+    base: Option<&str>,
+    known: &[&str],
+) -> Result<String, &'static str> {
+    use std::collections::HashMap;
+    let mut args = vec!["rev-list", "--reverse", "--topo-order", revision];
+    let exclude = base.map(|id| format!("^{id}"));
+    if let Some(exclude) = exclude.as_deref() {
+        args.push(exclude);
+    }
+    let commits = git_raw(tool, root, &args).map_err(|_| "git_unavailable")?;
+    let temp = tempfile::tempdir().map_err(|_| "local_state_unavailable")?;
+    let index = temp.path().join("index");
+    let mut rewritten: HashMap<String, String> = HashMap::new();
+    let mut blob_cache: HashMap<String, String> = HashMap::new();
+    for commit in commits.lines() {
+        if !(commit.len() == 40 || commit.len() == 64)
+            || !commit.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err("unsafe_history");
+        }
+        let output = git_output(tool, root, &["cat-file", "commit", commit])
+            .map_err(|_| "git_unavailable")?;
+        if !output.status.success() {
+            return Err("unsafe_history");
+        }
+        let raw = String::from_utf8(output.stdout).map_err(|_| "unsafe_history")?;
+        let (header, message) = raw.split_once("\n\n").ok_or("unsafe_history")?;
+        if known.iter().any(|key| !key.is_empty() && raw.contains(key)) {
+            return Err("redaction_required");
+        }
+        if header.lines().any(|line| {
+            line.starts_with("gpgsig ")
+                || line.starts_with("gpgsig-sha256 ")
+                || line.starts_with("mergetag ")
+        }) {
+            return Err("redaction_required");
+        }
+        git_index(tool, root, &index, &["read-tree", "--reset", commit])
+            .map_err(|_| "candidate_read_tree")?;
+        let entries = git_raw(tool, root, &["ls-tree", "-r", "-z", commit, "--", "chats/"])
+            .map_err(|_| "git_unavailable")?;
+        for entry in entries.split('\0').filter(|entry| !entry.is_empty()) {
+            let (metadata, path) = entry.split_once('\t').ok_or("unsafe_history")?;
+            if !safe_chat_path(path) {
+                return Err("unsafe_history");
+            }
+            let mut parts = metadata.split_whitespace();
+            if parts.next() != Some("100644") || parts.next() != Some("blob") {
+                return Err("unsafe_history");
+            }
+            let oid = parts.next().ok_or("unsafe_history")?;
+            if parts.next().is_some() || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("unsafe_history");
+            }
+            let cleaned = if let Some(cleaned) = blob_cache.get(oid) {
+                cleaned.clone()
+            } else {
+                let snapshot =
+                    chat_snapshot_at(tool, root, commit, path)?.ok_or("unsafe_history")?;
+                let clean =
+                    crate::chat_archive_snapshot::redact_historical_snapshot(&snapshot, known)?;
+                let new_oid = if clean == snapshot {
+                    oid.to_owned()
+                } else {
+                    let bytes = serde_json::to_vec(&clean).map_err(|_| "unsafe_history")?;
+                    git_hash_object(tool, root, &bytes).map_err(|_| "candidate_blob")?
+                };
+                blob_cache.insert(oid.to_owned(), new_oid.clone());
+                new_oid
+            };
+            if cleaned != oid {
+                let entry = format!("100644,{cleaned},{path}");
+                git_index(
+                    tool,
+                    root,
+                    &index,
+                    &["update-index", "--add", "--cacheinfo", &entry],
+                )
+                .map_err(|_| "candidate_update_index")?;
+            }
+        }
+        let tree = git_index(tool, root, &index, &["write-tree"])
+            .map_err(|_| "candidate_write_tree")?
+            .trim()
+            .to_owned();
+        let mut lines = Vec::new();
+        let mut trees = 0;
+        for line in header.split('\n') {
+            if line.starts_with("tree ") {
+                trees += 1;
+                lines.push(format!("tree {tree}"));
+            } else if let Some(parent) = line.strip_prefix("parent ") {
+                let parent = if let Some(mapped) = rewritten.get(parent) {
+                    mapped.as_str()
+                } else if let Some(base) = base {
+                    if git(tool, root, &["merge-base", "--is-ancestor", parent, base]).is_err() {
+                        return Err("redaction_required");
+                    }
+                    parent
+                } else {
+                    return Err("redaction_required");
+                };
+                lines.push(format!("parent {parent}"));
+            } else {
+                lines.push(line.to_owned());
+            }
+        }
+        if trees != 1 {
+            return Err("unsafe_history");
+        }
+        let cleaned_commit = format!("{}\n\n{}", lines.join("\n"), message);
+        let oid = git_hash_typed(tool, root, "commit", cleaned_commit.as_bytes())
+            .map_err(|_| "candidate_commit")?;
+        rewritten.insert(commit.to_owned(), oid);
+    }
+    rewritten.get(revision).cloned().ok_or("redaction_required")
 }
 fn safe_chat_path(path: &str) -> bool {
     path.strip_prefix("chats/")
@@ -1669,6 +2677,10 @@ fn restore_missing_default_skills(
 }
 
 fn fresh_archive(tool: &Path, root: &Path) -> bool {
+    fresh_archive_with_local_files(tool, root, false)
+}
+
+fn fresh_archive_with_local_files(tool: &Path, root: &Path, allow_local_files: bool) -> bool {
     let Ok(has_defaults) = crate::skills_write::fresh_builtin_state_mode(root) else {
         return false;
     };
@@ -1705,7 +2717,9 @@ fn fresh_archive(tool: &Path, root: &Path) -> bool {
         } else if ["zettels", "receipts", "objects"].contains(&name) {
             if !kind.is_dir()
                 || kind.is_symlink()
-                || !fs::read_dir(entry.path()).is_ok_and(|mut entries| entries.next().is_none())
+                || (!allow_local_files
+                    && !fs::read_dir(entry.path())
+                        .is_ok_and(|mut entries| entries.next().is_none()))
             {
                 return false;
             }
@@ -1724,11 +2738,304 @@ fn fresh_archive(tool: &Path, root: &Path) -> bool {
             if !default_file_unchanged(&entry.path(), name) {
                 return false;
             }
-        } else {
+        } else if !allow_local_files {
             return false;
         }
     }
     true
+}
+
+fn ensure_recovery_directory(root: &Path, relative: &Path) -> Result<(), &'static str> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err("first_receive_interrupted");
+        };
+        current.push(name);
+        match fs::create_dir(&current) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(_) => return Err("first_receive_interrupted"),
+        }
+        let meta = fs::symlink_metadata(&current).map_err(|_| "first_receive_interrupted")?;
+        if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+            return Err("first_receive_interrupted");
+        }
+    }
+    Ok(())
+}
+
+// While the first receive journal exists, missing files in the received tree
+// are incomplete checkout work. Never replace an existing path: its current
+// contents belong to the user, while the received version stays in Git.
+fn restore_missing_received_files(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+    deleted_chats: &[String],
+) -> Result<(), &'static str> {
+    use std::io::Write;
+    safe_history(tool, root, revision)?;
+    let tree = git_output(
+        tool,
+        root,
+        &["ls-tree", "-r", "-z", "--full-tree", revision],
+    )
+    .map_err(|_| "first_receive_interrupted")?;
+    if !tree.status.success() {
+        return Err("first_receive_interrupted");
+    }
+    let tree = std::str::from_utf8(&tree.stdout).map_err(|_| "first_receive_interrupted")?;
+    for entry in tree.split('\0').filter(|entry| !entry.is_empty()) {
+        let (metadata, name) = entry.split_once('\t').ok_or("first_receive_interrupted")?;
+        if let Some(id) = name
+            .strip_prefix("chats/")
+            .and_then(|name| name.strip_suffix(".json"))
+        {
+            if deleted_chats.iter().any(|deleted| deleted == id) {
+                continue;
+            }
+        }
+        let mut parts = metadata.split_whitespace();
+        let mode = parts.next().ok_or("first_receive_interrupted")?;
+        if !matches!(mode, "100644" | "100755") || parts.next() != Some("blob") {
+            return Err("first_receive_interrupted");
+        }
+        let relative = Path::new(name);
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("first_receive_interrupted");
+        }
+        let parent = relative.parent().ok_or("first_receive_interrupted")?;
+        ensure_recovery_directory(root, parent)?;
+        let destination = root.join(relative);
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !crate::archive_location::is_link_or_reparse(&metadata) =>
+            {
+                continue
+            }
+            Ok(_) => return Err("first_receive_interrupted"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err("first_receive_interrupted"),
+        }
+        let spec = format!("{revision}:{name}");
+        let output =
+            git_output(tool, root, &["show", &spec]).map_err(|_| "first_receive_interrupted")?;
+        if !output.status.success() {
+            return Err("first_receive_interrupted");
+        }
+        let mut staging = tempfile::Builder::new()
+            .prefix("momso-received-")
+            .tempfile_in(root.join(".git"))
+            .map_err(|_| "local_state_unavailable")?;
+        staging
+            .write_all(&output.stdout)
+            .and_then(|_| staging.as_file().sync_all())
+            .map_err(|_| "local_state_unavailable")?;
+        match staging.persist_noclobber(&destination) {
+            Ok(_) => (),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta =
+                    fs::symlink_metadata(&destination).map_err(|_| "first_receive_interrupted")?;
+                if !meta.is_file() || crate::archive_location::is_link_or_reparse(&meta) {
+                    return Err("first_receive_interrupted");
+                }
+            }
+            Err(_) => return Err("first_receive_interrupted"),
+        }
+        #[cfg(test)]
+        if name == "dictionary/yoga.json"
+            && std::env::var_os("MOMSO_C31_CRASH_DICTIONARY").is_some()
+        {
+            std::process::exit(73);
+        }
+    }
+    Ok(())
+}
+
+fn restore_journaled_defaults(
+    tool: &Path,
+    root: &Path,
+    db: &Path,
+    saved: &Path,
+) -> Result<(), &'static str> {
+    let mut journal = read_receive_journal(db)?.ok_or("first_receive_interrupted")?;
+    if journal.root != root || journal.phase != "checkout" {
+        return Err("first_receive_interrupted");
+    }
+    for name in [
+        ".gitignore",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "GEMINI.md",
+        "skills",
+        ".agents",
+        ".claude",
+        crate::yoga_dictionary::DIRECTORY,
+    ] {
+        let base = saved.join(name);
+        if !base.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&base)
+            .follow_links(false)
+            .sort_by_file_name()
+        {
+            let entry = entry.map_err(|_| "first_receive_interrupted")?;
+            let meta =
+                fs::symlink_metadata(entry.path()).map_err(|_| "first_receive_interrupted")?;
+            if crate::archive_location::is_link_or_reparse(&meta) {
+                return Err("first_receive_interrupted");
+            }
+            if meta.is_dir() {
+                continue;
+            }
+            if !meta.is_file() {
+                return Err("first_receive_interrupted");
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(saved)
+                .map_err(|_| "first_receive_interrupted")?;
+            let path = relative
+                .to_str()
+                .ok_or("first_receive_interrupted")?
+                .replace('\\', "/");
+            if ![".gitignore", "AGENTS.md", "CLAUDE.md", "GEMINI.md"].contains(&path.as_str())
+                && !safe_skill_path(&path)
+                && !crate::yoga_dictionary::is_path(&path)
+            {
+                return Err("first_receive_interrupted");
+            }
+            let destination = root.join(relative);
+            let existing = match fs::symlink_metadata(&destination) {
+                Ok(meta) => {
+                    if !meta.is_file() || crate::archive_location::is_link_or_reparse(&meta) {
+                        return Err("first_receive_interrupted");
+                    }
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => return Err("first_receive_interrupted"),
+            };
+            if journal.restore_done.contains(&path) && existing {
+                continue;
+            }
+            let tracked = !git(tool, root, &["ls-files", "--", &path])
+                .map_err(|_| "first_receive_interrupted")?
+                .trim()
+                .is_empty();
+            // Tracked files come from the received Git tree, not the old default.
+            if !existing && tracked {
+                return Err("first_receive_interrupted");
+            }
+            if let Some(rest) = path
+                .strip_prefix(".agents/skills/")
+                .or_else(|| path.strip_prefix(".claude/skills/"))
+            {
+                let canonical = format!("skills/{rest}");
+                if !git(tool, root, &["ls-files", "--", &canonical])
+                    .map_err(|_| "first_receive_interrupted")?
+                    .trim()
+                    .is_empty()
+                {
+                    continue;
+                }
+            }
+            if !existing {
+                if !journal.restore_intents.contains(&path) {
+                    journal.restore_intents.push(path.clone());
+                }
+                write_receive_journal(db, &journal)?;
+                ensure_recovery_directory(
+                    root,
+                    relative.parent().ok_or("first_receive_interrupted")?,
+                )?;
+                match fs::hard_link(entry.path(), &destination) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let meta = fs::symlink_metadata(&destination)
+                            .map_err(|_| "first_receive_interrupted")?;
+                        if !meta.is_file() || crate::archive_location::is_link_or_reparse(&meta) {
+                            return Err("first_receive_interrupted");
+                        }
+                    }
+                    Err(_) => return Err("first_receive_interrupted"),
+                }
+            }
+            if !journal.restore_done.contains(&path) {
+                journal.restore_done.push(path);
+            }
+            write_receive_journal(db, &journal)?;
+        }
+    }
+    Ok(())
+}
+
+fn recover_completed_checkout(
+    tool: &Path,
+    root: &Path,
+    db: &Path,
+    journal: &ReceiveJournal,
+) -> Result<(), &'static str> {
+    let _app_write = crate::chat_file_changes::lock_app_write();
+    let _write = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+    let expected = journal
+        .revision
+        .as_deref()
+        .ok_or("first_receive_interrupted")?;
+    let head = git(tool, root, &["rev-parse", "--verify", "HEAD"])
+        .map_err(|_| "first_receive_interrupted")?;
+    let observed = git(
+        tool,
+        root,
+        &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+    )
+    .map_err(|_| "first_receive_interrupted")?;
+    if journal.phase != "checkout" || expected != head || observed != head {
+        return Err("first_receive_interrupted");
+    }
+    safe_history(tool, root, &head)?;
+    let marker = root.join(".git/momso-first-receive-in-progress");
+    let meta = fs::symlink_metadata(&marker).map_err(|_| "first_receive_interrupted")?;
+    if !meta.is_file() || meta.len() > 128 || crate::archive_location::is_link_or_reparse(&meta) {
+        return Err("first_receive_interrupted");
+    }
+    let name = fs::read_to_string(&marker).map_err(|_| "first_receive_interrupted")?;
+    let id = name
+        .strip_prefix("momso-first-pull-")
+        .ok_or("first_receive_interrupted")?;
+    uuid::Uuid::parse_str(id).map_err(|_| "first_receive_interrupted")?;
+    let saved = root.join(".git").join(name);
+    let meta = fs::symlink_metadata(&saved).map_err(|_| "first_receive_interrupted")?;
+    if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+        return Err("first_receive_interrupted");
+    }
+    if journal.has_defaults == Some(true) {
+        // Do not adopt a locally edited tracked skill as the received baseline.
+        for (name, _) in crate::skills::BUNDLED_SKILLS {
+            let path = format!("skills/{name}/SKILL.md");
+            if !git(tool, root, &["ls-files", "--", &path])
+                .map_err(|_| "first_receive_interrupted")?
+                .trim()
+                .is_empty()
+                && git(tool, root, &["diff", "--quiet", "HEAD", "--", &path]).is_err()
+            {
+                return Err("first_receive_interrupted");
+            }
+        }
+        crate::skills_write::adopt_received_builtin_states(tool, root, &saved)
+            .map_err(|_| "first_receive_interrupted")?;
+    } else if journal.has_defaults != Some(false) {
+        return Err("first_receive_interrupted");
+    }
+    restore_journaled_defaults(tool, root, db, &saved)?;
+    fs::remove_file(marker).map_err(|_| "first_receive_interrupted")?;
+    Ok(())
 }
 
 fn first_receive(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static str> {
@@ -1749,18 +3056,89 @@ fn first_receive_with_hooks(
     root: &Path,
     revision: &str,
     after_check: impl FnOnce(),
+    after_move: impl FnMut(),
+) -> Result<(), &'static str> {
+    first_receive_impl(tool, root, revision, after_check, after_move, None)
+}
+
+fn receive_checkout_paths_clear(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+) -> Result<(), &'static str> {
+    let output = git_output(
+        tool,
+        root,
+        &["ls-tree", "-r", "-z", "--name-only", revision],
+    )
+    .map_err(|_| "fast_forward_failed")?;
+    if !output.status.success() {
+        return Err("fast_forward_failed");
+    }
+    let names = std::str::from_utf8(&output.stdout).map_err(|_| "fast_forward_failed")?;
+    for name in names.split('\0').filter(|name| !name.is_empty()) {
+        let mut current = root.to_path_buf();
+        let components = Path::new(name).components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(part) = component else {
+                return Err("fast_forward_failed");
+            };
+            current.push(part);
+            match fs::symlink_metadata(&current) {
+                Ok(meta) => {
+                    if index + 1 == components.len()
+                        || !meta.is_dir()
+                        || crate::archive_location::is_link_or_reparse(&meta)
+                    {
+                        return Err("fast_forward_failed");
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(_) => return Err("fast_forward_failed"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn first_receive_impl(
+    tool: &Path,
+    root: &Path,
+    revision: &str,
+    after_check: impl FnOnce(),
     mut after_move: impl FnMut(),
+    db: Option<&Path>,
 ) -> Result<(), &'static str> {
     use std::io::Write;
     let _write = crate::archive_zet::WRITE_LOCK
         .lock()
         .map_err(|_| "unavailable")?;
     let _chat_guard = crate::chat_archive_store::lock_store().map_err(|_| "busy")?;
-    if !fresh_archive(tool, root) {
+    let resumed_checkout = if let Some(db) = db {
+        matches!(read_receive_journal(db)?, Some(journal)
+            if journal.root == root
+                && journal.phase == "checkout"
+                && journal.revision.as_deref() == Some(revision)
+                && journal.has_defaults.is_some()
+                && !receive_marker_present(root))
+    } else {
+        false
+    };
+    if !fresh_archive_with_local_files(tool, root, resumed_checkout) {
         return Err("unsaved_changes");
     }
     let has_defaults =
         crate::skills_write::fresh_builtin_state_mode(root).map_err(|_| "unsaved_changes")?;
+    if let Some(db) = db {
+        let mut journal = read_receive_journal(db)?.ok_or("first_receive_interrupted")?;
+        if journal.root != root {
+            return Err("first_receive_interrupted");
+        }
+        journal.phase = "checkout".into();
+        journal.revision = Some(revision.to_owned());
+        journal.has_defaults = Some(has_defaults);
+        write_receive_journal(db, &journal)?;
+    }
     after_check();
     let saved = root
         .join(".git")
@@ -1806,6 +3184,12 @@ fn first_receive_with_hooks(
                     .map_err(|_| "local_state_unavailable")?;
                 moved.push(name);
                 after_move();
+                #[cfg(test)]
+                if name == "AGENTS.md"
+                    && std::env::var_os("MOMSO_C31_CRASH_BEFORE_CHECKOUT").is_some()
+                {
+                    std::process::exit(73);
+                }
                 let unchanged = if name == crate::yoga_dictionary::DIRECTORY {
                     crate::yoga_dictionary::defaults_unchanged(&saved)
                 } else if ["skills", ".agents", ".claude"].contains(&name) {
@@ -1821,13 +3205,29 @@ fn first_receive_with_hooks(
         if crate::skills_write::fresh_builtin_state_mode(root) != Ok(has_defaults) {
             return Err("unsaved_changes");
         }
-        git(tool, root, &["merge", "--ff-only", revision]).map_err(|_| "fast_forward_failed")?;
+        receive_checkout_paths_clear(tool, root, revision)?;
+        git(
+            tool,
+            root,
+            &["merge", "--ff-only", "--no-overwrite-ignore", revision],
+        )
+        .map_err(|_| "fast_forward_failed")?;
+        #[cfg(test)]
+        if std::env::var_os("MOMSO_C28_CRASH_AFTER_CHECKOUT").is_some() {
+            std::process::exit(73);
+        }
         if has_defaults {
             crate::skills_write::adopt_received_builtin_states(tool, root, &saved)
                 .map_err(|_| "local_state_unavailable")?;
         }
         Ok(())
     })();
+    if result.is_err()
+        && db.is_some()
+        && git(tool, root, &["rev-parse", "--verify", "HEAD"]).as_deref() == Ok(revision)
+    {
+        return result;
+    }
     if result.is_err() {
         for name in moved {
             if [
@@ -1848,6 +3248,8 @@ fn first_receive_with_hooks(
                 let _ = fs::remove_file(saved.join(name));
             }
         }
+    } else if let Some(db) = db {
+        restore_journaled_defaults(tool, root, db, &saved)?;
     } else {
         for name in moved {
             if ["skills", ".agents", ".claude"].contains(&name) {
@@ -1872,7 +3274,7 @@ fn first_receive_with_hooks(
             copy_recovery_if_absent(&saved.join(name), &root.join(name))?;
         }
     }
-    if result.is_ok() {
+    if result.is_ok() && db.is_none() {
         crate::yoga_dictionary::initialize(root).map_err(|_| "local_state_unavailable")?;
     }
     let removed = fs::remove_dir(&saved).is_ok();
@@ -1923,20 +3325,68 @@ fn recover_interrupted_first_receive(tool: &Path, root: &Path) -> Result<bool, &
         let name = entry.file_name();
         let name = name.to_str().ok_or("first_receive_interrupted")?;
         let meta = fs::symlink_metadata(entry.path()).map_err(|_| "first_receive_interrupted")?;
-        if ![".gitignore", "AGENTS.md", "CLAUDE.md", "GEMINI.md"].contains(&name)
-            || !meta.is_file()
-            || crate::archive_location::is_link_or_reparse(&meta)
-            || fs::symlink_metadata(root.join(name)).is_ok()
-        {
+        if crate::archive_location::is_link_or_reparse(&meta) {
+            return Err("first_receive_interrupted");
+        }
+        let safe = if [".gitignore", "AGENTS.md", "CLAUDE.md", "GEMINI.md"].contains(&name) {
+            meta.is_file() && default_file_unchanged(&entry.path(), name)
+        } else if ["skills", ".agents", ".claude"].contains(&name) {
+            meta.is_dir() && default_skills_unchanged(&saved, name)
+        } else if name == crate::yoga_dictionary::DIRECTORY {
+            meta.is_dir() && crate::yoga_dictionary::defaults_unchanged(&saved)
+        } else {
+            false
+        };
+        if !safe {
             return Err("first_receive_interrupted");
         }
     }
-    for entry in entries {
-        let destination = root.join(entry.file_name());
-        fs::hard_link(entry.path(), destination).map_err(|_| "first_receive_interrupted")?;
-        fs::remove_file(entry.path()).map_err(|_| "first_receive_interrupted")?;
+    for entry in &entries {
+        for source in walkdir::WalkDir::new(entry.path()).follow_links(false) {
+            let source = source.map_err(|_| "first_receive_interrupted")?;
+            let meta =
+                fs::symlink_metadata(source.path()).map_err(|_| "first_receive_interrupted")?;
+            if crate::archive_location::is_link_or_reparse(&meta) {
+                return Err("first_receive_interrupted");
+            }
+            let relative = source
+                .path()
+                .strip_prefix(&saved)
+                .map_err(|_| "first_receive_interrupted")?;
+            let destination = root.join(relative);
+            if meta.is_dir() {
+                match fs::create_dir(&destination) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let target = fs::symlink_metadata(&destination)
+                            .map_err(|_| "first_receive_interrupted")?;
+                        if !target.is_dir() || crate::archive_location::is_link_or_reparse(&target)
+                        {
+                            return Err("first_receive_interrupted");
+                        }
+                    }
+                    Err(_) => return Err("first_receive_interrupted"),
+                }
+            } else if meta.is_file() {
+                match fs::hard_link(source.path(), &destination) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let target = fs::symlink_metadata(&destination)
+                            .map_err(|_| "first_receive_interrupted")?;
+                        if !target.is_file()
+                            || crate::archive_location::is_link_or_reparse(&target)
+                            || !matches!((fs::read(source.path()), fs::read(&destination)), (Ok(a), Ok(b)) if a == b)
+                        {
+                            return Err("first_receive_interrupted");
+                        }
+                    }
+                    Err(_) => return Err("first_receive_interrupted"),
+                }
+            } else {
+                return Err("first_receive_interrupted");
+            }
+        }
     }
-    fs::remove_dir(&saved).map_err(|_| "first_receive_interrupted")?;
     fs::remove_file(marker).map_err(|_| "first_receive_interrupted")?;
     Ok(true)
 }
@@ -1949,7 +3399,15 @@ fn transfer_report(
     action: &str,
 ) -> Result<bool, &'static str> {
     let mut merge_revision = None;
-    transfer_with_merge_revision(tool, root, target, branch, action, &mut merge_revision)
+    transfer_with_merge_revision(
+        tool,
+        root,
+        target,
+        branch,
+        action,
+        &mut merge_revision,
+        None,
+    )
 }
 
 fn transfer_with_merge_revision(
@@ -1959,6 +3417,63 @@ fn transfer_with_merge_revision(
     branch: &str,
     action: &str,
     merge_revision: &mut Option<String>,
+    journal_db: Option<&Path>,
+) -> Result<bool, &'static str> {
+    transfer_with_options(
+        tool,
+        root,
+        target,
+        branch,
+        action,
+        merge_revision,
+        TransferOptions {
+            journal_db,
+            check: None,
+        },
+    )
+}
+
+struct RedactionCheck<'a> {
+    known: &'a [String],
+    watched: Option<&'a [String]>,
+    uploaded_key_found: &'a mut Option<bool>,
+}
+
+struct TransferOptions<'a> {
+    journal_db: Option<&'a Path>,
+    check: Option<RedactionCheck<'a>>,
+}
+
+#[cfg(test)]
+fn transfer_with_redaction_check(
+    tool: &Path,
+    root: &Path,
+    target: &str,
+    branch: &str,
+    action: &str,
+    merge_revision: &mut Option<String>,
+    options: (Option<RedactionCheck<'_>>, Option<&Path>),
+) -> Result<bool, &'static str> {
+    let (check, journal_db) = options;
+    transfer_with_options(
+        tool,
+        root,
+        target,
+        branch,
+        action,
+        merge_revision,
+        TransferOptions { journal_db, check },
+    )
+}
+
+fn transfer_with_options(
+    tool: &Path,
+    root: &Path,
+    target: &str,
+    branch: &str,
+    action: &str,
+    merge_revision: &mut Option<String>,
+    options: TransferOptions<'_>,
 ) -> Result<bool, &'static str> {
     let _write = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
     recover_interrupted_first_receive(tool, root)?;
@@ -1973,9 +3488,86 @@ fn transfer_with_merge_revision(
             *merge_revision = Some(merge_disjoint(tool, root)?);
             merged = true;
         }
-        let revision =
+        let mut revision =
             git(tool, root, &["rev-parse", "--verify", "HEAD"]).map_err(|_| "nothing_saved")?;
         safe_history(tool, root, &revision)?;
+        if let Some(check) = options.check {
+            let remote_ref = format!("refs/heads/{branch}");
+            let reported = remote_git(tool, root, &["ls-remote", "--heads", target, &remote_ref])?;
+            let base = if reported.is_empty() {
+                None
+            } else {
+                let mut fields = reported.split_whitespace();
+                let oid = fields.next().ok_or("remote_unavailable")?;
+                if fields.next() != Some(remote_ref.as_str())
+                    || fields.next().is_some()
+                    || git(
+                        tool,
+                        root,
+                        &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+                    )
+                    .as_deref()
+                        != Ok(oid)
+                {
+                    return Err("remote_unavailable");
+                }
+                Some(oid.to_owned())
+            };
+            let refs: Vec<&str> = check.known.iter().map(String::as_str).collect();
+            let watched: Vec<&str> = check
+                .watched
+                .unwrap_or(check.known)
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let any_uploaded = match base.as_deref() {
+                Some(base) => uploaded_chat_contains_key(tool, root, base, &watched)?,
+                None => false,
+            };
+            *check.uploaded_key_found = if check.watched.is_some() {
+                Some(any_uploaded)
+            } else {
+                specific_uploaded_key_found(any_uploaded, &watched)
+            };
+            if unpushed_chat_needs_redaction(tool, root, &revision, base.as_deref(), &refs)? {
+                let candidate =
+                    redacted_history_candidate(tool, root, &revision, base.as_deref(), &refs)
+                        .map_err(|e| {
+                            if e == "sensitive_metadata" {
+                                "redaction_required"
+                            } else {
+                                e
+                            }
+                        })?;
+                safe_history(tool, root, &candidate)?;
+                let old_tree = git(tool, root, &["rev-parse", &format!("{revision}^{{tree}}")])
+                    .map_err(|_| "git_unavailable")?;
+                let new_tree = git(tool, root, &["rev-parse", &format!("{candidate}^{{tree}}")])
+                    .map_err(|_| "git_unavailable")?;
+                if old_tree != new_tree {
+                    return Err("redaction_required");
+                }
+                let _app_guard = crate::chat_file_changes::lock_app_write();
+                let _write_guard = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+                let _chat_guard = crate::chat_archive_store::lock_store().map_err(|_| "busy")?;
+                let dirty = git(
+                    tool,
+                    root,
+                    &["status", "--porcelain", "--untracked-files=all"],
+                )
+                .map_err(|_| "git_unavailable")?;
+                if !dirty.lines().all(|line| safe_untracked_default(root, line))
+                    || git(tool, root, &["rev-parse", "--verify", "HEAD"]).as_deref()
+                        != Ok(revision.as_str())
+                    || git(tool, root, &["symbolic-ref", "-q", "HEAD"]).is_err()
+                {
+                    return Err("redaction_required");
+                }
+                git(tool, root, &["update-ref", "HEAD", &candidate, &revision])
+                    .map_err(|_| "redaction_required")?;
+                revision = candidate;
+            }
+        }
         let dest = format!("{revision}:refs/heads/{branch}");
         remote_git(tool, root, &["push", "--no-follow-tags", target, &dest])?;
         fs::write(
@@ -1994,6 +3586,10 @@ fn transfer_with_merge_revision(
             .map_err(|_| "remote_unavailable")?;
             safe_history(tool, root, &revision)?;
             let _guard = crate::chat_file_changes::lock_app_write();
+            if let Some(db) = options.journal_db {
+                return first_receive_impl(tool, root, &revision, || {}, || {}, Some(db))
+                    .map(|_| false);
+            }
             return first_receive(tool, root, &revision).map(|_| false);
         }
         let dirty = git(
@@ -2226,22 +3822,26 @@ async fn run_transfer<R: tauri::Runtime>(
             .default_branch_ref
             .map(|x| x.name)
             .unwrap_or_else(|| "main".into());
-        let retry = root.join(".git/momso-first-receive-in-progress").exists();
+        let journal = match read_receive_journal(&db) {
+            Ok(journal) => journal,
+            Err(error) => return RemoteStatus::new("unavailable", Some(error)),
+        };
+        let retry = journal.is_some() || receive_marker_present(&root);
+        if action == "push" && retry {
+            return RemoteStatus::new("unavailable", Some("first_receive_in_progress"));
+        }
         let first_receive = action == "pull"
             && (retry || git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).is_err());
         let progress = |state, completed, available| {
             if first_receive {
-                let _ = progress_app.emit(
-                    "archive-first-receive-progress",
-                    receive_progress(state, completed, available),
-                );
+                let value = receive_progress(state, completed, available);
+                remember_receive_progress(&root, &db, &value);
+                let _ = progress_app.emit("archive-first-receive-progress", value);
             }
         };
-        if first_receive {
-            progress(if retry { "recovering" } else { "receiving" }, 0, false);
-        }
         if action == "push" {
-            if let Err(e) = crate::chat_archive_store::save_pending(&root, &resources, &paths) {
+            if let Err(e) = crate::chat_archive_store::save_pending_for_push(&root, &resources, &paths) {
+                if e == "redaction_pending" { return RemoteStatus::new("redactionPending", None); }
                 return RemoteStatus::new("unavailable", Some(e));
             }
         }
@@ -2252,16 +3852,91 @@ async fn run_transfer<R: tauri::Runtime>(
             .unwrap_or_else(|| url(&remote.name_with_owner));
         #[cfg(not(test))]
         let target = url(&remote.name_with_owner);
+        if first_receive {
+            let outcome = receive_first_with_progress(
+                &tool,
+                &root,
+                &db,
+                &target,
+                &branch,
+                |value| {
+                    let _ = progress_app.emit("archive-first-receive-progress", value);
+                },
+                || crate::chat_archive_store::restore_emitting(&root, &db, &app),
+            );
+            return match outcome {
+                Ok(()) => {
+                    #[cfg(test)]
+                    let mut result = if test_remote.is_some() {
+                        RemoteStatus::new("connected", None)
+                    } else {
+                        status(&root, &resources)
+                    };
+                    #[cfg(not(test))]
+                    let mut result = status(&root, &resources);
+                    result.repo = Some(remote.name_with_owner.clone());
+                    result.visibility = Some("private".into());
+                    result.signed_in_as = Some(user);
+                    result
+                }
+                Err(error) => {
+                    let value = receive_failure_progress(&root, error);
+                    remember_receive_progress(&root, &db, &value);
+                    let _ = progress_app.emit("archive-first-receive-progress", value);
+                    let mut result = RemoteStatus::transfer_error(error);
+                    result.repo = Some(remote.name_with_owner.clone());
+                    result.visibility = Some("private".into());
+                    result.signed_in_as = Some(user);
+                    result
+                }
+            };
+        }
         let before = git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).ok();
         let mut merge_revision = None;
-        let transfer_result = transfer_with_merge_revision(
+        let proof_key = if action == "push" { match crate::chat_archive_tracking::proof_key() { Ok(key) => Some(key), Err(_) => return RemoteStatus::new("unavailable", Some("credentials_unavailable")) } } else { None };
+        let _credential_guard = if action == "push" {
+            match crate::credentials::prevent_secret_changes() {
+                Ok(guard) => Some(guard),
+                Err(_) => return RemoteStatus::new("unavailable", Some("credentials_unavailable")),
+            }
+        } else { None };
+        let known = if action == "push" {
+            match crate::chat_archive_store::known_values(&paths.data_root, &paths.database_path) {
+                Ok(values) => values,
+                Err(_) => return RemoteStatus::new("unavailable", Some("credentials_unavailable")),
+            }
+        } else { Vec::new() };
+        if action == "push" {
+            let Some(key) = proof_key.as_deref() else { return RemoteStatus::new("unavailable", Some("credentials_unavailable")); };
+            let current = crate::chat_archive_tracking::proof(&root, &known, key);
+            let stored = crate::chat_archive_tracking::stored_proof(&paths.database_path);
+            if !matches!((current, stored), (Ok(current), Ok(Some(stored))) if current == stored) {
+                return RemoteStatus::new("redactionPending", None);
+            }
+        }
+        let watched = if action == "push" { match crate::redaction_wait::watched_values_unlocked() { Ok(values) => values, Err(_) => return RemoteStatus::new("unavailable", Some("credentials_unavailable")) } } else { Vec::new() };
+        let mut uploaded_key_found = None;
+        let check = if action == "push" {
+            let _ = app.emit("chat-archive-redaction-progress", serde_json::json!({"state":"checkingHistory","completed":0,"total":0,"available":false}));
+            Some(RedactionCheck { known: &known, watched: if watched.is_empty() { None } else { Some(&watched) }, uploaded_key_found: &mut uploaded_key_found })
+        } else { None };
+        let transfer_result = transfer_with_options(
             &tool,
             &root,
             &target,
             &branch,
             action,
             &mut merge_revision,
+            TransferOptions { journal_db: Some(&paths.database_path), check },
         );
+        if action == "push" && transfer_result.is_ok() && crate::redaction_wait::clear_after_upload_unlocked(&paths.database_path).is_err() {
+            let mut result = RemoteStatus::new("redactionCleanupPending", None);
+            result.uploaded_key_found = uploaded_key_found;
+            return result;
+        }
+        if action == "push" {
+            let _ = app.emit("chat-archive-redaction-progress", serde_json::json!({"state":if transfer_result.is_ok() {"complete"} else {"failed"},"completed":0,"total":0,"available":transfer_result.is_ok()}));
+        }
         let after = git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).ok();
         let changed = before != after;
         let merged = merge_revision.is_some();
@@ -2314,6 +3989,7 @@ async fn run_transfer<R: tauri::Runtime>(
                 false,
             );
             let mut s = RemoteStatus::transfer_error(e);
+            s.uploaded_key_found = uploaded_key_found;
             s.auto_merged = merged;
             s.preserved_documents = preserved;
             if e == "diverged" {
@@ -2341,6 +4017,7 @@ async fn run_transfer<R: tauri::Runtime>(
             progress("empty", 0, false);
         }
         result.auto_merged = merged;
+        result.uploaded_key_found = uploaded_key_found;
         result.preserved_documents = preserved;
         if people_conflict == Ok(Some(true)) {
             result.conflict_paths = Some(vec!["dictionary/people.json".to_owned()]);
@@ -2412,12 +4089,214 @@ pub(crate) async fn archive_remote_disconnect(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn saved_default_conflict_is_reported_without_changing_either_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let git_dir = root.join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        let name = format!("momso-first-pull-{}", uuid::Uuid::new_v4());
+        let saved = git_dir.join(&name);
+        std::fs::create_dir(&saved).unwrap();
+        std::fs::write(git_dir.join("momso-first-receive-in-progress"), name).unwrap();
+        std::fs::write(saved.join("AGENTS.md"), "saved").unwrap();
+        std::fs::write(root.join("AGENTS.md"), "user").unwrap();
+        let value = super::receive_failure_progress(root, "first_receive_interrupted");
+        assert_eq!(value.reason, Some("first_receive_conflict"));
+        assert_eq!(value.conflict_paths, vec!["AGENTS.md"]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "user"
+        );
+        assert_eq!(
+            std::fs::read_to_string(saved.join("AGENTS.md")).unwrap(),
+            "saved"
+        );
+        std::fs::write(root.join("AGENTS.md"), "saved").unwrap();
+        assert!(super::saved_default_conflicts(root).is_empty());
+    }
+    #[test]
+    fn first_receive_status_command_matches_progress_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
+        let db = base.join("momso.db");
+        let backups = base.join("backups");
+        crate::storage::initialize(&db, &backups, "test").unwrap();
+        let archive =
+            crate::archive_location::ArchiveLocation::load(db.clone(), base, vec![]).unwrap();
+        let root = base.join("momso");
+        let paths = crate::runtime::RuntimePaths {
+            data_root: base.to_path_buf(),
+            database_path: db.clone(),
+            objects_path: root.join("objects"),
+            exports_path: base.join("exports"),
+            backups_path: backups,
+            logs_path: base.join("logs"),
+            archive,
+            archive_lease: None,
+        };
+        let app = tauri::test::mock_builder()
+            .manage(crate::AppState {
+                paths,
+                approvals: crate::approval::ApprovalBroker::default(),
+                setup_secrets: crate::setup_secret::SecretBroker::default(),
+                usage_monitor: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                usage_cache: std::sync::Arc::new(crate::usage_status::UsageCache::default()),
+                chat_active: Default::default(),
+                browser: Default::default(),
+                selections: Default::default(),
+            })
+            .invoke_handler(tauri::generate_handler![
+                archive_first_receive_status,
+                crate::zet_create,
+                crate::zet_update,
+                crate::zet_read
+            ])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        fs::create_dir_all(root.join("zettels")).unwrap();
+        let input = serde_json::json!({"input":{"title":"Yoga","summary":"Practice","kind":"note","body":"First","assets":[],"edges":[]}});
+        let id = crate::command_entry_tests::invoke(&window, "zet_create", input.clone())
+            .as_str()
+            .unwrap()
+            .to_owned();
+        begin_receive_journal(&db, &root, "fixture", "main").unwrap();
+        let invoke_error = |cmd: &str, body: serde_json::Value| {
+            tauri::test::get_ipc_response(
+                &window,
+                tauri::webview::InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.into(),
+                },
+            )
+            .unwrap_err()
+        };
+        assert_eq!(
+            invoke_error("zet_create", input.clone()),
+            "first_receive_in_progress"
+        );
+        assert_eq!(
+            invoke_error(
+                "zet_update",
+                serde_json::json!({"id":id,"changes":{"body":"blocked"}})
+            ),
+            "first_receive_in_progress"
+        );
+        assert_eq!(
+            crate::command_entry_tests::invoke(&window, "zet_read", serde_json::json!({"id":id}))
+                ["body"],
+            "First"
+        );
+        let fake_tool = || -> Result<(), &'static str> {
+            let _tracking = crate::chat_file_changes::begin_chat(&root, &db, "test-chat")?;
+            fs::write(root.join("tool-wrote"), b"written").unwrap();
+            Ok(())
+        };
+        assert_eq!(fake_tool(), Err("first_receive_in_progress"));
+        assert!(!root.join("tool-wrote").exists());
+        let expected = receive_progress("receiving", 0, false);
+        remember_receive_progress(&root, &db, &expected);
+        assert_eq!(
+            crate::command_entry_tests::invoke(
+                &window,
+                "archive_first_receive_status",
+                serde_json::json!({})
+            ),
+            serde_json::to_value(expected).unwrap()
+        );
+        let failed = receive_progress("failed", 1, false);
+        remember_receive_progress(&root, &db, &failed);
+        assert_eq!(
+            crate::command_entry_tests::invoke(
+                &window,
+                "archive_first_receive_status",
+                serde_json::json!({})
+            ),
+            serde_json::to_value(failed).unwrap()
+        );
+        finish_receive_journal(&db).unwrap();
+        fake_tool().unwrap();
+        let tracking = crate::chat_file_changes::begin_chat(&root, &db, "active-chat").unwrap();
+        assert_eq!(
+            receive_first_locked(
+                Path::new("unused"),
+                &root,
+                &db,
+                "fixture",
+                "main",
+                |_| {},
+                || Ok(())
+            ),
+            Err("busy")
+        );
+        drop(tracking);
+        crate::command_entry_tests::invoke(
+            &window,
+            "zet_update",
+            serde_json::json!({"id":id,"changes":{"body":"allowed"}}),
+        );
+        assert!(crate::command_entry_tests::invoke(&window, "zet_create", input).is_string());
+        let complete = receive_progress("complete", 3, true);
+        remember_receive_progress(&root, &db, &complete);
+        assert_eq!(
+            crate::command_entry_tests::invoke(
+                &window,
+                "archive_first_receive_status",
+                serde_json::json!({})
+            ),
+            serde_json::to_value(complete).unwrap()
+        );
+    }
+    #[test]
+    fn first_receive_lock_excludes_other_process_and_releases_on_exit() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        if let Some(path) = std::env::var_os("MOMSO_TEST_RECEIVE_LOCK_DB") {
+            let _lock = super::lock_first_receive(std::path::Path::new(&path)).unwrap();
+            println!("MOMSO_LOCK_READY");
+            std::io::stdout().flush().unwrap();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("state.sqlite");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "archive_remote::tests::first_receive_lock_excludes_other_process_and_releases_on_exit", "--nocapture"])
+            .env("MOMSO_TEST_RECEIVE_LOCK_DB", &db)
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                output.read_line(&mut line).unwrap() > 0,
+                "child exited before acquiring lock"
+            );
+            if line.contains("MOMSO_LOCK_READY") {
+                break;
+            }
+        }
+        assert!(matches!(super::lock_first_receive(&db), Err("busy")));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(super::lock_first_receive(&db).is_ok());
+    }
+    #[test]
     fn first_receive_progress_matches_chat_restore_fields() {
         let pending =
             serde_json::to_value(super::receive_progress("recovering", 0, false)).unwrap();
         assert_eq!(
             pending,
-            serde_json::json!({"completed":0,"total":3,"state":"recovering","available":false})
+            serde_json::json!({"completed":0,"total":3,"state":"recovering","available":false,"reason":null,"conflictPaths":[]})
         );
         let completed = serde_json::to_value(super::receive_progress("complete", 3, true)).unwrap();
         assert_eq!(completed["available"], true);
@@ -2780,6 +4659,112 @@ mod tests {
         bare: PathBuf,
         tool: PathBuf,
     }
+
+    #[test]
+    fn missing_proof_without_keys_does_not_block_real_push_command() {
+        for room_count in [0, 2] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path();
+            let root = base.join("archive");
+            let bare = base.join("remote.git");
+            let db = base.join("momso.db");
+            let backups = base.join("backups");
+            let tool = crate::process::resolve_tool("git.exe").unwrap();
+            git(&tool, base, &["init", "--bare", bare.to_str().unwrap()]).unwrap();
+            if room_count > 0 {
+                crate::storage::initialize_before_chat_redaction_for_test(&db);
+                let conn = rusqlite::Connection::open(&db).unwrap();
+                conn.execute("INSERT INTO chats(id,title,created_at,updated_at) VALUES('chat_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','fixture','2020-01-01','2020-01-01')", []).unwrap();
+            }
+            crate::storage::initialize(&db, &backups, "fixture").unwrap();
+            let location =
+                crate::archive_location::ArchiveLocation::load(db.clone(), base, vec![]).unwrap();
+            *location.current.try_write().unwrap() = root.clone();
+            crate::archive::initialize(&root, base).unwrap();
+            for _ in usize::from(room_count > 0)..room_count {
+                crate::chat::create(&db).unwrap();
+            }
+            assert!(crate::chat_archive_tracking::stored_proof(&db)
+                .unwrap()
+                .is_none());
+            let paths = crate::runtime::RuntimePaths {
+                data_root: base.to_owned(),
+                database_path: db.clone(),
+                objects_path: root.join("objects"),
+                exports_path: base.join("exports"),
+                backups_path: backups,
+                logs_path: base.join("logs"),
+                archive: location,
+                archive_lease: None,
+            };
+            let app = tauri::test::mock_builder()
+                .manage(crate::AppState {
+                    paths,
+                    approvals: Default::default(),
+                    setup_secrets: Default::default(),
+                    usage_monitor: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    usage_cache: Default::default(),
+                    chat_active: Default::default(),
+                    browser: Default::default(),
+                    selections: Default::default(),
+                })
+                .manage(TestRemote {
+                    tool: tool.clone(),
+                    target: bare.to_string_lossy().into_owned(),
+                })
+                .invoke_handler(tauri::generate_handler![
+                    archive_remote_push,
+                    crate::chat_archive_status::chat_archive_sync_status
+                ])
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap();
+            let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .unwrap();
+            let status = crate::command_entry_tests::invoke(
+                &window,
+                "chat_archive_sync_status",
+                serde_json::json!({}),
+            );
+            assert_eq!(status["state"], "saved");
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = crate::credentials::prevent_secret_changes().unwrap();
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            });
+            ready_rx.recv().unwrap();
+            let push = crate::command_entry_tests::invoke(
+                &window,
+                "archive_remote_push",
+                serde_json::json!({}),
+            );
+            holder.join().unwrap();
+            assert_eq!(push["state"], "connected", "{push}");
+            assert!(crate::chat_archive_tracking::stored_proof(&db)
+                .unwrap()
+                .is_some());
+            let refs = git(
+                &tool,
+                base,
+                &[
+                    "--git-dir",
+                    bare.to_str().unwrap(),
+                    "show-ref",
+                    "--verify",
+                    "refs/heads/main",
+                ],
+            )
+            .unwrap();
+            assert!(!refs.is_empty());
+            let status = crate::command_entry_tests::invoke(
+                &window,
+                "chat_archive_sync_status",
+                serde_json::json!({}),
+            );
+            assert_eq!(status["state"], "saved");
+        }
+    }
     impl Fixture {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
@@ -2877,6 +4862,202 @@ mod tests {
     }
 
     #[test]
+    fn unpushed_old_chat_key_is_rewritten_before_send_without_losing_document_history() {
+        let f = Fixture::new();
+        f.push();
+        let remote_before = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        let key = "fixture-opaque-personal-value";
+        let id = "chat_20261115_120000";
+        fs::create_dir(f.root.join("chats")).unwrap();
+        let path = f.root.join("chats").join(format!("{id}.json"));
+        let snapshot = |text| {
+            serde_json::json!({"version":1,"room":{"id":id,"title":"lesson"},"messages":[{"id":"m","text":text}],"groups":[],"imports":[],"importMessages":[],"attachments":[],"redactions":0}).to_string()
+        };
+        fs::write(&path, snapshot(key)).unwrap();
+        git(&f.tool, &f.root, &["add", "--", "chats/"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "chat",
+            ],
+        )
+        .unwrap();
+        let old_chat_commit = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        f.local_commit();
+        fs::write(&path, snapshot("[가림]")).unwrap();
+        git(&f.tool, &f.root, &["add", "--", "chats/"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "mask",
+            ],
+        )
+        .unwrap();
+        let head = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            unpushed_chat_needs_redaction(&f.tool, &f.root, &head, Some(&remote_before), &[key]),
+            Ok(true)
+        );
+        let candidate =
+            redacted_history_candidate(&f.tool, &f.root, &head, Some(&remote_before), &[key]);
+        assert!(candidate.is_ok(), "candidate: {candidate:?}");
+        let mut uploaded = None;
+        let keys = vec![key.to_owned(), "other-fixture-key".to_owned()];
+        let watched = vec![key.to_owned()];
+        let result = transfer_with_redaction_check(
+            &f.tool,
+            &f.root,
+            f.remote(),
+            "main",
+            "push",
+            &mut None,
+            (
+                Some(RedactionCheck {
+                    known: &keys,
+                    watched: Some(&watched),
+                    uploaded_key_found: &mut uploaded,
+                }),
+                None,
+            ),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(uploaded, Some(false));
+        let pushed = git(&f.tool, &f.bare, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert!(!unpushed_chat_needs_redaction(
+            &f.tool,
+            &f.bare,
+            &pushed,
+            Some(&remote_before),
+            &[key]
+        )
+        .unwrap());
+        assert!(git(&f.tool, &f.bare, &["cat-file", "-e", &old_chat_commit]).is_err());
+        // Inspect the actual objects received by the fake remote, decompressed.
+        let received = git_output(
+            &f.tool,
+            &f.bare,
+            &["cat-file", "--batch-all-objects", "--batch"],
+        )
+        .unwrap();
+        assert!(received.status.success());
+        assert!(!received
+            .stdout
+            .windows(key.len())
+            .any(|bytes| bytes == key.as_bytes()));
+        assert_eq!(
+            git(&f.tool, &f.root, &["show", "HEAD:zettels/local.md"]).unwrap(),
+            "local"
+        );
+        assert!(git(
+            &f.tool,
+            &f.root,
+            &["log", "--format=%s", "--", "zettels/local.md"]
+        )
+        .unwrap()
+        .contains("local"));
+    }
+
+    #[test]
+    fn uploaded_snapshot_key_is_reported_without_rewriting_remote_history() {
+        let f = Fixture::new();
+        let key = "fixture-opaque-previous-value";
+        let id = "chat_20261115_120000";
+        fs::create_dir(f.root.join("chats")).unwrap();
+        let path = f.root.join("chats").join(format!("{id}.json"));
+        let snapshot = |text| {
+            serde_json::json!({"version":1,"room":{"id":id,"title":"lesson"},"messages":[{"id":"m","text":text}],"groups":[],"imports":[],"importMessages":[],"attachments":[],"redactions":0}).to_string()
+        };
+        fs::write(&path, snapshot(key)).unwrap();
+        git(&f.tool, &f.root, &["add", "--", "chats/"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "previous",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let old = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        f.local_commit();
+        fs::write(&path, snapshot("[가림]")).unwrap();
+        git(&f.tool, &f.root, &["add", "--", "chats/"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "mask",
+            ],
+        )
+        .unwrap();
+        let mut uploaded = None;
+        let keys = vec![key.to_owned(), "other-fixture-key".to_owned()];
+        let watched = vec![key.to_owned()];
+        let result = transfer_with_redaction_check(
+            &f.tool,
+            &f.root,
+            f.remote(),
+            "main",
+            "push",
+            &mut None,
+            (
+                Some(RedactionCheck {
+                    known: &keys,
+                    watched: Some(&watched),
+                    uploaded_key_found: &mut uploaded,
+                }),
+                None,
+            ),
+        );
+        assert!(result.is_ok());
+        assert_eq!(uploaded, Some(true));
+        assert_eq!(
+            specific_uploaded_key_found(true, &[key, "other-fixture-key"]),
+            None
+        );
+        assert_eq!(
+            specific_uploaded_key_found(false, &[key, "other-fixture-key"]),
+            Some(false)
+        );
+        assert!(git(
+            &f.tool,
+            &f.bare,
+            &["merge-base", "--is-ancestor", &old, "refs/heads/main"]
+        )
+        .is_ok());
+        let pushed = git(&f.tool, &f.bare, &["rev-parse", "refs/heads/main"]).unwrap();
+        assert!(
+            !unpushed_chat_needs_redaction(&f.tool, &f.bare, &pushed, Some(&old), &[key]).unwrap()
+        );
+    }
+
+    #[test]
     fn ipc_divergence_preserves_versions_and_allows_local_work_and_retry() {
         let f = Fixture::new();
         crate::archive::initialize(&f.root, f._dir.path()).unwrap();
@@ -2971,6 +5152,10 @@ mod tests {
             archive: location,
             archive_lease: None,
         };
+        while !crate::chat_redaction_recheck::step(&f.root, &paths)
+            .unwrap()
+            .available
+        {}
         let app = tauri::test::mock_builder()
             .manage(crate::AppState {
                 paths,
@@ -2980,6 +5165,7 @@ mod tests {
                 usage_cache: Default::default(),
                 chat_active: Default::default(),
                 browser: Default::default(),
+                selections: Default::default(),
             })
             .manage(TestRemote {
                 tool: f.tool.clone(),
@@ -3275,12 +5461,22 @@ mod tests {
         };
         let tool = std::env::var("MOMSO_TEST_FIRST_RECEIVE_GIT").unwrap();
         let revision = std::env::var("MOMSO_TEST_FIRST_RECEIVE_REVISION").unwrap();
+        let crash_after = std::env::var("MOMSO_TEST_FIRST_RECEIVE_AFTER")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let mut moved = 0;
         let _ = first_receive_with_hooks(
             Path::new(&tool),
             Path::new(&root),
             &revision,
             || {},
-            || std::process::exit(73),
+            || {
+                moved += 1;
+                if moved == crash_after {
+                    std::process::exit(73);
+                }
+            },
         );
         panic!("expected interrupted process");
     }
@@ -3335,6 +5531,1053 @@ mod tests {
             "initial"
         );
         assert!(!fresh.join(".git/momso-first-receive-in-progress").exists());
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn abrupt_first_receive_after_multiple_moves_or_directory_recovers() {
+        let f = Fixture::new();
+        f.push();
+        for count in [2, 5] {
+            let fresh = f._dir.path().join(format!("fresh-crash-{count}"));
+            fs::create_dir(&fresh).unwrap();
+            crate::archive::initialize(&fresh, f._dir.path()).unwrap();
+            relation(&f.tool, &fresh, f.remote(), "main").unwrap();
+            let revision = git(
+                &f.tool,
+                &fresh,
+                &["rev-parse", "refs/remotes/momso/observed"],
+            )
+            .unwrap();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "archive_remote::tests::first_receive_crash_child",
+                    "--nocapture",
+                ])
+                .env("MOMSO_TEST_FIRST_RECEIVE_ROOT", &fresh)
+                .env("MOMSO_TEST_FIRST_RECEIVE_GIT", &f.tool)
+                .env("MOMSO_TEST_FIRST_RECEIVE_REVISION", &revision)
+                .env("MOMSO_TEST_FIRST_RECEIVE_AFTER", count.to_string())
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert_eq!(status.status.code(), Some(73));
+            transfer(&f.tool, &fresh, f.remote(), "main", "pull").unwrap();
+            assert_eq!(
+                fs::read_to_string(fresh.join("zettels/a.md")).unwrap(),
+                "initial"
+            );
+            assert!(!fresh.join(".git/momso-first-receive-in-progress").exists());
+        }
+    }
+
+    #[test]
+    fn first_receive_database_crash_child() {
+        let Ok(root) = std::env::var("MOMSO_C28_ROOT") else {
+            return;
+        };
+        let db = std::env::var("MOMSO_C28_DB").unwrap();
+        let tool = std::env::var("MOMSO_C28_GIT").unwrap();
+        let crash = std::env::var("MOMSO_C28_PHASE").unwrap();
+        let root = Path::new(&root);
+        let db = Path::new(&db);
+        let _ = receive_first_with_progress(
+            Path::new(&tool),
+            root,
+            db,
+            "fixture",
+            "main",
+            |event| {
+                if crash == "before_index" && event.state == "indexing" {
+                    std::process::exit(73);
+                }
+                if crash == "before_restore" && event.state == "restoring" {
+                    std::process::exit(73);
+                }
+            },
+            || {
+                crate::chat_archive_store::restore_with_progress(root, db, |event| {
+                    if crash == "during_restore"
+                        && event.state == "restoring"
+                        && event.completed == 1
+                    {
+                        std::process::exit(73);
+                    }
+                })?;
+                if crash == "after_restore" {
+                    std::process::exit(73);
+                }
+                Ok(())
+            },
+        );
+        panic!("expected interrupted process");
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn missing_file_after_restore_intent_is_recreated() {
+        let f = Fixture::new();
+        let base = f._dir.path().join("ambiguous");
+        let root = base.join("momso");
+        let saved = base.join("saved");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&saved).unwrap();
+        git(&f.tool, &root, &["init", "--initial-branch=main"]).unwrap();
+        fs::write(saved.join("AGENTS.md"), "saved original").unwrap();
+        let db = base.join("local.sqlite");
+        crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+        let mut journal = begin_receive_journal(&db, &root, "fixture", "main").unwrap();
+        journal.phase = "checkout".into();
+        journal.restore_intents.push("AGENTS.md".into());
+        write_receive_journal(&db, &journal).unwrap();
+        restore_journaled_defaults(&f.tool, &root, &db, &saved).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "saved original"
+        );
+        assert_eq!(
+            fs::read_to_string(saved.join("AGENTS.md")).unwrap(),
+            "saved original"
+        );
+        assert!(read_receive_journal(&db).unwrap().is_some());
+    }
+
+    #[test]
+    fn first_receive_checkout_crash_child() {
+        let Ok(root) = std::env::var("MOMSO_C28_ROOT") else {
+            return;
+        };
+        let db = std::env::var("MOMSO_C28_DB").unwrap();
+        let tool = std::env::var("MOMSO_C28_GIT").unwrap();
+        let target = std::env::var("MOMSO_C28_TARGET").unwrap();
+        let root = Path::new(&root);
+        let db = Path::new(&db);
+        let _ = receive_first_with_progress(
+            Path::new(&tool),
+            root,
+            db,
+            &target,
+            "main",
+            |_| {},
+            || crate::chat_archive_store::restore(root, db),
+        );
+        panic!("expected interrupted process");
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn checkout_and_skill_crashes_restore_received_document_and_keep_local_work() {
+        for phase in ["checkout", "skill"] {
+            let f = Fixture::new();
+            fs::remove_file(f.root.join("zettels/a.md")).unwrap();
+            let remote_id = "zet_20261115_143052";
+            let document = |id: &str| {
+                format!("---\nid: {id}\ntitle: Example\nsummary: Example\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\nbody\n")
+            };
+            fs::write(
+                f.root.join("zettels").join(format!("{remote_id}.md")),
+                document(remote_id),
+            )
+            .unwrap();
+            if phase == "skill" {
+                let (name, content) = crate::skills::BUNDLED_SKILLS[0];
+                let dir = f.root.join("skills").join(name);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("SKILL.md"), format!("{content}\n")).unwrap();
+            }
+            git(&f.tool, &f.root, &["add", "--all", "--", "zettels"]).unwrap();
+            if phase == "skill" {
+                git(&f.tool, &f.root, &["add", "--", "skills"]).unwrap();
+            }
+            git(
+                &f.tool,
+                &f.root,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    "receive fixture",
+                ],
+            )
+            .unwrap();
+            f.push();
+            let base = f._dir.path().join("new-pc");
+            let root = base.join("momso");
+            fs::create_dir_all(&root).unwrap();
+            crate::archive::initialize(&root, &base).unwrap();
+            let db = base.join("local.sqlite");
+            crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "archive_remote::tests::first_receive_checkout_crash_child",
+                    "--nocapture",
+                ])
+                .env("MOMSO_C28_ROOT", &root)
+                .env("MOMSO_C28_DB", &db)
+                .env("MOMSO_C28_GIT", &f.tool)
+                .env("MOMSO_C28_TARGET", f.remote())
+                .stdin(Stdio::null());
+            if phase == "checkout" {
+                child.env("MOMSO_C28_CRASH_AFTER_CHECKOUT", "1");
+            } else {
+                child.env("MOMSO_C28_CRASH_DURING_SKILL", "1");
+            }
+            assert_eq!(child.output().unwrap().status.code(), Some(73), "{phase}");
+            assert_eq!(
+                read_receive_journal(&db).unwrap().unwrap().phase,
+                "checkout"
+            );
+            fs::remove_file(root.join("zettels").join(format!("{remote_id}.md"))).unwrap();
+            let local_id = "zet_20261115_143053";
+            fs::write(
+                root.join("zettels").join(format!("{local_id}.md")),
+                document(local_id),
+            )
+            .unwrap();
+            let local = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
+            let local_chat = local["id"].as_str().unwrap();
+            receive_first_with_progress(
+                &f.tool,
+                &root,
+                &db,
+                f.remote(),
+                "main",
+                |_| {},
+                || crate::chat_archive_store::restore(&root, &db),
+            )
+            .unwrap();
+            assert!(root
+                .join("zettels")
+                .join(format!("{remote_id}.md"))
+                .exists());
+            assert_eq!(
+                fs::read_to_string(root.join("zettels").join(format!("{local_id}.md"))).unwrap(),
+                document(local_id)
+            );
+            assert_eq!(
+                serde_json::to_value(crate::chat::list(&db).unwrap())
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(crate::chat::read(&db, local_chat).is_ok());
+            assert!(read_receive_journal(&db).unwrap().is_none());
+            assert!(!root.join(".git/momso-first-receive-in-progress").exists());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn dictionary_file_recovery_survives_process_exit() {
+        let f = Fixture::new();
+        fs::remove_file(f.root.join("zettels/a.md")).unwrap();
+        let id = "zet_20261115_143052";
+        fs::write(f.root.join("zettels").join(format!("{id}.md")), format!("---\nid: {id}\ntitle: Example\nsummary: Example\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\nbody\n")).unwrap();
+        crate::yoga_dictionary::initialize(&f.root).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &["add", "--all", "--", "zettels", "dictionary"],
+        )
+        .unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "dictionary fixture",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let base = f._dir.path().join("dictionary-crash");
+        let root = base.join("momso");
+        fs::create_dir_all(&root).unwrap();
+        crate::archive::initialize(&root, &base).unwrap();
+        let db = base.join("local.sqlite");
+        crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+        let child = |crash_name: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "archive_remote::tests::first_receive_checkout_crash_child",
+                    "--nocapture",
+                ])
+                .env("MOMSO_C28_ROOT", &root)
+                .env("MOMSO_C28_DB", &db)
+                .env("MOMSO_C28_GIT", &f.tool)
+                .env("MOMSO_C28_TARGET", f.remote())
+                .env(crash_name, "1")
+                .stdin(Stdio::null());
+            command.output().unwrap().status.code()
+        };
+        assert_eq!(child("MOMSO_C28_CRASH_AFTER_CHECKOUT"), Some(73));
+        fs::remove_file(root.join("dictionary/yoga.json")).unwrap();
+        assert_eq!(child("MOMSO_C31_CRASH_DICTIONARY"), Some(73));
+        assert!(root.join("dictionary/yoga.json").is_file());
+        receive_first_with_progress(
+            &f.tool,
+            &root,
+            &db,
+            f.remote(),
+            "main",
+            |_| {},
+            || crate::chat_archive_store::restore(&root, &db),
+        )
+        .unwrap();
+        assert!(read_receive_journal(&db).unwrap().is_none());
+        assert!(crate::yoga_dictionary::list(&root).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn renamed_conflicting_default_can_resume_first_receive() {
+        let f = Fixture::new();
+        fs::remove_file(f.root.join("zettels/a.md")).unwrap();
+        let id = "zet_20261115_143052";
+        let document = |body: &str| {
+            format!("---\nid: {id}\ntitle: Example\nsummary: Example\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\n{body}\n")
+        };
+        fs::write(
+            f.root.join("zettels").join(format!("{id}.md")),
+            document("received"),
+        )
+        .unwrap();
+        fs::write(f.root.join("AGENTS.md"), "received rules").unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &["add", "--all", "--", "zettels", "AGENTS.md"],
+        )
+        .unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "received fixture",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let base = f._dir.path().join("conflict-pc");
+        let root = base.join("momso");
+        fs::create_dir_all(&root).unwrap();
+        crate::archive::initialize(&root, &base).unwrap();
+        let db = base.join("local.sqlite");
+        crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "archive_remote::tests::first_receive_checkout_crash_child",
+                "--nocapture",
+            ])
+            .env("MOMSO_C28_ROOT", &root)
+            .env("MOMSO_C28_DB", &db)
+            .env("MOMSO_C28_GIT", &f.tool)
+            .env("MOMSO_C28_TARGET", f.remote())
+            .env("MOMSO_C31_CRASH_BEFORE_CHECKOUT", "1")
+            .stdin(Stdio::null());
+        assert_eq!(child.output().unwrap().status.code(), Some(73));
+        fs::write(root.join("AGENTS.md"), "local rules").unwrap();
+        let mut reported = None;
+        let blocked = receive_first_with_progress(
+            &f.tool,
+            &root,
+            &db,
+            f.remote(),
+            "main",
+            |p| reported = Some(p),
+            || crate::chat_archive_store::restore(&root, &db),
+        );
+        assert_eq!(blocked, Err("first_receive_interrupted"));
+        let reported = reported.unwrap();
+        assert_eq!(reported.reason, Some("first_receive_conflict"));
+        assert_eq!(reported.conflict_paths, vec!["AGENTS.md"]);
+        let renamed = root.join("AGENTS-local.md");
+        fs::rename(root.join("AGENTS.md"), &renamed).unwrap();
+        let local_document = root.join("zettels").join(format!("{id}.md"));
+        fs::write(&local_document, document("local")).unwrap();
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new()
+                .append(true)
+                .open(root.join(".git/info/exclude"))
+                .unwrap(),
+            "zettels/{id}.md"
+        )
+        .unwrap();
+        let collision = receive_first_with_progress(
+            &f.tool,
+            &root,
+            &db,
+            f.remote(),
+            "main",
+            |_| {},
+            || crate::chat_archive_store::restore(&root, &db),
+        );
+        assert_eq!(collision, Err("fast_forward_failed"));
+        assert_eq!(
+            fs::read_to_string(&local_document).unwrap(),
+            document("local")
+        );
+        let moved_document = root.join("zettels/local-preserved.txt");
+        fs::rename(&local_document, &moved_document).unwrap();
+        receive_first_with_progress(
+            &f.tool,
+            &root,
+            &db,
+            f.remote(),
+            "main",
+            |_| {},
+            || crate::chat_archive_store::restore(&root, &db),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&renamed).unwrap(), "local rules");
+        assert_eq!(
+            fs::read_to_string(&moved_document).unwrap(),
+            document("local")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("zettels").join(format!("{id}.md"))).unwrap(),
+            document("received")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("AGENTS.md")).unwrap(),
+            "received rules"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn missing_received_dictionary_is_replaced_without_overwriting_other_files() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.root.join("dictionary")).unwrap();
+        fs::write(f.root.join("dictionary/yoga.json"), "received dictionary").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "dictionary/yoga.json"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "dictionary",
+            ],
+        )
+        .unwrap();
+        let revision = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        fs::remove_file(f.root.join("dictionary/yoga.json")).unwrap();
+        fs::write(f.root.join("zettels/a.md"), "user edit").unwrap();
+        fs::write(f.root.join("zettels/new.md"), "new user document").unwrap();
+        restore_missing_received_files(&f.tool, &f.root, &revision, &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(f.root.join("dictionary/yoga.json")).unwrap(),
+            "received dictionary"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/a.md")).unwrap(),
+            "user edit"
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("zettels/new.md")).unwrap(),
+            "new user document"
+        );
+        assert_eq!(
+            git(&f.tool, &f.root, &["show", "HEAD:zettels/a.md"]).unwrap(),
+            "initial"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn app_start_preparation_resumes_and_emits_progress() {
+        use tauri::Listener;
+        let f = Fixture::new();
+        fs::remove_file(f.root.join("zettels/a.md")).unwrap();
+        let id = "zet_20261115_143052";
+        fs::write(f.root.join("zettels").join(format!("{id}.md")), format!("---\nid: {id}\ntitle: Example\nsummary: Example\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\nbody\n")).unwrap();
+        git(&f.tool, &f.root, &["add", "--all", "--", "zettels"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "receive fixture",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let base = f._dir.path().join("startup-pc");
+        let root = base.join("momso");
+        fs::create_dir_all(&root).unwrap();
+        crate::archive::initialize(&root, &base).unwrap();
+        let db = base.join("local.sqlite");
+        let backups = base.join("backup");
+        crate::storage::initialize(&db, &backups, "test").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "archive_remote::tests::first_receive_checkout_crash_child",
+                "--nocapture",
+            ])
+            .env("MOMSO_C28_ROOT", &root)
+            .env("MOMSO_C28_DB", &db)
+            .env("MOMSO_C28_GIT", &f.tool)
+            .env("MOMSO_C28_TARGET", f.remote())
+            .env("MOMSO_C28_CRASH_AFTER_CHECKOUT", "1")
+            .stdin(Stdio::null());
+        assert_eq!(child.output().unwrap().status.code(), Some(73));
+        let received = root.join("zettels").join(format!("{id}.md"));
+        fs::remove_file(&received).unwrap();
+        Connection::open(&db).unwrap().execute(
+            "INSERT INTO archive_location_settings(id,path,initialized) VALUES(1,?1,1) ON CONFLICT(id) DO UPDATE SET path=excluded.path,initialized=1",
+            [root.to_str().unwrap()],
+        ).unwrap();
+        let archive =
+            crate::archive_location::ArchiveLocation::load(db.clone(), &base, vec![]).unwrap();
+        let paths = crate::runtime::RuntimePaths {
+            data_root: base.clone(),
+            database_path: db.clone(),
+            objects_path: root.join("objects"),
+            exports_path: base.join("exports"),
+            backups_path: backups,
+            logs_path: base.join("logs"),
+            archive,
+            archive_lease: None,
+        };
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorded = events.clone();
+        let app = tauri::test::mock_builder()
+            .manage(TestRemote {
+                tool: f.tool.clone(),
+                target: f.remote().to_owned(),
+            })
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.listen("archive-first-receive-progress", move |event| {
+            recorded
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(event.payload()).unwrap());
+        });
+        crate::prepare_archive_for_start(&paths, &base).unwrap();
+        assert!(!received.exists());
+        start_first_receive_recovery(app.handle().clone(), paths, base);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::time::Instant::now() < until {
+            if events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event["state"] == "complete" || event["state"] == "interrupted")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["state"] == "recovering" && event["available"] == false),
+            "events: {events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|event| event["state"] == "complete" && event["available"] == true));
+        assert!(received.is_file());
+        assert!(read_receive_journal(&db).unwrap().is_none());
+        drop(app);
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn receiving_journal_retries_with_an_incomplete_pack_file() {
+        let f = Fixture::new();
+        fs::remove_file(f.root.join("zettels/a.md")).unwrap();
+        let id = "zet_20261115_143052";
+        fs::write(f.root.join("zettels").join(format!("{id}.md")), format!("---\nid: {id}\ntitle: Example\nsummary: Example\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\nbody\n")).unwrap();
+        git(&f.tool, &f.root, &["add", "--all", "--", "zettels"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "valid document",
+            ],
+        )
+        .unwrap();
+        f.push();
+        for interrupted_download in [false, true] {
+            let base = f._dir.path().join(format!("new-pc-{interrupted_download}"));
+            let root = base.join("momso");
+            fs::create_dir_all(&root).unwrap();
+            crate::archive::initialize(&root, &base).unwrap();
+            let db = base.join("local.sqlite");
+            crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+            begin_receive_journal(&db, &root, f.remote(), "main").unwrap();
+            if interrupted_download {
+                let pack = root.join(".git/objects/pack");
+                fs::create_dir_all(&pack).unwrap();
+                fs::write(pack.join("tmp_pack_interrupted"), b"PACK\0\0").unwrap();
+            }
+            let mut states = Vec::new();
+            receive_first_with_progress(
+                &f.tool,
+                &root,
+                &db,
+                f.remote(),
+                "main",
+                |value| {
+                    if value.state == "indexing" {
+                        assert!(read_receive_journal(&db)
+                            .unwrap()
+                            .unwrap()
+                            .revision
+                            .is_some());
+                    }
+                    states.push(value);
+                },
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(read_receive_journal(&db).unwrap().is_none());
+            assert!(root.join("zettels").join(format!("{id}.md")).is_file());
+            assert!(states
+                .iter()
+                .any(|state| state.state == "complete" && state.available));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires real Git and local loopback sockets"]
+    fn interrupted_git_fetch_retries_from_local_transport() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::time::{Duration, Instant};
+
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let f = Fixture::new();
+        fs::remove_file(f.root.join("zettels/a.md")).unwrap();
+        let id = "zet_20261115_143052";
+        let mut content = format!("---\nid: {id}\ntitle: Example\nsummary: Example\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\n").into_bytes();
+        let mut random = 0x1234_5678_9abc_def0_u64;
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        for _ in 0..(8 * 1024 * 1024) {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            content.push(alphabet[(random as usize) & 63]);
+        }
+        fs::write(f.root.join("zettels").join(format!("{id}.md")), content).unwrap();
+        git(&f.tool, &f.root, &["add", "--all", "--", "zettels"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "transfer fixture",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let base = f._dir.path().join("fetch-crash");
+        let root = base.join("momso");
+        fs::create_dir_all(&root).unwrap();
+        crate::archive::initialize(&root, &base).unwrap();
+        let db = base.join("local.sqlite");
+        crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+        begin_receive_journal(&db, &root, f.remote(), "main").unwrap();
+
+        let daemon_probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let daemon_addr = daemon_probe.local_addr().unwrap();
+        drop(daemon_probe);
+        let mut daemon_command = Command::new(&f.tool);
+        hidden(&mut daemon_command)
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--export-all",
+                "--listen=127.0.0.1",
+            ])
+            .arg(format!("--port={}", daemon_addr.port()))
+            .arg(format!("--base-path={}", f._dir.path().display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut daemon = OwnedChild(daemon_command.spawn().unwrap());
+        let until = Instant::now() + Duration::from_secs(15);
+        while TcpStream::connect_timeout(&daemon_addr, Duration::from_millis(100)).is_err() {
+            assert!(Instant::now() < until, "local Git daemon did not start");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let transmitted = Arc::new(AtomicUsize::new(0));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let counter = transmitted.clone();
+        let stop = stopping.clone();
+        let proxy = std::thread::spawn(move || {
+            let (mut client, _) = listener.accept().unwrap();
+            let mut server = TcpStream::connect(daemon_addr).unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut input = client.try_clone().unwrap();
+            let mut upstream = server.try_clone().unwrap();
+            let pump = std::thread::spawn(move || {
+                let _ = std::io::copy(&mut input, &mut upstream);
+                let _ = upstream.shutdown(Shutdown::Write);
+            });
+            let mut buffer = [0_u8; 8192];
+            while !stop.load(Ordering::Relaxed) {
+                match server.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if client.write_all(&buffer[..count]).is_err() {
+                            break;
+                        }
+                        counter.fetch_add(count, Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = server.shutdown(Shutdown::Both);
+            let _ = pump.join();
+        });
+        let url = format!("git://127.0.0.1:{}/remote.git", proxy_addr.port());
+        let mut fetch_command = Command::new(&f.tool);
+        hidden(&mut fetch_command)
+            .current_dir(&root)
+            .args([
+                "-c",
+                "fetch.unpackLimit=1",
+                "fetch",
+                "--no-tags",
+                &url,
+                "+refs/heads/main:refs/remotes/momso/observed",
+            ])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut fetch = OwnedChild(fetch_command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while transmitted.load(Ordering::Relaxed) < 256 * 1024 {
+            assert!(
+                Instant::now() < deadline,
+                "Git did not start receiving the pack"
+            );
+            assert!(
+                fetch.0.try_wait().unwrap().is_none(),
+                "Git exited before interruption"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        fetch.0.kill().unwrap();
+        let status = fetch.0.wait().unwrap();
+        assert!(!status.success());
+        stopping.store(true, Ordering::Relaxed);
+        let _ = daemon.0.kill();
+        let _ = daemon.0.wait();
+        proxy.join().unwrap();
+        assert!(read_receive_journal(&db).unwrap().is_some());
+        receive_first_with_progress(&f.tool, &root, &db, f.remote(), "main", |_| {}, || Ok(()))
+            .unwrap();
+        assert!(read_receive_journal(&db).unwrap().is_none());
+        assert!(root.join("zettels").join(format!("{id}.md")).is_file());
+        git(&f.tool, &root, &["fsck", "--no-reflogs"]).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn automatic_connection_emits_progress_matching_status() {
+        use tauri::Listener;
+        let f = Fixture::new();
+        fs::remove_file(f.root.join("zettels/a.md")).unwrap();
+        let id = "zet_20261115_143052";
+        fs::write(f.root.join("zettels").join(format!("{id}.md")), format!("---\nid: {id}\ntitle: Example\nsummary: Example\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\nbody\n")).unwrap();
+        git(&f.tool, &f.root, &["add", "--all", "--", "zettels"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "valid document",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let base = f._dir.path().join("automatic-connect");
+        let root = base.join("momso");
+        fs::create_dir_all(&root).unwrap();
+        crate::archive::initialize(&root, &base).unwrap();
+        let db = base.join("local.sqlite");
+        crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let status_root = root.clone();
+        let status_db = db.clone();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        app.listen("archive-first-receive-progress", move |event| {
+            let event: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+            let status =
+                serde_json::to_value(current_first_receive_progress(&status_root, &status_db))
+                    .unwrap();
+            captured.lock().unwrap().push((event, status));
+        });
+        receive_connected_with_progress(
+            &f.tool,
+            &root,
+            &db,
+            f.remote(),
+            "main",
+            Some(app.handle()),
+        )
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|(event, _)| event["state"] == "receiving" && event["available"] == false));
+        assert!(events
+            .iter()
+            .any(|(event, _)| event["state"] == "complete" && event["available"] == true));
+        assert!(
+            events.iter().all(|(event, status)| event == status),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn legacy_journal_without_verified_revision_never_completes() {
+        let f = Fixture::new();
+        let base = f._dir.path().join("unknown-revision");
+        let root = base.join("momso");
+        fs::create_dir_all(&root).unwrap();
+        crate::archive::initialize(&root, &base).unwrap();
+        let db = base.join("local.sqlite");
+        crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+        let mut journal = begin_receive_journal(&db, &root, "fixture", "main").unwrap();
+        journal.phase = "indexing".into();
+        write_receive_journal(&db, &journal).unwrap();
+        let result = receive_first_with_progress(
+            &f.tool,
+            &root,
+            &db,
+            "fixture",
+            "main",
+            |_| {},
+            || panic!("must not restore without a verified revision"),
+        );
+        assert_eq!(result, Err("first_receive_interrupted"));
+        assert!(read_receive_journal(&db).unwrap().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires a real Git executable"]
+    fn interrupted_index_and_chat_restore_resume_without_duplicates_or_resurrection() {
+        let f = Fixture::new();
+        for phase in [
+            "before_index",
+            "during_index",
+            "before_restore",
+            "during_restore",
+            "after_restore",
+        ] {
+            let base = f._dir.path().join(format!("journal-{phase}"));
+            let root = base.join("archive");
+            fs::create_dir_all(&root).unwrap();
+            crate::archive::initialize(&root, &base).unwrap();
+            let db = base.join("local.sqlite");
+            let source = base.join("source.sqlite");
+            crate::storage::initialize(&db, &base.join("backup"), "test").unwrap();
+            crate::storage::initialize(&source, &base.join("source-backup"), "test").unwrap();
+            let id = "zet_20261115_143052";
+            fs::write(root.join("zettels").join(format!("{id}.md")), format!("---\nid: {id}\ntitle: Example\nsummary: Example\nkind: note\nstatus: draft\ncreated_at: '2026-11-15T14:30:52+09:00'\nupdated_at: '2026-11-15T14:30:52+09:00'\nassets: []\nedges: []\n---\nbody\n")).unwrap();
+            let remote = serde_json::to_value(crate::chat::create(&source).unwrap()).unwrap();
+            let remote_id = remote["id"].as_str().unwrap();
+            crate::chat::append(
+                &source,
+                remote_id,
+                crate::chat::Role::User,
+                "remote message",
+                None,
+                None,
+            )
+            .unwrap();
+            let deleted = serde_json::to_value(crate::chat::create(&source).unwrap()).unwrap();
+            let deleted_id = deleted["id"].as_str().unwrap();
+            fs::create_dir_all(root.join("chats")).unwrap();
+            for chat in [remote_id, deleted_id] {
+                let data = crate::chat_archive_snapshot::snapshot(&source, chat).unwrap();
+                fs::write(
+                    root.join("chats").join(format!("{chat}.json")),
+                    serde_json::to_vec(&data).unwrap(),
+                )
+                .unwrap();
+            }
+            git(&f.tool, &root, &["add", "--", "zettels", "chats"]).unwrap();
+            git(
+                &f.tool,
+                &root,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    "received fixture",
+                ],
+            )
+            .unwrap();
+            let revision = git(&f.tool, &root, &["rev-parse", "HEAD"]).unwrap();
+            git(
+                &f.tool,
+                &root,
+                &["update-ref", "refs/remotes/momso/observed", &revision],
+            )
+            .unwrap();
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES(?1,'pending',CURRENT_TIMESTAMP)", [format!("chat_archive_delete:{deleted_id}")]).unwrap();
+            let deleted_snapshot =
+                fs::read(root.join("chats").join(format!("{deleted_id}.json"))).unwrap();
+            conn.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES(?1,?2,CURRENT_TIMESTAMP)", rusqlite::params![format!("chat_archive_snapshot_hash:{deleted_id}"), crate::object_store::digest(&deleted_snapshot)]).unwrap();
+            conn.execute(
+                "INSERT INTO chat_deletions(chat_id,deleted_at) VALUES(?1,'2026-11-17T00:00:00Z')",
+                [&deleted_id],
+            )
+            .unwrap();
+            drop(conn);
+            let mut journal = begin_receive_journal(&db, &root, "fixture", "main").unwrap();
+            journal.phase = "indexing".into();
+            write_receive_journal(&db, &journal).unwrap();
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "archive_remote::tests::first_receive_database_crash_child",
+                    "--nocapture",
+                ])
+                .env("MOMSO_C28_ROOT", &root)
+                .env("MOMSO_C28_DB", &db)
+                .env("MOMSO_C28_GIT", &f.tool)
+                .env("MOMSO_C28_PHASE", phase)
+                .stdin(Stdio::null());
+            if phase == "during_index" {
+                child.env("MOMSO_C28_CRASH_DURING_INDEX", "1");
+            }
+            assert_eq!(child.output().unwrap().status.code(), Some(73), "{phase}");
+            assert!(read_receive_journal(&db).unwrap().is_some());
+            let local = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
+            let local_id = local["id"].as_str().unwrap();
+            crate::chat::append(
+                &db,
+                local_id,
+                crate::chat::Role::User,
+                "local message",
+                None,
+                None,
+            )
+            .unwrap();
+            receive_first_with_progress(
+                &f.tool,
+                &root,
+                &db,
+                "fixture",
+                "main",
+                |_| {},
+                || crate::chat_archive_store::restore(&root, &db),
+            )
+            .unwrap();
+            assert!(read_receive_journal(&db).unwrap().is_none());
+            let rooms = serde_json::to_value(crate::chat::list(&db).unwrap()).unwrap();
+            let rooms = rooms.as_array().unwrap();
+            assert_eq!(rooms.len(), 2, "{phase}");
+            assert!(rooms.iter().any(|room| room["id"] == remote_id));
+            assert!(rooms.iter().any(|room| room["id"] == local_id));
+            let tombstone: serde_json::Value = serde_json::from_slice(
+                &fs::read(root.join("chats").join(format!("{deleted_id}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(tombstone["deleted"], true);
+            assert_eq!(
+                Connection::open(&db)
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM archive_zets WHERE id=?1",
+                        [id],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+        }
     }
 
     #[test]
@@ -4022,7 +7265,8 @@ mod tests {
                 f.remote(),
                 "main",
                 "pull",
-                &mut merged_revision
+                &mut merged_revision,
+                None,
             ),
             Ok(true)
         );

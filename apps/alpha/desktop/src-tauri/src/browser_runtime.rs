@@ -104,9 +104,15 @@ pub(crate) struct BrowserManager {
 fn limited(text: &str, count: usize) -> String {
     text.chars().take(count).collect()
 }
-fn page_value(page: PageState) -> Value {
-    let elements: Vec<_> = page.elements.into_iter().take(40).map(|e| json!({"id":limited(&e.id,128),"role":limited(&e.role,24),"name":limited(&e.name,128),"kind":e.kind})).collect();
-    json!({"status":"page","origin":page.origin,"title":limited(&page.title,256),"text":limited(&page.text,4000),"elements":elements,"dataProvenance":page.data_provenance})
+fn page_value(page: PageState, known: &[&str]) -> Value {
+    let clean = |value: &str, limit| {
+        limited(
+            &crate::chat_archive_redact::redact_with_known(value, known).text,
+            limit,
+        )
+    };
+    let elements: Vec<_> = page.elements.into_iter().take(40).map(|e| json!({"id":limited(&e.id,128),"role":clean(&e.role,24),"name":clean(&e.name,128),"kind":e.kind})).collect();
+    json!({"status":"page","origin":page.origin,"title":clean(&page.title,256),"text":clean(&page.text,4000),"elements":elements,"dataProvenance":page.data_provenance})
 }
 fn human(reason: &'static str, chat_id: &str, notify: &Notify) -> Value {
     let reason = match reason {
@@ -119,14 +125,14 @@ fn human(reason: &'static str, chat_id: &str, notify: &Notify) -> Value {
     );
     json!({"status":"human_required"})
 }
-fn safe_page(page: PageState, chat_id: &str, notify: &Notify) -> Value {
+fn safe_page(page: PageState, chat_id: &str, notify: &Notify, known: &[&str]) -> Value {
     if page.elements.iter().any(|e| e.kind == "password") {
         return human("password", chat_id, notify);
     }
     if page.elements.iter().any(|e| e.kind == "one_time_code") {
         return human("one_time_code", chat_id, notify);
     }
-    page_value(page)
+    page_value(page, known)
 }
 fn error(err: DriverError, chat_id: &str, notify: &Notify) -> Value {
     match err {
@@ -348,9 +354,21 @@ impl BrowserManager {
             if !entry.policy.allows(url) {
                 return json!({"status":"blocked"});
             }
+            let data_root = root.clone();
+            let known = match tokio::task::spawn_blocking(move || {
+                crate::chat_archive_store::known_values(&data_root, &data_root.join("momso.db"))
+            })
+            .await
+            {
+                Ok(Ok(known)) => known,
+                _ => return json!({"status":"unavailable"}),
+            };
+            let refs: Vec<&str> = known.iter().map(String::as_str).collect();
             let url = url.to_owned();
             return match call(&entry, move |s| s.navigate(&url)).await {
-                Ok(page) if entry.policy.allows(&page.origin) => safe_page(page, chat_id, &notify),
+                Ok(page) if entry.policy.allows(&page.origin) => {
+                    safe_page(page, chat_id, &notify, &refs)
+                }
                 Ok(_) => json!({"status":"blocked"}),
                 Err(e) => error(e, chat_id, &notify),
             };
@@ -368,7 +386,17 @@ impl BrowserManager {
         }
         if method == "browser_read" {
             return if entry.policy.allows_read_only(method) {
-                page_value(page)
+                let data_root = root.clone();
+                let known = match tokio::task::spawn_blocking(move || {
+                    crate::chat_archive_store::known_values(&data_root, &data_root.join("momso.db"))
+                })
+                .await
+                {
+                    Ok(Ok(known)) => known,
+                    _ => return json!({"status":"unavailable"}),
+                };
+                let refs: Vec<&str> = known.iter().map(String::as_str).collect();
+                page_value(page, &refs)
             } else {
                 json!({"status":"read_only"})
             };
@@ -495,6 +523,26 @@ impl BrowserManager {
 mod scope_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn browser_page_hides_known_key_from_ai_response() {
+        let secret = "fixture-opaque-known-secret";
+        let page = PageState {
+            origin: "https://example.test".into(),
+            title: format!("title {secret}"),
+            text: format!("body {secret}"),
+            elements: vec![crate::browser_driver::Element {
+                id: "fixture-id".into(),
+                role: "button".into(),
+                name: format!("button {secret}"),
+                kind: "normal",
+            }],
+            data_provenance: "untrusted_page_data",
+        };
+        let result = serde_json::to_string(&page_value(page, &[secret])).unwrap();
+        assert!(!result.contains(secret));
+        assert!(result.contains("fixture-id"));
+    }
 
     #[tokio::test]
     async fn scope_approval_is_policy_bound_and_denial_keeps_read_only() {
@@ -636,6 +684,8 @@ mod tests {
             let continuation = Arc::new(AtomicBool::new(false));
             let worker_continuation = continuation.clone();
             let root = temp.path().to_path_buf();
+            crate::storage::initialize(&root.join("momso.db"), &root.join("backups"), "fixture")
+                .unwrap();
             let handler: crate::setup_bridge::Handler = Arc::new(move |input| {
                 let manager = worker_manager.clone();
                 let broker = worker_broker.clone();

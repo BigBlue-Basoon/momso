@@ -38,6 +38,17 @@ class PublicHygieneTest(unittest.TestCase):
             (root / "apps" / "alpha" / "desktop" / "fixture.txt").write_text("C:/" + "Users/someone/data", encoding="utf-8")
             self.assertEqual(hygiene.findings(root, [])[0][2], "user_path")
 
+    def test_only_known_license_attributions_are_exempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            third_party = root / "apps" / "alpha" / "desktop" / "third-party"
+            third_party.mkdir(parents=True)
+            license_file = third_party / "ego-tree-0.10.0-LICENSE"
+            license_file.write_text("june" + "@" + "causal.agency\n", encoding="utf-8")
+            self.assertEqual(hygiene.findings(root, []), [])
+            license_file.write_text("someone" + "@" + "example.net\n", encoding="utf-8")
+            self.assertEqual(hygiene.findings(root, [])[0][2], "email")
+
 
 if __name__ == "__main__":
     unittest.main()

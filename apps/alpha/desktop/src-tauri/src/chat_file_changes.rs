@@ -35,6 +35,13 @@ pub(crate) fn has_active(root: &Path) -> bool {
 }
 
 pub(crate) struct Tracking(ActivityKey);
+pub(crate) fn begin_chat(root: &Path, db: &Path, chat: &str) -> Result<Tracking, &'static str> {
+    let _guard = lock_app_write();
+    if crate::archive_remote::first_receive_pending(root, db) {
+        return Err("first_receive_in_progress");
+    }
+    Ok(Tracking::start(root, chat))
+}
 impl Tracking {
     pub(crate) fn start(root: &Path, chat: &str) -> Self {
         let key = (root.to_path_buf(), chat.to_owned());

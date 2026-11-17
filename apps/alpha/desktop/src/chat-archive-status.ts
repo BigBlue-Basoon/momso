@@ -7,7 +7,9 @@ import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { isDesktopRuntime } from './runtime'
 
-export type ChatArchiveSync = { state: 'saved' | 'pending' | string; pendingWrites: number; pendingDeletions: number }
+// 2026-11-17 뒤쪽 fdce0939: 키를 바꾸거나 지운 뒤 예전 사본을 다시 가리는 동안 state 가 redactionPending, 가린 뒤 올리기를 기다리면 redactionUploadPending.
+//   retiredKeysPending·retiredKeysExpired 는 다시 가려야 할(가리지 못하고 기한이 지난) 옛 키의 수. 진행은 chat-archive-redaction-progress { state, completed, total, available }.
+export type ChatArchiveSync = { state: 'saved' | 'pending' | 'redactionPending' | 'redactionUploadPending' | string; pendingWrites: number; pendingDeletions: number; retiredKeysPending: number; retiredKeysExpired: number }
 
 let lastFailure: string | null = null
 const subs = new Set<() => void>()
@@ -39,5 +41,26 @@ export async function chatArchiveSyncStatus() {
   if (!isDesktopRuntime()) return null
   const value = await invoke<Partial<ChatArchiveSync> | null>('chat_archive_sync_status')
   if (!value || typeof value.state !== 'string') return null
-  return { state: value.state, pendingWrites: Number(value.pendingWrites) || 0, pendingDeletions: Number(value.pendingDeletions) || 0 }
+  return { state: value.state, pendingWrites: Number(value.pendingWrites) || 0, pendingDeletions: Number(value.pendingDeletions) || 0, retiredKeysPending: Number(value.retiredKeysPending) || 0, retiredKeysExpired: Number(value.retiredKeysExpired) || 0 }
+}
+
+/** 옛 키를 채팅방 사본에서 다시 가리는 진행(chat-archive-redaction-progress). 끝나거나(complete) 실패하면(failed) false. */
+let redacting = false
+const redactSubs = new Set<() => void>()
+let redactWatching = false
+export function watchRedaction() {
+  if (redactWatching || !isDesktopRuntime()) return
+  redactWatching = true
+  void listen<{ state?: string | null; available?: boolean | null }>('chat-archive-redaction-progress', (event) => {
+    const state = event.payload?.state ?? ''
+    redacting = event.payload?.available !== true && state !== 'complete' && state !== 'failed'
+    redactSubs.forEach((notify) => notify())
+  }).catch(() => { redactWatching = false })
+}
+export function isRedacting() {
+  return redacting
+}
+export function subscribeRedaction(notify: () => void) {
+  redactSubs.add(notify)
+  return () => { redactSubs.delete(notify) }
 }

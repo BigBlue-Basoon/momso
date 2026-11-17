@@ -612,6 +612,10 @@ pub(crate) fn reindex(root: &Path, database: &Path) -> Result<ReindexResult, Str
         .transaction()
         .map_err(|_| "색인을 다시 만들지 못했습니다".to_string())?;
     tx.execute_batch("DELETE FROM archive_zets_assets; DELETE FROM archive_zets_edges; DELETE FROM archive_zets; DELETE FROM archive_receipts_read; DELETE FROM archive_receipts_wrote; DELETE FROM archive_receipts;").map_err(|_| "색인을 다시 만들지 못했습니다".to_string())?;
+    #[cfg(test)]
+    if std::env::var_os("MOMSO_C28_CRASH_DURING_INDEX").is_some() {
+        std::process::exit(73);
+    }
     for h in &zets {
         tx.execute("INSERT INTO archive_zets(id,title,summary,kind,status,created_at,updated_at,file_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", rusqlite::params![h.id,h.title,h.summary,h.kind,h.status,h.created_at,h.updated_at,format!("zettels/{}.md",h.id)]).map_err(|_| "색인을 다시 만들지 못했습니다".to_string())?;
         for asset in &h.assets {
@@ -1066,6 +1070,7 @@ pub(crate) fn save(root: &Path, resources: &Path, database: &Path) -> Result<(),
     let _guard = crate::archive_zet::WRITE_LOCK
         .lock()
         .map_err(|_| "저장을 완료하지 못했습니다".to_string())?;
+    crate::archive_remote::ensure_document_write_allowed(root, database)?;
     save_unlocked(root, resources, database)
 }
 
@@ -1073,7 +1078,17 @@ fn save_unlocked(root: &Path, resources: &Path, database: &Path) -> Result<(), S
     if !check(root, resources)?.is_empty() {
         return Err("몸소 폴더 검사를 먼저 확인해 주세요".into());
     }
-    crate::chat_archive_store::validate(root, database).map_err(str::to_string)?;
+    let proof_key = crate::chat_archive_tracking::proof_key().ok();
+    let credentials = crate::credentials::try_prevent_secret_changes().ok();
+    let pending = match (credentials.as_ref(), proof_key.as_deref()) {
+        (Some(_), Some(key)) => {
+            crate::chat_archive_store::redaction_pending_with_key(root, database, key)
+        }
+        _ => true,
+    };
+    if !pending {
+        crate::chat_archive_store::validate(root, database).map_err(str::to_string)?;
+    }
     let (tool, _) = storage_tool(resources)?;
     if run_storage_tool(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok() {
         let changed = run_storage_tool(
@@ -1103,9 +1118,11 @@ fn save_unlocked(root: &Path, resources: &Path, database: &Path) -> Result<(), S
             run_storage_tool(&tool, root, &["add", "-A", "--", folder])?;
         }
     }
-    let chat_tracked = run_storage_tool(&tool, root, &["ls-files", "--", "chats"])?;
-    if root.join("chats").exists() || !chat_tracked.trim().is_empty() {
-        run_storage_tool(&tool, root, &["add", "-A", "--", "chats"])?;
+    if !pending {
+        let chat_tracked = run_storage_tool(&tool, root, &["ls-files", "--", "chats"])?;
+        if root.join("chats").exists() || !chat_tracked.trim().is_empty() {
+            run_storage_tool(&tool, root, &["add", "-A", "--", "chats"])?;
+        }
     }
     run_storage_tool(
         &tool,
@@ -1124,11 +1141,13 @@ fn save_unlocked(root: &Path, resources: &Path, database: &Path) -> Result<(), S
         "--",
         "zettels/",
         "receipts/",
-        "chats/",
         "AGENTS.md",
         "CLAUDE.md",
         "GEMINI.md",
     ];
+    if !pending {
+        diff_paths.push("chats/");
+    }
     diff_paths.extend(dictionary_paths.iter().map(String::as_str));
     let changed = run_storage_tool(&tool, root, &diff_paths)?;
     let paths: Vec<String> = changed.lines().map(str::to_owned).collect();
@@ -1174,6 +1193,7 @@ pub(crate) fn save_one(
     let _guard = crate::archive_zet::WRITE_LOCK
         .lock()
         .map_err(|_| "글을 저장하지 못했습니다".to_string())?;
+    crate::archive_remote::ensure_document_write_allowed(root, database)?;
     if !crate::archive_zet::valid_zet_id(id) {
         return Err("글 번호가 올바르지 않습니다".into());
     }
@@ -1394,7 +1414,6 @@ pub(crate) fn restore_version(
     discard_unsaved: bool,
 ) -> Result<(), String> {
     use std::io::Write;
-    let (tool, _) = storage_tool(resources)?;
     let relative = format!("zettels/{id}.md");
     if !crate::archive_zet::valid_zet_id(id) {
         return Err("글 번호가 올바르지 않습니다".into());
@@ -1402,6 +1421,8 @@ pub(crate) fn restore_version(
     let _guard = crate::archive_zet::WRITE_LOCK
         .lock()
         .map_err(|_| "이전 글을 복원하지 못했습니다".to_string())?;
+    crate::archive_remote::ensure_document_write_allowed(root, database)?;
+    let (tool, _) = storage_tool(resources)?;
     let pending = run_storage_tool(&tool, root, &["status", "--porcelain", "--", &relative])?;
     if !discard_unsaved && !pending.trim().is_empty() {
         return Err("저장하지 않은 내용이 있습니다".into());

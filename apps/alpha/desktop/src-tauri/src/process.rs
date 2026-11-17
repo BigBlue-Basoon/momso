@@ -15,6 +15,21 @@ use tokio_util::sync::CancellationToken;
 const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 static LOCAL_AI_TOOLS: OnceLock<PathBuf> = OnceLock::new();
 
+pub(crate) fn remove_inherited_ai_secrets(command: &mut Command) {
+    for name in [
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "MOMSO_CODEX_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+    ] {
+        command.env_remove(name);
+    }
+}
+
 pub(crate) fn set_local_ai_tools(path: PathBuf) {
     let _ = LOCAL_AI_TOOLS.set(path);
 }
@@ -281,6 +296,7 @@ pub(crate) async fn run_resolved_tool_cancellable(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    remove_inherited_ai_secrets(&mut command);
     command
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
@@ -375,6 +391,7 @@ pub(crate) async fn run_json_rpc_tool(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    remove_inherited_ai_secrets(&mut command);
     command
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
@@ -494,6 +511,62 @@ pub(crate) fn empty_environment() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_provider_keys_are_removed_before_child_launch() {
+        let mut command = Command::new("fixture-executable");
+        for name in [
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "MOMSO_CODEX_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ] {
+            command.env(name, "fixture-secret");
+        }
+        remove_inherited_ai_secrets(&mut command);
+        command.env("GEMINI_API_KEY", "fixture-selected-secret");
+        let env: HashMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env["GEMINI_API_KEY"].as_deref(),
+            Some("fixture-selected-secret")
+        );
+        for name in [
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "MOMSO_CODEX_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "GOOGLE_API_KEY",
+        ] {
+            assert!(env[name].is_none());
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn audit_fake_cli_child_inherits_selected_key() {
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", r#"& $env:ComSpec /D /C "if defined ANTHROPIC_API_KEY (echo inherited) else (echo removed)""#]);
+        remove_inherited_ai_secrets(&mut command);
+        command.env("ANTHROPIC_API_KEY", "synthetic-key-only");
+        let result = command.output().await.unwrap();
+        assert!(result.status.success());
+        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "inherited");
+    }
 
     #[test]
     fn finds_app_local_provider_binaries_without_path() {

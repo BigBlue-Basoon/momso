@@ -8,6 +8,30 @@ pub(crate) struct SyncStatus {
     state: &'static str,
     pending_writes: i64,
     pending_deletions: i64,
+    retired_keys_pending: Option<usize>,
+    retired_keys_expired: Option<usize>,
+}
+
+fn status_state(
+    pending: Result<bool, &'static str>,
+    counts: Result<(usize, usize), ()>,
+    writes: i64,
+    deletions: i64,
+) -> (&'static str, Option<usize>, Option<usize>) {
+    let (pending_count, expired_count) = match counts {
+        Ok((p, e)) => (Some(p), Some(e)),
+        Err(()) => return ("credentialStoreUnavailable", None, None),
+    };
+    let state = match pending {
+        Err("credentials_unavailable") => "credentialStoreUnavailable",
+        Err("credentials_busy") => "redactionPending",
+        Err(_) => "unavailable",
+        Ok(true) => "redactionPending",
+        Ok(false) if pending_count.unwrap_or(0) > 0 => "redactionUploadPending",
+        Ok(false) if writes + deletions == 0 => "saved",
+        Ok(false) => "pending",
+    };
+    (state, pending_count, expired_count)
 }
 
 #[tauri::command]
@@ -15,10 +39,14 @@ pub(crate) async fn chat_archive_sync_status(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<SyncStatus, &'static str> {
     let db = state.paths.database_path.clone();
+    let root = state.paths.archive.current.clone().read_owned().await;
     tauri::async_runtime::spawn_blocking(move || {
+        let counts = crate::redaction_wait::counts().map_err(|_| ());
+        let pending = crate::chat_archive_store::redaction_pending(&root, &db);
         let conn = rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|_| "unavailable")?;
         let (writes, deletions): (i64, i64) = conn.query_row("SELECT count(*) FILTER (WHERE key GLOB 'chat_archive_write:*'), count(*) FILTER (WHERE key GLOB 'chat_archive_delete:*') FROM app_runtime_meta", [], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|_| "unavailable")?;
-        Ok(SyncStatus { state: if writes + deletions == 0 { "saved" } else { "pending" }, pending_writes: writes, pending_deletions: deletions })
+        let (state, retired_keys_pending, retired_keys_expired) = status_state(pending, counts, writes, deletions);
+        Ok(SyncStatus { state, pending_writes: writes, pending_deletions: deletions, retired_keys_pending, retired_keys_expired })
     }).await.map_err(|_| "unavailable")?
 }
 
@@ -80,6 +108,23 @@ pub(crate) async fn chat_archive_redaction_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_errors_are_distinct_from_running_recheck() {
+        assert_eq!(
+            status_state(Err("credentials_unavailable"), Ok((0, 0)), 0, 0).0,
+            "credentialStoreUnavailable"
+        );
+        assert_eq!(
+            status_state(Ok(false), Err(()), 0, 0),
+            ("credentialStoreUnavailable", None, None)
+        );
+        assert_eq!(
+            status_state(Err("storage_error"), Ok((0, 0)), 0, 0).0,
+            "unavailable"
+        );
+        assert_eq!(status_state(Ok(false), Ok((0, 0)), 0, 0).0, "saved");
+    }
 
     #[test]
     fn reads_count_without_accepting_invalid_paths_or_other_rooms() {

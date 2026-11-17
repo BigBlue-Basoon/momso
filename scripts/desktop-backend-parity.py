@@ -9,6 +9,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 TREES = ("apps/alpha/desktop/src-tauri", ".github", "scripts", "apps/alpha/desktop/scripts")
+INTEGRATION_ONLY_FILES = {".github/pull_request_template.md"}
+INTEGRATION_ONLY_TREES = {".github/ISSUE_TEMPLATE"}
 SKIP_DIRS = {"target", "gen", "generated", "node_modules", ".git", "__pycache__"}
 TRACKED_GENERATED_PLACEHOLDERS = ("apps/alpha/desktop/src-tauri/generated/node/.gitkeep",)
 EXCEPTIONS = {
@@ -40,14 +42,15 @@ def inventory(root):
         if directory.is_symlink():
             raise RuntimeError(f"Refusing symlinked directory: {tree}")
         for parent, dirs, names in os.walk(directory, followlinks=False):
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and
+                       (Path(parent) / d).relative_to(root).as_posix() not in INTEGRATION_ONLY_TREES]
             for name in dirs:
                 if (Path(parent) / name).is_symlink():
                     raise RuntimeError(f"Refusing symlinked directory: {Path(parent) / name}")
             for name in names:
                 path = Path(parent) / name
                 relative = path.relative_to(root).as_posix()
-                if relative in EXCEPTIONS:
+                if relative in EXCEPTIONS or relative in INTEGRATION_ONLY_FILES:
                     continue
                 if path.is_symlink():
                     raise RuntimeError(f"Refusing symlink: {relative}")
@@ -65,8 +68,9 @@ def lf_rules(root):
     path = root / ".gitattributes"
     if not path.is_file():
         return set()
+    prefixes = ("apps/alpha/desktop/src-tauri/", "apps/alpha/desktop/scripts/", "scripts/", ".github/")
     return {line.strip() for line in path.read_text(encoding="utf-8").splitlines()
-            if line.strip().startswith("apps/alpha/desktop/src-tauri/")}
+            if line.strip().startswith(prefixes)}
 
 
 def check_ignore_rules(screen):
@@ -150,6 +154,9 @@ def main():
                 shutil.copyfile(origin, destination)
         target = inventory(screen)
     differences = []
+    for name in sorted(INTEGRATION_ONLY_FILES | INTEGRATION_ONLY_TREES):
+        if (screen / name).exists():
+            differences.append(f"{name} (integration only; preserved)")
     for name in sorted(set(source) | set(target)):
         if name not in source or name not in target or source[name].read_bytes() != target[name].read_bytes():
             differences.append(name)

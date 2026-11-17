@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 use uuid::Uuid;
 
+pub(crate) fn canonical_provider(value: Option<&str>) -> Option<&str> {
+    match value {
+        Some("chatgpt" | "codex") => Some("codex"),
+        Some("claude") => Some("claude"),
+        Some("gemini") => Some("gemini"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChatSummary {
@@ -331,7 +340,8 @@ pub(crate) fn archived_list(path: &Path) -> Result<Vec<ArchivedChat>, String> {
                 group_id: row.get(2)?,
                 updated_at: row.get(3)?,
                 archived_at: row.get(4)?,
-                provider: row.get(5)?,
+                provider: canonical_provider(row.get::<_, Option<String>>(5)?.as_deref())
+                    .map(str::to_owned),
             })
         })
         .map_err(|_| "storage_error".to_string())?;
@@ -360,7 +370,8 @@ fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
         role: Role::from_db(row.get(1)?)?,
         text: row.get(2)?,
         created_at: row.get(3)?,
-        provider: row.get(4)?,
+        provider: canonical_provider(row.get::<_, Option<String>>(4)?.as_deref())
+            .map(str::to_owned),
         model: row.get(5)?,
         effort: row.get(6)?,
         actual_effort: row.get(10)?,
@@ -409,6 +420,37 @@ pub(crate) fn list(path: &Path) -> Result<Vec<ChatSummary>, String> {
         .map_err(|_| "채팅방 목록을 읽지 못했습니다".to_string())?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|_| "채팅방 목록을 읽지 못했습니다".to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatListPage {
+    items: Vec<ChatSummary>,
+    has_more: bool,
+    next_offset: Option<u32>,
+}
+
+pub(crate) fn list_page(path: &Path, offset: u32) -> Result<ChatListPage, String> {
+    const PAGE_SIZE: usize = 80;
+    let c = db(path)?;
+    let mut q = c.prepare(&format!("{SELECT_SUMMARY} WHERE c.id IN (SELECT id FROM chats WHERE archived_at IS NULL ORDER BY pinned_order IS NULL,pinned_order,updated_at DESC,rowid DESC LIMIT 81 OFFSET ?1) ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC")).map_err(|_| "채팅방 목록을 읽지 못했습니다".to_owned())?;
+    let mut items = q
+        .query_map([offset], summary)
+        .map_err(|_| "채팅방 목록을 읽지 못했습니다".to_owned())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "채팅방 목록을 읽지 못했습니다".to_owned())?;
+    let has_more = items.len() > PAGE_SIZE;
+    items.truncate(PAGE_SIZE);
+    let next_offset = if has_more {
+        offset.checked_add(PAGE_SIZE as u32)
+    } else {
+        None
+    };
+    Ok(ChatListPage {
+        items,
+        has_more,
+        next_offset,
+    })
 }
 pub(crate) fn read(path: &Path, id: &str) -> Result<ChatDetail, String> {
     let c = db(path)?;
@@ -1140,6 +1182,40 @@ mod tests {
         c.execute_batch(include_str!("../migrations/0091_chat_search_pages.sql"))
             .unwrap();
         (d, p)
+    }
+
+    #[test]
+    fn chat_list_pages_match_full_order_and_exclude_archived() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("fixture.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "fixture").unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for n in 0..163 {
+            conn.execute("INSERT INTO chats(id,title,created_at,updated_at,archived_at) VALUES(?1,?2,'2026-01-01','2026-01-01',?3)", rusqlite::params![format!("chat_{n:08x}-0000-4000-8000-{n:012x}"),format!("fixture-{n}"),if n == 162 { Some("2026-01-01") } else { None }]).unwrap();
+        }
+        let first = serde_json::to_value(list_page(&db, 0).unwrap()).unwrap();
+        let second = serde_json::to_value(list_page(&db, 80).unwrap()).unwrap();
+        let third = serde_json::to_value(list_page(&db, 160).unwrap()).unwrap();
+        assert_eq!(
+            (first["hasMore"].as_bool(), first["nextOffset"].as_u64()),
+            (Some(true), Some(80))
+        );
+        assert_eq!(
+            (second["hasMore"].as_bool(), second["nextOffset"].as_u64()),
+            (Some(true), Some(160))
+        );
+        assert_eq!(
+            (third["hasMore"].as_bool(), third["nextOffset"].as_u64()),
+            (Some(false), None)
+        );
+        let combined: Vec<_> = [first, second, third]
+            .iter()
+            .flat_map(|page| page["items"].as_array().unwrap().clone())
+            .collect();
+        assert_eq!(
+            serde_json::Value::Array(combined),
+            serde_json::to_value(list(&db).unwrap()).unwrap()
+        );
     }
     #[test]
     fn authentication_method_roundtrips_without_secret_material() {
