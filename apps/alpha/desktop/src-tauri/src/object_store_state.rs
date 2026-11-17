@@ -608,6 +608,12 @@ mod tests {
         let old_hash = "b".repeat(64);
         let conn = storage::open_writable_connection(&database).unwrap();
         conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('older-asset','other',?1,1,?2,'old-private-name','tester','old')", rusqlite::params![old_hash,format!("sha256/bb/{old_hash}")]).unwrap();
+        for (id, hash, name) in [
+            ("retry", "c".repeat(64), "old-retry.wav"),
+            ("offline", "d".repeat(64), "old-offline.wav"),
+        ] {
+            conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES(?1,'other',?2,1,?3,?4,'tester','old')", rusqlite::params![id,hash,format!("sha256/{}/{hash}",&hash[..2]),name]).unwrap();
+        }
         drop(conn);
         let older = temp.path().join("older.db");
         storage::create_snapshot_file(&database, &older).unwrap();
@@ -617,6 +623,27 @@ mod tests {
         conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('asset',?1,'purge_pending','now','later')", [uuid::Uuid::new_v4().to_string()]).unwrap();
         conn.execute("UPDATE momso_source_assets SET original_file_name='deleted',captured_by='redacted' WHERE id='older-asset'", []).unwrap();
         conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('older-asset',?1,'purge_pending','now','later')", [uuid::Uuid::new_v4().to_string()]).unwrap();
+        for (id, state, name, remaining) in [
+            (
+                "retry",
+                "purge_pending",
+                "retry-name.wav",
+                r#"["remote-copy"]"#,
+            ),
+            (
+                "offline",
+                "purged",
+                "offline-name.wav",
+                r#"["remote_access:not_connected"]"#,
+            ),
+        ] {
+            conn.execute(
+                "UPDATE momso_source_assets SET original_file_name=?1 WHERE id=?2",
+                rusqlite::params![name, id],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until,remote_remaining_json) VALUES(?1,?2,?3,'now','later',?4)", rusqlite::params![id,uuid::Uuid::new_v4().to_string(),state,remaining]).unwrap();
+        }
         drop(conn);
         let failure = storage::restore_snapshot_file_with_hook(&older, &database, &backups, || {
             Err(storage::StorageError::Integrity("injected".into()))
@@ -627,7 +654,7 @@ mod tests {
             conn.query_row("SELECT count(*) FROM source_asset_deletions", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            4
         );
         drop(conn);
         storage::restore_snapshot_file(&older, &database, &backups).unwrap();
@@ -645,11 +672,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "deleted");
+        for (id, expected) in [("retry", "retry-name.wav"), ("offline", "offline-name.wav")] {
+            let name: String = conn
+                .query_row(
+                    "SELECT original_file_name FROM momso_source_assets WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(name, expected);
+        }
         assert_eq!(
             conn.query_row("SELECT count(*) FROM source_asset_deletions", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            4
         );
     }
 

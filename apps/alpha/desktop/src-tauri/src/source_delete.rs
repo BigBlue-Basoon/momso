@@ -167,6 +167,18 @@ pub(crate) fn preview(
     {
         chats.insert(value.map_err(|_| "unavailable")?);
     }
+    let mut live_chats = BTreeSet::new();
+    let mut chat_stmt = conn
+        .prepare("SELECT EXISTS(SELECT 1 FROM chats WHERE id=?1) AND NOT EXISTS(SELECT 1 FROM chat_deletions WHERE chat_id=?1)")
+        .map_err(|_| "unavailable")?;
+    for chat in chats {
+        let live: bool = chat_stmt
+            .query_row([&chat], |row| row.get(0))
+            .map_err(|_| "unavailable")?;
+        if live {
+            live_chats.insert(chat);
+        }
+    }
     let mut stmt = conn.prepare("SELECT DISTINCT record_id,record_version FROM momso_record_source_assets WHERE asset_id=?1 ORDER BY record_id,record_version").map_err(|_| "unavailable")?;
     let record_versions = stmt
         .query_map([&asset_id], |r| {
@@ -185,7 +197,7 @@ pub(crate) fn preview(
         state,
         documents: documents.into_iter().collect(),
         receipts: receipts.into_iter().collect(),
-        chats: chats.into_iter().collect(),
+        chats: live_chats.into_iter().collect(),
         record_versions,
         local_remaining,
         remote_remaining,
@@ -249,11 +261,39 @@ pub(crate) struct DeletedSourcePage {
     next_cursor: Option<DeletedSourceCursor>,
 }
 
+fn local_retry_needed(remaining: &[String]) -> bool {
+    remaining.iter().any(|item| {
+        item != "external_copies_unverified" && item != "database_backups_may_contain_metadata"
+    })
+}
+
 fn list_deleted(
     root: &Path,
     database: &Path,
     before: Option<DeletedSourceCursor>,
     limit: usize,
+) -> Result<DeletedSourcePage, String> {
+    let data_root = database.parent().ok_or("unavailable")?;
+    let target = crate::object_store::load_config(data_root)?
+        .filter(remote_deletion_supported)
+        .and_then(|config| {
+            crate::object_store::load_keys(&config).ok()?;
+            let identity = crate::object_store_transfer::identity(database).ok()?;
+            Some(remote_target(&config, &identity))
+        });
+    list_deleted_with_target(root, database, before, limit, target.as_deref())
+}
+
+fn remote_deletion_supported(config: &crate::object_store::Config) -> bool {
+    crate::object_store_lock::supported(config) || crate::r2_oauth::uses_oauth(config)
+}
+
+fn list_deleted_with_target(
+    root: &Path,
+    database: &Path,
+    before: Option<DeletedSourceCursor>,
+    limit: usize,
+    target: Option<&str>,
 ) -> Result<DeletedSourcePage, String> {
     if before
         .as_ref()
@@ -263,31 +303,48 @@ fn list_deleted(
     }
     let limit = limit.clamp(1, 100);
     let conn = crate::storage::open_writable_connection(database).map_err(|_| "unavailable")?;
-    let mut statement = conn.prepare("SELECT asset_id,requested_at FROM source_asset_deletions WHERE state IN ('pending','trashed','purge_pending') AND (?1 IS NULL OR requested_at < ?1 OR (requested_at = ?1 AND asset_id < ?2)) ORDER BY requested_at DESC,asset_id DESC LIMIT ?3").map_err(|_| "unavailable")?;
+    let mut statement = conn.prepare("SELECT asset_id,requested_at,state,local_remaining_json,remote_plan_json FROM source_asset_deletions WHERE state IN ('pending','trashed','purge_pending') AND (?1 IS NULL OR requested_at < ?1 OR (requested_at = ?1 AND asset_id < ?2)) ORDER BY requested_at DESC,asset_id DESC").map_err(|_| "unavailable")?;
     let rows = statement
         .query_map(
             rusqlite::params![
                 before.as_ref().map(|v| &v.deleted_at),
                 before.as_ref().map(|v| &v.asset_id),
-                (limit + 1) as i64
             ],
             |row| {
-                Ok(DeletedSourceCursor {
-                    asset_id: row.get(0)?,
-                    deleted_at: row.get(1)?,
-                })
+                Ok((
+                    DeletedSourceCursor {
+                        asset_id: row.get(0)?,
+                        deleted_at: row.get(1)?,
+                    },
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
             },
         )
         .map_err(|_| "unavailable")?;
-    let mut cursors = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "unavailable")?;
-    let has_more = cursors.len() > limit;
-    cursors.truncate(limit);
-    let next_cursor = has_more.then(|| cursors.last().cloned()).flatten();
-    let mut items = Vec::with_capacity(cursors.len());
-    for cursor in cursors {
+    let mut items = Vec::with_capacity(limit);
+    let mut has_more = false;
+    let mut last_cursor = None;
+    for row in rows {
+        let (cursor, row_state, local_json, remote_plan) = row.map_err(|_| "unavailable")?;
+        let local_remaining: Option<Vec<String>> = local_json
+            .map(|value| serde_json::from_str(&value).map_err(|_| "unavailable"))
+            .transpose()?;
+        let local_retry = row_state == "purge_pending"
+            && local_remaining.as_deref().is_none_or(local_retry_needed);
+        let remote_retry = target
+            .zip(remote_plan.as_deref())
+            .is_some_and(|(target, plan)| parse_bound_plan(plan, target).is_ok());
+        if row_state == "purge_pending" && !local_retry && !remote_retry {
+            continue;
+        }
+        if items.len() == limit {
+            has_more = true;
+            break;
+        }
         let references = preview(root, database, &cursor.asset_id)?;
+        last_cursor = Some(cursor.clone());
         let counts = ReferenceCounts {
             documents: references.documents.len(),
             receipts: references.receipts.len(),
@@ -295,13 +352,20 @@ fn list_deleted(
             record_versions: references.record_versions.len(),
         };
         let total = counts.documents + counts.receipts + counts.chats + counts.record_versions;
-        let state = references.state;
+        let state = match references.state.as_str() {
+            "purge_pending" if local_retry => "local_retry_pending".to_owned(),
+            "purge_pending" => "remote_retry_pending".to_owned(),
+            _ => references.state,
+        };
         items.push(DeletedSourceItem {
             asset: crate::source_assets::get(database, &cursor.asset_id)
                 .map_err(|_| "unavailable")?,
             deleted_at: cursor.deleted_at,
             can_restore: matches!(state.as_str(), "pending" | "trashed"),
-            can_purge: matches!(state.as_str(), "trashed" | "purge_pending"),
+            can_purge: matches!(
+                state.as_str(),
+                "trashed" | "local_retry_pending" | "remote_retry_pending"
+            ),
             deletion_state: state,
             reference_count: total,
             reference_counts: counts,
@@ -312,7 +376,7 @@ fn list_deleted(
     Ok(DeletedSourcePage {
         items,
         has_more,
-        next_cursor,
+        next_cursor: if has_more { last_cursor } else { None },
     })
 }
 
@@ -590,8 +654,9 @@ pub(crate) async fn delete_remote_key(
     expected_hash: &str,
 ) -> bool {
     let header = match config.provider.as_str() {
-        "aws" => reqwest::header::ETAG.as_str(),
-        "gcp" => "x-goog-generation",
+        "aws" => Some(reqwest::header::ETAG.as_str()),
+        "gcp" => Some("x-goog-generation"),
+        "cloudflare" if crate::r2_oauth::uses_oauth(config) => None,
         // These APIs do not document an atomic conditional delete. Do not
         // guess: keep the exact key in remoteRemaining for the caller.
         _ => return false,
@@ -611,13 +676,12 @@ pub(crate) async fn delete_remote_key(
     {
         return false;
     }
-    let Some(condition) = response
-        .headers()
-        .get(header)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    else {
-        return false;
+    let condition = match header {
+        Some(header) => match response.headers().get(header).and_then(|v| v.to_str().ok()) {
+            Some(value) => Some(value.to_owned()),
+            None => return false,
+        },
+        None => None,
     };
     let mut bytes = Vec::new();
     loop {
@@ -634,7 +698,11 @@ pub(crate) async fn delete_remote_key(
     if crate::object_store::digest(&bytes) != expected_hash {
         return false;
     }
-    let result = crate::object_store::conditional_delete(config, keys, key, &condition).await;
+    let result = if let Some(condition) = condition {
+        crate::object_store::conditional_delete(config, keys, key, &condition).await
+    } else {
+        crate::object_store::request(config, keys, reqwest::Method::DELETE, key, &[], vec![]).await
+    };
     if !result
         .is_ok_and(|r| r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND)
     {
@@ -1065,7 +1133,7 @@ async fn purge_remote(
     database: &Path,
     asset_id: &str,
     hash: &str,
-    saved_plan: Option<String>,
+    mut saved_plan: Option<String>,
     config: &crate::object_store::Config,
     keys: &crate::object_store::Keys,
     identity: &age::x25519::Identity,
@@ -1079,6 +1147,14 @@ async fn purge_remote(
             ..RemotePlan::default()
         }
     };
+    if saved_plan.is_none() {
+        let initial = serde_json::to_string(&plan).map_err(|_| "remote_plan_invalid")?;
+        let conn = crate::storage::open_writable_connection(database).map_err(|_| "unavailable")?;
+        if conn.execute("UPDATE source_asset_deletions SET remote_plan_json=?1 WHERE asset_id=?2 AND state='purge_pending' AND remote_plan_json IS NULL", rusqlite::params![initial,asset_id]).map_err(|_| "unavailable")? != 1 {
+            return Err("remote_plan_changed");
+        }
+        saved_plan = Some(initial);
+    }
     let catalog = crate::object_store_transfer::catalog_with_keys(config, keys, identity).await?;
     let fresh = remote_plan(&catalog, hash, target).map_err(|_| "invalid_manifest")?;
     for (key, value) in fresh.data_keys {
@@ -1123,7 +1199,7 @@ async fn purge_remote(
         let conn = crate::storage::open_writable_connection(database).map_err(|_| "unavailable")?;
         if conn.execute("UPDATE source_asset_deletions SET remote_plan_json=?1 WHERE asset_id=?2 AND state='purge_pending' AND remote_plan_json IS ?3", rusqlite::params![json,asset_id,saved_plan]).map_err(|_| "unavailable")? != 1 { return Err("remote_plan_changed"); }
     }
-    if !crate::object_store_lock::supported(config) {
+    if !remote_deletion_supported(config) {
         let remaining = plan
             .data_keys
             .keys()
@@ -1134,6 +1210,171 @@ async fn purge_remote(
         return Ok((Vec::new(), remaining));
     }
     Ok(delete_remote_keys(config, keys, &plan).await)
+}
+
+fn finish_purge(
+    database: &Path,
+    asset_id: &str,
+    mut local_remaining: Vec<String>,
+    remote: Result<(Vec<String>, Vec<String>), &'static str>,
+    remote_deletable: bool,
+) -> Result<PurgeResult, String> {
+    local_remaining.push("database_backups_may_contain_metadata".into());
+    local_remaining.sort();
+    local_remaining.dedup();
+    let mut remote_remaining = vec![
+        "object_versions_unverified".to_owned(),
+        "provider_soft_delete_or_retention_unverified".to_owned(),
+        "unfinished_uploads_unverified".to_owned(),
+        "other_stores_unverified".to_owned(),
+        "app_state_backups_may_contain_metadata".to_owned(),
+    ];
+    let (removed_remote_keys, retry_remote, remote_complete) = match remote {
+        Ok((removed, remaining)) => {
+            let retry =
+                remote_deletable && remaining.iter().any(|item| !item.starts_with("shared:"));
+            let complete = remaining.is_empty();
+            remote_remaining.extend(remaining);
+            (removed, retry, complete)
+        }
+        Err(reason) => {
+            remote_remaining.push(format!("remote_access:{reason}"));
+            (
+                Vec::new(),
+                remote_deletable
+                    && !matches!(reason, "remote_target_changed" | "remote_plan_invalid"),
+                false,
+            )
+        }
+    };
+    let retry_local = local_retry_needed(&local_remaining);
+    let state = if retry_local || retry_remote {
+        "purge_pending"
+    } else {
+        "purged"
+    };
+    let result_state = if retry_local {
+        "local_retry_pending"
+    } else if retry_remote {
+        "remote_retry_pending"
+    } else {
+        "partial"
+    };
+    let mut conn = crate::storage::open_writable_connection(database).map_err(|_| "unavailable")?;
+    let remote_json = serde_json::to_string(&remote_remaining).map_err(|_| "unavailable")?;
+    let local_json = serde_json::to_string(&local_remaining).map_err(|_| "unavailable")?;
+    let tx = conn.transaction().map_err(|_| "unavailable")?;
+    if tx.execute("UPDATE source_asset_deletions SET state=?1,remote_remaining_json=?2,local_remaining_json=?3 WHERE asset_id=?4 AND state='purge_pending'", rusqlite::params![state,remote_json,local_json,asset_id]).map_err(|_| "unavailable")? != 1 {
+        return Err("invalid_state".into());
+    }
+    if remote_complete && !retry_local {
+        tx.execute("UPDATE momso_source_assets SET original_file_name='deleted',media_type=NULL,captured_by='redacted' WHERE id=?1", [asset_id]).map_err(|_| "unavailable")?;
+    }
+    tx.commit().map_err(|_| "unavailable")?;
+    Ok(PurgeResult {
+        state: result_state,
+        asset_id: asset_id.to_owned(),
+        local_remaining,
+        remote_remaining,
+        removed_remote_keys,
+    })
+}
+
+// Called with the connection and remote source-mutation locks already held.
+pub(crate) async fn retry_pending_for_backup(
+    paths: &crate::runtime::RuntimePaths,
+    config: &crate::object_store::Config,
+    keys: &crate::object_store::Keys,
+    identity: &age::x25519::Identity,
+) -> Result<(), &'static str> {
+    if !remote_deletion_supported(config) {
+        return Ok(());
+    }
+    let rows = {
+        let conn = crate::storage::open_writable_connection(&paths.database_path)
+            .map_err(|_| "unavailable")?;
+        let mut stmt = conn.prepare("SELECT d.asset_id,a.content_sha256,d.operation_id,d.state,d.remote_remaining_json FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE d.state IN ('purge_pending','purged') ORDER BY d.requested_at,d.asset_id").map_err(|_| "unavailable")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(|_| "unavailable")?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "unavailable")?;
+        rows
+    };
+    let root = paths.objects_path.parent().ok_or("unavailable")?;
+    for (asset_id, hash, operation, state, remote_json) in rows {
+        if state == "purged" {
+            let Some(json) = remote_json else { continue };
+            let remaining: Vec<String> = serde_json::from_str(&json).map_err(|_| "unavailable")?;
+            if !remaining.iter().any(|value| {
+                matches!(
+                    value.as_str(),
+                    "remote_access:not_connected" | "remote_access:remote_target_changed"
+                )
+            }) {
+                continue;
+            }
+            let conn = crate::storage::open_writable_connection(&paths.database_path)
+                .map_err(|_| "unavailable")?;
+            let saved: Option<String> = conn.query_row("SELECT remote_plan_json FROM source_asset_deletions WHERE asset_id=?1 AND state='purged'", [&asset_id], |row| row.get(0)).map_err(|_| "unavailable")?;
+            let Some(plan) = saved.as_deref() else {
+                continue;
+            };
+            if parse_bound_plan(plan, &remote_target(config, identity)).is_err() {
+                continue;
+            }
+            if conn.execute("UPDATE source_asset_deletions SET state='purge_pending' WHERE asset_id=?1 AND state='purged' AND remote_remaining_json=?2", rusqlite::params![asset_id,json]).map_err(|_| "unavailable")? != 1 {
+                return Err("invalid_state");
+            }
+        }
+        let local = {
+            let _guard = crate::chat_file_changes::lock_app_write();
+            purge_local(
+                root,
+                &paths.backups_path,
+                &paths.data_root,
+                &hash,
+                &operation,
+                Some(identity),
+                |stage, manifest, encrypted| {
+                    persist_staged_plan(
+                        (&paths.database_path, &asset_id, &hash),
+                        config,
+                        identity,
+                        stage,
+                        manifest,
+                        encrypted,
+                    )
+                },
+            )
+        };
+        let saved: Option<String> = crate::storage::open_writable_connection(&paths.database_path).map_err(|_| "unavailable")?.query_row("SELECT remote_plan_json FROM source_asset_deletions WHERE asset_id=?1 AND state='purge_pending'", [&asset_id], |row| row.get(0)).map_err(|_| "unavailable")?;
+        let remote = if saved.is_some() {
+            purge_remote(
+                &paths.database_path,
+                &asset_id,
+                &hash,
+                saved,
+                config,
+                keys,
+                identity,
+            )
+            .await
+        } else {
+            Err("remote_target_changed")
+        };
+        finish_purge(&paths.database_path, &asset_id, local, remote, true)
+            .map_err(|_| "unavailable")?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1175,7 +1416,7 @@ pub(crate) async fn source_asset_purge(
         )
         .map_err(|_| "unavailable")?
     };
-    let mut local_remaining = {
+    let local_remaining = {
         let _guard = crate::chat_file_changes::lock_app_write();
         let identity = crate::object_store_transfer::identity(&paths.database_path).ok();
         let config = crate::object_store::load_config(&paths.data_root)
@@ -1204,17 +1445,14 @@ pub(crate) async fn source_asset_purge(
             },
         )
     };
-    local_remaining.push("database_backups_may_contain_metadata".into());
-    let mut remote_remaining = vec![
-        "object_versions_unverified".to_owned(),
-        "provider_soft_delete_or_retention_unverified".to_owned(),
-        "unfinished_uploads_unverified".to_owned(),
-        "other_stores_unverified".to_owned(),
-        "app_state_backups_may_contain_metadata".to_owned(),
-    ];
-    let mut removed_remote_keys = Vec::new();
+    let connection = crate::object_store::load_config(&paths.data_root);
+    let remote_deletable = match &connection {
+        Ok(Some(config)) => remote_deletion_supported(config),
+        Ok(None) => false,
+        Err(_) => true,
+    };
     let remote = async {
-        let config = crate::object_store::load_config(&paths.data_root)?.ok_or("not_connected")?;
+        let config = connection?.ok_or("not_connected")?;
         let keys = crate::object_store::load_keys(&config)?;
         let remote_lock = if crate::object_store_lock::supported(&config) {
             Some(crate::object_store_lock::SourceMutationLock::acquire(&paths.data_root, &config, &keys).await?)
@@ -1245,35 +1483,357 @@ pub(crate) async fn source_asset_purge(
         work
     }
     .await;
-    match remote {
-        Ok((removed, remaining)) => {
-            removed_remote_keys = removed;
-            remote_remaining.extend(remaining);
-        }
-        Err(reason) => remote_remaining.push(format!("remote_access:{reason}")),
-    }
-    {
-        let mut conn = crate::storage::open_writable_connection(&paths.database_path)
-            .map_err(|_| "unavailable")?;
-        let remote_json = serde_json::to_string(&remote_remaining).map_err(|_| "unavailable")?;
-        let local_json = serde_json::to_string(&local_remaining).map_err(|_| "unavailable")?;
-        let tx = conn.transaction().map_err(|_| "unavailable")?;
-        tx.execute("UPDATE source_asset_deletions SET remote_remaining_json=?1,local_remaining_json=?2 WHERE asset_id=?3", rusqlite::params![remote_json,local_json,references.asset_id]).map_err(|_| "unavailable")?;
-        tx.execute("UPDATE momso_source_assets SET original_file_name='deleted',media_type=NULL,captured_by='redacted' WHERE id=?1", [&references.asset_id]).map_err(|_| "unavailable")?;
-        tx.commit().map_err(|_| "unavailable")?;
-    }
-    Ok(PurgeResult {
-        state: "partial",
-        asset_id: references.asset_id,
+    finish_purge(
+        &paths.database_path,
+        &references.asset_id,
         local_remaining,
-        remote_remaining,
-        removed_remote_keys,
-    })
+        remote,
+        remote_deletable,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_r2_upload_purge_failure_and_retry_preserves_other_assets() {
+        use std::{
+            collections::BTreeMap,
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc, Mutex,
+            },
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        for folder in ["objects", "zettels", "receipts", ".git"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let database = temp.path().join("state.db");
+        crate::storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
+        let hash = "a".repeat(64);
+        let conn = crate::storage::open_writable_connection(&database).unwrap();
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset','other',?1,1,?2,'lesson.wav','test','now')", rusqlite::params![hash,format!("sha256/aa/{hash}")]).unwrap();
+        conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('asset',?1,'purge_pending','now','later')", [uuid::Uuid::new_v4().to_string()]).unwrap();
+        drop(conn);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let objects = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let (server_objects, server_stop, server_failed) =
+            (objects.clone(), stop.clone(), failed.clone());
+        let server = std::thread::spawn(move || {
+            let base = format!(
+                "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects",
+                "a".repeat(32)
+            );
+            while !server_stop.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 8192];
+                let head_end = loop {
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(i) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                let head = String::from_utf8(request[..head_end].to_vec()).unwrap();
+                assert!(head
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token")));
+                let mut first = head.lines().next().unwrap().split_whitespace();
+                let method = first.next().unwrap();
+                let path = first.next().unwrap();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|n| n.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while request.len() - head_end < length {
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let mut map = server_objects.lock().unwrap();
+                let (status, body) = if method == "GET" && path.starts_with(&format!("{base}?")) {
+                    let entries: Vec<_> = map
+                        .keys()
+                        .filter(|key| key.contains("/manifests/"))
+                        .map(|key| serde_json::json!({"key":key}))
+                        .collect();
+                    ("200 OK", serde_json::to_vec(&serde_json::json!({"success":true,"result":entries,"result_info":{"is_truncated":false}})).unwrap())
+                } else {
+                    let key = path
+                        .strip_prefix(&format!("{base}/"))
+                        .expect("R2 object path");
+                    match method {
+                        "PUT" => {
+                            map.insert(key.into(), request[head_end..head_end + length].to_vec());
+                            ("200 OK", b"{}".to_vec())
+                        }
+                        "GET" => map
+                            .get(key)
+                            .map(|value| ("200 OK", value.clone()))
+                            .unwrap_or(("404 Not Found", vec![])),
+                        "DELETE" if !server_failed.swap(true, Ordering::SeqCst) => {
+                            ("403 Forbidden", vec![])
+                        }
+                        "DELETE" => {
+                            map.remove(key);
+                            ("200 OK", b"{}".to_vec())
+                        }
+                        _ => panic!("unexpected method"),
+                    }
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        let config = crate::object_store::Config {
+            provider: "cloudflare".into(),
+            endpoint: format!("http://{address}"),
+            region: "wrangleroauth".into(),
+            bucket: "momso-fixture".into(),
+            credential_id: "test".into(),
+            last_backup_at: None,
+            write_safety: Some(crate::object_store::WriteSafety::CheckThenWrite),
+        };
+        let keys = crate::object_store::Keys {
+            access_key_id: "fixture".into(),
+            secret_access_key: "test-token".into(),
+        };
+        let identity = age::x25519::Identity::generate();
+        let mut target_keys = Vec::new();
+        let mut other_keys = Vec::new();
+        for (name, source_hash, bytes) in [
+            ("target", hash.clone(), b"target cipher".to_vec()),
+            ("other", "b".repeat(64), b"other cipher".to_vec()),
+        ] {
+            let manifest = crate::object_store_transfer::Manifest {
+                version: 1,
+                kind: "object".into(),
+                relative_path: name.into(),
+                sha256: source_hash,
+                size: 1,
+                upload_id: uuid::Uuid::new_v4().to_string(),
+                chunks: vec![crate::object_store::digest(&bytes)],
+                created_at: "2026-01-01T00:00:00Z".into(),
+            };
+            let data_key = crate::object_store_transfer::chunk_key(&manifest, 0);
+            let manifest_key = format!("{}/manifests/{name}.age", crate::object_store::PREFIX);
+            let encrypted = crate::object_store_transfer::encrypt_bytes(
+                &serde_json::to_vec(&manifest).unwrap(),
+                &identity,
+            )
+            .unwrap();
+            for (key, value) in [(&data_key, bytes), (&manifest_key, encrypted)] {
+                assert!(crate::object_store::request(
+                    &config,
+                    &keys,
+                    reqwest::Method::PUT,
+                    key,
+                    &[],
+                    value
+                )
+                .await
+                .unwrap()
+                .status()
+                .is_success());
+            }
+            if name == "target" {
+                target_keys.extend([data_key, manifest_key]);
+            } else {
+                other_keys.extend([data_key, manifest_key]);
+            }
+        }
+        let (removed, remaining) =
+            purge_remote(&database, "asset", &hash, None, &config, &keys, &identity)
+                .await
+                .unwrap();
+        assert!(!remaining.is_empty());
+        assert_eq!(
+            finish_purge(&database, "asset", vec![], Ok((removed, remaining)), true)
+                .unwrap()
+                .state,
+            "remote_retry_pending"
+        );
+        let target = remote_target(&config, &identity);
+        let page = list_deleted_with_target(&root, &database, None, 40, Some(&target)).unwrap();
+        assert_eq!(page.items.len(), 1);
+        let saved: String = crate::storage::open_writable_connection(&database)
+            .unwrap()
+            .query_row(
+                "SELECT remote_plan_json FROM source_asset_deletions WHERE asset_id='asset'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (removed, remaining) = purge_remote(
+            &database,
+            "asset",
+            &hash,
+            Some(saved),
+            &config,
+            &keys,
+            &identity,
+        )
+        .await
+        .unwrap();
+        assert!(remaining.is_empty());
+        finish_purge(&database, "asset", vec![], Ok((removed, remaining)), true).unwrap();
+        assert!(
+            list_deleted_with_target(&root, &database, None, 40, Some(&target))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let map = objects.lock().unwrap();
+        assert!(target_keys.iter().all(|key| !map.contains_key(key)));
+        assert!(other_keys.iter().all(|key| map.contains_key(key)));
+        drop(map);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_remote_lookup_saves_bound_retry_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("state.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let conn = crate::storage::open_writable_connection(&db).unwrap();
+        let hash = "a".repeat(64);
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset','other',?1,1,?2,'lesson.wav','test','now')", rusqlite::params![hash,format!("sha256/aa/{hash}")]).unwrap();
+        conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('asset',?1,'purge_pending','now','later')", [uuid::Uuid::new_v4().to_string()]).unwrap();
+        drop(conn);
+        let config = crate::object_store::Config {
+            provider: "aws".into(),
+            endpoint: "http://127.0.0.1:1".into(),
+            region: "auto".into(),
+            bucket: "fixture".into(),
+            credential_id: "fixture".into(),
+            last_backup_at: None,
+            write_safety: Some(crate::object_store::WriteSafety::Conditional),
+        };
+        let keys = crate::object_store::Keys {
+            access_key_id: "fixture".into(),
+            secret_access_key: "fixture".into(),
+        };
+        let identity = age::x25519::Identity::generate();
+        assert!(
+            purge_remote(&db, "asset", &hash, None, &config, &keys, &identity)
+                .await
+                .is_err()
+        );
+        let plan: String = crate::storage::open_writable_connection(&db)
+            .unwrap()
+            .query_row(
+                "SELECT remote_plan_json FROM source_asset_deletions WHERE asset_id='asset'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(parse_bound_plan(&plan, &remote_target(&config, &identity)).is_ok());
+        let mut other = config.clone();
+        other.bucket = "different".into();
+        assert!(parse_bound_plan(&plan, &remote_target(&other, &identity)).is_err());
+    }
+
+    #[tokio::test]
+    async fn preview_counts_archived_chats_but_not_permanently_deleted_chats() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        for name in ["zettels", "receipts", "objects", "chats", ".git"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let db = temp.path().join("state.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let first = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let second = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let hash = crate::object_store::digest(b"source bytes");
+        let conn = crate::storage::open_writable_connection(&db).unwrap();
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset-1','other',?1,12,?2,'photo.jpg','test','now')", rusqlite::params![hash, format!("sha256/{}/{hash}", &hash[..2])]).unwrap();
+        drop(conn);
+        let object = root.join("objects/sha256").join(&hash[..2]).join(&hash);
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        fs::write(object, b"source bytes").unwrap();
+        crate::archive_receipt::attach_asset(&root, &db, &first, "asset-1").unwrap();
+        crate::archive_receipt::attach_asset(&root, &db, &second, "asset-1").unwrap();
+        let active: crate::chat_codex::Active = Default::default();
+        assert_eq!(
+            crate::chat::archive_if_idle(&db, &active, &second)
+                .await
+                .state,
+            "ok"
+        );
+        assert_eq!(preview(&root, &db, "asset-1").unwrap().chats.len(), 2);
+        let deleted = crate::chat::delete_with(&db, &active, &second, |_| async { Ok(()) }).await;
+        assert_eq!(serde_json::to_value(deleted).unwrap()["state"], "deleted");
+        crate::chat_archive_store::remove(&root, &db, &second).unwrap();
+        let references = preview(&root, &db, "asset-1").unwrap();
+        assert_eq!(references.chats, vec![first]);
+        assert_eq!(references.receipts.len(), 2);
+        assert!(root.join("chats").join(format!("{second}.json")).exists());
+    }
+
+    #[test]
+    fn preview_excludes_deleted_document_with_stale_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        for name in ["zettels", "receipts", "objects", ".git"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let db = temp.path().join("state.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let hash = crate::object_store::digest(b"source bytes");
+        let conn = crate::storage::open_writable_connection(&db).unwrap();
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset-1','other',?1,12,?2,'photo.jpg','test','now')", rusqlite::params![hash, format!("sha256/{}/{hash}", &hash[..2])]).unwrap();
+        drop(conn);
+        let id = crate::archive_zet::create(
+            &root,
+            &db,
+            crate::archive_zet::ZetCreate {
+                title: "lesson".into(),
+                summary: "summary".into(),
+                kind: "note".into(),
+                body: "text".into(),
+                assets: vec![format!("sha256:{hash}")],
+                edges: vec![],
+            },
+        )
+        .unwrap();
+        let file = root.join("zettels").join(format!("{id}.md"));
+        assert_eq!(preview(&root, &db, "asset-1").unwrap().documents.len(), 1);
+        fs::remove_file(file).unwrap();
+        assert!(preview(&root, &db, "asset-1").unwrap().documents.is_empty());
+    }
 
     #[test]
     fn move_never_replaces_a_destination() {
@@ -1511,9 +2071,15 @@ mod tests {
             ("a", "a".repeat(64), "trashed"),
             ("b", "b".repeat(64), "purge_pending"),
             ("c", "c".repeat(64), "pending"),
+            ("d", "d".repeat(64), "purge_pending"),
         ] {
             conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES(?1,'other',?2,1,?3,'source.txt','test','2026-01-01T00:00:00Z')", rusqlite::params![id,hash,format!("sha256/{}/{hash}",&hash[..2])]).unwrap();
-            conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until,local_remaining_json,remote_remaining_json) VALUES(?1,?2,?3,'2026-01-02T00:00:00Z','old','[\"local-copy\"]','[\"remote-copy\"]')", rusqlite::params![id,format!("operation-{id}"),state]).unwrap();
+            let local = if id == "d" {
+                r#"["external_copies_unverified"]"#
+            } else {
+                r#"["local-copy"]"#
+            };
+            conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until,local_remaining_json,remote_remaining_json) VALUES(?1,?2,?3,'2026-01-02T00:00:00Z','old',?4,'[\"remote-copy\"]')", rusqlite::params![id,format!("operation-{id}"),state,local]).unwrap();
         }
         drop(conn);
         let first = list_deleted(&root, &db, None, 1).unwrap();
@@ -1531,6 +2097,183 @@ mod tests {
         assert_eq!(third["items"][0]["id"], "a");
         assert_eq!(third["hasMore"], false);
         assert!(third["nextCursor"].is_null());
+    }
+
+    #[test]
+    fn purge_without_connected_store_leaves_no_actionable_list_item() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        for folder in ["objects", "zettels", "receipts", ".git"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let backups = temp.path().join("backups");
+        fs::create_dir_all(&backups).unwrap();
+        let db = temp.path().join("state.db");
+        crate::storage::initialize(&db, &backups, "test").unwrap();
+        let bytes = b"private source";
+        let hash = crate::object_store::digest(bytes);
+        let conn = crate::storage::open_writable_connection(&db).unwrap();
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset','other',?1,?2,?3,'lesson.wav','test','now')", rusqlite::params![hash,bytes.len() as i64,format!("sha256/{}/{hash}",&hash[..2])]).unwrap();
+        drop(conn);
+        let object = root.join("objects/sha256").join(&hash[..2]).join(&hash);
+        fs::create_dir_all(object.parent().unwrap()).unwrap();
+        fs::write(&object, bytes).unwrap();
+        let plan = preview(&root, &db, "asset").unwrap().plan_digest.unwrap();
+        trash(&root, &db, "asset", &plan).unwrap();
+        let conn = crate::storage::open_writable_connection(&db).unwrap();
+        conn.execute(
+            "UPDATE source_asset_deletions SET state='purge_pending' WHERE asset_id='asset'",
+            [],
+        )
+        .unwrap();
+        let operation: String = conn
+            .query_row(
+                "SELECT operation_id FROM source_asset_deletions WHERE asset_id='asset'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let local = purge_local(
+            &root,
+            &backups,
+            temp.path(),
+            &hash,
+            &operation,
+            None,
+            |_, _, _| Err("not_connected"),
+        );
+        let result = finish_purge(&db, "asset", local, Err("not_connected"), false).unwrap();
+        assert_eq!(result.state, "partial");
+        assert!(result
+            .remote_remaining
+            .iter()
+            .any(|v| v == "remote_access:not_connected"));
+        assert!(!object.exists());
+        assert!(list_deleted(&root, &db, None, 40).unwrap().items.is_empty());
+        let conn = crate::storage::open_writable_connection(&db).unwrap();
+        let (state, name): (String, String) = conn.query_row("SELECT d.state,a.original_file_name FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE d.asset_id='asset'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(state, "purged");
+        assert_eq!(name, "lesson.wav");
+    }
+
+    #[tokio::test]
+    async fn backup_retries_confirmed_purge_after_reconnection_but_not_trash() {
+        use std::io::{Read, Write};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        for folder in ["objects", "zettels", "receipts", ".git"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let backups = temp.path().join("backups");
+        fs::create_dir_all(&backups).unwrap();
+        let database = temp.path().join("state.db");
+        crate::storage::initialize(&database, &backups, "test").unwrap();
+        let conn = crate::storage::open_writable_connection(&database).unwrap();
+        for (id, hash, state, remaining) in [
+            (
+                "confirmed",
+                "a".repeat(64),
+                "purged",
+                Some(r#"["remote_access:not_connected"]"#),
+            ),
+            ("trash", "b".repeat(64), "trashed", None),
+            (
+                "other",
+                "c".repeat(64),
+                "purged",
+                Some(r#"["remote_access:remote_target_changed"]"#),
+            ),
+            (
+                "unbound",
+                "d".repeat(64),
+                "purged",
+                Some(r#"["remote_access:not_connected"]"#),
+            ),
+        ] {
+            conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES(?1,'other',?2,1,?3,'lesson.wav','test','now')", rusqlite::params![id,hash,format!("sha256/{}/{hash}",&hash[..2])]).unwrap();
+            conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until,remote_remaining_json) VALUES(?1,?2,?3,'now','later',?4)", rusqlite::params![id,uuid::Uuid::new_v4().to_string(),state,remaining]).unwrap();
+        }
+        let other_plan = RemotePlan {
+            target: "different-target".into(),
+            ..RemotePlan::default()
+        };
+        conn.execute(
+            "UPDATE source_asset_deletions SET remote_plan_json=?1 WHERE asset_id='other'",
+            [serde_json::to_string(&other_plan).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut request = [0u8; 8192];
+            let count = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /bucket?"));
+            let body = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let config = crate::object_store::Config {
+            provider: "aws".into(),
+            endpoint: format!("http://{address}"),
+            region: "auto".into(),
+            bucket: "bucket".into(),
+            credential_id: "test".into(),
+            last_backup_at: None,
+            write_safety: Some(crate::object_store::WriteSafety::Conditional),
+        };
+        let keys = crate::object_store::Keys {
+            access_key_id: "TEST".into(),
+            secret_access_key: "test".into(),
+        };
+        let identity = age::x25519::Identity::generate();
+        let plan = RemotePlan {
+            target: remote_target(&config, &identity),
+            ..RemotePlan::default()
+        };
+        crate::storage::open_writable_connection(&database)
+            .unwrap()
+            .execute(
+                "UPDATE source_asset_deletions SET remote_plan_json=?1 WHERE asset_id='confirmed'",
+                [serde_json::to_string(&plan).unwrap()],
+            )
+            .unwrap();
+        let archive =
+            crate::archive_location::ArchiveLocation::load(database.clone(), temp.path(), vec![])
+                .unwrap();
+        let paths = crate::runtime::RuntimePaths {
+            data_root: temp.path().to_path_buf(),
+            database_path: database.clone(),
+            objects_path: root.join("objects"),
+            exports_path: temp.path().join("exports"),
+            backups_path: backups,
+            logs_path: temp.path().join("logs"),
+            archive,
+            archive_lease: None,
+        };
+        retry_pending_for_backup(&paths, &config, &keys, &identity)
+            .await
+            .unwrap();
+        server.join().unwrap();
+        let conn = crate::storage::open_writable_connection(&database).unwrap();
+        let confirmed: (String, String) = conn.query_row("SELECT d.state,a.original_file_name FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE d.asset_id='confirmed'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let trash: (String, String) = conn.query_row("SELECT d.state,a.original_file_name FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE d.asset_id='trash'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let other: (String, String) = conn.query_row("SELECT d.state,a.original_file_name FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE d.asset_id='other'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        let unbound: (String, String) = conn.query_row("SELECT d.state,a.original_file_name FROM source_asset_deletions d JOIN momso_source_assets a ON a.id=d.asset_id WHERE d.asset_id='unbound'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(confirmed, ("purged".into(), "deleted".into()));
+        assert_eq!(trash, ("trashed".into(), "lesson.wav".into()));
+        assert_eq!(other, ("purged".into(), "lesson.wav".into()));
+        assert_eq!(unbound, ("purged".into(), "lesson.wav".into()));
     }
 
     #[test]
@@ -1857,7 +2600,8 @@ mod tests {
         let remote = objects.clone();
         let requests = seen.clone();
         let server = std::thread::spawn(move || {
-            for _ in 0..5 {
+            let mut denied_once = false;
+            for _ in 0..9 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -1885,7 +2629,10 @@ mod tests {
                         Some(bytes) => ("200 OK", bytes.clone()),
                         None => ("404 Not Found", vec![]),
                     },
-                    "DELETE" if key == manifest_key => ("403 Forbidden", vec![]),
+                    "DELETE" if key == manifest_key && !denied_once => {
+                        denied_once = true;
+                        ("403 Forbidden", vec![])
+                    }
                     "DELETE" => {
                         all.remove(&key);
                         ("204 No Content", vec![])
@@ -1936,10 +2683,79 @@ mod tests {
             )]),
             shared_keys: vec![],
         };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        for folder in ["objects", "zettels", "receipts"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        let database = temp.path().join("state.db");
+        crate::storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
+        let conn = crate::storage::open_writable_connection(&database).unwrap();
+        let hash = "a".repeat(64);
+        conn.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset','other',?1,1,?2,'lesson.wav','test','now')", rusqlite::params![hash,format!("sha256/aa/{hash}")]).unwrap();
+        conn.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('asset',?1,'purge_pending','now','later')", [uuid::Uuid::new_v4().to_string()]).unwrap();
+        drop(conn);
+        let mut stored = config.clone();
+        stored.endpoint = "https://s3.us-east-1.amazonaws.com".into();
+        stored.region = "us-east-1".into();
+        stored.credential_id = uuid::Uuid::new_v4().to_string();
+        crate::object_store::save_config(temp.path(), &stored).unwrap();
         let (removed, remaining) = delete_remote_keys(&config, &keys, &plan).await;
-        server.join().unwrap();
         assert_eq!(removed, [data_key]);
         assert_eq!(remaining, [manifest_key]);
+        let outcome = finish_purge(
+            &database,
+            "asset",
+            vec!["external_copies_unverified".into()],
+            Ok((removed, remaining)),
+            true,
+        )
+        .unwrap();
+        assert_eq!(outcome.state, "remote_retry_pending");
+        crate::storage::open_writable_connection(&database)
+            .unwrap()
+            .execute(
+                "UPDATE source_asset_deletions SET remote_plan_json=?1 WHERE asset_id='asset'",
+                [serde_json::to_string(&plan).unwrap()],
+            )
+            .unwrap();
+        assert!(
+            list_deleted_with_target(&root, &database, None, 40, Some("other"))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let page = serde_json::to_value(
+            list_deleted_with_target(&root, &database, None, 40, Some("test")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page["items"][0]["originalFileName"], "lesson.wav");
+        assert_eq!(page["items"][0]["deletionState"], "remote_retry_pending");
+        assert_eq!(page["items"][0]["canPurge"], true);
+        let (removed, remaining) = delete_remote_keys(&config, &keys, &plan).await;
+        assert!(remaining.is_empty());
+        finish_purge(
+            &database,
+            "asset",
+            vec!["external_copies_unverified".into()],
+            Ok((removed, remaining)),
+            true,
+        )
+        .unwrap();
+        assert!(list_deleted(&root, &database, None, 40)
+            .unwrap()
+            .items
+            .is_empty());
+        let conn = crate::storage::open_writable_connection(&database).unwrap();
+        let name: String = conn
+            .query_row(
+                "SELECT original_file_name FROM momso_source_assets WHERE id='asset'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "deleted");
+        server.join().unwrap();
         assert_eq!(objects.lock().unwrap().get(other_key).unwrap(), b"other");
         assert!(!seen.lock().unwrap().iter().any(|(_, key)| key == other_key));
     }

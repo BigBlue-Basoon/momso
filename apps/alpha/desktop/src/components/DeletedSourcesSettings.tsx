@@ -6,6 +6,12 @@ import { W } from '../words'
 import { QuestionDialog } from './ZetPanel'
 
 const D = W.deletedSources
+/** 완전히 삭제를 눌렀지만 이 PC 의 것(local)이나 원격의 사본(remote)을 아직 다 지우지 못한 줄. 되돌리기는 없고, 완전히 삭제를 다시 누르면 다시 시도한다. */
+const isRetry = (state: string) => state === 'local_retry_pending' || state === 'remote_retry_pending'
+const retryState = (result: unknown) => {
+  const state = (result as { state?: unknown } | null | undefined)?.state
+  return typeof state === 'string' && isRetry(state) ? state : null
+}
 const dateFormat = new Intl.DateTimeFormat('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' })
 function when(value: string | null | undefined) {
   if (!value) return null
@@ -61,8 +67,12 @@ export function DeletedSourcesSettings({ onChanged }: { onChanged?: () => void }
     setWorking(id)
     setError(null)
     try {
-      await action()
-      setItems((current) => current?.filter((item) => item.id !== id) ?? current)
+      const result = await action()
+      // 완전히 삭제가 다 끝나지 못했으면(다시 시도할 수 있음) 줄을 남기고 그 상태로 바꾼다. 그 밖에는 목록에서 뺀다.
+      const retry = retryState(result)
+      setItems((current) => retry
+        ? current?.map((item) => item.id === id ? { ...item, deletionState: retry, canRestore: false, canPurge: true } : item) ?? current
+        : current?.filter((item) => item.id !== id) ?? current)
       onChanged?.()
     } catch (reason) {
       setError(archiveErrorMessage(reason, failed))
@@ -73,11 +83,11 @@ export function DeletedSourcesSettings({ onChanged }: { onChanged?: () => void }
   // 완전히 삭제는 쓰는 곳을 다시 확인한 지문(planDigest)과 함께 보낸다(뒤쪽 계약).
   async function purge(id: string) {
     const preview = await previewSourceDelete(id)
-    await purgeSource(id, preview.planDigest)
+    return purgeSource(id, preview.planDigest)
   }
 
-  // 완전히 삭제를 시작한 원자료(purge_pending)는 뒤쪽이 이름을 지워 'deleted' 로 준다(2026-11-17 실제 앱). 그 영어 낱말을 보이지 않고 정해 둔 말로.
-  const nameOf = (item: DeletedSource) => item.deletionState === 'purge_pending' ? D.purgedName : item.originalFileName || W.zetPanel.text57(W.rawMaterial)
+  // 목록에는 아직 무언가 할 수 있는 것만 온다. 이름은 원격까지 다 지워질 때 지워지므로(그때는 목록에서 빠짐) 그대로 보인다(2026-11-17 뒤쪽 f033fd0).
+  const nameOf = (item: DeletedSource) => item.originalFileName || W.zetPanel.text57(W.rawMaterial)
 
   return (
     <div className="settings-page">
@@ -92,7 +102,8 @@ export function DeletedSourcesSettings({ onChanged }: { onChanged?: () => void }
         <ul className="archived-list">
           {items.map((item) => {
             const title = nameOf(item)
-            const meta = [when(item.deletedAt), D.usedCount(item.referenceCount)].filter(Boolean).join(' · ')
+            // 다 지우지 못해 다시 시도할 줄은 쓰던 곳 수 대신 무엇을 기다리는지 적는다(이 PC 의 것·원격의 사본을 한 글로).
+            const meta = [when(item.deletedAt), isRetry(item.deletionState) ? D.retryPending : D.usedCount(item.referenceCount)].filter(Boolean).join(' · ')
             return (
               <li key={item.id} className="archived-row" aria-busy={working === item.id || undefined}>
                 <span className="archived-main">

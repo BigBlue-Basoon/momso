@@ -22,6 +22,307 @@ pub(crate) fn invoke(window: &tauri::WebviewWindow<MockRuntime>, cmd: &str, body
 }
 
 #[test]
+fn oauth_r2_commands_import_backup_purge_and_retry() {
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Mutex,
+        },
+    };
+    struct Cleanup {
+        root: std::path::PathBuf,
+        credential: String,
+        stop: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            object_store::unregister_test_config(&self.root);
+            if let Ok(_guard) = credentials::prevent_secret_changes() {
+                let _ = credentials::remove_secret_unlocked(&self.credential);
+            }
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let db = root.join("momso.db");
+    let backups = root.join("backups");
+    std::fs::create_dir_all(&backups).unwrap();
+    storage::initialize(&db, &backups, "test").unwrap();
+    let profile = backup_profile::ensure(&db).unwrap();
+    let (identity, _) = credentials::get_or_create_backup_identity(&profile.workspace_id).unwrap();
+    storage::open_writable_connection(&db).unwrap().execute("UPDATE momso_backup_profiles SET recovery_key_confirmed_at='now' WHERE workspace_id=?1", [&profile.workspace_id]).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let objects = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let fail = Arc::new(AtomicBool::new(false));
+    let (remote, stopped, fail_delete) = (objects.clone(), stop.clone(), fail.clone());
+    let server = std::thread::spawn(move || {
+        let base = format!(
+            "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects",
+            "a".repeat(32)
+        );
+        while !stopped.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+                .unwrap();
+            let mut raw = Vec::new();
+            let mut buffer = [0u8; 8192];
+            let end = loop {
+                let n = stream.read(&mut buffer).unwrap();
+                assert_ne!(n, 0);
+                raw.extend_from_slice(&buffer[..n]);
+                if let Some(i) = raw.windows(4).position(|v| v == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let head = String::from_utf8(raw[..end].to_vec()).unwrap();
+            assert!(head
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token")));
+            let mut parts = head.lines().next().unwrap().split_whitespace();
+            let method = parts.next().unwrap();
+            let path = parts.next().unwrap();
+            let len = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|n| n.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while raw.len() - end < len {
+                let n = stream.read(&mut buffer).unwrap();
+                assert_ne!(n, 0);
+                raw.extend_from_slice(&buffer[..n]);
+            }
+            let mut map = remote.lock().unwrap();
+            let (status, body) = if method == "GET" && path.starts_with(&format!("{base}?")) {
+                let part = if path.contains("data%2F") {
+                    "/data/"
+                } else {
+                    "/manifests/"
+                };
+                let entries: Vec<_> = map
+                    .keys()
+                    .filter(|key| key.contains(part))
+                    .map(|key| json!({"key":key}))
+                    .collect();
+                ("200 OK", serde_json::to_vec(&json!({"success":true,"result":entries,"result_info":{"is_truncated":false}})).unwrap())
+            } else {
+                let key = path
+                    .strip_prefix(&format!("{base}/"))
+                    .expect("local R2 object path");
+                match method {
+                    "PUT" => {
+                        map.insert(key.into(), raw[end..end + len].to_vec());
+                        ("200 OK", b"{}".to_vec())
+                    }
+                    "GET" => map
+                        .get(key)
+                        .map(|v| ("200 OK", v.clone()))
+                        .unwrap_or(("404 Not Found", vec![])),
+                    "DELETE" if fail_delete.swap(false, Ordering::SeqCst) => {
+                        ("403 Forbidden", vec![])
+                    }
+                    "DELETE" => {
+                        map.remove(key);
+                        ("200 OK", b"{}".to_vec())
+                    }
+                    _ => panic!("unexpected method"),
+                }
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+    let _cleanup = Cleanup {
+        root: root.to_path_buf(),
+        credential: format!("backup:{}:age-identity", profile.workspace_id),
+        stop,
+        server: Some(server),
+    };
+    object_store::register_test_config(
+        root,
+        object_store::Config {
+            provider: "cloudflare".into(),
+            endpoint: format!("http://{address}"),
+            region: "wrangleroauth".into(),
+            bucket: "momso-fixture".into(),
+            credential_id: uuid::Uuid::new_v4().to_string(),
+            last_backup_at: None,
+            write_safety: Some(object_store::WriteSafety::CheckThenWrite),
+        },
+    );
+    let archive = archive_location::ArchiveLocation::load(db.clone(), root, vec![]).unwrap();
+    let archive_root = root.join("momso");
+    archive::initialize(&archive_root, root).unwrap();
+    let paths = RuntimePaths {
+        data_root: root.to_path_buf(),
+        database_path: db.clone(),
+        objects_path: archive_root.join("objects"),
+        exports_path: root.join("exports"),
+        backups_path: backups,
+        logs_path: root.join("logs"),
+        archive,
+        archive_lease: None,
+    };
+    let app = mock_builder()
+        .manage(AppState {
+            paths,
+            approvals: Default::default(),
+            setup_secrets: Default::default(),
+            usage_monitor: Default::default(),
+            usage_cache: Default::default(),
+            chat_active: Default::default(),
+            browser: Default::default(),
+            selections: Default::default(),
+        })
+        .invoke_handler(tauri::generate_handler![
+            plan_source_asset_import,
+            apply_source_asset_import,
+            chat_create,
+            chat_attach_asset,
+            object_store_transfer::object_store_backup,
+            source_delete::source_asset_delete_preview,
+            source_delete::source_asset_trash,
+            source_delete::source_asset_purge,
+            source_delete::source_asset_deleted_list
+        ])
+        .build(mock_context(noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let mut imported = Vec::new();
+    for (name, content) in [
+        ("target.txt", "target fixture"),
+        ("other.txt", "other fixture"),
+    ] {
+        let file = root.join(name);
+        std::fs::write(&file, content).unwrap();
+        app.state::<AppState>().selections.remember(
+            std::slice::from_ref(&file),
+            selection_grants::Purpose::Source,
+        );
+        let proposal = json!({"sourcePath":file,"assetKind":"raw_transcript","mediaType":"text/plain","recordLink":null,"actor":"fixture"});
+        let plan = invoke(
+            &window,
+            "plan_source_asset_import",
+            json!({"proposal":proposal}),
+        );
+        let asset = invoke(
+            &window,
+            "apply_source_asset_import",
+            json!({"input":{"proposal":proposal,"planDigest":plan["planDigest"],"importConfirmed":true}}),
+        );
+        imported.push(asset);
+    }
+    let chat = invoke(&window, "chat_create", json!({}));
+    let attachment = invoke(
+        &window,
+        "chat_attach_asset",
+        json!({"chatId":chat["id"],"assetId":imported[0]["id"]}),
+    );
+    assert!(attachment.is_string());
+    let backup = invoke(&window, "object_store_backup", json!({}));
+    assert_eq!(backup["completedCount"], 2);
+    let mut target_keys = Vec::new();
+    let mut other_keys = Vec::new();
+    for (key, value) in objects
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| key.contains("/manifests/"))
+    {
+        let decoded = object_store_transfer::decrypt_bytes(value, &identity, 1024 * 1024).unwrap();
+        let manifest: object_store_transfer::Manifest = serde_json::from_slice(&decoded).unwrap();
+        let dest = if manifest.sha256 == imported[0]["contentSha256"].as_str().unwrap() {
+            &mut target_keys
+        } else {
+            &mut other_keys
+        };
+        dest.push(key.clone());
+        dest.extend(
+            (0..manifest.chunks.len()).map(|i| object_store_transfer::chunk_key(&manifest, i)),
+        );
+    }
+    assert!(!target_keys.is_empty() && !other_keys.is_empty());
+    let id = imported[0]["id"].as_str().unwrap();
+    let preview = invoke(
+        &window,
+        "source_asset_delete_preview",
+        json!({"assetId":id}),
+    );
+    let trash = invoke(
+        &window,
+        "source_asset_trash",
+        json!({"assetId":id,"planDigest":preview["planDigest"]}),
+    );
+    assert_eq!(trash["state"], "trashed");
+    let preview = invoke(
+        &window,
+        "source_asset_delete_preview",
+        json!({"assetId":id}),
+    );
+    fail.store(true, Ordering::SeqCst);
+    let result = invoke(
+        &window,
+        "source_asset_purge",
+        json!({"assetId":id,"planDigest":preview["planDigest"],"confirmed":true}),
+    );
+    assert_eq!(result["state"], "remote_retry_pending");
+    let listed = invoke(
+        &window,
+        "source_asset_deleted_list",
+        json!({"before":null,"limit":10}),
+    );
+    assert_eq!(listed["items"][0]["originalFileName"], "target.txt");
+    assert_eq!(listed["items"][0]["deletionState"], "remote_retry_pending");
+    let preview = invoke(
+        &window,
+        "source_asset_delete_preview",
+        json!({"assetId":id}),
+    );
+    let result = invoke(
+        &window,
+        "source_asset_purge",
+        json!({"assetId":id,"planDigest":preview["planDigest"],"confirmed":true}),
+    );
+    assert_ne!(result["state"], "remote_retry_pending");
+    assert_eq!(
+        invoke(
+            &window,
+            "source_asset_deleted_list",
+            json!({"before":null,"limit":10})
+        )["items"],
+        json!([])
+    );
+    let map = objects.lock().unwrap();
+    assert!(target_keys.iter().all(|key| !map.contains_key(key)));
+    assert!(other_keys.iter().all(|key| map.contains_key(key)));
+}
+
+#[test]
 fn webview_import_rejects_unselected_and_consumes_selected_file() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
@@ -222,6 +523,142 @@ fn webview_import_rejects_unselected_and_consumes_selected_file() {
             false
         )
         .is_err());
+}
+
+#[test]
+fn source_purge_without_store_disappears_through_desktop_commands() {
+    source_purge_without_remote_delete(false);
+}
+
+#[test]
+fn oauth_r2_purge_without_recovery_key_reports_retry() {
+    source_purge_without_remote_delete(true);
+}
+
+fn source_purge_without_remote_delete(oauth_r2: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    if oauth_r2 {
+        object_store::save_config(
+            root,
+            &object_store::Config {
+                provider: "cloudflare".into(),
+                endpoint: "https://fixture.r2.cloudflarestorage.com".into(),
+                region: "wrangleroauth".into(),
+                bucket: "momso-fixture".into(),
+                credential_id: uuid::Uuid::new_v4().to_string(),
+                last_backup_at: None,
+                write_safety: Some(object_store::WriteSafety::CheckThenWrite),
+            },
+        )
+        .unwrap();
+    }
+    let database_path = root.join("momso.db");
+    let backups_path = root.join("backups");
+    std::fs::create_dir_all(&backups_path).unwrap();
+    storage::initialize(&database_path, &backups_path, "test").unwrap();
+    let archive =
+        archive_location::ArchiveLocation::load(database_path.clone(), root, vec![]).unwrap();
+    let archive_root = root.join("momso");
+    for folder in ["objects", "zettels", "receipts", ".git"] {
+        std::fs::create_dir_all(archive_root.join(folder)).unwrap();
+    }
+    let contents = b"synthetic private lesson";
+    let hash = object_store::digest(contents);
+    let object = archive_root
+        .join("objects/sha256")
+        .join(&hash[..2])
+        .join(&hash);
+    std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+    std::fs::write(&object, contents).unwrap();
+    let connection = storage::open_writable_connection(&database_path).unwrap();
+    connection.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset-1','other',?1,?2,?3,'lesson.wav','test','now')", rusqlite::params![hash,contents.len() as i64,format!("sha256/{}/{hash}",&hash[..2])]).unwrap();
+    drop(connection);
+    let paths = RuntimePaths {
+        data_root: root.to_path_buf(),
+        database_path,
+        objects_path: archive_root.join("objects"),
+        exports_path: root.join("exports"),
+        backups_path,
+        logs_path: root.join("logs"),
+        archive,
+        archive_lease: None,
+    };
+    let app = mock_builder()
+        .manage(AppState {
+            paths,
+            approvals: approval::ApprovalBroker::default(),
+            setup_secrets: setup_secret::SecretBroker::default(),
+            usage_monitor: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage_cache: Arc::new(usage_status::UsageCache::default()),
+            chat_active: Default::default(),
+            browser: Default::default(),
+            selections: Default::default(),
+        })
+        .invoke_handler(tauri::generate_handler![
+            source_delete::source_asset_delete_preview,
+            source_delete::source_asset_deleted_list,
+            source_delete::source_asset_trash,
+            source_delete::source_asset_purge,
+        ])
+        .build(mock_context(noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let preview = invoke(
+        &window,
+        "source_asset_delete_preview",
+        json!({"assetId":"asset-1"}),
+    );
+    let trash = invoke(
+        &window,
+        "source_asset_trash",
+        json!({"assetId":"asset-1","planDigest":preview["planDigest"]}),
+    );
+    assert_eq!(trash["state"], "trashed");
+    let listed = invoke(
+        &window,
+        "source_asset_deleted_list",
+        json!({"before":null,"limit":10}),
+    );
+    assert_eq!(listed["items"][0]["originalFileName"], "lesson.wav");
+    assert_eq!(listed["items"][0]["canRestore"], true);
+    let preview = invoke(
+        &window,
+        "source_asset_delete_preview",
+        json!({"assetId":"asset-1"}),
+    );
+    let purged = invoke(
+        &window,
+        "source_asset_purge",
+        json!({"assetId":"asset-1","planDigest":preview["planDigest"],"confirmed":true}),
+    );
+    assert_eq!(
+        purged["state"],
+        if oauth_r2 {
+            "remote_retry_pending"
+        } else {
+            "partial"
+        }
+    );
+    assert!(purged["remoteRemaining"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v
+            == if oauth_r2 {
+                "remote_access:recovery_key_missing"
+            } else {
+                "remote_access:not_connected"
+            }));
+    assert!(!object.exists());
+    let listed = invoke(
+        &window,
+        "source_asset_deleted_list",
+        json!({"before":null,"limit":10}),
+    );
+    assert_eq!(listed["items"], json!([]));
 }
 
 #[test]

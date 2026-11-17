@@ -90,7 +90,40 @@ fn config_path(root: &Path) -> std::path::PathBuf {
     root.join("object-store.json")
 }
 
+#[cfg(test)]
+fn test_configs() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Config>>
+{
+    static CONFIGS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Config>>,
+    > = std::sync::OnceLock::new();
+    CONFIGS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn register_test_config(root: &Path, config: Config) {
+    assert!(config.endpoint.starts_with("http://127.0.0.1:"));
+    assert!(crate::r2_oauth::uses_oauth(&config));
+    test_configs()
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), config);
+}
+
+#[cfg(test)]
+pub(crate) fn unregister_test_config(root: &Path) {
+    test_configs().lock().unwrap().remove(root);
+}
+
 pub(crate) fn load_config(root: &Path) -> Result<Option<Config>, &'static str> {
+    #[cfg(test)]
+    if let Some(config) = test_configs()
+        .lock()
+        .map_err(|_| "unavailable")?
+        .get(root)
+        .cloned()
+    {
+        return Ok(Some(config));
+    }
     match fs::read(config_path(root)) {
         Ok(data) => {
             let config: Config = serde_json::from_slice(&data).map_err(|_| "unavailable")?;
@@ -136,7 +169,11 @@ pub(crate) fn load_keys(config: &Config) -> Result<Keys, &'static str> {
     if crate::r2_oauth::uses_oauth(config) {
         return Ok(Keys {
             access_key_id: "wrangler-oauth".into(),
-            secret_access_key: String::new(),
+            secret_access_key: if cfg!(test) && config.endpoint.starts_with("http://127.0.0.1:") {
+                "test-token".into()
+            } else {
+                String::new()
+            },
         });
     }
     let secret = credentials::get_secret(&key_name(config))

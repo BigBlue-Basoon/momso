@@ -85,6 +85,20 @@ async fn clear_token_cache() {
 }
 
 static BUNDLED_NODE: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
+static HTTP_CLIENT: OnceLock<Result<reqwest::Client, ()>> = OnceLock::new();
+
+fn http_client() -> Result<&'static reqwest::Client, &'static str> {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(60))
+                .build()
+                .map_err(|_| ())
+        })
+        .as_ref()
+        .map_err(|_| "unavailable")
+}
 
 pub(crate) fn configure_resources(resources: &std::path::Path) {
     let roots = [
@@ -262,11 +276,7 @@ pub(crate) async fn request(
     } else {
         method
     };
-    let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|_| "unavailable")?
+    let mut builder = http_client()?
         .request(actual_method.clone(), url)
         .bearer_auth(&token.0);
     if actual_method == reqwest::Method::PUT {
@@ -370,11 +380,7 @@ impl R2Target {
 }
 
 async fn create_exact_bucket(target: &R2Target, token: &OAuthToken) -> Result<(), &'static str> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|_| "unavailable")?;
+    let client = http_client()?;
     let result = client
         .get(target.bucket_url(true)?)
         .bearer_auth(&token.0)
@@ -521,17 +527,14 @@ pub(crate) async fn connect_approved(
     if !response.status().is_success() {
         return Err("created_not_connected");
     }
-    let response = request(&config, &keys, reqwest::Method::GET, &key, &[], vec![])
+    crate::object_store_transfer::read_bounded(response, 64 * 1024)
         .await
         .map_err(|_| "created_not_connected")?;
-    if !response.status().is_success()
-        || response
-            .bytes()
+    let actual =
+        crate::object_store_transfer::get_bytes(&config, &keys, &key, b"momso-probe".len())
             .await
-            .map_err(|_| "created_not_connected")?
-            .as_ref()
-            != b"momso-probe"
-    {
+            .map_err(|_| "created_not_connected")?;
+    if actual.as_deref() != Some(b"momso-probe".as_slice()) {
         return Err("created_not_connected");
     }
     if cancel.is_cancelled() {
@@ -829,6 +832,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_connection_keeps_authorization_per_request() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            for (index, expected) in ["fake-token-one", "fake-token-two"].into_iter().enumerate() {
+                let mut headers = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(stream.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push(line);
+                }
+                assert!(headers[0].starts_with("GET "));
+                assert!(headers.iter().any(|line| line
+                    .trim()
+                    .eq_ignore_ascii_case(&format!("authorization: Bearer {expected}"))));
+                let connection = if index == 0 { "keep-alive" } else { "close" };
+                write!(
+                    stream.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: {connection}\r\n\r\nok"
+                )
+                .unwrap();
+                stream.get_mut().flush().unwrap();
+            }
+        });
+        let config = crate::object_store::Config {
+            provider: "cloudflare".into(),
+            endpoint: format!("http://{address}"),
+            region: "wrangleroauth".into(),
+            bucket: "momso-fixture".into(),
+            credential_id: "test".into(),
+            last_backup_at: None,
+            write_safety: Some(crate::object_store::WriteSafety::CheckThenWrite),
+        };
+        for token in ["fake-token-one", "fake-token-two"] {
+            let keys = crate::object_store::Keys {
+                access_key_id: "fake".into(),
+                secret_access_key: token.into(),
+            };
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                request(
+                    &config,
+                    &keys,
+                    reqwest::Method::GET,
+                    "momso/object-store/v1/data/test",
+                    &[],
+                    vec![],
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
+        }
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn checked_upload_reuses_connection_after_small_error_and_write_bodies() {
+        use std::{
+            io::{BufRead, BufReader, Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut stream = BufReader::new(stream);
+            for (index, method) in ["GET", "PUT", "GET"].into_iter().enumerate() {
+                let mut first = String::new();
+                assert_ne!(stream.read_line(&mut first).unwrap(), 0);
+                assert!(first.starts_with(&format!("{method} ")));
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(stream.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request_body = vec![0; length];
+                stream.read_exact(&mut request_body).unwrap();
+                if method == "PUT" {
+                    assert_eq!(request_body, b"payload");
+                }
+                let (status, body) = match index {
+                    0 => ("404 Not Found", "{\"success\":false}"),
+                    1 => ("200 OK", "{\"success\":true}"),
+                    _ => ("200 OK", "payload"),
+                };
+                let connection = if index == 2 { "close" } else { "keep-alive" };
+                write!(stream.get_mut(), "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{body}", body.len()).unwrap();
+                stream.get_mut().flush().unwrap();
+            }
+        });
+        let config = crate::object_store::Config {
+            provider: "cloudflare".into(),
+            endpoint: format!("http://{address}"),
+            region: "wrangleroauth".into(),
+            bucket: "momso-fixture".into(),
+            credential_id: "test".into(),
+            last_backup_at: None,
+            write_safety: Some(crate::object_store::WriteSafety::CheckThenWrite),
+        };
+        let keys = crate::object_store::Keys {
+            access_key_id: "fake".into(),
+            secret_access_key: "fake-token".into(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::object_store_transfer::put_once(
+                &config,
+                &keys,
+                "momso/object-store/v1/data/test",
+                b"payload".to_vec(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_ok());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn creates_only_approved_bucket_and_refuses_existing_one() {
         use std::{
             io::{Read, Write},
@@ -1113,7 +1258,10 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .all(|path| path.contains("/buckets/momso-fixture/objects/")));
+            .all(|path| path == &format!(
+                "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects/momso/object-store/v1/data/example",
+                "a".repeat(32)
+            )));
         assert!(target.object_url("../../outside").is_err());
         assert!(R2Target::new("https://example.com/", &"a".repeat(32), "fixture").is_err());
     }

@@ -721,6 +721,7 @@
   // ---- 원자료 열기와 지우기(가짜, T59). 지운 원자료는 미디어 목록과 채팅방에서 다룬 것에서 빠진다. ----
   const trashedSources = new Set()
   const purgedSources = new Set()
+  const retrySources = new Map()
   window.__sourceCalls = []
   if (query.get('copyfail')) setTimeout(() => emit('chat-archive-changed', { chatId: null, state: 'unavailable', reason: query.get('copyfail') }), 2500)
   function sourceCommand(command, args) {
@@ -751,7 +752,9 @@
       case 'source_asset_deleted_list': {
         // ?deleted=many 면 미리 지운 것 45개(쪽 나눔 확인), 기본은 이 창에서 지운 것만.
         if (query.get('deleted') === 'many' && !window.__deletedSeeded) { window.__deletedSeeded = true; for (let i = 0; i < 45; i++) trashedSources.add('sha256:seed' + String(i).padStart(4, '0')) }
-        const all = [...trashedSources].map((id, i) => ({ id, originalFileName: id.startsWith('sha256:seed') ? `수업 녹음 ${id.slice(-4)}.m4a` : (Object.fromEntries(files.map((f) => [f.id, f.title]))[id] || '수업 사진.jpg'), deletedAt: new Date(Date.now() - i * 3600e3).toISOString(), deletionState: purgedSources.has(id) ? 'purge_pending' : 'trashed', canRestore: !purgedSources.has(id), canPurge: true, referenceCount: i % 3 }))
+        // ?deleted=retry 면 다 지우지 못한 줄 둘(이 PC 의 것·원격의 사본)과 되돌릴 수 있는 줄 하나.
+        if (query.get('deleted') === 'retry' && !window.__deletedSeeded) { window.__deletedSeeded = true; trashedSources.add('sha256:seed0000'); for (const [n, s] of [['0001', 'local_retry_pending'], ['0002', 'remote_retry_pending']]) { trashedSources.add('sha256:seed' + n); retrySources.set('sha256:seed' + n, s) } }
+        const all = [...trashedSources].map((id, i) => ({ id, originalFileName: id.startsWith('sha256:seed') ? `수업 녹음 ${id.slice(-4)}.m4a` : (Object.fromEntries(files.map((f) => [f.id, f.title]))[id] || '수업 사진.jpg'), deletedAt: new Date(Date.now() - i * 3600e3).toISOString(), deletionState: retrySources.get(id) || 'trashed', canRestore: !retrySources.has(id), canPurge: true, referenceCount: i % 3 }))
         const start = args.before ? all.findIndex((x) => x.id === args.before.assetId) + 1 : 0
         const items = all.slice(start, start + 40)
         const more = start + items.length < all.length
@@ -759,7 +762,9 @@
       }
       case 'source_asset_purge':
         if (!args.confirmed) throw 'confirmation_required'
-        trashedSources.delete(id); purgedSources.add(id)
+        // ?purgeretry=local|remote 면 다 지우지 못해 목록에 남는다(뒤쪽 local_retry_pending·remote_retry_pending).
+        if (query.get('purgeretry')) { const s = query.get('purgeretry') + '_retry_pending'; retrySources.set(id, s); return { state: s, assetId: id, localRemaining: [], remoteRemaining: ['remote_access:network'], removedRemoteKeys: [] } }
+        trashedSources.delete(id); retrySources.delete(id); purgedSources.add(id)
         return { state: 'partial', assetId: id, localRemaining: ['database_backups_may_contain_metadata'], remoteRemaining: ['object_versions_unverified', 'other_stores_unverified'], removedRemoteKeys: [] }
     }
     return undefined

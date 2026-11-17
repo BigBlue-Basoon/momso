@@ -384,8 +384,8 @@ async fn archive_reindex(state: State<'_, AppState>) -> Result<archive::ReindexR
 }
 
 #[tauri::command]
-async fn chat_attach_asset(
-    app: tauri::AppHandle,
+async fn chat_attach_asset<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     chat_id: String,
     asset_id: String,

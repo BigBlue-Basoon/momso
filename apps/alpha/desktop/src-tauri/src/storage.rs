@@ -482,7 +482,10 @@ fn preserve_source_deletions(
             item.id.clone()
         };
         if matches!(item.state.as_str(), "purge_pending" | "purged") {
-            tx.execute("UPDATE momso_source_assets SET original_file_name='deleted',media_type=NULL,captured_by='redacted' WHERE id=?1", [&id])?;
+            // The current deletion record is authoritative: retryable or
+            // offline purges retain their name, while completed ones may
+            // already be redacted. Never resurrect older snapshot metadata.
+            tx.execute("UPDATE momso_source_assets SET original_file_name=?1,media_type=?2,captured_by=?3 WHERE id=?4", rusqlite::params![item.name,item.media,item.captured_by,id])?;
         }
         tx.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until,remote_plan_json,remote_remaining_json,local_remaining_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(asset_id) DO UPDATE SET operation_id=excluded.operation_id,state=excluded.state,requested_at=excluded.requested_at,retain_until=excluded.retain_until,remote_plan_json=excluded.remote_plan_json,remote_remaining_json=excluded.remote_remaining_json,local_remaining_json=excluded.local_remaining_json", rusqlite::params![id,item.operation,item.state,item.requested_at,item.retain_until,item.remote_plan,item.remote_remaining,item.local_remaining])?;
     }
