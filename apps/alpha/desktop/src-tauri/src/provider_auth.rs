@@ -404,10 +404,28 @@ pub(crate) fn chat_auth_method(
 struct Change<'a> {
     provider: &'a str,
     state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
 }
 
 pub(crate) fn notify(app: &AppHandle, provider: &str, state: &'static str) {
-    let _ = app.emit("provider-auth-changed", Change { provider, state });
+    notify_with_reason(app, provider, state, None);
+}
+
+fn notify_with_reason(
+    app: &AppHandle,
+    provider: &str,
+    state: &'static str,
+    reason: Option<&'static str>,
+) {
+    let _ = app.emit(
+        "provider-auth-changed",
+        Change {
+            provider,
+            state,
+            reason,
+        },
+    );
 }
 
 async fn run_login_tool(
@@ -425,6 +443,17 @@ async fn run_login_tool(
         Some(token),
     )
     .await
+}
+
+fn login_reason(
+    result: &Result<process::ProcessOutput, process::ProcessError>,
+    cancelled: bool,
+) -> Option<&'static str> {
+    if matches!(result, Err(process::ProcessError::TimedOut)) && !cancelled {
+        Some("timeout")
+    } else {
+        None
+    }
 }
 
 pub(crate) async fn read_status(provider: &'static str) -> ProviderStatus {
@@ -594,6 +623,7 @@ pub(crate) async fn provider_login_start(app: AppHandle, provider: String) -> &'
             &["auth", "login", "--claudeai"]
         };
         let result = run_login_tool(&provider, args, token.clone()).await;
+        let reason = login_reason(&result, token.is_cancelled());
         let state = if token.is_cancelled() {
             "cancelled"
         } else if result.is_ok_and(|o| o.success) {
@@ -606,7 +636,7 @@ pub(crate) async fn provider_login_start(app: AppHandle, provider: String) -> &'
             "unavailable"
         };
         drop(reservation);
-        notify(&app, &provider, state);
+        notify_with_reason(&app, &provider, state, reason);
     });
     "inProgress"
 }
@@ -741,6 +771,21 @@ pub(crate) fn provider_api_key_clear(app: AppHandle, provider: String) -> &'stat
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn login_timeout_has_a_distinct_reason() {
+        assert_eq!(
+            super::login_reason(&Err(crate::process::ProcessError::TimedOut), false),
+            Some("timeout")
+        );
+        assert_eq!(
+            super::login_reason(&Err(crate::process::ProcessError::TimedOut), true),
+            None
+        );
+        assert_eq!(
+            super::login_reason(&Err(crate::process::ProcessError::Cancelled), false),
+            None
+        );
+    }
     #[test]
     fn first_run_and_retry_distinguish_offline_rejected_and_unsupported() {
         use super::*;

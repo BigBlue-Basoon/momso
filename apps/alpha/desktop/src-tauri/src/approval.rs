@@ -168,6 +168,7 @@ pub(crate) fn dictionary_delete_request(
 pub(crate) struct ApprovalClosed {
     pub(crate) request_id: String,
     pub(crate) chat_id: Option<String>,
+    pub(crate) reason: &'static str,
 }
 impl ApprovalRequest {
     pub(crate) fn redact_sensitive(&mut self, known: &[&str]) {
@@ -195,6 +196,7 @@ impl ApprovalRequest {
         ApprovalClosed {
             request_id: self.request_id.clone(),
             chat_id: self.chat_id.clone(),
+            reason: "provider_cancelled",
         }
     }
 }
@@ -277,22 +279,45 @@ impl ApprovalBroker {
         emit: impl FnOnce(&ApprovalRequest) -> bool,
         close: impl FnOnce(ApprovalClosed),
     ) -> Result<ApprovalChoice, String> {
+        self.request_with_timeout(
+            request,
+            cancellation,
+            emit,
+            close,
+            std::time::Duration::from_secs(300),
+        )
+        .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        request: ApprovalRequest,
+        cancellation: CancellationToken,
+        emit: impl FnOnce(&ApprovalRequest) -> bool,
+        close: impl FnOnce(ApprovalClosed),
+        timeout: std::time::Duration,
+    ) -> Result<ApprovalChoice, String> {
         let id = request.request_id.clone();
-        let closed = request.closed();
+        let mut closed = request.closed();
         let receiver = self.register(id.clone(), request.options.clone()).await?;
         if !emit(&request) {
             self.pending.lock().await.remove(&id);
             return Err("승인 요청을 화면에 전달하지 못했습니다".to_owned());
         }
         tokio::select! {
-            result = receiver => result.map_err(|_| "승인 요청이 이미 끝났습니다".to_owned()),
+            result = receiver => {
+                closed.reason = if result.is_ok() { "responded" } else { "provider_cancelled" };
+                close(closed);
+                result.map_err(|_| "승인 요청이 이미 끝났습니다".to_owned())
+            },
             _ = cancellation.cancelled() => {
                 self.pending.lock().await.remove(&id);
                 close(closed);
                 Err("요청을 중단했습니다".to_owned())
             },
-            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+            _ = tokio::time::sleep(timeout) => {
                 self.pending.lock().await.remove(&id);
+                closed.reason = "timeout";
                 close(closed);
                 Err("timeout".to_owned())
             },
@@ -303,6 +328,56 @@ impl ApprovalBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_event_distinguishes_timeout_answer_and_cancellation() {
+        for (mode, expected) in [(0, "timeout"), (1, "responded"), (2, "provider_cancelled")] {
+            let broker = ApprovalBroker::default();
+            let responder = broker.clone();
+            let token = CancellationToken::new();
+            let cancel = token.clone();
+            let request = browser_request(
+                "chat",
+                "codex",
+                "https://example.test",
+                "click",
+                "publish",
+                "send",
+            );
+            let (tx, rx) = oneshot::channel();
+            let result = broker
+                .request_with_timeout(
+                    request,
+                    token,
+                    move |card| {
+                        let id = card.request_id.clone();
+                        tokio::spawn(async move {
+                            if mode == 1 {
+                                responder
+                                    .respond(&id, ApprovalChoice::AllowOnce)
+                                    .await
+                                    .unwrap();
+                            }
+                            if mode == 2 {
+                                cancel.cancel();
+                            }
+                        });
+                        true
+                    },
+                    |closed| {
+                        let _ = tx.send(closed);
+                    },
+                    if mode == 0 {
+                        std::time::Duration::ZERO
+                    } else {
+                        std::time::Duration::from_secs(2)
+                    },
+                )
+                .await;
+            assert_eq!(rx.await.unwrap().reason, expected);
+            assert_eq!(result.is_ok(), mode == 1);
+        }
+    }
 
     #[test]
     fn approval_event_masks_known_and_pattern_secrets() {

@@ -833,9 +833,18 @@ function App() {
             : [...current, { request, chatId, at, status: 'pending', error: null }]
         ))
       },
-      onClosed: (requestId) => {
-        // 답하지 않은 물음만 거둔다. 답한 것은 한 줄로 남는다.
-        setApprovals((current) => current.filter((item) => item.request.requestId !== requestId || item.status === 'answered'))
+      onClosed: (requestId, reason) => {
+        // 뒤쪽은 답해서 끝날 때에도 닫힘을 보낸다(reason responded). 까닭으로 가른다(2026-11-17 계약):
+        //   responded: 답한 줄은 답 처리가 남긴다. 여기서는 아무것도 하지 않는다.
+        //   auto_declined: 몸소가 스스로 거절한 요청. 선생님이 할 일이 없어 줄 없이 거둔다(AI 의 답에서 알 수 있다).
+        //   provider_cancelled 인데 선생님이 멈춤을 눌렀으면: "답을 중간에 멈췄습니다"가 이미 뜨므로 줄 없이 거둔다.
+        //   그 밖(timeout·provider_cancelled·옛 값 없음): 답하지 않은 물음이면 그 자리에 까닭에 맞는 한 줄.
+        if (reason === 'responded') return
+        setApprovals((current) => current.flatMap((item) => {
+          if (item.request.requestId !== requestId || item.status === 'answered') return [item]
+          if (reason === 'auto_declined' || (reason === 'provider_cancelled' && item.stopping)) return []
+          return [{ ...item, status: 'closed' as const, closedReason: reason, error: null }]
+        }))
       },
     }).then((unlisten) => {
       if (disposed) unlisten()
@@ -936,8 +945,15 @@ function App() {
             : [...current, { request: { ...request, chatId }, at, status: 'pending', error: null }]
         ))
       },
-      onClosed: (requestId) => {
-        setSecretRequests((current) => current.filter((item) => item.request.requestId !== requestId || item.status !== 'pending'))
+      onClosed: (requestId, reason) => {
+        // 까닭으로 가른다(2026-11-17 계약): submitted·user_cancelled 는 답 처리가 "저장했습니다"·"그만두었습니다"를 남긴다.
+        // 선생님이 멈춤을 눌러 AI 쪽이 거둔 것은 줄 없이. 그 밖(timeout·provider_cancelled·옛 값 없음)은 키를 넣기 전(pending)이었을 때만 한 줄.
+        if (reason === 'submitted' || reason === 'user_cancelled') return
+        setSecretRequests((current) => current.flatMap((item) => {
+          if (item.request.requestId !== requestId || item.status !== 'pending') return [item]
+          if (reason === 'provider_cancelled' && item.stopping) return []
+          return [{ ...item, status: 'closed' as const, closedReason: reason, error: null }]
+        }))
       },
     }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
@@ -962,8 +978,9 @@ function App() {
   }
 
   async function answerApproval(requestId: string, choice: ApprovalChoice) {
+    // 답을 보내는 사이에 닫혔으면(closed) 그 한 줄을 덮지 않는다.
     const update = (patch: Partial<ApprovalItem>) => setApprovals((current) => current.map((item) => (
-      item.request.requestId === requestId ? { ...item, ...patch } : item
+      item.request.requestId === requestId && item.status !== 'closed' ? { ...item, ...patch } : item
     )))
     update({ status: 'sending', error: null })
     try {
@@ -1115,6 +1132,9 @@ function App() {
     const running = generatingRef.current
     if (!running) return
     // 멈추면 백엔드가 chat-error(또는 chat-done)를 보낸다. 오지 않아도 화면은 바로 멈춘다.
+    // 그 채팅방의 기다리는 물음·키 카드에 멈춤 표시를 해 둔다: 뒤쪽이 provider_cancelled 로 닫으면 줄 없이 거둔다.
+    setApprovals((current) => current.map((item) => item.chatId === running.chatId && item.status !== 'answered' ? { ...item, stopping: true } : item))
+    setSecretRequests((current) => current.map((item) => item.request.chatId === running.chatId && item.status === 'pending' ? { ...item, stopping: true } : item))
     void cancelChatMessage(running.chatId).catch(() => {})
     finishGenerating(running.chatId)
   }
@@ -1295,7 +1315,7 @@ function App() {
   const chatApprovals = approvals.filter((item) => item.chatId === selectedChatId)
   const chatSecrets = secretRequests.filter((item) => item.request.chatId === selectedChatId)
   const waitingChatIds = [...new Set([
-    ...approvals.filter((item) => item.status !== 'answered' && item.chatId).map((item) => item.chatId as string),
+    ...approvals.filter((item) => item.status !== 'answered' && item.status !== 'closed' && item.chatId).map((item) => item.chatId as string),
     ...secretRequests.filter((item) => (item.status === 'pending' || item.status === 'sending') && item.request.chatId).map((item) => item.request.chatId as string),
   ])]
 

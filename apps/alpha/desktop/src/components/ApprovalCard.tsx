@@ -15,9 +15,27 @@ export type ApprovalItem = {
   chatId: string | null
   /** 물음이 왔을 때 그 대화의 말 수. 답한 뒤 남는 한 줄을 그 자리에 둔다. */
   at: number
-  status: 'pending' | 'sending' | 'answered'
+  /** closed: 답하기 전에 뒤쪽이 물음을 닫음(agent-approval-closed). 답한 것처럼 그 자리에 한 줄로 남는다. */
+  status: 'pending' | 'sending' | 'answered' | 'closed'
+  /** 닫힌 까닭(timeout·provider_cancelled, 옛 값이면 null). */
+  closedReason?: string | null
+  /** 선생님이 이 채팅방의 답을 멈췄다. 그 뒤 AI 쪽이 거두어 닫히면 줄 없이 거둔다("답을 중간에 멈췄습니다"가 이미 뜬다). */
+  stopping?: boolean
   choice?: ApprovalChoice
   error?: string | null
+}
+
+/** 답하기 전에 닫힌 물음의 한 줄(답한 줄과 같은 꼴, 확인 표시 없이). 까닭 값이 없으면(옛 값) "닫혔습니다"까지만. */
+export function closedText(reason: string | null | undefined, plain: string, timeout: string) {
+  return reason === 'timeout' ? timeout : reason === 'provider_cancelled' ? W.approvals.closedByAi : plain
+}
+function ClosedLine({ subject, reason }: { subject: string | null; reason?: string | null }) {
+  return (
+    <p className="approval-done">
+      <span>{closedText(reason, W.approvals.closed, W.approvals.closedTimeout)}</span>
+      {subject && <span className="approval-done-subject">{subject}</span>}
+    </p>
+  )
 }
 
 function providerName(provider: string) {
@@ -95,6 +113,7 @@ function SetupApprovalCard({ item, setup, onAnswer }: { item: ApprovalItem; setu
   const visibility = setup.visibility ? words.visibilityText[setup.visibility] : null
   const cost = setup.cost ? words.costText[setup.cost] : null
 
+  if (item.status === 'closed') return <ClosedLine subject={subject} reason={item.closedReason} />
   if (item.status === 'answered' && item.choice) {
     return (
       <p className="approval-done">
@@ -159,6 +178,7 @@ function BrowserApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
   const effect = !scope && request.reason ? (words.effect as Record<string, string>)[request.reason] ?? null : null
   const subject = request.description.trim()
 
+  if (item.status === 'closed') return <ClosedLine subject={subject || null} reason={item.closedReason} />
   if (item.status === 'answered' && item.choice) {
     return (
       <p className="approval-done">
@@ -226,6 +246,7 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
   if (request.kind === 'setup_change' && request.setup) return <SetupApprovalCard item={item} setup={request.setup} onAnswer={onAnswer} />
   if (isBrowserApproval(request)) return <BrowserApprovalCard item={item} onAnswer={onAnswer} />
 
+  if (item.status === 'closed') return <ClosedLine subject={subject} reason={item.closedReason} />
   if (item.status === 'answered' && item.choice) {
     return (
       <p className="approval-done">

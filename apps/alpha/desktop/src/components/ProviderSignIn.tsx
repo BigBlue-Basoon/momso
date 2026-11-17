@@ -84,7 +84,15 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
   // 백엔드가 로그인을 마쳤다고 알리면(목록이 다시 읽혀 상태가 바뀌면) 기다림을 거둔다.
   useEffect(() => { if (item.state === 'account') setPending(false) }, [item.state])
   useEffect(() => { if (item.installed) setInstall('idle') }, [item.installed])
-  useEffect(() => listenOnce(item.provider, (state) => { if (state && state !== 'inProgress') setPending(false) }), [item.provider])
+  // 로그인하는 중이던 것이 계정 연결(account)도 그만두기(cancelled)도 아닌 값으로 끝나면(5분 지남도 unavailable 로 온다) 말없이 거두지 않고 한 줄을 남긴다(2026-11-17 본부).
+  const pendingRef = useRef(false)
+  pendingRef.current = pending
+  useEffect(() => listenOnce(item.provider, (state, reason) => {
+    if (!state || state === 'inProgress') return
+    // 시간 안에 끝나지 않은 것은 뒤쪽이 reason timeout 으로 가른다(2026-11-17 계약). 그 밖의 실패는 지금 글.
+    if (pendingRef.current && state !== 'account' && state !== 'cancelled') setError(reason === 'timeout' ? W.signIn.loginTimeout : W.signIn.loginUnfinished)
+    setPending(false)
+  }), [item.provider])
 
   // 설치 진행 이벤트(이 회사 것만). 다른 곳에서 시작한 설치도 여기서 보인다.
   const changedRef = useRef(onChanged)
@@ -327,10 +335,10 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
 }
 
 /** 한 회사의 provider-auth-changed 를 듣는다(정리 함수를 돌려준다). */
-function listenOnce(provider: AiProvider, onState: (state: string | null) => void) {
+function listenOnce(provider: AiProvider, onState: (state: string | null, reason: string | null) => void) {
   let stop: (() => void) | undefined
   let disposed = false
-  void listenProviderAuth((changed, state) => { if (changed === provider) onState(state) })
+  void listenProviderAuth((changed, state, reason) => { if (changed === provider) onState(state, reason) })
     .then((unlisten) => { if (disposed) unlisten(); else stop = unlisten })
     .catch(() => {})
   return () => { disposed = true; stop?.() }

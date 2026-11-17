@@ -187,18 +187,32 @@ impl SecretBroker {
         emit: impl FnOnce(&SecretRequest) -> bool,
         close: impl FnOnce(serde_json::Value),
     ) -> Result<SecretLease, &'static str> {
+        self.request_with_timeout(request, cancel, emit, close, Duration::from_secs(300))
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        request: SecretRequest,
+        cancel: CancellationToken,
+        emit: impl FnOnce(&SecretRequest) -> bool,
+        close: impl FnOnce(serde_json::Value),
+        timeout: Duration,
+    ) -> Result<SecretLease, &'static str> {
         let receiver = self.register(&request).await?;
         if !emit(&request) {
             self.pending.lock().await.remove(&request.request_id);
             return Err("unavailable");
         }
-        let outcome = tokio::select! {
-            v = receiver => v.map_err(|_| "cancelled"),
-            _ = cancel.cancelled() => Err("cancelled"),
-            _ = tokio::time::sleep(Duration::from_secs(300)) => Err("timeout"),
+        let (outcome, reason) = tokio::select! {
+            v = receiver => match v { Ok(lease) => (Ok(lease), "submitted"), Err(_) => (Err("cancelled"), "user_cancelled") },
+            _ = cancel.cancelled() => (Err("cancelled"), "provider_cancelled"),
+            _ = tokio::time::sleep(timeout) => (Err("timeout"), "timeout"),
         };
         self.pending.lock().await.remove(&request.request_id);
-        close(serde_json::json!({"requestId":request.request_id,"chatId":request.chat_id}));
+        close(
+            serde_json::json!({"requestId":request.request_id,"chatId":request.chat_id,"reason":reason}),
+        );
         outcome
     }
 }
@@ -233,6 +247,68 @@ impl SecretBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn closed_event_reports_submission_user_cancel_timeout_and_provider_cancel() {
+        for (mode, expected) in [
+            (0, "timeout"),
+            (1, "submitted"),
+            (2, "user_cancelled"),
+            (3, "provider_cancelled"),
+        ] {
+            let broker = SecretBroker::in_memory();
+            let responder = broker.clone();
+            let token = CancellationToken::new();
+            let cancel = token.clone();
+            let request = SecretRequest {
+                request_id: "req".into(),
+                chat_id: "room".into(),
+                service: "aws".into(),
+                account: "fixture".into(),
+                resource_name: "momso-test".into(),
+                fields: vec!["accessKeyId", "secretAccessKey"],
+                reason: None,
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let result = broker
+                .request_with_timeout(
+                    request,
+                    token,
+                    move |_| {
+                        tokio::spawn(async move {
+                            match mode {
+                                1 => responder
+                                    .submit(
+                                        "req",
+                                        "room",
+                                        SecretInput {
+                                            access_key_id: "fixture".into(),
+                                            secret_access_key: "fixture".into(),
+                                            gcp_oauth_token: None,
+                                        },
+                                    )
+                                    .await
+                                    .unwrap(),
+                                2 => responder.cancel("req", "room").await.unwrap(),
+                                3 => cancel.cancel(),
+                                _ => (),
+                            }
+                        });
+                        true
+                    },
+                    |closed| {
+                        let _ = tx.send(closed);
+                    },
+                    if mode == 0 {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(2)
+                    },
+                )
+                .await;
+            assert_eq!(rx.await.unwrap()["reason"], expected);
+            assert_eq!(result.is_ok(), mode == 1);
+        }
+    }
     #[derive(Default)]
     struct FakeStore(std::sync::Mutex<HashMap<String, String>>);
     impl SecretStore for FakeStore {

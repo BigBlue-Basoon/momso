@@ -46,20 +46,22 @@ const SMALL_CLAUDE_MOTION = { strength: 0.2, speed: 1.8 }
 const RING_RADIUS = 16
 const RING_LENGTH = 2 * Math.PI * RING_RADIUS
 
+// 회사가 준 기간만 이름에 쓴다(2026-11-17 본부 결정, 뒤쪽 대조 13). 백엔드는 기간(분)을 받으면 five_hour·weekly·'N_hours' 처럼 주고,
+// 못 받으면 primary·secondary 를 그대로 준다. 그때는 기간을 말하지 않는 이름으로.
 const WINDOW_LABEL: Record<string, string> = {
-  // 클로드가 주는 갈래(백엔드가 원래 값을 그대로 줌): 지금 세션(5시간 창), 주간 전체, 주간 특정 모델.
-  session: W.usageMeter.text1,
+  // 클로드가 주는 갈래(백엔드가 원래 값을 그대로 줌): 지금 세션(기간을 주지 않음), 주간 전체, 주간 특정 모델(회사가 weekly 라고 이름 붙임).
+  session: W.usageMeter.windowSession,
   weekly_all: W.usageMeter.text2,
   weekly_scoped: W.usageMeter.text2,
   '5h': W.usageMeter.text1,
   five_hour: W.usageMeter.text1,
-  primary: W.usageMeter.text1,
+  primary: W.usageMeter.windowFirst,
   daily: W.usageMeter.text3,
   day: W.usageMeter.text3,
   weekly: W.usageMeter.text2,
   week: W.usageMeter.text2,
   '7d': W.usageMeter.text2,
-  secondary: W.usageMeter.text2,
+  secondary: W.usageMeter.windowSecond,
   monthly: W.usageMeter.text4,
   month: W.usageMeter.text4,
 }

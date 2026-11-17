@@ -1092,6 +1092,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn korean_text_limits_count_characters_not_utf8_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize(temp.path()).unwrap();
+        let revision = user_revision(temp.path()).unwrap();
+        let make = |variant: String, meaning: String| TermEdit {
+            id: None,
+            add_variants: vec![variant],
+            remove_variants: vec![],
+            enabled: None,
+            meaning: Some(meaning),
+            category: None,
+            expected_revision: revision.clone(),
+        };
+        assert_eq!(
+            edit_term(temp.path(), make("가".repeat(101), "나".repeat(500))),
+            Err("invalid_input".into())
+        );
+        assert_eq!(
+            edit_term(temp.path(), make("가".repeat(100), "나".repeat(501))),
+            Err("invalid_input".into())
+        );
+        assert!(edit_term(temp.path(), make("가".repeat(100), "나".repeat(500))).is_ok());
+        let people_revision = list(temp.path()).unwrap().people_revision;
+        let person = |name: String| PersonEdit {
+            id: None,
+            name,
+            aliases: vec![],
+            confirmed_by_user: true,
+            expected_revision: people_revision.clone(),
+        };
+        assert_eq!(
+            edit_person(temp.path(), person("김".repeat(101))),
+            Err("invalid_input".into())
+        );
+        assert!(edit_person(temp.path(), person("김".repeat(100))).is_ok());
+    }
+
+    #[test]
     fn dictionary_io_errors_distinguish_missing_permission_and_full() {
         use std::io::{Error, ErrorKind};
         assert_eq!(

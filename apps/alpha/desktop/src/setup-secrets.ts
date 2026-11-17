@@ -37,7 +37,8 @@ function readFields(value: unknown): SecretField[] {
   })
 }
 
-export async function listenSecretRequests(handlers: { onRequest: (request: SecretRequest) => void; onClosed: (requestId: string) => void }) {
+// agent-setup-secret-closed 의 reason(2026-11-17): submitted / user_cancelled / timeout / provider_cancelled. 옛 값은 없음.
+export async function listenSecretRequests(handlers: { onRequest: (request: SecretRequest) => void; onClosed: (requestId: string, reason: string | null) => void }) {
   if (!isDesktopRuntime()) return () => {}
   const stops = await Promise.all([
     listen<Record<string, unknown>>('agent-setup-secret-request', (event) => {
@@ -52,7 +53,7 @@ export async function listenSecretRequests(handlers: { onRequest: (request: Secr
         fields: readFields(p.fields),
       })
     }),
-    listen<{ requestId?: string; chatId?: string }>('agent-setup-secret-closed', (event) => { if (event.payload?.requestId) handlers.onClosed(event.payload.requestId) }),
+    listen<{ requestId?: string; chatId?: string; reason?: string | null }>('agent-setup-secret-closed', (event) => { if (event.payload?.requestId) handlers.onClosed(event.payload.requestId, typeof event.payload.reason === 'string' ? event.payload.reason : null) }),
   ])
   return () => stops.forEach((stop) => stop())
 }

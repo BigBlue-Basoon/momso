@@ -390,6 +390,12 @@
       ] },
       notConnected('gemini'),
     ]
+    // ?usage=nominutes: 기간(분)을 받지 못한 창(primary·secondary, 클로드 session)과 받은 창(15_minutes·2_days).
+    if (usageMode === 'nominutes') return [
+      { provider: 'codex', state: 'ok', reason: null, plan: 'pro', checkedAt, windows: [{ kind: 'primary', usedPercent: 30, resetsAt: null }, { kind: 'secondary', usedPercent: 12, resetsAt: soon(40) }, { kind: '15_minutes', usedPercent: 5, resetsAt: soon(0.2) }, { kind: '2_days', usedPercent: 50, resetsAt: soon(30) }] },
+      { provider: 'claude', state: 'ok', reason: null, plan: 'max', planLabel: null, checkedAt, windows: [{ kind: 'session', usedPercent: 22, resetsAt: soon(3) }, { kind: 'weekly_all', usedPercent: 47, resetsAt: soon(90) }] },
+      notConnected('gemini'),
+    ]
     if (usageMode === 'none') return [notConnected('codex'), notConnected('claude'), notConnected('gemini')]
     // 지금 실제 백엔드와 같은 모습: Codex 만 숫자, 나머지는 까닭 글과 함께 unavailable.
     if (usageMode === 'real-like') return [{ provider: 'codex', state: 'ok', reason: null, plan: 'pro', checkedAt, windows: [{ kind: 'weekly', usedPercent: 54, resetsAt: Math.round(Date.now() / 1000) + 50 * 3600 }] }, unavailable('claude', 'no_quota_api'), unavailable('gemini', 'fetch_failed')]
@@ -611,9 +617,10 @@
     emit('agent-approval-request', request)
     return requestId
   }
-  window.__closeApproval = (requestId) => {
+  // reason: responded / timeout / provider_cancelled / auto_declined(2026-11-17 계약). 없으면 옛 값.
+  window.__closeApproval = (requestId, reason) => {
     delete approvalsPending[requestId]
-    emit('agent-approval-closed', { requestId })
+    emit('agent-approval-closed', reason ? { requestId, reason } : { requestId })
   }
   // 스킬로 하는 연결의 물음(가짜). archive-backend-port-notes.md "2026-11-16 옮긴 것"의 C9 설정 승인 계약 모양:
   //   kind 'setup_change', setup { action:'create_and_connect', service, account, region, resourceName, visibility:'private', cost:'possible' },
@@ -639,6 +646,8 @@
     emit('agent-setup-secret-request', { requestId, chatId, service: 'cloudflare', account: '0123456789abcdef0123456789abcdef', resourceName: 'momso-teacher', fields: ['accessKeyId', 'secretAccessKey'], ...(extra || {}) })
     return requestId
   }
+  // 키를 넣기 전에 뒤쪽이 요청을 닫은 것처럼(5분 지남). window.__closeSecret('secret-1')
+  window.__closeSecret = (requestId, reason) => emit('agent-setup-secret-closed', reason ? { requestId, chatId: null, reason } : { requestId, chatId: null })
 
   // ---- 미디어(화면 확인용 가짜). ?media=ok(기본) / none(명령 없음). 그림은 색 띠 SVG. ----
   const mediaMode = query.get('media') || 'ok'
@@ -961,6 +970,9 @@
       case 'provider_login_start':
         if (!item || !item.methods.includes('account')) return 'unavailable'
         emit('provider-auth-changed', { provider: args.provider, state: 'inProgress' })
+        // ?loginresult=unavailable 면 로그인이 끝나지 않은 것처럼(5분 지남·실패는 뒤쪽이 unavailable 로 알린다).
+        // ?loginreason=timeout 이면 reason 도 붙인다(시간 초과).
+        if (query.get('loginresult')) { window.__authTimer = setTimeout(() => emit('provider-auth-changed', { provider: args.provider, state: query.get('loginresult'), ...(query.get('loginreason') ? { reason: query.get('loginreason') } : {}) }), Number(query.get('logindelay') || 1500)) } else
         window.__authTimer = setTimeout(() => { Object.assign(item, { state: 'account', accountLabel: 'teacher@example.com', planLabel: 'Plus', active: 'account' }); emit('provider-auth-changed', { provider: args.provider, state: 'account' }) }, Number(query.get('logindelay') || 1500))
         return 'inProgress'
       case 'provider_login_cancel': clearTimeout(window.__authTimer); emit('provider-auth-changed', { provider: args.provider, state: 'cancelled' }); return 'cancelled'
@@ -1093,7 +1105,7 @@
         // 계약: setup_secret_submit({ requestId, chatId, input: { accessKeyId, secretAccessKey, gcpOauthToken? } }). 값은 남기지 않는다(칸 이름과 길이만).
         window.__secretCalls.push(['submit', args.requestId, args.chatId, Object.fromEntries(Object.entries(args.input || {}).map(([k, v]) => [k, String(v).length]))])
         if (query.get('secretfail') === '1') throw 'unavailable'
-        emit('agent-setup-secret-closed', { requestId: args.requestId, chatId: args.chatId })
+        emit('agent-setup-secret-closed', { requestId: args.requestId, chatId: args.chatId, reason: 'submitted' })
         return null
       case 'agent_setup_secret_cancel':
         // 계약(T48): agent_setup_secret_cancel({ requestId, chatId }) → 값 없음, 그 뒤 agent-setup-secret-closed.
@@ -1106,6 +1118,8 @@
         if (!pending) throw '승인 요청을 찾을 수 없습니다'
         if (!pending.options.includes(args.choice)) throw '이 승인 요청에서 선택할 수 없는 응답입니다'
         delete approvalsPending[args.requestId]
+        // 2026-11-17 뒤쪽: 답해서 끝나도 닫힘이 온다(reason responded). 답이 돌아오기 전에 오는 가장 나쁜 차례로.
+        emit('agent-approval-closed', { requestId: args.requestId, reason: 'responded' })
         return null
       }
       case 'chat_group_list':
