@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::{oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -170,6 +170,27 @@ pub(crate) struct ApprovalClosed {
     pub(crate) chat_id: Option<String>,
 }
 impl ApprovalRequest {
+    pub(crate) fn redact_sensitive(&mut self, known: &[&str]) {
+        let clean = |value: &mut String| {
+            *value = crate::chat_archive_redact::redact_with_known(value, known).text;
+        };
+        clean(&mut self.description);
+        for target in &mut self.targets {
+            clean(&mut target.path);
+        }
+        if let Some(reason) = &mut self.reason {
+            clean(reason);
+        }
+        if let Some(setup) = &mut self.setup {
+            clean(&mut setup.service);
+            clean(&mut setup.account);
+            clean(&mut setup.resource_name);
+            if let Some(region) = &mut setup.region {
+                clean(region);
+            }
+        }
+    }
+
     pub(crate) fn closed(&self) -> ApprovalClosed {
         ApprovalClosed {
             request_id: self.request_id.clone(),
@@ -224,9 +245,20 @@ impl ApprovalBroker {
     pub(crate) async fn request(
         &self,
         app: &tauri::AppHandle,
-        request: ApprovalRequest,
+        mut request: ApprovalRequest,
         cancellation: CancellationToken,
     ) -> Result<ApprovalChoice, String> {
+        let state = app.try_state::<crate::AppState>().ok_or("unavailable")?;
+        let data_root = state.paths.data_root.clone();
+        let database = state.paths.database_path.clone();
+        let known = tokio::task::spawn_blocking(move || {
+            crate::chat_archive_store::known_values(&data_root, &database)
+        })
+        .await
+        .map_err(|_| "unavailable")?
+        .map_err(|_| "unavailable")?;
+        let refs: Vec<&str> = known.iter().map(String::as_str).collect();
+        request.redact_sensitive(&refs);
         self.request_with(
             request,
             cancellation,
@@ -271,6 +303,25 @@ impl ApprovalBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_event_masks_known_and_pattern_secrets() {
+        let secret = "fixture-opaque-secret-value";
+        let mut request = browser_scope_request(
+            "chat",
+            "claude",
+            "https://example.test",
+            "skill",
+            "publish",
+            secret,
+        );
+        request.targets[0].path = format!("https://example.test/{secret}");
+        request.reason = Some(secret.to_owned());
+        request.redact_sensitive(&[secret]);
+        let output = serde_json::to_string(&request).unwrap();
+        assert!(!output.contains(secret));
+        assert!(output.contains("example.test"));
+    }
 
     #[test]
     fn dictionary_approval_is_bound_to_user_file_and_one_time_choices() {

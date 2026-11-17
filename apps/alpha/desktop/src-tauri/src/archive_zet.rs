@@ -177,6 +177,7 @@ pub(crate) fn create(
     let _guard = WRITE_LOCK
         .lock()
         .map_err(|_| "글을 저장하지 못했습니다".to_string())?;
+    crate::archive_remote::ensure_document_write_allowed(root, database)?;
     let (id, stamp, mut file) = crate::archive::allocate_file(&root.join("zettels"), "zet")?;
     let head = ZetHead {
         id: id.clone(),
@@ -301,6 +302,7 @@ pub(crate) fn update_inner(
     expected_hash: Option<&str>,
 ) -> Result<(), String> {
     use std::io::Write;
+    crate::archive_remote::ensure_document_write_allowed(root, database)?;
     if !valid_zet_id(id) {
         return Err("글 번호가 올바르지 않습니다".into());
     }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { open as openDialog } from '@tauri-apps/plugin-dialog'
+import { isSelectionExpired, selectLocalPaths } from '../runtime'
 import { FolderOpen } from 'lucide-react'
 import { getArchiveStatus, openWebAddress } from '../archive'
 import { folderMoveRatio, getFolderLocation, isFolderMoving, listenFolderMove, listenFolderMoveEnd, openFolderLocation, setFolderLocation, type FolderMoveProgress, type FolderMoveResult, type FolderMoveState } from '../app-folder'
@@ -82,7 +82,8 @@ export function AppFolderSetting({ fallbackOpen }: { fallbackOpen: (path: string
     if (!movable || moving) return
     setError(null)
     setOneDrive(false)
-    const picked = await openDialog({ directory: true, multiple: false }).catch(() => null)
+    // 폴더 고르는 창은 뒤쪽이 연다(select_local_paths archive). 취소하면 빈 배열.
+    const picked = (await selectLocalPaths('archive').catch(() => [] as string[]))[0]
     if (typeof picked !== 'string') return
     setKept(null)
     setProgress(null)
@@ -90,8 +91,8 @@ export function AppFolderSetting({ fallbackOpen }: { fallbackOpen: (path: string
     // 진행 양은 위의 듣기가 받는다(화면이 열릴 때부터 듣고 있다).
     try {
       await applyResult(await setFolderLocation(picked), picked)
-    } catch {
-      setError(W.appSettingsParts.text1)
+    } catch (error) {
+      setError(isSelectionExpired(error) ? W.selectAgain : W.appSettingsParts.text1)
       setMoving(false)
       setProgress(null)
     }

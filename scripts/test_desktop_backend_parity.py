@@ -49,6 +49,29 @@ class ParityTest(unittest.TestCase):
             (screen / ".gitignore").write_text("", encoding="utf-8")
             self.assertFalse(parity.check_ignore_rules(screen))
 
+    def test_private_templates_and_docs_are_never_synced(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, screen = Path(temp) / 'source', Path(temp) / 'screen'
+            for directory in (root, screen):
+                directory.mkdir()
+                package = directory / 'apps/alpha/desktop/package.json'
+                package.parent.mkdir(parents=True)
+                package.write_text(json.dumps({'scripts': {'build:bundle': 'node scripts/prepare-node.mjs && npm run build'}}), encoding='utf-8')
+            for name in ('.github/ISSUE_TEMPLATE/private.md', '.github/pull_request_template.md', 'docs/development/private.md'):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('private', encoding='utf-8')
+            with patch.object(parity, 'ROOT', root), patch('sys.argv', ['parity', str(screen), '--sync']):
+                self.assertEqual(parity.main(), 0)
+            self.assertFalse((screen / '.github').exists())
+            self.assertFalse((screen / 'docs').exists())
+            private = screen / '.github/pull_request_template.md'
+            private.parent.mkdir(parents=True)
+            private.write_text('preserve', encoding='utf-8')
+            with patch.object(parity, 'ROOT', root), patch('sys.argv', ['parity', str(screen), '--sync']):
+                self.assertEqual(parity.main(), 1)
+            self.assertEqual(private.read_text(encoding='utf-8'), 'preserve')
+
     def test_unknown_screen_file_is_never_deleted(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "source"

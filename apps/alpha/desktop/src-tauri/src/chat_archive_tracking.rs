@@ -54,6 +54,14 @@ pub(crate) fn proof(root: &Path, secrets: &[String], key: &str) -> Result<String
     proof_with_key(root, secrets, key.as_bytes())
 }
 
+pub(crate) fn text_fingerprint(text: &str) -> String {
+    use sha2::Digest;
+    let mut hash = Sha256::new();
+    hash.update(b"momso-preserved-chat-field-v1\0");
+    hash.update(text.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
 pub(crate) fn stored_proof(db: &Path) -> Result<Option<String>, &'static str> {
     let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|_| "storage_error")?;

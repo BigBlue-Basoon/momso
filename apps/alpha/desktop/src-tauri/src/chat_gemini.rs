@@ -394,6 +394,7 @@ pub(crate) async fn run_command<F: FnMut(&str, Value) + Send>(
     cancel: CancellationToken,
     emit: &mut F,
 ) -> Result<(), String> {
+    crate::process::remove_inherited_ai_secrets(&mut cmd);
     cmd.env_remove("GOOGLE_API_KEY")
         .env("GEMINI_API_KEY", &key)
         .current_dir(archive)

@@ -591,6 +591,27 @@ pub fn serve(pipe: Option<&str>) -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn all_fifteen_tools_reject_unexpected_secret_arguments() {
+        let mut bridge = BridgeClient::new(tempfile::tempfile().unwrap()).unwrap();
+        let mut ready = true;
+        let listing = response_with_bridge(
+            &json!({"id":1,"method":"tools/list"}),
+            &mut ready,
+            Some(&mut bridge),
+        )
+        .unwrap();
+        let tools = listing["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 15);
+        let secret = "fixture-unexpected-secret-not-forwarded";
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap();
+            let request = json!({"id":2,"method":"tools/call","params":{"name":name,"arguments":{"secret":secret}}});
+            let response = response_with_bridge(&request, &mut ready, Some(&mut bridge)).unwrap();
+            assert!(response.get("error").is_some(), "{name}");
+            assert!(!response.to_string().contains(secret));
+        }
+    }
+    #[test]
     fn temporary_aws_credentials_are_explicit_and_unknown_fields_rejected() {
         for (input, expected) in [
             (

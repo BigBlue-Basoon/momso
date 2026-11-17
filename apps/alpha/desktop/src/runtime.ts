@@ -204,3 +204,21 @@ export async function confirmBackupRecoveryKey(recoveryKey: string) {
   if (!isDesktopRuntime()) throw new Error(W.runtime.text24)
   await invoke('confirm_backup_recovery_key', { recoveryKey })
 }
+
+/**
+ * 파일·폴더 고르기(2026-11-17 뒤쪽 e9b6a27b, desktop-selection-opening-contract-2026-11-17.md). 고르는 창은 뒤쪽이 연다.
+ *   select_local_paths({ purpose: 'source' | 'conversation' | 'archive' }) → 고른 경로의 배열(취소하면 빈 배열).
+ *   뒤쪽은 고른 경로와 쓸 곳을 5분 동안 기억하고, 그 뒤의 명령(첨부·가져오기·폴더 옮기기)이 성공했을 때만 지운다.
+ *   고르지 않았거나 5분이 지난 경로는 selection_required 로 거절한다(실패 뒤 다시 시도는 5분 안이면 다시 고르지 않아도 된다).
+ */
+export type SelectionPurpose = 'source' | 'conversation' | 'archive'
+export async function selectLocalPaths(purpose: SelectionPurpose): Promise<string[]> {
+  if (!isDesktopRuntime()) return []
+  const value = await invoke<unknown>('select_local_paths', { purpose })
+  return Array.isArray(value) ? value.filter((path): path is string => typeof path === 'string' && path.length > 0) : []
+}
+
+/** 고른 지 5분이 지나 뒤쪽이 거절한 것인가(selection_required). 그때는 "파일을 다시 선택해 주세요". */
+export function isSelectionExpired(error: unknown) {
+  return String(error instanceof Error ? error.message : error).includes('selection_required')
+}

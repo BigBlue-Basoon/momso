@@ -62,7 +62,15 @@ pub(crate) struct SkillHead {
 }
 
 pub(crate) fn valid_name(name: &str) -> bool {
+    let reserved = matches!(name, "con" | "prn" | "aux" | "nul" | "conin$" | "conout$")
+        || name
+            .strip_prefix("com")
+            .or_else(|| name.strip_prefix("lpt"))
+            .is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            });
     !name.is_empty()
+        && !reserved
         && name.len() <= 64
         && !name.starts_with('-')
         && !name.ends_with('-')

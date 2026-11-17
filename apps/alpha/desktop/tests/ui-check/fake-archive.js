@@ -1012,6 +1012,9 @@
         return { autoMerged: false, preservedDocuments: [], conflictPaths: [] }
       }
       if (command === 'archive_remote_push') {
+        // ?pushredaction=1 이면 가리는 동안이라 미룸, ?keyleft=1 이면 올린 기록에 옛 키가 남음(2026-11-17).
+        if (query.get('pushredaction') === '1') return { ...remote, state: 'redactionPending', reason: null }
+        if (query.get('keyleft') === '1') { Object.assign(remote, { ahead: 0, lastPushedAt: new Date().toISOString() }); return { ...remote, uploadedKeyFound: true, expiredKeyWarning: false } }
         if (query.get('pushreason')) return { ...remote, reason: query.get('pushreason'), ...merged() }
         Object.assign(remote, { ahead: 0, lastPushedAt: new Date().toISOString() }); return { ...remote, ...merged() }
       }
@@ -1215,7 +1218,34 @@
         return skillCommand(command, args)
       // 채팅방 사본 쓰기 형편(CHAT-ARCHIVE-RETRY.md). ?copyfail=<까닭> 이면 대기 2개, 앱을 켠 뒤 그 까닭으로 chat-archive-changed 를 한 번 보낸다.
       case 'chat_archive_sync_status':
+        // ?redaction=pending|upload|expired: 옛 키 다시 가리기(2026-11-17).
+        if (query.get('redaction') === 'pending') return { state: 'redactionPending', pendingWrites: 0, pendingDeletions: 0, retiredKeysPending: 1, retiredKeysExpired: 0 }
+        if (query.get('redaction') === 'upload') return { state: 'redactionUploadPending', pendingWrites: 0, pendingDeletions: 0, retiredKeysPending: 1, retiredKeysExpired: 0 }
+        if (query.get('redaction') === 'expired') return { state: 'saved', pendingWrites: 0, pendingDeletions: 0, retiredKeysPending: 0, retiredKeysExpired: 1 }
         return query.get('copyfail') || query.get('copypending') ? { state: 'pending', pendingWrites: 2, pendingDeletions: 0 } : { state: 'saved', pendingWrites: 0, pendingDeletions: 0 }
+      // 앱 시작 진행(2026-11-17). ?startup=migrating|backup|checking 이면 끝나지 않은 형편을 준다(그동안 목록은 ?slowcmd=chat_list_page 로 늦춘다).
+      case 'runtime_startup_status': {
+        const st = query.get('startup')
+        if (st) return { state: st, completed: st === 'checking' ? 0 : st === 'backup' ? 1 : 2, total: 4, available: false }
+        return { state: 'complete', completed: 4, total: 4, available: true }
+      }
+      // 채팅방 목록 쪽 나눔(2026-11-17). ?listpage=none 이면 명령이 없는 옛 뒤쪽.
+      case 'chat_list_page': {
+        if (query.get('listpage') === 'none') throw 'Command chat_list_page not found'
+        window.__listPageCalls = (window.__listPageCalls || []).concat([args.offset ?? 0])
+        const all = chatList()
+        const start = Number(args.offset || 0)
+        const items = all.slice(start, start + 80)
+        const next = start + items.length
+        return { items, hasMore: next < all.length, nextOffset: next < all.length ? next : null }
+      }
+      // 처음 받아 오기 지금 형편(2026-11-17). ?receivestatus=receiving|conflict 로 앱을 켤 때의 형편을 흉내 낸다.
+      case 'archive_first_receive_status': {
+        const st = query.get('receivestatus')
+        if (st === 'receiving') return { completed: 1, total: 3, state: 'indexing', available: false, reason: null, conflictPaths: [] }
+        if (st === 'conflict') return { completed: 0, total: 3, state: 'interrupted', available: false, reason: 'first_receive_conflict', conflictPaths: ['AGENTS.md', 'CLAUDE.md', 'zettels/2026-11-15-hatha.md', 'dictionary/people.json'] }
+        return { completed: 0, total: 3, state: 'complete', available: true, reason: null, conflictPaths: [] }
+      }
       case 'media_list':
         return mediaList()
       case 'source_asset_open': case 'source_asset_delete_preview': case 'source_asset_trash': case 'source_asset_restore_trashed': case 'source_asset_purge': case 'source_asset_deleted_list':
@@ -1253,7 +1283,8 @@
         // 계약: chat_import_export({ path, provider }) → { imported, duplicate, skipped, omittedNonTextMessages, omittedAttachments, updated, addedMessages, conflicts }.
         // ?importfail=invalid_format 처럼 실패 값을 흉내 낸다. 제미나이는 unsupported_format.
         window.__importCalls = (window.__importCalls || []).concat([[args.provider, args.path]])
-        if (args.provider === 'gemini') throw 'unsupported_format'
+        // 2026-11-17 제미나이도 받는다(?geminifail=gemini_json_required|gemini_file_too_large).
+        if (args.provider === 'gemini' && query.get('geminifail')) throw query.get('geminifail')
         if (query.get('importfail')) throw query.get('importfail')
         return new Promise((done) => setTimeout(() => done({ imported: 2, duplicate: 1, skipped: 0, omittedNonTextMessages: 0, omittedAttachments: 0, updated: 0, addedMessages: 0, conflicts: 0 }), 900))
       }
@@ -1272,7 +1303,8 @@
         return query.get('redacted') ? Number(query.get('redacted')) : null
       case 'chat_import_export_preview': {
         // 계약: { conversations, alreadyImported, unreadable, oldest, newest }. ?importpreview=empty 이면 0개.
-        if (args.provider === 'gemini') throw 'unsupported_format'
+        // 2026-11-17 제미나이도 받는다(?geminifail=gemini_json_required|gemini_file_too_large).
+        if (args.provider === 'gemini' && query.get('geminifail')) throw query.get('geminifail')
         if (query.get('importfail')) throw query.get('importfail')
         const empty = query.get('importpreview') === 'empty'
         return new Promise((done) => setTimeout(() => done(empty

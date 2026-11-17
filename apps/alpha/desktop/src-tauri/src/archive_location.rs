@@ -58,12 +58,15 @@ pub(crate) async fn archive_location_get(
 }
 
 #[tauri::command]
-pub(crate) async fn archive_location_set(
-    app: tauri::AppHandle,
+pub(crate) async fn archive_location_set<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, crate::AppState>,
     path: String,
 ) -> Result<LocationSetResult, String> {
     use tauri::Emitter;
+    let selection = state
+        .selections
+        .begin(&path, crate::selection_grants::Purpose::Archive)?;
     if crate::runtime::r2_test_enabled() {
         return Ok(LocationSetResult {
             state: "unavailable",
@@ -94,6 +97,7 @@ pub(crate) async fn archive_location_set(
         })
         .await;
     let event = if matches!(result.state, "ok" | "unchanged") {
+        selection.succeed();
         "archive-location-done"
     } else {
         "archive-location-failed"

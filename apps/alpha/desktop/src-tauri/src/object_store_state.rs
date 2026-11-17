@@ -142,11 +142,16 @@ fn apply_snapshot_with_callback(
     paths: &RuntimePaths,
     mut emit: impl FnMut(crate::chat_archive_store::RestoreProgress),
 ) -> Result<PathBuf, &'static str> {
+    let _receive_guard = crate::archive_remote::lock_remote_for_restore()?;
+    let _receive_file_lock = crate::archive_remote::lock_first_receive(&paths.database_path)?;
     let restore_guard = crate::chat_search_index::RESTORE_LOCK
         .lock()
         .map_err(|_| "restore_failed")?;
-    storage::validate_snapshot_file(snapshot).map_err(|_| "invalid_snapshot")?;
     let root = paths.objects_path.parent().ok_or("invalid_snapshot")?;
+    if crate::archive_remote::first_receive_pending(root, &paths.database_path) {
+        return Err("first_receive_in_progress");
+    }
+    storage::validate_snapshot_file(snapshot).map_err(|_| "invalid_snapshot")?;
     let path = root.to_str().ok_or("invalid_snapshot")?;
     let db = Connection::open(snapshot).map_err(|_| "invalid_snapshot")?;
     db.execute("INSERT INTO archive_location_settings(id,path,initialized) VALUES(1,?1,1) ON CONFLICT(id) DO UPDATE SET path=excluded.path,initialized=1", [path]).map_err(|_| "invalid_snapshot")?;
@@ -210,6 +215,9 @@ pub(crate) async fn app_state_restore(
     let location = state.paths.archive.current.clone().write_owned().await;
     let mut paths = state.paths.clone();
     paths.objects_path = location.join("objects");
+    if crate::archive_remote::first_receive_pending(&location, &paths.database_path) {
+        return Err("first_receive_in_progress");
+    }
     let _guard = object_store::CONNECTION_LOCK.lock().await;
     let config = object_store::load_config(&paths.data_root)?.ok_or("not_connected")?;
     let keys = object_store::load_keys(&config)?;
@@ -343,6 +351,46 @@ mod tests {
         );
         assert_eq!(fs::read(document).unwrap(), b"user document");
         assert_eq!(fs::read(original).unwrap(), b"user original");
+    }
+
+    #[test]
+    fn app_state_restore_refuses_pending_first_receive_without_replacing_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
+        let database_path = base.join("momso.db");
+        let backups_path = base.join("backups");
+        storage::initialize(&database_path, &backups_path, "test").unwrap();
+        let archive =
+            crate::archive_location::ArchiveLocation::load(database_path.clone(), base, vec![])
+                .unwrap();
+        let archive_root = base.join("momso");
+        crate::archive::initialize(&archive_root, base).unwrap();
+        let snapshot = base.join("snapshot.db");
+        storage::create_snapshot_file(&database_path, &snapshot).unwrap();
+        let room = crate::chat::create(&database_path).unwrap();
+        let id = serde_json::to_value(room).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        Connection::open(&database_path).unwrap().execute(
+            "INSERT INTO app_runtime_meta(key,value,updated_at) VALUES(?1,'pending',CURRENT_TIMESTAMP)",
+            [crate::archive_remote::FIRST_RECEIVE_JOURNAL],
+        ).unwrap();
+        let paths = RuntimePaths {
+            data_root: base.to_path_buf(),
+            database_path: database_path.clone(),
+            objects_path: archive_root.join("objects"),
+            exports_path: base.join("exports"),
+            backups_path,
+            logs_path: base.join("logs"),
+            archive,
+            archive_lease: None,
+        };
+        assert_eq!(
+            apply_snapshot(&snapshot, &paths),
+            Err("first_receive_in_progress")
+        );
+        assert!(crate::chat::read(&database_path, &id).is_ok());
     }
 
     #[test]
@@ -641,6 +689,12 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(username["state"], "ok", "stage 1: username");
+        crate::permission_modes::set(
+            &paths.database_path,
+            crate::permission_modes::Provider::Codex,
+            "Full access",
+        )
+        .unwrap();
         let original_id = crate::archive_zet::create(
             &archive_root,
             &paths.database_path,
@@ -817,6 +871,52 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         let hash = asset["contentSha256"].as_str().unwrap();
         let reference = format!("sha256:{hash}");
         let object_relative = format!("sha256/{}/{hash}", &hash[..2]);
+        let deleted_file = root.join("deleted-lesson.txt");
+        fs::write(&deleted_file, "deleted original bytes").unwrap();
+        let deleted_proposal_json = serde_json::json!({"sourcePath":deleted_file,"assetKind":"raw_transcript","mediaType":"text/plain","recordLink":null,"actor":"test"});
+        let deleted_plan = serde_json::to_value(
+            crate::source_assets::plan_import(
+                &paths.database_path,
+                &paths.objects_path,
+                serde_json::from_value(deleted_proposal_json.clone()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let deleted_input = serde_json::from_value(serde_json::json!({"proposal":deleted_proposal_json,"planDigest":deleted_plan["planDigest"],"importConfirmed":true})).unwrap();
+        let deleted_asset = serde_json::to_value(
+            crate::source_assets::apply_import(
+                &paths.database_path,
+                &paths.objects_path,
+                deleted_input,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let deleted_asset_id = deleted_asset["id"].as_str().unwrap();
+        let deleted_reference = format!(
+            "sha256:{}",
+            deleted_asset["contentSha256"].as_str().unwrap()
+        );
+        crate::archive_receipt::attach_asset(
+            &archive_root,
+            &paths.database_path,
+            &chat_id,
+            deleted_asset_id,
+        )
+        .unwrap();
+        let delete_plan = serde_json::to_value(
+            crate::source_delete::preview(&archive_root, &paths.database_path, deleted_asset_id)
+                .unwrap(),
+        )
+        .unwrap();
+        crate::source_delete::trash_for_test(
+            &archive_root,
+            &paths.database_path,
+            deleted_asset_id,
+            delete_plan["planDigest"].as_str().unwrap(),
+        )
+        .unwrap();
         crate::archive_receipt::attach_asset(
             &archive_root,
             &paths.database_path,
@@ -855,7 +955,19 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         let bare = root.join("remote.git");
         fs::write(
             archive_root.join("dictionary/people.json"),
-            r#"{"people":[{"name":"fixture-person"}]}"#,
+            r#"{"people":[{"id":"fixture-person","name":"fixture-person","confirmed":true}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            archive_root.join("dictionary/my-terms.json"),
+            r#"{"terms":[{"term":{"id":"fixture-term","sanskrit":"fixture-term","korean":[],"koreanNames":[],"meaning":"test","sources":[]},"baseMeaning":null}]}"#,
+        )
+        .unwrap();
+        let custom_skill = archive_root.join("skills/fixture-skill");
+        fs::create_dir_all(&custom_skill).unwrap();
+        fs::write(
+            custom_skill.join("SKILL.md"),
+            "---\nname: fixture-skill\ntitle: fixture skill\ndescription: fixture description\n---\nfixture skill content\n",
         )
         .unwrap();
         crate::archive_remote::git(&tool, root, &["init", "--bare", bare.to_str().unwrap()])
@@ -920,8 +1032,14 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             crate::archive_remote::git(&tool, &archive_root, &["rev-parse", "HEAD"]).unwrap();
         let document_path = archive_root.join("zettels").join(format!("{id}.md"));
         fs::remove_file(&document_path).unwrap();
-        crate::chat_recovery::restore_git(&archive_root, root, &id, revision.trim())
-            .expect("stage 4: recover deleted document");
+        crate::chat_recovery::restore_git(
+            &archive_root,
+            root,
+            Some(&paths.database_path),
+            &id,
+            revision.trim(),
+        )
+        .expect("stage 4: recover deleted document");
         assert!(
             fs::read_to_string(&document_path)
                 .unwrap()
@@ -961,7 +1079,33 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         )
         .unwrap();
         crate::chat_archive_store::write(&archive_root, &paths, &chat_id).unwrap();
-        crate::archive::save(&archive_root, root, &paths.database_path).unwrap();
+        let archived = serde_json::to_value(crate::chat::create(&paths.database_path).unwrap())
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            crate::chat::set_archived(&paths.database_path, &archived, true).state,
+            "ok"
+        );
+        crate::chat_archive_store::write(&archive_root, &paths, &archived).unwrap();
+        let imported_file = root.join("fixture-import.json");
+        fs::write(&imported_file, serde_json::json!([{"id":"fixture-import","current_node":"a","mapping":{"a":{"parent":null,"message":{"author":{"role":"user"},"content":{"parts":["imported message"]}}}}}]).to_string()).unwrap();
+        crate::chat_export_import::import(&paths.database_path, &imported_file, "chatgpt").unwrap();
+        let imported_id: String = storage::open_writable_connection(&paths.database_path)
+            .unwrap()
+            .query_row(
+                "SELECT chat_id FROM chat_imports WHERE source_id='fixture-import'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::chat_archive_store::write(&archive_root, &paths, &imported_id).unwrap();
+        while !crate::chat_redaction_recheck::step(&archive_root, &paths)
+            .unwrap()
+            .available
+        {}
+        crate::chat_archive_store::save_pending(&archive_root, root, &paths).unwrap();
         crate::archive_remote::transfer(
             &tool,
             &archive_root,
@@ -1133,6 +1277,73 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         let _manifest = backup_snapshot(&config, &keys, &identity, &paths)
             .await
             .unwrap();
+        // An object-store-only recovery restores the database and objects, not Git files.
+        let storage_pc = root.join("storage-only-pc");
+        fs::create_dir_all(&storage_pc).unwrap();
+        let storage_db = storage_pc.join("momso.db");
+        let storage_backups = storage_pc.join("backups");
+        fs::create_dir_all(&storage_backups).unwrap();
+        storage::initialize(&storage_db, &storage_backups, "test").unwrap();
+        let storage_archive = storage_pc.join("momso");
+        let storage_location =
+            crate::archive_location::ArchiveLocation::load(storage_db.clone(), &storage_pc, vec![])
+                .unwrap();
+        crate::archive::initialize(&storage_archive, &storage_pc).unwrap();
+        let storage_paths = RuntimePaths {
+            data_root: storage_pc.clone(),
+            database_path: storage_db.clone(),
+            objects_path: storage_archive.join("objects"),
+            exports_path: storage_pc.join("exports"),
+            backups_path: storage_backups,
+            logs_path: storage_pc.join("logs"),
+            archive: storage_location,
+            archive_lease: None,
+        };
+        let (storage_snapshot, _) =
+            download_latest_snapshot(&config, &keys, &identity, &storage_paths)
+                .await
+                .unwrap();
+        apply_snapshot(storage_snapshot.path(), &storage_paths).unwrap();
+        object_store_restore::restore_selected(&config, &keys, &identity, &storage_paths, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read(storage_paths.objects_path.join(&object_relative)).unwrap(),
+            b"original bytes",
+            "storage only: original restored"
+        );
+        assert_eq!(
+            serde_json::to_value(crate::chat::read(&storage_db, &chat_id).unwrap()).unwrap()
+                ["title"],
+            "fixture room",
+            "storage only: chat from application snapshot"
+        );
+        assert_eq!(
+            crate::permission_modes::get(&storage_db, crate::permission_modes::Provider::Codex)
+                .unwrap(),
+            "Full access"
+        );
+        let deleted_count: i64 = storage::open_writable_connection(&storage_db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM source_asset_deletions WHERE asset_id=?1 AND state='trashed'",
+                [deleted_asset_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted_count, 1);
+        assert!(
+            !storage_archive
+                .join("zettels")
+                .join(format!("{id}.md"))
+                .exists(),
+            "storage only: document files need Git"
+        );
+        #[cfg(windows)]
+        crate::source_assets::clear_readonly_attribute(
+            &storage_paths.objects_path.join(&object_relative),
+        )
+        .unwrap();
         let source_archive_root = archive_root.clone();
         let new_pc = root.join("new-pc");
         fs::create_dir_all(&new_pc).unwrap();
@@ -1177,6 +1388,38 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                 .contains("fixture-person"),
             "stage 6: people file"
         );
+        assert!(
+            fs::read_to_string(archive_root.join("dictionary/my-terms.json"))
+                .unwrap()
+                .contains("fixture-term")
+        );
+        let skill = fs::read_to_string(archive_root.join("skills/fixture-skill/SKILL.md")).unwrap();
+        assert!(crate::skills::parse("fixture-skill", &skill).is_ok());
+        assert!(
+            serde_json::to_value(crate::yoga_dictionary::list(&archive_root).unwrap())
+                .unwrap()
+                .to_string()
+                .contains("fixture-term")
+        );
+        let archived_db = storage::open_writable_connection(&database_path).unwrap();
+        assert!(archived_db
+            .query_row(
+                "SELECT archived_at FROM chats WHERE id=?1",
+                [&archived],
+                |row| row.get::<_, Option<String>>(0)
+            )
+            .unwrap()
+            .is_some());
+        drop(archived_db);
+        assert_eq!(
+            serde_json::to_value(
+                crate::chat_export_import::import(&database_path, &imported_file, "chatgpt")
+                    .unwrap()
+            )
+            .unwrap()["duplicate"],
+            1,
+            "Git only: repeated import remains deduplicated"
+        );
         let github_profile =
             serde_json::to_value(crate::archive::profile_get(&archive_root).unwrap()).unwrap();
         assert_eq!(
@@ -1201,6 +1444,132 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         let repeated =
             serde_json::to_value(crate::chat::read(&database_path, &chat_id).unwrap()).unwrap();
         assert_eq!(repeated["messages"].as_array().unwrap().len(), before);
+        assert!(
+            crate::archive::history(&archive_root, &new_pc, &id)
+                .unwrap()
+                .len()
+                >= 2,
+            "Git only: document history"
+        );
+        let new_paths = RuntimePaths {
+            data_root: new_pc.clone(),
+            database_path: database_path.clone(),
+            objects_path: archive_root.join("objects"),
+            exports_path: new_pc.join("exports"),
+            backups_path: backups_path.clone(),
+            logs_path: new_pc.join("logs"),
+            archive: crate::archive_location::ArchiveLocation::load(
+                database_path.clone(),
+                &new_pc,
+                vec![],
+            )
+            .unwrap(),
+            archive_lease: None,
+        };
+        crate::chat::append(
+            &database_path,
+            &chat_id,
+            crate::chat::Role::User,
+            "continued on the new device",
+            None,
+            None,
+        )
+        .unwrap();
+        let reply_script = new_pc.join("fake-codex-reply.ps1");
+        fs::write(&reply_script, r#"
+$null = [Console]::ReadLine()
+'{"id":1,"result":{}}'
+$null = [Console]::ReadLine()
+$null = [Console]::ReadLine()
+'{"id":2,"result":{"thread":{"id":"fixture-new-thread"},"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"},"model":"fixture-model","reasoningEffort":"low"}}'
+$null = [Console]::ReadLine()
+'{"method":"item/agentMessage/delta","params":{"delta":"new device answer"}}'
+'{"method":"turn/completed","params":{"turn":{"status":"completed"}}}'
+"#).unwrap();
+        let mut reply_command = tokio::process::Command::new("powershell.exe");
+        reply_command
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&reply_script)
+            .current_dir(&archive_root)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        crate::chat_codex::run_command(
+            reply_command,
+            &database_path,
+            &archive_root,
+            &chat_id,
+            "continued on the new device",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::permission_modes::codex_settings("Ask for approval").unwrap(),
+            None,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+            None,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        crate::chat_archive_store::write(&archive_root, &new_paths, &chat_id).unwrap();
+        crate::archive::save_one(
+            &archive_root,
+            &new_pc,
+            &database_path,
+            &id,
+            crate::archive_zet::ZetUpdate {
+                title: None,
+                summary: None,
+                body: Some("continued document".into()),
+                status: None,
+                assets: None,
+                edges: None,
+            },
+            None,
+        )
+        .unwrap();
+        crate::chat_archive_store::save_pending(&archive_root, &new_pc, &new_paths).unwrap();
+        crate::archive_remote::transfer(
+            &tool,
+            &archive_root,
+            bare.to_str().unwrap(),
+            "main",
+            "push",
+        )
+        .unwrap();
+        crate::archive_remote::transfer(
+            &tool,
+            &source_archive_root,
+            bare.to_str().unwrap(),
+            "main",
+            "pull",
+        )
+        .unwrap();
+        crate::archive::reindex(&source_archive_root, &paths.database_path).unwrap();
+        crate::chat_archive_store::restore(&source_archive_root, &paths.database_path).unwrap();
+        assert!(
+            fs::read_to_string(source_archive_root.join("zettels").join(format!("{id}.md")))
+                .unwrap()
+                .contains("continued document"),
+            "one device at a time: old device receives edited document"
+        );
+        assert!(
+            serde_json::to_value(crate::chat::read(&paths.database_path, &chat_id).unwrap())
+                .unwrap()
+                .to_string()
+                .contains("continued on the new device"),
+            "one device at a time: old device receives new message"
+        );
+        assert!(
+            serde_json::to_value(crate::chat::read(&paths.database_path, &chat_id).unwrap())
+                .unwrap()
+                .to_string()
+                .contains("new device answer")
+        );
         let active = crate::chat_codex::Active::default();
         let deleted =
             crate::chat::delete_with(&paths.database_path, &active, &chat_id, |_| async {
@@ -1210,7 +1579,11 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         assert_eq!(serde_json::to_value(deleted).unwrap()["state"], "deleted");
         crate::chat_archive_store::remove(&source_archive_root, &paths.database_path, &chat_id)
             .unwrap();
-        crate::archive::save(&source_archive_root, root, &paths.database_path).unwrap();
+        while !crate::chat_redaction_recheck::step(&source_archive_root, &paths)
+            .unwrap()
+            .available
+        {}
+        crate::chat_archive_store::save_pending(&source_archive_root, root, &paths).unwrap();
         crate::archive_remote::transfer(
             &tool,
             &source_archive_root,
@@ -1264,6 +1637,37 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             !archive_root.join("objects").join(&object_relative).exists(),
             "stage 6: Git alone does not restore originals"
         );
+        assert_eq!(
+            crate::permission_modes::get(&database_path, crate::permission_modes::Provider::Codex)
+                .unwrap(),
+            "Ask for approval"
+        );
+        let missing = serde_json::to_value(
+            crate::chat_items::read_attachment_text(
+                &archive_root,
+                &database_path,
+                &deleted_reference,
+                0,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(missing["state"], "not_found");
+        assert!(missing["content"].is_null());
+        let items = serde_json::to_value(
+            crate::chat_items::list(&archive_root, &database_path, &chat_id).unwrap(),
+        )
+        .unwrap();
+        assert!(!items["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["id"] == deleted_reference));
+        assert!(!items["deleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["id"] == deleted_reference));
         let paths = RuntimePaths {
             data_root: new_pc.clone(),
             database_path,
@@ -1448,7 +1852,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         }
         assert_eq!(
             crate::chat::list(&paths.database_path).unwrap().len(),
-            2,
+            3,
             "stage 8: imported rooms"
         );
         let safety_db = Connection::open(safety).unwrap();

@@ -23,17 +23,18 @@ import { ZetPanel, ZetPanelToggle, useZetPanelFrame } from './components/ZetPane
 import { FirstRun } from './components/FirstRun'
 import { useProviderAuth } from './components/ProviderSignIn'
 import { isConnected } from './provider-auth'
-import { listenChatRestoreProgress, watchFirstReceive, type RestoreProgress } from './restore-progress'
+import { listenChatRestoreProgress, watchFirstReceive, watchStartup, type RestoreProgress, type StartupProgress } from './restore-progress'
 import { watchChatArchive } from './chat-archive-status'
 import { effortKorean } from './permission-labels'
 import { checkFirstRun, type FirstRunCheck } from './first-run'
 import './App.css'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
-import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import {
   initializeRuntime,
   isDesktopRuntime,
   openRuntimeDataRoot,
+  isSelectionExpired,
+  selectLocalPaths,
   type RuntimeSession,
 } from './runtime'
 import { archiveErrorMessage } from './archive'
@@ -56,7 +57,7 @@ import {
   listenChatListUpdated,
   setChatPinned,
   listenChatEvents,
-  listChats,
+  listChatsPage,
   readChat,
   readChatContext,
   renameChat,
@@ -341,11 +342,24 @@ function App() {
     toastTimer.current = window.setTimeout(() => { setToast(null); setToastAction(null) }, action ? 8000 : 2600)
   }
 
+  // 채팅방 목록은 쪽으로 받는다(chat_list_page, 80개씩). 다시 읽을 때는 이미 받아 둔 만큼(적어도 한 쪽)을 다시 받는다.
+  const chatsNext = useRef<number | null>(null)
+  const chatsCount = useRef(0)
+  const chatsLoadingMore = useRef(false)
   const refreshChats = useCallback(async () => {
     // 설치된 앱이 아니면(브라우저로 연 개발 화면) 대화 목록을 부르지 않는다.
     if (!isDesktopRuntime()) return null
     try {
-      const next = await listChats()
+      const want = Math.max(1, chatsCount.current)
+      let page = await listChatsPage(0)
+      const next = [...page.items]
+      while (page.hasMore && page.nextOffset !== null && next.length < want) {
+        page = await listChatsPage(page.nextOffset)
+        const seen = new Set(next.map((chat) => chat.id))
+        next.push(...page.items.filter((chat) => !seen.has(chat.id)))
+      }
+      chatsNext.current = page.hasMore ? page.nextOffset : null
+      chatsCount.current = next.length
       setChats(next)
       setChatsError(null)
       setChatsLoaded(true)
@@ -354,6 +368,26 @@ function App() {
       setChatsError(archiveErrorMessage(error, W.app.text1))
       setChatsLoaded(true)
       return null
+    }
+  }, [])
+
+  // 왼쪽 목록을 끝까지 내리면 다음 쪽을 받아 붙인다(찾기 창과 같은 방식, 새 단추 없음).
+  const loadMoreChats = useCallback(async () => {
+    if (chatsNext.current === null || chatsLoadingMore.current || !isDesktopRuntime()) return
+    chatsLoadingMore.current = true
+    try {
+      const page = await listChatsPage(chatsNext.current)
+      chatsNext.current = page.hasMore ? page.nextOffset : null
+      setChats((current) => {
+        const seen = new Set(current.map((chat) => chat.id))
+        const merged = [...current, ...page.items.filter((chat) => !seen.has(chat.id))]
+        chatsCount.current = merged.length
+        return merged
+      })
+    } catch {
+      chatsNext.current = null
+    } finally {
+      chatsLoadingMore.current = false
     }
   }, [])
 
@@ -560,15 +594,16 @@ function App() {
       refreshChatItems(chatId, true)
       showToast(names.length === 1 ? W.attach.done(names[0]) : W.attach.doneMany(names.length))
     } catch (error) {
-      showToast(archiveErrorMessage(error, W.attach.failed))
+      // 고른 지 5분이 지나 뒤쪽이 거절하면(selection_required) 다시 고르라는 한 줄.
+      showToast(isSelectionExpired(error) ? W.selectAgain : archiveErrorMessage(error, W.attach.failed))
     } finally {
       attachingRef.current = false
     }
   }
 
+  // 클립: 고르는 창은 뒤쪽이 연다(select_local_paths source, 여럿). 취소하면 빈 배열이라 아무 일도 없다.
   async function pickAndAttach() {
-    const picked = await openDialog({ multiple: true }).catch(() => null)
-    const paths = Array.isArray(picked) ? picked : typeof picked === 'string' ? [picked] : []
+    const paths = await selectLocalPaths('source').catch(() => [] as string[])
     await attachFiles(paths)
   }
 
@@ -834,6 +869,16 @@ function App() {
       .then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
   }, [desktopRuntime, selectedChatId])
+
+  // 앱 시작 진행(runtime_startup_status / runtime-startup-progress). 끝나기 전에는 왼쪽 목록의 "불러오는 중" 줄에 단계를 얹는다.
+  const [startup, setStartup] = useState<StartupProgress | null>(null)
+  useEffect(() => {
+    if (!desktopRuntime) return
+    return watchStartup(setStartup)
+  }, [desktopRuntime])
+  const startupDetail = startup && !startup.available && W.app.startup[startup.state]
+    ? (startup.total > 0 ? `${W.app.startup[startup.state]} ${startup.completed}/${startup.total}` : W.app.startup[startup.state])
+    : null
 
   // 사본 쓰기 실패와 처음 받아 오기를 앱을 켤 때부터 듣는다(설정 화면을 열기 전에 온 것도 알리고, 받는 동안 문서 고치기를 막는다).
   useEffect(() => {
@@ -1314,6 +1359,8 @@ function App() {
               selectedChatId={selectedChatId}
               error={chatsError}
               loading={desktopRuntime && !chatsLoaded && session.mode !== 'error'}
+              loadingDetail={startupDetail}
+              onLoadMore={() => void loadMoreChats()}
               onRetry={() => void refreshChats()}
               restoring={chatRestore}
               onNewChat={startNewChat}

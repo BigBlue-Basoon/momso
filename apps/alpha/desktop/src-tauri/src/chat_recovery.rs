@@ -255,12 +255,20 @@ pub(crate) fn list(root: &Path, id: &str) -> Result<Vec<RecoveryCopy>, String> {
     Ok(result)
 }
 
-pub(crate) fn restore(root: &Path, id: &str, hash: &str) -> Result<(), String> {
+pub(crate) fn restore(
+    root: &Path,
+    database: Option<&Path>,
+    id: &str,
+    hash: &str,
+) -> Result<(), String> {
     let (key, _) = reference_parts(id)?;
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid_id".into());
     }
     let _guard = crate::chat_file_changes::lock_app_write();
+    if let Some(database) = database {
+        crate::archive_remote::ensure_document_write_allowed(root, database)?;
+    }
     let source = directory(root)?.join(format!("{key}-{hash}.md"));
     let meta = fs::symlink_metadata(&source).map_err(|_| "not_found")?;
     if !meta.is_file()
@@ -279,10 +287,14 @@ pub(crate) fn restore(root: &Path, id: &str, hash: &str) -> Result<(), String> {
 pub(crate) fn restore_git(
     root: &Path,
     resources: &Path,
+    database: Option<&Path>,
     id: &str,
     revision: &str,
 ) -> Result<(), String> {
     let _guard = crate::chat_file_changes::lock_app_write();
+    if let Some(database) = database {
+        crate::archive_remote::ensure_document_write_allowed(root, database)?;
+    }
     let (_, relative) = reference_parts(id)?;
     if ![40, 64].contains(&revision.len()) || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("invalid_id".into());
@@ -387,7 +399,7 @@ mod tests {
             Some(id)
         );
         fs::write(&path, b"AI rewrite").unwrap();
-        restore(&root, id, &digest(b"uncommitted lesson")).unwrap();
+        restore(&root, None, id, &digest(b"uncommitted lesson")).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"uncommitted lesson");
         fs::remove_file(&path).unwrap();
         let after = crate::chat_file_changes::capture(&root).unwrap();
@@ -433,10 +445,10 @@ mod tests {
         assert_eq!(receipt["head"]["wrote"][0]["missing"], true);
         fs::remove_dir(root.join("zettels/classes")).unwrap();
         fs::remove_dir(root.join("zettels")).unwrap();
-        restore(&root, id, &digest(b"uncommitted lesson")).unwrap();
+        restore(&root, None, id, &digest(b"uncommitted lesson")).unwrap();
         assert_eq!(fs::read(path).unwrap(), b"uncommitted lesson");
         assert!(
-            matches!(restore(&root, "document-path:../escape.md", &"a".repeat(64)), Err(e) if e == "invalid_id")
+            matches!(restore(&root, None, "document-path:../escape.md", &"a".repeat(64)), Err(e) if e == "invalid_id")
         );
     }
 
@@ -472,7 +484,7 @@ mod tests {
         assert!(list(&root, id).unwrap().is_empty());
         assert_eq!(history(&root, &root, id).unwrap(), vec![revision.trim()]);
         fs::remove_file(&path).unwrap();
-        restore_git(&root, &root, id, revision.trim()).unwrap();
+        restore_git(&root, &root, None, id, revision.trim()).unwrap();
         assert_eq!(fs::read(path).unwrap(), b"saved \xff text\n");
     }
 
@@ -485,14 +497,14 @@ mod tests {
         capture(&root).unwrap();
         let hash = digest(b"unsaved lesson");
         fs::write(&path, b"AI rewrite").unwrap();
-        restore(&root, id, &hash).unwrap();
+        restore(&root, None, id, &hash).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"unsaved lesson");
         assert!(list(&root, id)
             .unwrap()
             .iter()
             .any(|v| v.hash == digest(b"AI rewrite")));
         fs::remove_file(&path).unwrap();
-        restore(&root, id, &hash).unwrap();
+        restore(&root, None, id, &hash).unwrap();
         assert_eq!(fs::read(path).unwrap(), b"unsaved lesson");
     }
 
@@ -538,7 +550,7 @@ mod tests {
             .iter()
             .any(|v| v.hash == digest(b"changed but ignored by git status")));
         fs::remove_file(&path).unwrap();
-        restore_git(&root, &root, id, revision.trim()).unwrap();
+        restore_git(&root, &root, None, id, revision.trim()).unwrap();
         assert_eq!(fs::read(path).unwrap(), b"saved lesson\n");
     }
 
@@ -573,7 +585,7 @@ mod tests {
         let hash = digest(b"lesson\r\nnext\r\n");
         assert!(list(&root, id).unwrap().iter().any(|v| v.hash == hash));
         fs::remove_file(&path).unwrap();
-        restore(&root, id, &hash).unwrap();
+        restore(&root, None, id, &hash).unwrap();
         assert_eq!(fs::read(path).unwrap(), b"lesson\r\nnext\r\n");
     }
 }

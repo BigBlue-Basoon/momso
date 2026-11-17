@@ -21,6 +21,13 @@ pub(crate) fn prevent_secret_changes() -> Result<std::sync::MutexGuard<'static, 
         .map_err(|_| CredentialError::StoreUnavailable)
 }
 
+pub(crate) fn try_prevent_secret_changes(
+) -> Result<std::sync::MutexGuard<'static, ()>, CredentialError> {
+    SECRET_CHANGE_LOCK
+        .try_lock()
+        .map_err(|_| CredentialError::StoreUnavailable)
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum CredentialError {
     #[error("Windows 자격 증명 저장소를 사용할 수 없습니다")]
@@ -86,6 +93,21 @@ pub(crate) fn get_secret(name: &str) -> Result<Option<String>, CredentialError> 
 
 pub(crate) fn set_secret(name: &str, secret: &str) -> Result<(), CredentialError> {
     let _guard = prevent_secret_changes()?;
+    if crate::redaction_wait::protects(name) {
+        if let Some(old) = get_secret(name)? {
+            if old != secret {
+                crate::redaction_wait::enqueue_unlocked(name, &old)?;
+            }
+        }
+    }
+    put_secret_unlocked(name, secret)?;
+    if crate::redaction_wait::protects(name) {
+        crate::redaction_wait::watch_new_unlocked(name)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn put_secret_unlocked(name: &str, secret: &str) -> Result<(), CredentialError> {
     #[cfg(test)]
     if let Some(store) = fake_store() {
         store
@@ -101,6 +123,15 @@ pub(crate) fn set_secret(name: &str, secret: &str) -> Result<(), CredentialError
 
 pub(crate) fn delete_secret(name: &str) -> Result<(), CredentialError> {
     let _guard = prevent_secret_changes()?;
+    if crate::redaction_wait::protects(name) {
+        if let Some(old) = get_secret(name)? {
+            crate::redaction_wait::enqueue_unlocked(name, &old)?;
+        }
+    }
+    remove_secret_unlocked(name)
+}
+
+pub(crate) fn remove_secret_unlocked(name: &str) -> Result<(), CredentialError> {
     #[cfg(test)]
     if let Some(store) = fake_store() {
         store

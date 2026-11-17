@@ -88,7 +88,7 @@ fn text_state(state: &'static str) -> AttachmentTextPage {
 }
 
 #[cfg(windows)]
-fn opened_path_matches(file: &fs::File, expected: &Path) -> bool {
+pub(crate) fn opened_path_matches(file: &fs::File, expected: &Path) -> bool {
     use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
     let handle = file.as_raw_handle() as _;

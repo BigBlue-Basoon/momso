@@ -32,8 +32,8 @@ import { isMissingCommand } from '../ai-models'
 import { W } from '../words'
 import { QuestionDialog } from './ZetPanel'
 import { readZet } from '../archive'
-import { chatArchiveFailure, chatArchiveSyncStatus, subscribeChatArchive } from '../chat-archive-status'
-import { listenFirstReceiveProgress, progressPercent, type RestoreProgress } from '../restore-progress'
+import { chatArchiveFailure, chatArchiveSyncStatus, isRedacting, subscribeChatArchive, subscribeRedaction, watchRedaction } from '../chat-archive-status'
+import { firstReceiveSnapshot, progressPercent, subscribeFirstReceive } from '../restore-progress'
 
 const B = W.backup
 const dateFormat = new Intl.DateTimeFormat('ko-KR', { month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit' })
@@ -114,25 +114,30 @@ function GithubBackup() {
   // 채팅방 사본 쓰기 실패(chat-archive-changed unavailable): 까닭 줄과 같은 자리·같은 꼴의 한 줄. 까닭을 모르면(앱을 다시 켬) 남은 쓰기 수로.
   const copyFailure = useSyncExternalStore(subscribeChatArchive, chatArchiveFailure, () => null)
   const [copyPending, setCopyPending] = useState(0)
+  // 옛 키 다시 가리기(2026-11-17): 가리는 동안 올리기가 미뤄지면 한 줄, 예전에 올린 기록에 키가 남았을 수 있으면 한 줄. 새 자리 없이 이 칸의 알림 줄로.
+  const [syncRedaction, setSyncRedaction] = useState(false)
+  const [pushRedaction, setPushRedaction] = useState(false)
+  const [keyLeft, setKeyLeft] = useState(false)
+  useEffect(() => { watchRedaction() }, [])
+  const redacting = useSyncExternalStore(subscribeRedaction, isRedacting, () => false)
   useEffect(() => {
     let alive = true
-    chatArchiveSyncStatus().then((value) => { if (alive) setCopyPending(value && value.state === 'pending' ? value.pendingWrites : 0) }).catch(() => {})
+    chatArchiveSyncStatus().then((value) => {
+      if (!alive) return
+      setCopyPending(value && value.state === 'pending' ? value.pendingWrites : 0)
+      setSyncRedaction(Boolean(value && (value.state === 'redactionPending' || value.state === 'redactionUploadPending' || value.retiredKeysPending > 0)))
+      if (value && value.retiredKeysExpired > 0) setKeyLeft(true)
+    }).catch(() => {})
     return () => { alive = false }
   }, [copyFailure])
   const copyLine = copyFailure ? `${B.chatCopy[copyFailure] ?? B.chatCopy.other}. ${B.chatCopyRetry}` : copyPending > 0 ? B.chatCopyPending(copyPending) : null
-  // 새 PC 에서 처음 받아 오는 동안의 진행(archive-first-receive-progress, 받기를 눌렀을 때만 온다). 끝나거나 실패하면 거둔다(실패 까닭은 받기 결과의 줄).
-  const [receiving, setReceiving] = useState<RestoreProgress | null>(null)
-  const [receiveEmpty, setReceiveEmpty] = useState(false)
-  useEffect(() => {
-    let stop: (() => void) | undefined
-    let disposed = false
-    void listenFirstReceiveProgress((value) => {
-      if (!value.available && W.restoreProgress.receive[value.state]) { setReceiving(value); setReceiveEmpty(false); return }
-      setReceiving(null)
-      setReceiveEmpty(value.state === 'empty')
-    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
-    return () => { disposed = true; stop?.() }
-  }, [])
+  // 새 PC 에서 처음 받아 오는 동안의 진행과 같은 이름의 파일 때문에 멈춘 것(앱 전체가 듣는 것을 그대로 본다: 앱을 켤 때 지금 형편을 묻고 이벤트를 듣는다).
+  const firstReceive = useSyncExternalStore(subscribeFirstReceive, firstReceiveSnapshot, firstReceiveSnapshot)
+  const receiving = firstReceive.receiving && W.restoreProgress.receive[firstReceive.receiving.state] ? firstReceive.receiving : null
+  const receiveEmpty = firstReceive.empty
+  // 같은 이름의 파일이 있어 멈췄으면 그 파일들(뒤쪽 진행 값 또는 받기 결과의 conflictPaths).
+  const receiveConflict = firstReceive.conflictPaths.length > 0 ? firstReceive.conflictPaths
+    : status?.reason === 'first_receive_conflict' && Array.isArray(status.conflictPaths) ? status.conflictPaths : []
   // 저장소 만들기(archive_remote_create)는 username 이 있을 때만 누를 수 있다. 명령이 없으면 눌리지 않는다(누른 뒤 알게 되면 막는다).
   const [createAvailable, setCreateAvailable] = useState(true)
   const newRepoName = username ? `momso-${username}` : null
@@ -157,16 +162,19 @@ function GithubBackup() {
   const connected = status?.state === 'connected'
   // Git 이 없어서 막혔으면(git_missing) 그 까닭 줄 대신 그 자리에서 바로 설치할 수 있는 줄을 둔다(GitInstallRow).
   const gitMissing = status?.reason === 'git_missing'
-  const standing = !note && status?.reason && !gitMissing ? remoteMessage(status) : null
+  const standing = !note && status?.reason && !gitMissing && status.reason !== 'first_receive_conflict' ? remoteMessage(status) : null
 
   async function run(action: () => Promise<RemoteStatus>) {
     setWorking(true); setNote(null)
     try {
       const next = await action()
+      // 바꾼 키를 가리는 동안이라 올리기를 미뤘다(state redactionPending). 연결 상태는 그대로 두고 그 한 줄만.
+      if (next.state === 'redactionPending') { setPushRedaction(true); setWorking(false); return }
+      setPushRedaction(false)
+      if (next.uploadedKeyFound === true || next.expiredKeyWarning === true) setKeyLeft(true)
       setStatus(next)
       const preserved = await preservedMessage(next)
       setNote([next.reason ? remoteMessage(next) : preserved ? null : B.done, preserved].filter(Boolean).join('. ') || B.done)
-      setReceiving(null)
     } catch (error) { setNote(message(errorState(error))) }
     setWorking(false)
   }
@@ -226,6 +234,10 @@ function GithubBackup() {
         </div>
       )}
       {!receiving && receiveEmpty && !note && <p className="backup-note" role="status">{W.restoreProgress.receiveEmpty}</p>}
+      {/* 같은 이름의 파일이 있어 처음 받아 오기를 멈춤(first_receive_conflict): 두 PC 의 "남은 파일" 줄과 같은 자리·같은 꼴. 다시 시도는 있는 "다운로드" 단추. */}
+      {!receiving && receiveConflict.length > 0 && (
+        <p className="backup-note" role="alert">{W.restoreProgress.receiveConflict(receiveConflict.length, [...receiveConflict.slice(0, 3), ...(receiveConflict.length > 3 ? [W.sourceDelete.more(receiveConflict.length - 3)] : [])].join(', '))}</p>
+      )}
       {status === undefined && <p className="backup-note" role="status">{B.githubLoading}</p>}
       {statusFailed && (
         <p className="backup-note" role="alert">
@@ -236,6 +248,8 @@ function GithubBackup() {
       {gitMissing && <GitInstallRow onInstalled={refresh} />}
       {(note ?? standing) && <p className="backup-note" role="status">{note ?? standing}</p>}
       {copyLine && <p className="backup-note" role="status">{copyLine}</p>}
+      {(redacting || syncRedaction || pushRedaction) && <p className="backup-note" role="status">{B.redactionWait}</p>}
+      {(keyLeft || status?.expiredKeyWarning === true) && <p className="backup-note" role="alert">{B.keyLeftWarning}</p>}
       {asking === 'disconnect' && (
         <QuestionDialog
           title={B.githubDisconnectTitle}

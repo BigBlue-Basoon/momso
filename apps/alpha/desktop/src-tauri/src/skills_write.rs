@@ -62,10 +62,6 @@ pub(crate) fn adopt_received_builtin_states(
         };
         let state_file = state_path(root, name)?;
         let before = snapshot(&state_file)?.ok_or("conflict")?;
-        let previous: State = serde_json::from_slice(&before).map_err(|_| "invalid_state")?;
-        if !previous.enabled || previous.hash != crate::archive_zet::content_hash(default) {
-            return Err("conflict");
-        }
         let agents = skills::skill_path(root, ".agents/skills", name)?;
         let claude = skills::skill_path(root, ".claude/skills", name)?;
         let enabled = snapshot(&agents)?.as_deref() == Some(content.as_slice())
@@ -74,20 +70,56 @@ pub(crate) fn adopt_received_builtin_states(
             hash: crate::archive_zet::content_hash(text),
             enabled,
         };
+        let next_bytes = serde_json::to_vec(&next).map_err(|_| "io_error")?;
         let backup = saved.join("skill-state").join(format!("{name}.json"));
-        fs::create_dir_all(backup.parent().ok_or("io_error")?).map_err(|_| "io_error")?;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(backup)
-            .map_err(|_| "io_error")?;
-        file.write_all(&before).map_err(|_| "io_error")?;
-        file.sync_all().map_err(|_| "io_error")?;
+        let parent = backup.parent().ok_or("io_error")?;
+        match fs::create_dir(parent) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = fs::symlink_metadata(parent).map_err(|_| "io_error")?;
+                if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
+                    return Err("conflict");
+                }
+            }
+            Err(_) => return Err("io_error"),
+        }
+        let original = match snapshot(&backup)? {
+            Some(original) => original,
+            None => {
+                let previous: State =
+                    serde_json::from_slice(&before).map_err(|_| "invalid_state")?;
+                if !previous.enabled || previous.hash != crate::archive_zet::content_hash(default) {
+                    return Err("conflict");
+                }
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&backup)
+                    .map_err(|_| "io_error")?;
+                file.write_all(&before).map_err(|_| "io_error")?;
+                file.sync_all().map_err(|_| "io_error")?;
+                before.clone()
+            }
+        };
+        let previous: State = serde_json::from_slice(&original).map_err(|_| "invalid_state")?;
+        if !previous.enabled || previous.hash != crate::archive_zet::content_hash(default) {
+            return Err("conflict");
+        }
+        if before == next_bytes {
+            continue;
+        }
+        if before != original {
+            return Err("conflict");
+        }
         apply(&[Change {
             path: state_file,
             before: Some(before),
-            after: Some(serde_json::to_vec(&next).map_err(|_| "io_error")?),
+            after: Some(next_bytes),
         }])?;
+        #[cfg(test)]
+        if std::env::var_os("MOMSO_C28_CRASH_DURING_SKILL").is_some() {
+            std::process::exit(73);
+        }
     }
     Ok(())
 }

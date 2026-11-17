@@ -2,7 +2,6 @@ import { W } from './words'
 // 보관함(읽는 글, 원본, 작업 기록) 명령을 부르는 얇은 층.
 // 화면은 이 파일의 함수만 쓴다. 명령의 모양은 momso-public-prep/archive-backend-port-notes.md 를 따른다.
 import { invoke } from '@tauri-apps/api/core'
-import { openUrl } from '@tauri-apps/plugin-opener'
 import { isDesktopRuntime } from './runtime'
 
 export type ZetKind = 'summary' | 'transcript' | 'note'
@@ -229,9 +228,10 @@ export async function searchSources(query: string) {
   return invoke<SourceSearchResult[]>('source_search', { query })
 }
 
+/** 웹 주소는 뒤쪽이 연다(open_external_url, 2026-11-17). 안쪽 주소(localhost·사설 IP·사용자 정보가 든 주소)는 invalid_url 로 거절된다. */
 export async function openWebAddress(address: string) {
   if (!isWebAddress(address)) throw new Error(W.archive.text1)
-  await openUrl(address)
+  await invoke('open_external_url', { url: address })
 }
 
 export async function readReceipt(id: string) {

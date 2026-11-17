@@ -17,7 +17,7 @@ import { ArrowLeft, Check, FileText, PanelRight, Pencil, Plus, RefreshCw, Scroll
 import { MenuItem, RowMenu } from './ChatSidebar'
 import { SourceDeleteDialog, type SourceNotice } from './SourceDelete'
 import { openSourceAsset } from '../source-assets'
-import { isFirstReceiving } from '../restore-progress'
+import { isFirstReceiveRefusal, isFirstReceiving } from '../restore-progress'
 import {
   archiveErrorMessage,
   isChangedMeanwhileError,
@@ -1089,6 +1089,8 @@ function ZetDocumentView({
     } catch (reason) {
       setSaving(false)
       if (isChangedMeanwhileError(reason)) setChangedMeanwhile(true)
+      // 받는 동안이라 뒤쪽이 거절했으면(first_receive_in_progress) 받아 오는 동안의 그 글로.
+      else if (isFirstReceiveRefusal(reason)) setSaveError(W.restoreProgress.docBusy)
       else setSaveError(W.zetPanel.text38(archiveErrorMessage(reason, '')).trim())
       return false
     }
@@ -1743,7 +1745,7 @@ function RestoreConfirm({
       return
     } catch (reason) {
       if (!isUnsavedError(reason)) {
-        setError(archiveErrorMessage(reason, W.zetPanel.text64))
+        setError(isFirstReceiveRefusal(reason) ? W.restoreProgress.docBusy : archiveErrorMessage(reason, W.zetPanel.text64))
         setWorking(false)
         return
       }
@@ -1758,7 +1760,7 @@ function RestoreConfirm({
       await restoreZetVersion(id, entry.revision, true)
       onRestored()
     } catch (reason) {
-      setError(archiveErrorMessage(reason, W.zetPanel.text64))
+      setError(isFirstReceiveRefusal(reason) ? W.restoreProgress.docBusy : archiveErrorMessage(reason, W.zetPanel.text64))
       setWorking(false)
     }
   }

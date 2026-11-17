@@ -1,11 +1,88 @@
 //! Wrangler OAuth authentication and Cloudflare R2 transport.
 
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::PathBuf,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 
 // Deliberately no Debug or Serialize: credentials must not be returned to the AI.
+#[derive(Clone)]
 pub(crate) struct OAuthToken(String);
+
+const TOKEN_CACHE_TIME: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct TokenCache {
+    value: Option<(OAuthToken, Instant, u64)>,
+    generation: u64,
+}
+
+impl TokenCache {
+    fn invalidate_if_matches(&mut self, token: &OAuthToken) {
+        if self
+            .value
+            .as_ref()
+            .is_some_and(|(cached, _, _)| cached.0 == token.0)
+        {
+            self.value = None;
+        }
+    }
+}
+
+static TOKEN_CACHE: OnceLock<tokio::sync::Mutex<TokenCache>> = OnceLock::new();
+
+fn token_cache() -> &'static tokio::sync::Mutex<TokenCache> {
+    TOKEN_CACHE.get_or_init(|| tokio::sync::Mutex::new(TokenCache::default()))
+}
+
+async fn acquire_cached_token<F, Fut>(
+    cache: &tokio::sync::Mutex<TokenCache>,
+    cancel: CancellationToken,
+    fetch: F,
+) -> Result<(OAuthToken, Option<u64>), &'static str>
+where
+    F: FnOnce(CancellationToken) -> Fut,
+    Fut: Future<Output = Result<OAuthToken, &'static str>>,
+{
+    if cancel.is_cancelled() {
+        return Err("cancelled");
+    }
+    let mut cache = tokio::select! {
+        _ = cancel.cancelled() => return Err("cancelled"),
+        cache = cache.lock() => cache,
+    };
+    if cancel.is_cancelled() {
+        return Err("cancelled");
+    }
+    if let Some((token, until, _)) = &cache.value {
+        if Instant::now() < *until {
+            return Ok((token.clone(), None));
+        }
+    }
+    cache.value = None;
+    let token = fetch(cancel.clone()).await?;
+    if cancel.is_cancelled() {
+        return Err("cancelled");
+    }
+    cache.generation = cache.generation.wrapping_add(1);
+    let generation = cache.generation;
+    cache.value = Some((token.clone(), Instant::now() + TOKEN_CACHE_TIME, generation));
+    Ok((token, Some(generation)))
+}
+
+async fn invalidate_token(token: &OAuthToken) {
+    let mut cache = token_cache().lock().await;
+    cache.invalidate_if_matches(token);
+}
+
+async fn clear_token_cache() {
+    token_cache().lock().await.value = None;
+}
 
 static BUNDLED_NODE: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
 
@@ -195,11 +272,15 @@ pub(crate) async fn request(
     if actual_method == reqwest::Method::PUT {
         builder = builder.header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
     }
-    builder
+    let response = builder
         .body(body)
         .send()
         .await
-        .map_err(|_| "invalid_endpoint")
+        .map_err(|_| "invalid_endpoint")?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        invalidate_token(&token).await;
+    }
+    Ok(response)
 }
 
 impl R2Target {
@@ -395,6 +476,8 @@ pub(crate) async fn connect_approved(
     if login_account(cancel.clone()).await? != details.account {
         return Err("approval_stale");
     }
+    // A newly approved account must never reuse a token from a prior login.
+    clear_token_cache().await;
     let token = current_token(cancel.clone()).await?;
     if cancel.is_cancelled() {
         return Err("cancelled");
@@ -564,6 +647,22 @@ fn parse_auth_output(success: bool, stdout: &str) -> Result<OAuthToken, &'static
 }
 
 pub(crate) async fn current_token(cancel: CancellationToken) -> Result<OAuthToken, &'static str> {
+    let (token, generation) = acquire_cached_token(token_cache(), cancel, fetch_token).await?;
+    if let Some(generation) = generation {
+        tokio::spawn(async move {
+            tokio::time::sleep(TOKEN_CACHE_TIME).await;
+            let mut cache = token_cache().lock().await;
+            if cache.value.as_ref().is_some_and(|(_, until, current)| {
+                *current == generation && Instant::now() >= *until
+            }) {
+                cache.value = None;
+            }
+        });
+    }
+    Ok(token)
+}
+
+async fn fetch_token(cancel: CancellationToken) -> Result<OAuthToken, &'static str> {
     let output = run_wrangler(
         &["auth", "token", "--json"],
         Duration::from_secs(90),
@@ -627,6 +726,107 @@ pub(crate) async fn login_account(cancel: CancellationToken) -> Result<String, &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cached_oauth_is_shared_expires_and_rejects_stale_invalidation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = tokio::sync::Mutex::new(TokenCache::default());
+        let fetches = AtomicUsize::new(0);
+        let fetch = |_: CancellationToken| async {
+            let number = fetches.fetch_add(1, Ordering::SeqCst) + 1;
+            tokio::task::yield_now().await;
+            Ok(OAuthToken(format!("fake-token-{number}")))
+        };
+        let (one, two, three) = tokio::join!(
+            acquire_cached_token(&cache, CancellationToken::new(), fetch),
+            acquire_cached_token(&cache, CancellationToken::new(), fetch),
+            acquire_cached_token(&cache, CancellationToken::new(), fetch)
+        );
+        let (old, _) = one.unwrap();
+        assert_eq!(two.unwrap().0 .0, old.0);
+        assert_eq!(three.unwrap().0 .0, old.0);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        {
+            let mut state = cache.lock().await;
+            state.value.as_mut().unwrap().1 = Instant::now() - Duration::from_secs(1);
+        }
+        let (new, _) = acquire_cached_token(&cache, CancellationToken::new(), fetch)
+            .await
+            .unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        {
+            let mut state = cache.lock().await;
+            state.invalidate_if_matches(&old);
+            assert!(state.value.is_some());
+            state.invalidate_if_matches(&new);
+            assert!(state.value.is_none());
+        }
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            acquire_cached_token(&cache, cancelled, fetch).await,
+            Err("cancelled")
+        ));
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_response_discards_token_without_retrying_request() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = [0u8; 8192];
+            let n = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).starts_with("PUT "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let config = crate::object_store::Config {
+            provider: "cloudflare".into(),
+            endpoint: format!("http://{address}"),
+            region: "wrangleroauth".into(),
+            bucket: "momso-fixture".into(),
+            credential_id: "test".into(),
+            last_backup_at: None,
+            write_safety: Some(crate::object_store::WriteSafety::CheckThenWrite),
+        };
+        let keys = crate::object_store::Keys {
+            access_key_id: "fake".into(),
+            secret_access_key: "fixture-expired-token".into(),
+        };
+        {
+            let mut cache = token_cache().lock().await;
+            cache.value = Some((
+                OAuthToken(keys.secret_access_key.clone()),
+                Instant::now() + TOKEN_CACHE_TIME,
+                99,
+            ));
+        }
+        let response = request(
+            &config,
+            &keys,
+            reqwest::Method::PUT,
+            "momso/object-store/v1/data/test",
+            &[],
+            b"fixture".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(token_cache().lock().await.value.is_none());
+        server.join().unwrap();
+    }
 
     #[tokio::test]
     async fn creates_only_approved_bucket_and_refuses_existing_one() {

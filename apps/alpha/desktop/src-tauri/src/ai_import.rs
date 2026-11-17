@@ -1,9 +1,11 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 const DISCOVERY_LIMIT: usize = 80;
@@ -28,7 +30,6 @@ pub struct AiConversationPreview {
     project_label: Option<String>,
     message_count: usize,
     source_name: String,
-    source_locator: String,
     sample_messages: Vec<AiConversationMessage>,
 }
 
@@ -43,7 +44,6 @@ pub struct AiConversation {
     project_label: Option<String>,
     message_count: usize,
     source_name: String,
-    source_locator: String,
     messages: Vec<AiConversationMessage>,
 }
 
@@ -55,7 +55,6 @@ struct ParsedConversation {
     updated_at: Option<String>,
     project_label: Option<String>,
     source_name: String,
-    source_locator: String,
     messages: Vec<AiConversationMessage>,
 }
 
@@ -70,7 +69,6 @@ impl ParsedConversation {
             project_label: self.project_label.clone(),
             message_count: self.messages.len(),
             source_name: self.source_name.clone(),
-            source_locator: self.source_locator.clone(),
             sample_messages: self.messages.iter().take(5).cloned().collect(),
         }
     }
@@ -85,13 +83,12 @@ impl ParsedConversation {
             project_label: self.project_label,
             message_count: self.messages.len(),
             source_name: self.source_name,
-            source_locator: self.source_locator,
             messages: self.messages,
         }
     }
 }
 
-fn provider_root(provider: &str) -> Result<PathBuf, String> {
+pub(crate) fn provider_root(provider: &str) -> Result<PathBuf, String> {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
@@ -113,6 +110,11 @@ fn collect_jsonl_files(directory: &Path, files: &mut Vec<PathBuf>) {
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        if fs::symlink_metadata(&path)
+            .map_or(true, |m| crate::archive_location::is_link_or_reparse(&m))
+        {
+            continue;
+        }
         if file_type.is_dir() {
             collect_jsonl_files(&path, files);
         } else if file_type.is_file()
@@ -286,7 +288,6 @@ fn parse_codex_rows(rows: &[Value], path: &Path) -> Option<ParsedConversation> {
         updated_at,
         project_label: path_project_label(cwd),
         source_name,
-        source_locator: path.to_string_lossy().into_owned(),
         messages,
     })
 }
@@ -351,19 +352,28 @@ fn parse_claude_rows(rows: &[Value], path: &Path) -> Option<ParsedConversation> 
         updated_at,
         project_label: path_project_label(cwd),
         source_name,
-        source_locator: path.to_string_lossy().into_owned(),
         messages,
     })
 }
 
 fn parse_local_file(provider: &str, path: &Path) -> Result<Option<ParsedConversation>, String> {
-    let metadata = fs::metadata(path)
-        .map_err(|error| format!("채팅방 파일 정보를 읽지 못했습니다: {error}"))?;
+    let file = fs::File::open(path).map_err(|_| "invalid_conversation_id")?;
+    parse_opened_file(provider, file, path)
+}
+
+fn parse_opened_file(
+    provider: &str,
+    file: fs::File,
+    path: &Path,
+) -> Result<Option<ParsedConversation>, String> {
+    #[cfg(windows)]
+    if !crate::chat_items::opened_path_matches(&file, path) {
+        return Err("invalid_conversation_id".into());
+    }
+    let metadata = file.metadata().map_err(|_| "invalid_conversation_id")?;
     if metadata.len() > MAX_SESSION_BYTES {
         return Ok(None);
     }
-    let file =
-        fs::File::open(path).map_err(|error| format!("채팅방 파일을 열지 못했습니다: {error}"))?;
     let rows = BufReader::new(file)
         .lines()
         .map_while(Result::ok)
@@ -377,35 +387,70 @@ fn parse_local_file(provider: &str, path: &Path) -> Result<Option<ParsedConversa
     })
 }
 
-fn canonical_provider_root(provider: &str) -> Result<PathBuf, String> {
-    let root = provider_root(provider)?;
-    if !root.exists() {
-        return Ok(root);
-    }
-    root.canonicalize()
-        .map_err(|error| format!("로컬 채팅방 폴더를 확인하지 못했습니다: {error}"))
+#[derive(Default)]
+struct LocalResults(Mutex<HashMap<String, (String, PathBuf)>>);
+fn local_results() -> &'static LocalResults {
+    static RESULTS: OnceLock<LocalResults> = OnceLock::new();
+    RESULTS.get_or_init(LocalResults::default)
 }
 
-fn validated_source_path(provider: &str, locator: &str) -> Result<PathBuf, String> {
-    let root = canonical_provider_root(provider)?;
-    let path = PathBuf::from(locator)
-        .canonicalize()
-        .map_err(|error| format!("선택한 채팅방 파일을 찾지 못했습니다: {error}"))?;
-    if !path.starts_with(&root)
-        || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+fn safe_local_path(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| "invalid_conversation_id")?;
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || path.extension().and_then(|x| x.to_str()) != Some("jsonl")
     {
-        return Err("허용된 로컬 채팅방 폴더 밖의 파일은 읽을 수 없습니다".to_string());
+        return Err("invalid_conversation_id".into());
     }
-    Ok(path)
+    let mut current = root.to_path_buf();
+    for component in std::iter::once(None).chain(relative.components().map(Some)) {
+        if let Some(component) = component {
+            current.push(component.as_os_str());
+        }
+        let meta = fs::symlink_metadata(&current).map_err(|_| "invalid_conversation_id")?;
+        if crate::archive_location::is_link_or_reparse(&meta) {
+            return Err("invalid_conversation_id".into());
+        }
+    }
+    let canonical_root = root.canonicalize().map_err(|_| "invalid_conversation_id")?;
+    let canonical_path = path.canonicalize().map_err(|_| "invalid_conversation_id")?;
+    if !canonical_path.starts_with(canonical_root) {
+        return Err("invalid_conversation_id".into());
+    }
+    Ok(canonical_path)
 }
 
 pub fn discover_local(provider: &str) -> Result<Vec<AiConversationPreview>, String> {
     let root = provider_root(provider)?;
+    if let Some(parent) = root.parent() {
+        if fs::symlink_metadata(parent)
+            .is_ok_and(|m| crate::archive_location::is_link_or_reparse(&m))
+        {
+            return Err("invalid_conversation_id".into());
+        }
+    }
+    discover_in(provider, &root, local_results())
+}
+
+fn discover_in(
+    provider: &str,
+    root: &Path,
+    registry: &LocalResults,
+) -> Result<Vec<AiConversationPreview>, String> {
+    let mut results = registry.0.lock().map_err(|_| "unavailable")?;
+    results.retain(|_, (p, _)| p != provider);
     if !root.exists() {
         return Ok(Vec::new());
     }
+    if fs::symlink_metadata(root).map_or(true, |m| crate::archive_location::is_link_or_reparse(&m))
+    {
+        return Err("invalid_conversation_id".into());
+    }
     let mut files = Vec::new();
-    collect_jsonl_files(&root, &mut files);
+    collect_jsonl_files(root, &mut files);
     if provider == "claude-code" {
         files.retain(|path| is_primary_claude_session(path));
     }
@@ -419,8 +464,15 @@ pub fn discover_local(provider: &str) -> Result<Vec<AiConversationPreview>, Stri
 
     let mut previews = Vec::new();
     for path in files.into_iter().take(DISCOVERY_LIMIT) {
-        if let Some(conversation) = parse_local_file(provider, &path)? {
-            previews.push(conversation.preview());
+        let Ok(safe) = safe_local_path(root, &path) else {
+            continue;
+        };
+        if let Some(conversation) = parse_local_file(provider, &safe)? {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut preview = conversation.preview();
+            preview.id = id.clone();
+            results.insert(id, (provider.to_owned(), path));
+            previews.push(preview);
         }
     }
     Ok(previews)
@@ -442,12 +494,36 @@ fn is_primary_claude_session(path: &Path) -> bool {
     })
 }
 
-pub fn load_local(provider: &str, locators: &[String]) -> Result<Vec<AiConversation>, String> {
+pub fn load_local(provider: &str, ids: &[String]) -> Result<Vec<AiConversation>, String> {
+    let root = provider_root(provider)?;
+    if let Some(parent) = root.parent() {
+        if fs::symlink_metadata(parent)
+            .is_ok_and(|m| crate::archive_location::is_link_or_reparse(&m))
+        {
+            return Err("invalid_conversation_id".into());
+        }
+    }
+    load_in(provider, &root, ids, local_results())
+}
+
+fn load_in(
+    provider: &str,
+    root: &Path,
+    ids: &[String],
+    registry: &LocalResults,
+) -> Result<Vec<AiConversation>, String> {
+    let results = registry.0.lock().map_err(|_| "unavailable")?;
     let mut conversations = Vec::new();
-    for locator in locators {
-        let path = validated_source_path(provider, locator)?;
+    for id in ids {
+        let (saved_provider, saved_path) = results.get(id).ok_or("invalid_conversation_id")?;
+        if saved_provider != provider {
+            return Err("invalid_conversation_id".into());
+        }
+        let path = safe_local_path(root, saved_path)?;
         if let Some(conversation) = parse_local_file(provider, &path)? {
-            conversations.push(conversation.into_conversation());
+            let mut result = conversation.into_conversation();
+            result.id = id.clone();
+            conversations.push(result);
         }
     }
     Ok(conversations)
@@ -456,6 +532,79 @@ pub fn load_local(provider: &str, locators: &[String]) -> Result<Vec<AiConversat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn opened_conversation_handle_cannot_point_outside_selected_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let expected = temp.path().join("expected.jsonl");
+        let outside = temp.path().join("outside.jsonl");
+        fs::write(&expected, "{}").unwrap();
+        fs::write(&outside, "{}").unwrap();
+        let handle = fs::File::open(&outside).unwrap();
+        assert!(parse_opened_file("codex", handle, &expected.canonicalize().unwrap()).is_err());
+    }
+
+    #[test]
+    fn discovery_uses_opaque_ids_and_rejects_unknown_or_outside_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("sessions");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("session.jsonl");
+        let data = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"fixture"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}),
+        ];
+        fs::write(
+            &file,
+            data.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let results = LocalResults::default();
+        let found = discover_in("codex", &root, &results).unwrap();
+        assert_eq!(found.len(), 1);
+        let id = found[0].id.clone();
+        assert!(!serde_json::to_string(&found[0])
+            .unwrap()
+            .contains(file.to_str().unwrap()));
+        assert_eq!(
+            load_in("codex", &root, std::slice::from_ref(&id), &results)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(load_in("codex", &root, &["invented".into()], &results).is_err());
+        assert!(load_in("claude-code", &root, std::slice::from_ref(&id), &results).is_err());
+        results.0.lock().unwrap().insert(
+            "outside".into(),
+            ("codex".into(), root.join("..").join("outside.jsonl")),
+        );
+        assert!(load_in("codex", &root, &["outside".into()], &results).is_err());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let outside = tmp.path().join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            fs::copy(&file, outside.join("linked.jsonl")).unwrap();
+            let junction = root.join("junction");
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(&outside)
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            results.0.lock().unwrap().insert(
+                "link".into(),
+                ("codex".into(), junction.join("linked.jsonl")),
+            );
+            assert!(load_in("codex", &root, &["link".into()], &results).is_err());
+        }
+    }
 
     #[test]
     fn parses_codex_user_and_assistant_messages_without_runtime_context() {

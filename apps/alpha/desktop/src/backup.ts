@@ -12,7 +12,8 @@ import { listen } from '@tauri-apps/api/event'
 import { isDesktopRuntime } from './runtime'
 
 export type RemoteStatus = {
-  state: 'not_connected' | 'connected' | 'unavailable'
+  /** redactionPending: 바꾼 키를 채팅방 사본에서 가리는 동안이라 올리기를 미뤘다(2026-11-17, 올리기 결과). */
+  state: 'not_connected' | 'connected' | 'unavailable' | 'redactionPending'
   reason: string | null
   /** 예전 계약의 이력 까닭. 2026-11-16 그의 결정(사용자 정보도 올림) 뒤로 뒤쪽은 늘 null 을 준다. 화면은 쓰지 않는다. */
   historyReason?: string | null
@@ -30,6 +31,9 @@ export type RemoteStatus = {
   autoMerged?: boolean
   preservedDocuments?: string[]
   conflictPaths?: string[] | null
+  /** 2026-11-17: 올린 기록에서 찾은 옛 키가 있는지(올리기 결과), 가리지 못하고 기한이 지난 옛 키가 있는지(상태). */
+  uploadedKeyFound?: boolean | null
+  expiredKeyWarning?: boolean | null
 }
 
 export type StoreProvider = 'aws' | 'gcp' | 'cloudflare' | 'ncp'

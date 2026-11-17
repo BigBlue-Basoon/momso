@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { open as openDialog } from '@tauri-apps/plugin-dialog'
+import { isSelectionExpired, selectLocalPaths } from '../runtime'
 import { LoaderCircle } from 'lucide-react'
 import { errorState } from '../backup'
 import { cancelChatImport, importChatExportWithProgress, previewChatExport, type ChatImportPreview, type ChatImportSource } from '../chats'
@@ -9,8 +9,8 @@ import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 const SOURCES: Array<{ id: ChatImportSource; mark: ProviderMarkId; ready: boolean }> = [
   { id: 'chatgpt', mark: 'chatgpt', ready: true },
   { id: 'claude', mark: 'claude', ready: true },
-  // 제미나이 내보내기는 뒤쪽이 아직 읽지 못한다(unsupported_format). 줄은 두되 고르기 단추는 없다.
-  { id: 'gemini', mark: 'gemini', ready: false },
+  // 제미나이: 2026-11-17 뒤쪽이 구글 데이터 내보내기의 JSON 과 zip 을 읽는다(HTML 이면 gemini_json_required, 64MiB 넘으면 gemini_file_too_large).
+  { id: 'gemini', mark: 'gemini', ready: true },
 ]
 
 type Step =
@@ -39,13 +39,16 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
   const busy = step?.kind === 'counting' || step?.kind === 'importing'
 
   function failure(source: ChatImportSource, error: unknown) {
+    // 고른 지 5분이 지나 뒤쪽이 거절하면(selection_required) 다시 고르라는 한 줄.
+    if (isSelectionExpired(error)) { setStep({ kind: 'result', source, text: W.selectAgain, failed: true }); return }
     const state = errorState(error)
     setStep({ kind: 'result', source, text: (state && words.reason[state]) || words.failed, failed: true })
   }
 
   async function pick(source: ChatImportSource) {
     if (busy) return
-    const picked = await openDialog({ multiple: false, directory: false, filters: [{ name: words.fileKind, extensions: ['zip', 'json'] }] }).catch(() => null)
+    // 고르는 창은 뒤쪽이 연다(select_local_paths conversation: JSON·JSONL·ZIP). 한 개만 쓴다. 취소하면 빈 배열.
+    const picked = (await selectLocalPaths('conversation').catch(() => [] as string[]))[0]
     if (typeof picked !== 'string') return
     setStep({ kind: 'counting', source })
     try {

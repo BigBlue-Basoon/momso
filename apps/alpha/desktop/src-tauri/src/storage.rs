@@ -6,7 +6,7 @@ use std::{
 };
 use thiserror::Error;
 
-const LATEST_SCHEMA_VERSION: u32 = 92;
+const LATEST_SCHEMA_VERSION: u32 = 93;
 const MAX_AUTOMATED_BACKUPS: usize = 5;
 
 struct Migration {
@@ -191,6 +191,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "build chat search index in background",
         sql: include_str!("../migrations/0092_chat_search_deferred.sql"),
     },
+    Migration {
+        version: 93,
+        description: "preserve masked chat fields",
+        sql: include_str!("../migrations/0093_chat_redaction_preserved.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -214,11 +219,48 @@ pub(crate) struct StorageStatus {
     pub(crate) health: &'static str,
 }
 
+#[cfg(test)]
+pub(crate) fn initialize_before_chat_redaction_for_test(database_path: &Path) {
+    let mut connection = open_connection(database_path).unwrap();
+    configure_writable_storage(&connection).unwrap();
+    for migration in MIGRATIONS.iter().filter(|item| item.version <= 89) {
+        apply_migration(&mut connection, migration).unwrap();
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn initialize(
     database_path: &Path,
     backups_path: &Path,
     app_version: &str,
 ) -> Result<StorageStatus, StorageError> {
+    initialize_with_progress(database_path, backups_path, app_version, |_| {})
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StartupProgress {
+    pub(crate) state: &'static str,
+    pub(crate) completed: u8,
+    pub(crate) total: u8,
+    pub(crate) available: bool,
+}
+
+pub(crate) fn initialize_with_progress(
+    database_path: &Path,
+    backups_path: &Path,
+    app_version: &str,
+    mut progress: impl FnMut(StartupProgress),
+) -> Result<StorageStatus, StorageError> {
+    let emit = |progress: &mut dyn FnMut(StartupProgress), state, completed, available| {
+        progress(StartupProgress {
+            state,
+            completed,
+            total: 4,
+            available,
+        });
+    };
+    emit(&mut progress, "checking", 0, false);
     let had_existing_data = database_path
         .metadata()
         .map(|metadata| metadata.len() > 0)
@@ -226,24 +268,42 @@ pub(crate) fn initialize(
     let mut connection = open_connection(database_path)?;
     ensure_supported_schema(&connection)?;
 
-    if had_existing_data {
-        check_integrity(&connection)?;
-    }
-    configure_writable_storage(&connection)?;
-
     let pending = pending_migrations(&connection, MIGRATIONS)?;
     let has_pending_migrations = !pending.is_empty();
+    // A migration backup is checked before any migration runs. Rechecking the
+    // unchanged source first would scan the same database twice.
+    if had_existing_data && !has_pending_migrations {
+        check_integrity(&connection)?;
+    }
+    emit(
+        &mut progress,
+        if had_existing_data && has_pending_migrations {
+            "backup"
+        } else if has_pending_migrations {
+            "migrating"
+        } else {
+            "checking"
+        },
+        1,
+        false,
+    );
     if had_existing_data && has_pending_migrations {
         create_backup(&connection, backups_path, "pre-migration")?;
         prune_automated_backups(backups_path)?;
     }
+    configure_writable_storage(&connection)?;
 
+    emit(&mut progress, "migrating", 2, false);
     for migration in pending {
         apply_migration(&mut connection, migration)?;
     }
 
     record_runtime_state(&mut connection, app_version)?;
-    check_integrity(&connection)?;
+    if !had_existing_data || has_pending_migrations {
+        emit(&mut progress, "checking", 3, false);
+        check_integrity(&connection)?;
+    }
+    emit(&mut progress, "storageReady", 4, false);
 
     Ok(StorageStatus {
         schema_version: schema_version(&connection)?,
@@ -306,6 +366,10 @@ pub(crate) fn sanitize_user_owned_backup_snapshot(path: &Path) -> Result<(), Sto
     connection.execute("DELETE FROM feedback_outbox", [])?;
     connection.execute("DELETE FROM momso_operation_runs", [])?;
     connection.execute("DELETE FROM ai_usage_events", [])?;
+    connection.execute(
+        "DELETE FROM app_runtime_meta WHERE key=?1",
+        [crate::archive_remote::FIRST_RECEIVE_JOURNAL],
+    )?;
     drop(connection);
     validate_snapshot_file(path)
 }
@@ -746,7 +810,16 @@ fn create_backup(
         destination.busy_timeout(Duration::from_secs(5))?;
         {
             let backup = Backup::new(source, &mut destination)?;
-            backup.run_to_completion(128, Duration::from_millis(10), None)?;
+            loop {
+                match backup.step(1024)? {
+                    rusqlite::backup::StepResult::Done => break,
+                    rusqlite::backup::StepResult::More => {}
+                    rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => return Err(StorageError::Integrity("backup did not complete".into())),
+                }
+            }
         }
         check_integrity(&destination)?;
         Ok(())
@@ -816,6 +889,23 @@ mod tests {
     }
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn startup_progress_reports_phases_without_paths_or_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("app.db");
+        let mut states = Vec::new();
+        initialize_with_progress(&db, &temp.path().join("backups"), "fixture", |p| {
+            states.push(p)
+        })
+        .unwrap();
+        assert_eq!(states.first().unwrap().state, "checking");
+        assert_eq!(states.last().unwrap().state, "storageReady");
+        assert!(!states.last().unwrap().available);
+        assert!(!serde_json::to_string(&states)
+            .unwrap()
+            .contains(temp.path().to_string_lossy().as_ref()));
+    }
 
     #[test]
     fn pending_chat_deletion_survives_upgrade_without_deleting_live_chat() {
@@ -1540,6 +1630,7 @@ mod tests {
                 [],
             )
             .expect("operation queues");
+        connection.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES(?1,'pending',CURRENT_TIMESTAMP)", [crate::archive_remote::FIRST_RECEIVE_JOURNAL]).unwrap();
         drop(connection);
 
         create_snapshot_file(&database_path, &snapshot_path).expect("snapshot creates");
@@ -1567,6 +1658,16 @@ mod tests {
         assert_eq!(snapshot_count, 0);
         assert_eq!(source_operations, 1);
         assert_eq!(snapshot_operations, 0);
+        let journal_count = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM app_runtime_meta WHERE key=?1",
+                [crate::archive_remote::FIRST_RECEIVE_JOURNAL],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(journal_count(&source), 1);
+        assert_eq!(journal_count(&snapshot), 0);
     }
 
     #[test]

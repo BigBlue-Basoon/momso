@@ -38,6 +38,8 @@ fn import_storage_error(error: rusqlite::Error) -> &'static str {
     }
 }
 const MAX_ENTRIES: usize = 100_000;
+const GEMINI_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const GEMINI_GROUP_MINUTES: i64 = 30;
 static RUNNING: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 fn running() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
     RUNNING.get_or_init(|| Mutex::new(HashMap::new()))
@@ -212,6 +214,9 @@ fn text_parts(v: &Value) -> Option<String> {
         return Some(s.to_owned());
     }
     if let Some(a) = v.as_array() {
+        if let [only] = a.as_slice() {
+            return text_parts(only);
+        }
         let pieces: Vec<_> = a.iter().filter_map(text_parts).collect();
         return (!pieces.is_empty()).then(|| pieces.join("\n"));
     }
@@ -271,7 +276,7 @@ fn insert_message(
     message: &ImportedMessage,
 ) -> Result<(), String> {
     let id = Uuid::new_v4().to_string();
-    tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,provider,model) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![id, chat, message.role, message.text, message.time, if message.role == "assistant" { Some(provider) } else { None }, message.model]).map_err(import_storage_error)?;
+    tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,provider,model) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![id, chat, message.role, message.text, message.time, if message.role == "assistant" { crate::chat::canonical_provider(Some(provider)) } else { None }, message.model]).map_err(import_storage_error)?;
     record_source(tx, chat, ordinal, &id, message)
 }
 
@@ -415,7 +420,8 @@ fn import_one(
         obj.get("uuid").or_else(|| obj.get("id"))
     }
     .and_then(Value::as_str)
-    .filter(|s| !s.is_empty());
+    .filter(|s| !s.is_empty())
+    .map(str::to_owned);
     let Some(source) = source else {
         counts.skipped += 1;
         return Ok(());
@@ -423,11 +429,36 @@ fn import_one(
     let existing_chat: Option<String> = tx
         .query_row(
             "SELECT chat_id FROM chat_imports WHERE source_provider=?1 AND source_id=?2",
-            params![provider, source],
+            params![provider, &source],
             |row| row.get(0),
         )
         .optional()
         .map_err(import_storage_error)?;
+    let title = obj
+        .get(if provider == "chatgpt" {
+            "title"
+        } else {
+            "name"
+        })
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let created = timestamp(
+        obj.get(if provider == "chatgpt" {
+            "create_time"
+        } else {
+            "created_at"
+        })
+        .unwrap_or(&Value::Null),
+    );
+    let updated = timestamp(
+        obj.get(if provider == "chatgpt" {
+            "update_time"
+        } else {
+            "updated_at"
+        })
+        .unwrap_or(&Value::Null),
+    );
     let mut messages: Vec<(&Value, &str, Option<&str>)> = Vec::new();
     if provider == "chatgpt" {
         let mapping = obj
@@ -527,6 +558,7 @@ fn import_one(
             })
         })
         .collect();
+    drop(value);
     if messages.is_empty() {
         counts.skipped += 1;
         return Ok(());
@@ -544,30 +576,6 @@ fn import_one(
         return update_existing(tx, &id, provider, &messages, counts);
     }
     let id = format!("chat_{}", Uuid::new_v4());
-    let title = obj
-        .get(if provider == "chatgpt" {
-            "title"
-        } else {
-            "name"
-        })
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let created = timestamp(
-        obj.get(if provider == "chatgpt" {
-            "create_time"
-        } else {
-            "created_at"
-        })
-        .unwrap_or(&Value::Null),
-    );
-    let updated = timestamp(
-        obj.get(if provider == "chatgpt" {
-            "update_time"
-        } else {
-            "updated_at"
-        })
-        .unwrap_or(&Value::Null),
-    );
     tx.execute(
         "INSERT INTO chats(id,title,created_at,updated_at) VALUES(?1,?2,?3,?4)",
         params![id, title, created, updated],
@@ -606,10 +614,12 @@ impl<'de> Visitor<'de> for ArraySeed<'_, '_> {
         f.write_str("conversation array")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        while let Some(v) = seq.next_element::<Value>()? {
+        while let Some(raw) = seq.next_element::<Box<serde_json::value::RawValue>>()? {
             if self.cancelled.load(Ordering::SeqCst) {
                 return Err(A::Error::custom("cancelled"));
             }
+            let v: Value = serde_json::from_str(raw.get()).map_err(A::Error::custom)?;
+            drop(raw);
             if let Err(error) = import_one(self.tx, self.provider, v, self.counts) {
                 *self.operation_error = Some(error);
                 return Err(A::Error::custom("import operation failed"));
@@ -656,6 +666,356 @@ pub(crate) fn import(db: &Path, file: &Path, provider: &str) -> Result<ResultCou
     import_controlled(db, file, provider, &AtomicBool::new(false), &|_| {})
 }
 
+#[derive(Debug)]
+struct GeminiTurn {
+    time: DateTime<Utc>,
+    prompt: String,
+    answer: Option<String>,
+}
+
+fn gemini_html_text(html: &str) -> String {
+    let fragment = scraper::Html::parse_fragment(html);
+    let mut result = String::new();
+    for node in fragment.root_element().descendants() {
+        match node.value() {
+            scraper::Node::Text(text) => result.push_str(text),
+            scraper::Node::Element(element)
+                if matches!(element.name(), "p" | "div" | "br" | "li" | "pre")
+                    && !result.is_empty()
+                    && !result.ends_with('\n') =>
+            {
+                result.push('\n');
+            }
+            _ => {}
+        }
+    }
+    result.trim().to_owned()
+}
+
+fn gemini_record(value: &Value) -> Option<GeminiTurn> {
+    let is_gemini = value
+        .get("header")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.to_lowercase().contains("gemini") || s.contains("제미나이"))
+        || value
+            .get("products")
+            .and_then(Value::as_array)
+            .is_some_and(|products| {
+                products
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|s| s.to_lowercase().contains("gemini") || s.contains("제미나이"))
+            })
+        || value
+            .get("titleUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.starts_with("https://gemini.google.com/"));
+    if !is_gemini {
+        return None;
+    }
+    let title = value.get("title")?.as_str()?.trim();
+    let prompt = title.strip_prefix("Prompted ").unwrap_or(title).trim();
+    let time = DateTime::parse_from_rfc3339(value.get("time")?.as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    if prompt.is_empty() {
+        return None;
+    }
+    let answer = value
+        .get("safeHtmlItem")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.get("html").and_then(Value::as_str))
+                .map(gemini_html_text)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| !s.is_empty());
+    Some(GeminiTurn {
+        time,
+        prompt: prompt.to_owned(),
+        answer,
+    })
+}
+
+fn gemini_parse<R: Read>(reader: R) -> Result<(Vec<GeminiTurn>, u64), String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(GEMINI_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "file_error")?;
+    if bytes.len() as u64 > GEMINI_MAX_BYTES {
+        return Err("gemini_file_too_large".into());
+    }
+    let items: Vec<Value> = serde_json::from_slice(&bytes).map_err(|_| "unsupported_format")?;
+    let mut turns = Vec::new();
+    let mut skipped = 0;
+    for item in items {
+        if let Some(turn) = gemini_record(&item) {
+            turns.push(turn);
+        } else {
+            skipped += 1;
+        }
+    }
+    if turns.is_empty() {
+        return Err("unsupported_format".into());
+    }
+    turns.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.prompt.cmp(&b.prompt)));
+    Ok((turns, skipped))
+}
+
+fn gemini_groups(turns: Vec<GeminiTurn>) -> Vec<Value> {
+    let mut groups: Vec<Vec<GeminiTurn>> = Vec::new();
+    for turn in turns {
+        let same_group = groups.last().and_then(|g| g.last()).is_some_and(|last| {
+            turn.time.date_naive() == last.time.date_naive()
+                && turn.time.signed_duration_since(last.time).num_seconds()
+                    <= GEMINI_GROUP_MINUTES * 60
+        });
+        if !same_group {
+            groups.push(Vec::new());
+        }
+        groups.last_mut().unwrap().push(turn);
+    }
+    groups.into_iter().map(|group| {
+        let first = &group[0];
+        let id = format!("gemini-{}", first.time.to_rfc3339());
+        let title: String = first.prompt.chars().take(80).collect();
+        let created = first.time.to_rfc3339();
+        let updated = group.last().unwrap().time.to_rfc3339();
+        let mut messages = Vec::new();
+        for turn in group {
+            let time = turn.time.to_rfc3339();
+            let message_id = format!("gemini-{time}");
+            messages.push(serde_json::json!({"uuid":format!("{message_id}-user"), "sender":"human", "text":turn.prompt, "created_at":time}));
+            if let Some(answer) = turn.answer {
+                messages.push(serde_json::json!({"uuid":format!("{message_id}-assistant"), "sender":"assistant", "text":answer, "created_at":time}));
+            }
+        }
+        serde_json::json!({"uuid":id, "name":title, "created_at":created, "updated_at":updated, "chat_messages":messages})
+    }).collect()
+}
+
+fn gemini_load(file: &Path) -> Result<(Vec<Value>, u64), String> {
+    let f = File::open(file).map_err(file_open_error)?;
+    if file
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("html") || s.eq_ignore_ascii_case("htm"))
+    {
+        return Err("gemini_json_required".into());
+    }
+    if !file
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("zip"))
+    {
+        let (turns, skipped) = gemini_parse(f)?;
+        return Ok((gemini_groups(turns), skipped));
+    }
+    let mut zip = zip::ZipArchive::new(f).map_err(|_| "unsupported_format")?;
+    if zip.len() > MAX_ENTRIES {
+        return Err("archive_limit".into());
+    }
+    let mut all = Vec::new();
+    let mut skipped = 0;
+    let mut total_bytes: u64 = 0;
+    let mut has_html = false;
+    for i in 0..zip.len() {
+        let entry = zip.by_index(i).map_err(|_| "unsupported_format")?;
+        let name = entry.name().rsplit('/').next().unwrap_or("");
+        if name.eq_ignore_ascii_case("MyActivity.html")
+            || name.eq_ignore_ascii_case("MyActivity.htm")
+        {
+            has_html = true;
+        }
+        if !name.eq_ignore_ascii_case("MyActivity.json") {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(entry.size());
+        if total_bytes > GEMINI_MAX_BYTES {
+            return Err("gemini_file_too_large".into());
+        }
+        if entry.size() > GEMINI_MAX_BYTES {
+            return Err("gemini_file_too_large".into());
+        }
+        match gemini_parse(entry) {
+            Ok((mut turns, count)) => {
+                all.append(&mut turns);
+                skipped += count;
+            }
+            Err(e) if e == "unsupported_format" => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if all.is_empty() {
+        if has_html {
+            return Err("gemini_json_required".into());
+        }
+        return Err("unsupported_format".into());
+    }
+    all.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.prompt.cmp(&b.prompt)));
+    Ok((gemini_groups(all), skipped))
+}
+
+#[derive(Default)]
+struct GeminiPartition {
+    groups: Vec<Value>,
+    duplicate: u64,
+    duplicate_groups: u64,
+    conflicts: u64,
+}
+
+fn gemini_partition(db: &Connection, groups: Vec<Value>) -> Result<GeminiPartition, String> {
+    let mut incoming: HashMap<String, usize> = HashMap::new();
+    for message in groups
+        .iter()
+        .filter_map(|group| group.get("chat_messages").and_then(Value::as_array))
+        .flatten()
+    {
+        let id = message
+            .get("uuid")
+            .and_then(Value::as_str)
+            .ok_or("unsupported_format")?;
+        *incoming.entry(id.to_owned()).or_default() += 1;
+    }
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_import_message_state')", [], |row| row.get(0)).map_err(import_storage_error)?;
+    let mut known: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    if exists {
+        let mut query = db.prepare("SELECT s.source_message_id,s.fingerprint,m.text FROM chat_import_message_state s JOIN chat_messages m ON m.id=s.message_id JOIN chat_imports i ON i.chat_id=s.chat_id WHERE i.source_provider='gemini' AND s.source_message_id IS NOT NULL").map_err(import_storage_error)?;
+        let mut rows = query.query([]).map_err(import_storage_error)?;
+        while let Some(row) = rows.next().map_err(import_storage_error)? {
+            let id: String = row.get(0).map_err(import_storage_error)?;
+            if incoming.contains_key(&id) {
+                let fingerprint = row.get(1).map_err(import_storage_error)?;
+                let text = row.get(2).map_err(import_storage_error)?;
+                known.entry(id).or_default().push((fingerprint, text));
+            }
+        }
+    }
+    let mut result = GeminiPartition::default();
+    for group in groups {
+        let previous_duplicate = result.duplicate;
+        let previous_conflicts = result.conflicts;
+        let mut group_turns = 0;
+        let messages = group
+            .get("chat_messages")
+            .and_then(Value::as_array)
+            .ok_or("unsupported_format")?;
+        let mut pending: Vec<Value> = Vec::new();
+        let flush = |pending: &mut Vec<Value>,
+                     result: &mut GeminiPartition|
+         -> Result<(), String> {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let first = &pending[0];
+            let time = first
+                .get("created_at")
+                .and_then(Value::as_str)
+                .ok_or("unsupported_format")?;
+            let prompt = first
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or("unsupported_format")?;
+            let last = pending
+                .last()
+                .and_then(|m| m.get("created_at"))
+                .and_then(Value::as_str)
+                .unwrap_or(time);
+            result.groups.push(serde_json::json!({"uuid":format!("gemini-{time}"),"name":prompt.chars().take(80).collect::<String>(),"created_at":time,"updated_at":last,"chat_messages":pending}));
+            pending.clear();
+            Ok(())
+        };
+        let mut index = 0;
+        while index < messages.len() {
+            group_turns += 1;
+            let user = &messages[index];
+            let mut end = index + 1;
+            if messages
+                .get(end)
+                .and_then(|m| m.get("sender"))
+                .and_then(Value::as_str)
+                == Some("assistant")
+            {
+                end += 1;
+            }
+            let matching = |item: &Value| -> Result<Option<bool>, String> {
+                let id = item
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .ok_or("unsupported_format")?;
+                let role = if item.get("sender").and_then(Value::as_str) == Some("human") {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                let text = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or("unsupported_format")?;
+                let candidate = fingerprint(role, text);
+                Ok(known.get(id).map(|saved| {
+                    saved.iter().any(|(hash, previous)| {
+                        hash == &candidate
+                            || (hash == "redacted-v1"
+                                && saved.len() == 1
+                                && incoming.get(id) == Some(&1)
+                                && matches_redacted_message(previous, text))
+                    })
+                }))
+            };
+            match matching(user)? {
+                Some(true) => {
+                    flush(&mut pending, &mut result)?;
+                    if end > index + 1 && matching(&messages[index + 1])? != Some(true) {
+                        result.conflicts += 1;
+                    } else {
+                        result.duplicate += 1;
+                    }
+                }
+                Some(false) => {
+                    flush(&mut pending, &mut result)?;
+                    result.conflicts += 1;
+                }
+                None => {
+                    for item in &messages[index..end] {
+                        let item_id = item
+                            .get("uuid")
+                            .and_then(Value::as_str)
+                            .ok_or("unsupported_format")?;
+                        let role = if item.get("sender").and_then(Value::as_str) == Some("human") {
+                            "user"
+                        } else {
+                            "assistant"
+                        };
+                        let item_text = item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .ok_or("unsupported_format")?;
+                        known
+                            .entry(item_id.to_owned())
+                            .or_default()
+                            .push((fingerprint(role, item_text), item_text.to_owned()));
+                        pending.push(item.clone());
+                    }
+                }
+            }
+            index = end;
+        }
+        flush(&mut pending, &mut result)?;
+        if result.duplicate - previous_duplicate == group_turns
+            && result.conflicts == previous_conflicts
+        {
+            result.duplicate_groups += 1;
+        }
+    }
+    Ok(result)
+}
+
 pub(crate) fn import_controlled(
     db: &Path,
     file: &Path,
@@ -663,10 +1023,7 @@ pub(crate) fn import_controlled(
     cancelled: &AtomicBool,
     progress: &dyn Fn(u64),
 ) -> Result<ResultCounts, String> {
-    if provider == "gemini" {
-        return Err("unsupported_format".into());
-    }
-    if !matches!(provider, "chatgpt" | "claude") {
+    if !matches!(provider, "chatgpt" | "claude" | "gemini") {
         return Err("unsupported_provider".into());
     }
     let mut db = Connection::open(db).map_err(import_storage_error)?;
@@ -676,6 +1033,26 @@ pub(crate) fn import_controlled(
     tx.execute_batch("CREATE TABLE IF NOT EXISTS chat_import_message_state (chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE, ordinal INTEGER NOT NULL, message_id TEXT NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE, source_message_id TEXT, fingerprint TEXT NOT NULL, PRIMARY KEY(chat_id,ordinal))").map_err(import_storage_error)?;
     let mut counts = ResultCounts::default();
     let mut processed = 0;
+    if provider == "gemini" {
+        let (groups, skipped) = gemini_load(file)?;
+        let partition = gemini_partition(&tx, groups)?;
+        counts.skipped = skipped;
+        counts.duplicate = partition.duplicate;
+        counts.conflicts = partition.conflicts;
+        for group in partition.groups {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err("cancelled".into());
+            }
+            import_one(&tx, provider, group, &mut counts)?;
+            processed += 1;
+            progress(processed);
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        tx.commit().map_err(import_storage_error)?;
+        return Ok(counts);
+    }
     let f = File::open(file).map_err(file_open_error)?;
     if file
         .extension()
@@ -744,6 +1121,12 @@ pub(crate) struct Preview {
     pub(crate) unreadable: u64,
     oldest: Option<String>,
     newest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gemini_new_items: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gemini_duplicate_items: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gemini_conflicting_items: Option<u64>,
 }
 
 struct PreviewSeed<'a> {
@@ -753,7 +1136,7 @@ struct PreviewSeed<'a> {
     operation_error: &'a mut Option<String>,
 }
 fn readable_conversation(v: &Value, provider: &str) -> bool {
-    if provider == "claude" {
+    if matches!(provider, "claude" | "gemini") {
         return v
             .get("chat_messages")
             .and_then(Value::as_array)
@@ -814,7 +1197,9 @@ impl<'de> Visitor<'de> for PreviewSeed<'_> {
         f.write_str("conversation array")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        while let Some(v) = seq.next_element::<Value>()? {
+        while let Some(raw) = seq.next_element::<Box<serde_json::value::RawValue>>()? {
+            let v: Value = serde_json::from_str(raw.get()).map_err(A::Error::custom)?;
+            drop(raw);
             self.result.conversations += 1;
             let source = if self.provider == "chatgpt" {
                 v.get("conversation_id").or_else(|| v.get("id"))
@@ -878,14 +1263,55 @@ fn preview_parse<R: Read>(
     de.end().map_err(|_| "invalid_format".to_string())
 }
 pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview, String> {
-    if provider == "gemini" {
-        return Err("unsupported_format".into());
-    }
-    if !matches!(provider, "chatgpt" | "claude") {
+    if !matches!(provider, "chatgpt" | "claude" | "gemini") {
         return Err("unsupported_provider".into());
     }
     let db = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(import_storage_error)?;
+    if provider == "gemini" {
+        let (groups, unreadable) = gemini_load(file)?;
+        let mut result = Preview {
+            unreadable,
+            conversations: groups.len() as u64,
+            ..Preview::default()
+        };
+        for group in &groups {
+            for (field, target) in [
+                ("created_at", &mut result.oldest),
+                ("updated_at", &mut result.newest),
+            ] {
+                if let Some(date) = group.get(field).and_then(Value::as_str) {
+                    if target.as_ref().is_none_or(|old| {
+                        if field == "created_at" {
+                            date < old.as_str()
+                        } else {
+                            date > old.as_str()
+                        }
+                    }) {
+                        *target = Some(date.to_owned());
+                    }
+                }
+            }
+        }
+        let partition = gemini_partition(&db, groups)?;
+        result.already_imported = partition.duplicate_groups;
+        result.gemini_new_items = Some(
+            partition
+                .groups
+                .iter()
+                .filter_map(|g| g.get("chat_messages").and_then(Value::as_array))
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|m| m.get("sender").and_then(Value::as_str) == Some("human"))
+                        .count() as u64
+                })
+                .sum(),
+        );
+        result.gemini_duplicate_items = Some(partition.duplicate);
+        result.gemini_conflicting_items = Some(partition.conflicts);
+        return Ok(result);
+    }
     let f = File::open(file).map_err(file_open_error)?;
     let mut result = Preview::default();
     if file
@@ -1021,6 +1447,264 @@ mod tests {
     }
 
     #[test]
+    fn gemini_json_preview_import_repeat_and_cancellation() {
+        let (dir, db) = fixture();
+        let file = dir.path().join("MyActivity.json");
+        let item = |prompt: &str, time: &str| {
+            serde_json::json!({
+                "header":"Gemini Apps", "products":["Gemini"], "title":format!("Prompted {prompt}"),
+                "time":time, "safeHtmlItem":[{"html":"<p>Answer &amp; details</p>"}], "unknown":true
+            })
+        };
+        std::fs::write(
+            &file,
+            serde_json::json!([
+                item("First question", "2026-01-01T10:00:00Z"),
+                item("Second question", "2026-01-01T10:25:00Z"),
+                item("Later question", "2026-01-01T11:00:00Z")
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let p = preview(&db, &file, "gemini").unwrap();
+        assert_eq!(p.conversations, 2);
+        let cancelled = AtomicBool::new(false);
+        assert!(
+            matches!(import_controlled(&db, &file, "gemini", &cancelled, &|_| cancelled.store(true, Ordering::SeqCst)), Err(e) if e == "cancelled")
+        );
+        assert_eq!(
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT count(*) FROM chats", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(import(&db, &file, "gemini").unwrap().imported, 2);
+        assert_eq!(import(&db, &file, "gemini").unwrap().duplicate, 3);
+        assert_eq!(preview(&db, &file, "gemini").unwrap().already_imported, 2);
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM chat_messages WHERE text='Answer & details'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        drop(connection);
+        let root = dir.path();
+        let archive_root = root.join("momso");
+        let archive =
+            crate::archive_location::ArchiveLocation::load(db.clone(), root, vec![]).unwrap();
+        crate::archive::initialize(&archive_root, root).unwrap();
+        let paths = crate::runtime::RuntimePaths {
+            data_root: root.to_path_buf(),
+            database_path: db.clone(),
+            objects_path: archive_root.join("objects"),
+            exports_path: root.join("exports"),
+            backups_path: root.join("backup"),
+            logs_path: root.join("logs"),
+            archive,
+            archive_lease: None,
+        };
+        crate::chat_archive_store::write_all(&archive_root, &paths).unwrap();
+        assert_eq!(
+            std::fs::read_dir(archive_root.join("chats"))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn gemini_rejects_empty_broken_and_other_google_activity() {
+        for bytes in [
+            &b"[]"[..],
+            &b"{"[..],
+            &b"[{\"header\":\"Search\",\"title\":\"query\",\"time\":\"2026-01-01T00:00:00Z\"}]"[..],
+        ] {
+            assert!(matches!(gemini_parse(bytes), Err(e) if e == "unsupported_format"));
+        }
+    }
+
+    #[test]
+    fn gemini_reexport_with_earlier_and_later_turns_has_no_duplicates() {
+        let (dir, db) = fixture();
+        let file = dir.path().join("MyActivity.json");
+        let turn = |n: i64| serde_json::json!({"header":"Gemini Apps", "title":format!("Prompted question {n}"), "time":DateTime::from_timestamp(1_800_000_000 + n * 60, 0).unwrap().to_rfc3339(), "safeHtmlItem":[{"html":format!("<p>answer {n}</p>")}]});
+        std::fs::write(
+            &file,
+            serde_json::json!((5..15).map(turn).collect::<Vec<_>>()).to_string(),
+        )
+        .unwrap();
+        assert_eq!(import(&db, &file, "gemini").unwrap().imported, 1);
+        std::fs::write(
+            &file,
+            serde_json::json!((0..18).map(turn).collect::<Vec<_>>()).to_string(),
+        )
+        .unwrap();
+        let preview = preview(&db, &file, "gemini").unwrap();
+        assert_eq!(preview.gemini_new_items, Some(8));
+        assert_eq!(preview.gemini_duplicate_items, Some(10));
+        let counts = import(&db, &file, "gemini").unwrap();
+        assert_eq!(
+            (counts.imported, counts.duplicate, counts.conflicts),
+            (2, 10, 0)
+        );
+        let db = Connection::open(&db).unwrap();
+        let (count, unique): (i64, i64) = db
+            .query_row(
+                "SELECT COUNT(*),COUNT(DISTINCT text) FROM chat_messages WHERE role='user'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, unique), (18, 18));
+    }
+
+    #[test]
+    fn gemini_same_timestamp_and_changed_answers_are_conflicts() {
+        let (dir, db) = fixture();
+        let file = dir.path().join("MyActivity.json");
+        let turn = |prompt: &str, answer: &str| serde_json::json!({"header":"Gemini Apps", "title":format!("Prompted {prompt}"), "time":"2026-01-01T10:00:00Z", "safeHtmlItem":[{"html":format!("<p>{answer}</p>")}]});
+        std::fs::write(
+            &file,
+            serde_json::json!([turn("first", "original")]).to_string(),
+        )
+        .unwrap();
+        assert_eq!(import(&db, &file, "gemini").unwrap().imported, 1);
+        std::fs::write(
+            &file,
+            serde_json::json!([turn("first", "changed"), turn("other", "answer")]).to_string(),
+        )
+        .unwrap();
+        let counts = import(&db, &file, "gemini").unwrap();
+        assert_eq!(
+            (counts.imported, counts.duplicate, counts.conflicts),
+            (0, 0, 2)
+        );
+        let db = Connection::open(&db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM chat_messages", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn gemini_redacted_match_requires_unique_timestamp() {
+        let (dir, db) = fixture();
+        let file = dir.path().join("MyActivity.json");
+        let turn = |prompt: &str| serde_json::json!({"header":"Gemini Apps", "title":format!("Prompted {prompt}"), "time":"2026-01-01T10:00:00Z"});
+        std::fs::write(&file, serde_json::json!([turn("common first")]).to_string()).unwrap();
+        assert_eq!(import(&db, &file, "gemini").unwrap().imported, 1);
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "UPDATE chat_messages SET text=?1 WHERE role='user'",
+                ["common [비밀값으로 보여 가림: 저장된 값]"],
+            )
+            .unwrap();
+        connection.execute("UPDATE chat_import_message_state SET fingerprint='redacted-v1' WHERE message_id IN (SELECT id FROM chat_messages WHERE role='user')", []).unwrap();
+        drop(connection);
+        assert_eq!(
+            preview(&db, &file, "gemini")
+                .unwrap()
+                .gemini_duplicate_items,
+            Some(1)
+        );
+        std::fs::write(
+            &file,
+            serde_json::json!([turn("common first"), turn("common second")]).to_string(),
+        )
+        .unwrap();
+        let counts = import(&db, &file, "gemini").unwrap();
+        assert_eq!(
+            (counts.imported, counts.duplicate, counts.conflicts),
+            (0, 0, 2)
+        );
+    }
+
+    #[test]
+    fn gemini_html_and_size_have_specific_reasons() {
+        use std::io::Write;
+        let (dir, db) = fixture();
+        let html = dir.path().join("MyActivity.html");
+        std::fs::write(&html, "<html></html>").unwrap();
+        assert!(matches!(preview(&db, &html, "gemini"), Err(e) if e == "gemini_json_required"));
+        let zip_path = dir.path().join("activity.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zip.start_file(
+            "Takeout/My Activity/Gemini Apps/MyActivity.html",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        write!(zip, "<html></html>").unwrap();
+        zip.finish().unwrap();
+        assert!(matches!(gemini_load(&zip_path), Err(e) if e == "gemini_json_required"));
+        assert!(
+            matches!(gemini_parse(std::io::repeat(b'x').take(GEMINI_MAX_BYTES+1)), Err(e) if e == "gemini_file_too_large")
+        );
+    }
+
+    #[test]
+    #[ignore = "set MOMSO_IMPORT_BENCH_FILE and MOMSO_IMPORT_BENCH_PROVIDER for a synthetic large export"]
+    fn benchmark_synthetic_large_export() {
+        let file = std::env::var_os("MOMSO_IMPORT_BENCH_FILE").expect("file");
+        let provider = std::env::var("MOMSO_IMPORT_BENCH_PROVIDER").expect("provider");
+        let (_dir, db) = fixture();
+        let counts = import(&db, Path::new(&file), &provider).unwrap();
+        assert_eq!(counts.imported, 1);
+    }
+
+    #[test]
+    fn gemini_zip_accepts_localized_folders() {
+        use std::io::Write;
+        let (dir, db) = fixture();
+        for folder in ["My Activity/Gemini Apps", "내 활동/Gemini 앱"] {
+            let archive = dir.path().join("gemini.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            zip.start_file(
+                format!("Takeout/{folder}/MyActivity.json"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            write!(zip, "{}", serde_json::json!([{"header":"Gemini Apps","title":"Prompted example", "time":"2026-01-01T00:00:00Z", "safeHtmlItem":[{"html":"<p>one</p><p>two</p>"}]}])).unwrap();
+            zip.finish().unwrap();
+            assert_eq!(preview(&db, &archive, "gemini").unwrap().conversations, 1);
+            let (groups, _) = gemini_load(&archive).unwrap();
+            assert_eq!(groups[0]["chat_messages"][1]["text"], "one\ntwo");
+        }
+    }
+
+    #[test]
+    #[ignore = "set MOMSO_GEMINI_EXPORT to inspect a real export without printing its contents"]
+    fn inspect_gemini_export_counts_only() {
+        let path = std::env::var_os("MOMSO_GEMINI_EXPORT").expect("MOMSO_GEMINI_EXPORT");
+        match gemini_load(Path::new(&path)) {
+            Ok((groups, unreadable)) => {
+                let items: usize = groups
+                    .iter()
+                    .filter_map(|group| group.get("chat_messages").and_then(Value::as_array))
+                    .map(|messages| {
+                        messages
+                            .iter()
+                            .filter(|message| {
+                                message.get("sender").and_then(Value::as_str) == Some("human")
+                            })
+                            .count()
+                    })
+                    .sum();
+                println!("items={items} groups={} unreadable={unreadable} reason=unrecognized_or_missing_fields", groups.len())
+            }
+            Err(reason) => println!("groups=0 unreadable=unknown reason={reason}"),
+        }
+    }
+
+    #[test]
     fn preview_counts_without_writing_and_cancel_rolls_back() {
         let (dir, db) = fixture();
         let file = dir.path().join("conversations.json");
@@ -1103,11 +1787,85 @@ mod tests {
         assert_eq!(detail["messages"][0]["text"], "  질문\n");
         assert!(detail["messages"][0]["createdAt"].is_null());
         assert_eq!(detail["messages"][1]["model"], "gpt-x");
+        assert_eq!(detail["messages"][1]["provider"], "codex");
         assert_eq!(detail["messages"].as_array().unwrap().len(), 2);
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT provider FROM chat_messages WHERE role='assistant'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "codex"
+        );
+        connection
+            .execute(
+                "UPDATE chat_messages SET provider='chatgpt' WHERE role='assistant'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let legacy = serde_json::to_value(crate::chat::read(&db, id).unwrap()).unwrap();
+        assert_eq!(legacy["messages"][1]["provider"], "codex");
+        assert_eq!(legacy["importedFrom"], "chatgpt");
+        crate::chat::set_archived(&db, id, true);
+        let archived = serde_json::to_value(crate::chat::archived_list(&db).unwrap()).unwrap();
+        assert_eq!(archived[0]["provider"], "codex");
+        let snapshot = crate::chat_archive_snapshot::snapshot(&db, id).unwrap();
+        assert_eq!(snapshot["messages"][1]["provider"], "codex");
+        assert_eq!(snapshot["imports"][0]["source_provider"], "chatgpt");
+        let mut old_snapshot = snapshot.clone();
+        old_snapshot["messages"][1]["provider"] = serde_json::json!("chatgpt");
+        assert!(crate::chat_archive_snapshot::merge_snapshots(&snapshot, &old_snapshot).is_ok());
+        assert_eq!(
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT provider FROM chat_messages WHERE role='assistant'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "chatgpt"
+        );
+        let resumed = crate::chat_handoff::prepare(&db, id, "codex", false, "계속").unwrap();
+        assert!(resumed.prompt.contains("  질문\n") && resumed.prompt.contains("답"));
+        assert!(crate::chat_codex::supported("codex"));
         let handoff = crate::chat_handoff::prepare(&db, id, "claude", false, "이어 질문").unwrap();
         assert!(handoff.prompt.contains("  질문\n"));
         assert!(handoff.prompt.contains("답"));
         assert!(!handoff.prompt.contains("다른 가지"));
+    }
+
+    #[test]
+    fn imported_claude_and_gemini_keep_canonical_provider_and_source() {
+        let (dir, db) = fixture();
+        let claude = dir.path().join("claude.json");
+        std::fs::write(&claude, serde_json::json!([{"uuid":"claude-room","chat_messages":[{"sender":"assistant","text":"answer"}]}]).to_string()).unwrap();
+        import(&db, &claude, "claude").unwrap();
+        let gemini = dir.path().join("gemini.json");
+        std::fs::write(&gemini, serde_json::json!([{"header":"Gemini Apps","title":"Prompted question","time":"2026-01-01T10:00:00Z","safeHtmlItem":[{"html":"<p>answer</p>"}]}]).to_string()).unwrap();
+        import(&db, &gemini, "gemini").unwrap();
+        for room in serde_json::to_value(crate::chat::list(&db).unwrap())
+            .unwrap()
+            .as_array()
+            .unwrap()
+        {
+            let source = room["importedFrom"].as_str().unwrap();
+            let detail =
+                serde_json::to_value(crate::chat::read(&db, room["id"].as_str().unwrap()).unwrap())
+                    .unwrap();
+            let assistant = detail["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "assistant")
+                .unwrap();
+            assert_eq!(assistant["provider"], source);
+            assert!(assistant["model"].is_null());
+        }
     }
 
     // Based on the reproduction in d26dcab7: later exports must add the reply.
