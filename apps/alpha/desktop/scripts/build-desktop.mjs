@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { cp, mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -38,6 +38,24 @@ export function longestPath(root, files) {
   }, '');
 }
 
+export function selectStageParent(tempRoot, tauriRoot, pathApi = path) {
+  const tempDrive = pathApi.parse(tempRoot).root.toLowerCase();
+  const tauriDrive = pathApi.parse(tauriRoot).root.toLowerCase();
+  if (!tempDrive || !tauriDrive) throw new Error('Absolute build paths required');
+  return tempDrive === tauriDrive ? tempRoot : pathApi.join(tauriRoot, 'target');
+}
+
+export async function withStage(parent, action) {
+  const stage = await mkdtemp(path.join(parent, 'momso-bundle-'));
+  try {
+    if (path.dirname(stage) !== parent) throw new Error('Invalid temporary bundle path');
+    return await action(stage);
+  } finally {
+    try { await rm(stage, { recursive: true, force: true }); }
+    catch (error) { process.stderr.write(`Could not remove build resources: ${stage}\n`); throw error; }
+  }
+}
+
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: desktop, stdio: 'inherit', ...options });
@@ -56,9 +74,14 @@ async function main() {
   if (args.some(arg => arg !== '--updater') || args.length > 1) throw new Error('Supported option: --updater');
   await run(process.execPath, [path.join(desktop, 'scripts/prepare-node.mjs')]);
   const tempRoot = await realpath(os.tmpdir());
-  const stage = await mkdtemp(path.join(tempRoot, 'momso-bundle-'));
-  if (path.dirname(stage) !== tempRoot) throw new Error('Invalid temporary bundle path');
-  try {
+  const tauriRoot = await realpath(tauri);
+  const chosenParent = selectStageParent(tempRoot, tauriRoot);
+  await mkdir(chosenParent, { recursive: true });
+  const stageParent = await realpath(chosenParent);
+  if (path.parse(stageParent).root.toLowerCase() !== path.parse(tauriRoot).root.toLowerCase()) {
+    throw new Error('Bundle staging must be on the build drive');
+  }
+  await withStage(stageParent, async stage => {
     const node = path.join(stage, 'node');
     const notices = path.join(stage, 'third-party');
     await cp(nodeSource, node, { recursive: true, filter: source => !omitNodeFile(path.relative(nodeSource, source)) });
@@ -84,10 +107,7 @@ async function main() {
     const config = { build: { beforeBuildCommand: 'npm run build' }, bundle: { resources } };
     if (args.includes('--updater')) config.bundle.createUpdaterArtifacts = true;
     await run(process.execPath, [cli, 'build', '--bundles', 'nsis', '--config', JSON.stringify(config)]);
-  } finally {
-    try { await rm(stage, { recursive: true, force: true }); }
-    catch (error) { process.stderr.write(`Could not remove build resources: ${stage}\n`); throw error; }
-  }
+  });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
