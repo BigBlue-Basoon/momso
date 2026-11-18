@@ -5,7 +5,9 @@ import { previewSourceDelete, purgeSource, restoreTrashedSource, sourceErrorCode
 import { W } from '../words'
 import { QuestionDialog } from './ZetPanel'
 
-export type SourceNotice = (text: string, action?: { label: string; run: () => void }) => void
+export type NoticeAction = { label: string; run: () => void }
+/** 알림 줄. 단추는 하나 또는 둘(2026-11-18: 다운로드 알림의 [채팅방에 첨부] [폴더에서 보기]). */
+export type SourceNotice = (text: string, action?: NoticeAction | NoticeAction[]) => void
 
 type Uses = { documents: string[]; chats: string[]; receipts: number; records: number }
 

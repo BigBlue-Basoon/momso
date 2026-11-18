@@ -342,6 +342,7 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
                             dir.path(),
                             &id,
                             &prompt,
+                            Vec::new(),
                             None,
                             None,
                             "default",

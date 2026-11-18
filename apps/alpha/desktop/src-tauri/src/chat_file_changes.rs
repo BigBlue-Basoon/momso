@@ -371,8 +371,18 @@ pub(crate) fn record_tracked(
     if result.actions.is_empty() && input.read.is_empty() {
         return Ok(false);
     }
+    let created: Vec<_> = result
+        .actions
+        .iter()
+        .filter_map(|(id, action)| {
+            (action == "created"
+                && result.evidence.get(id).is_some_and(|e| e == "tool")
+                && !result.unknown_actor.contains(id))
+            .then_some(id.clone())
+        })
+        .collect();
     input.wrote = result.actions.keys().cloned().collect();
-    crate::archive_receipt::create_with_evidence(
+    let receipt = crate::archive_receipt::create_with_evidence(
         root,
         database,
         input,
@@ -380,12 +390,207 @@ pub(crate) fn record_tracked(
         result.evidence,
         result.unknown_actor,
     )?;
+    save_ai_created_documents(root, database, after, &created, &receipt)?;
     Ok(true)
+}
+
+fn save_ai_created_documents(
+    root: &Path,
+    database: &Path,
+    after: &Snapshot,
+    ids: &[String],
+    receipt: &str,
+) -> Result<(), String> {
+    let _app = lock_app_write();
+    let _write = crate::archive_zet::WRITE_LOCK
+        .lock()
+        .map_err(|_| "save_failed".to_string())?;
+    crate::archive_remote::ensure_document_write_allowed(root, database)?;
+    if has_active(root) {
+        return Ok(());
+    }
+    let mut paths = Vec::new();
+    for id in ids {
+        let relative = if crate::archive_zet::valid_zet_id(id) {
+            format!("zettels/{id}.md")
+        } else if crate::chat_recovery::valid_document_reference(id) {
+            format!("zettels/{}", id.strip_prefix("document-path:").unwrap())
+        } else {
+            continue;
+        };
+        let path = root.join(&relative);
+        let meta = fs::symlink_metadata(&path).map_err(|_| "save_failed".to_string())?;
+        if !meta.is_file()
+            || crate::archive_location::is_link_or_reparse(&meta)
+            || reference(root, &relative).as_deref() != Some(id.as_str())
+        {
+            continue;
+        }
+        let bytes = fs::read(&path).map_err(|_| "save_failed".to_string())?;
+        if after
+            .get(id)
+            .is_none_or(|expected| Sha256::digest(&bytes).as_slice() != expected)
+        {
+            continue;
+        }
+        paths.push(relative);
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let (tool, _) = crate::archive::storage_tool(root)?;
+    paths.push(format!("receipts/{receipt}.md"));
+    if crate::archive_remote::fresh_archive_with_local_files(&tool, root, true) {
+        for name in [
+            ".gitignore",
+            "AGENTS.md",
+            "CLAUDE.md",
+            "GEMINI.md",
+            crate::yoga_dictionary::DIRECTORY,
+        ] {
+            if root.join(name).exists() {
+                paths.push(name.to_owned());
+            }
+        }
+    }
+    for path in &paths {
+        if !crate::archive_remote::git(
+            &tool,
+            root,
+            &["--literal-pathspecs", "ls-files", "--", path],
+        )
+        .map_err(|_| "save_failed".to_string())?
+        .is_empty()
+        {
+            return Err("save_failed".into());
+        }
+    }
+    let mut args = vec!["--literal-pathspecs", "add", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    crate::archive_remote::git(&tool, root, &args).map_err(|_| "save_failed".to_string())?;
+    crate::archive::commit_paths(&tool, root, "저장: AI가 만든 글", &paths)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ai_created_document_is_saved_before_connecting_empty_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "fixture").unwrap();
+        crate::archive::initialize(&root, temp.path()).unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let tracking = begin_chat(&root, &db, &chat).unwrap();
+        let before = capture(&root).unwrap();
+        let id = crate::archive_zet::create(
+            &root,
+            &db,
+            crate::archive_zet::ZetCreate {
+                title: "Fixture".into(),
+                summary: "Fixture".into(),
+                kind: "note".into(),
+                body: "fixture AI document".into(),
+                assets: vec![],
+                edges: vec![],
+            },
+        )
+        .unwrap();
+        let content = fs::read_to_string(root.join(format!("zettels/{id}.md"))).unwrap();
+        let after = capture(&root).unwrap();
+        let input = crate::archive_receipt::ReceiptCreate {
+            tool: "claude".into(),
+            model: "fixture".into(),
+            chat: Some(chat),
+            read: vec![],
+            wrote: vec![],
+            prompt: "fixture".into(),
+            changes: String::new(),
+        };
+        assert!(record_tracked(
+            &root,
+            &db,
+            input,
+            &before,
+            &after,
+            &BTreeSet::from([id.to_string()]),
+            tracking
+        )
+        .unwrap());
+        let tool = crate::archive::storage_tool(temp.path()).unwrap().0;
+        assert_eq!(
+            crate::archive_remote::git(&tool, &root, &["show", &format!("HEAD:zettels/{id}.md")])
+                .unwrap(),
+            content.trim_end()
+        );
+        let bare = temp.path().join("remote.git");
+        crate::archive_remote::git(
+            &tool,
+            temp.path(),
+            &["init", "--bare", bare.to_str().unwrap()],
+        )
+        .unwrap();
+        crate::archive_remote::connect_local(&tool, &root, bare.to_str().unwrap()).unwrap();
+        crate::archive_remote::receive_connected(&tool, &root, &db, bare.to_str().unwrap(), "main")
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(format!("zettels/{id}.md"))).unwrap(),
+            content
+        );
+    }
+
+    #[test]
+    fn human_changed_document_is_not_auto_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "fixture").unwrap();
+        crate::archive::initialize(&root, temp.path()).unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let tracking = begin_chat(&root, &db, &chat).unwrap();
+        let before = capture(&root).unwrap();
+        let id = "zet_20261118_120001";
+        fs::write(root.join(format!("zettels/{id}.md")), "human text").unwrap();
+        app_write(&root, Some(id));
+        let after = capture(&root).unwrap();
+        let input = crate::archive_receipt::ReceiptCreate {
+            tool: "claude".into(),
+            model: "fixture".into(),
+            chat: Some(chat),
+            read: vec![],
+            wrote: vec![],
+            prompt: "fixture".into(),
+            changes: String::new(),
+        };
+        assert!(record_tracked(
+            &root,
+            &db,
+            input,
+            &before,
+            &after,
+            &BTreeSet::from([id.to_string()]),
+            tracking
+        )
+        .unwrap());
+        let tool = crate::archive::storage_tool(temp.path()).unwrap().0;
+        assert!(crate::archive_remote::git(
+            &tool,
+            &root,
+            &["show", &format!("HEAD:zettels/{id}.md")]
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(root.join(format!("zettels/{id}.md"))).unwrap(),
+            "human text"
+        );
+    }
     #[test]
     fn deleted_file_tool_reference_and_uncertain_actor_are_distinguished() {
         let dir = tempfile::tempdir().unwrap();

@@ -27,6 +27,16 @@ export type MediaItem = {
   /** 그 일을 한 때(모르면 null). */
   at?: string | null
   evidence?: 'tool' | 'diff' | null
+  /**
+   * 생성물의 프롬프트와 버전(2026-11-18 화면이 바라는 꼴, 뒤쪽은 아직 주지 않음 — 개발 앱의 예시 생성물만 채운다).
+   *   prompt: 이 버전을 만들 때 AI 가 받은 말(고친 것이면 고치라는 말). lineageId: 같은 생성물의 버전끼리 같은 값.
+   *   version: 그 묶음 안의 차례(1부터). versionOf: 어느 버전에서 나왔는지. versionHow: 'regenerated'(같은 프롬프트로 다시) | 'edited'(고침).
+   */
+  prompt?: string | null
+  lineageId?: string | null
+  version?: number | null
+  versionOf?: string | null
+  versionHow?: 'regenerated' | 'edited' | null
 }
 
 /** 그 미디어를 만든(첨부한) 채팅방 하나. chats 가 있으면 첫째, 없으면 예전 chatId. */

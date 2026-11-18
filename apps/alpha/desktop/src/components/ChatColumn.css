@@ -320,3 +320,46 @@
 .message-failure { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-bottom: 0; color: var(--ink-soft); }
 .message-failure-actions { display: inline-flex; flex-wrap: wrap; gap: 2px; margin-left: -6px; }
 .message-failure .approval-button { height: 26px; padding: 0 8px; font-size: 12px; }
+
+/* 내 말에 붙여 보낸 첨부(2026-11-18). 스킬 표시와 같은 작은 알약 꼴로, 말풍선 위 오른쪽에 나란히. */
+.workbench-grid .message.user .message-attachments {
+  display: flex;
+  max-width: min(80%, 560px);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  margin: 0 0 4px;
+  padding: 0;
+  list-style: none;
+}
+
+.workbench-grid .message.user .message-attachment {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 240px;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.workbench-grid .message.user .message-attachment span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workbench-grid .message.user .message-attachment svg {
+  flex: none;
+  color: var(--muted);
+}
+
+.workbench-grid .message.user .message-attachment.is-deleted {
+  color: var(--muted);
+  text-decoration: line-through;
+}

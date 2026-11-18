@@ -162,6 +162,171 @@ async fn run_wrangler(
     }
 }
 
+fn login_url(line: &str) -> Option<reqwest::Url> {
+    let value = line
+        .trim()
+        .strip_prefix("Visit this link to authenticate: ")?;
+    let url = reqwest::Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("dash.cloudflare.com")
+        || url.port().is_some()
+        || url.path() != "/oauth2/auth"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let pairs: Vec<_> = url.query_pairs().collect();
+    if pairs
+        .iter()
+        .filter(|(key, value)| {
+            key == "redirect_uri" && value == "http://localhost:8976/oauth/callback"
+        })
+        .count()
+        != 1
+        || pairs
+            .iter()
+            .filter(|(key, _)| key == "redirect_uri")
+            .count()
+            != 1
+        || !pairs
+            .iter()
+            .any(|(key, value)| key == "state" && !value.is_empty())
+        || !pairs
+            .iter()
+            .any(|(key, value)| key == "response_type" && value == "code")
+    {
+        return None;
+    }
+    Some(url)
+}
+
+async fn read_login_output<R, F, Fut>(mut reader: R, mut open: F) -> Result<(), &'static str>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(reqwest::Url) -> Fut,
+    Fut: Future<Output = Result<(), &'static str>>,
+{
+    use tokio::io::AsyncReadExt;
+    let mut pending = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut total = 0usize;
+    let mut opened = false;
+    loop {
+        let size = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|_| "wrangler_auth_unavailable")?;
+        if size == 0 {
+            break;
+        }
+        total = total.checked_add(size).ok_or("wrangler_auth_unavailable")?;
+        if total > 65536 {
+            return Err("wrangler_auth_unavailable");
+        }
+        pending.extend_from_slice(&chunk[..size]);
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<_> = pending.drain(..=end).collect();
+            let text = std::str::from_utf8(&line).map_err(|_| "wrangler_auth_unavailable")?;
+            if let Some(url) = login_url(text) {
+                if opened {
+                    return Err("wrangler_auth_unavailable");
+                }
+                open(url).await?;
+                opened = true;
+            }
+        }
+    }
+    if opened {
+        Ok(())
+    } else {
+        Err("wrangler_auth_unavailable")
+    }
+}
+
+async fn run_interactive_login(
+    app: tauri::AppHandle,
+    cancel: CancellationToken,
+) -> Result<crate::process::ProcessOutput, &'static str> {
+    use std::process::Stdio;
+    let mut command = if let Some((node, npx)) = BUNDLED_NODE.get() {
+        let mut command = crate::process::hidden_async_command(node);
+        command
+            .arg(npx)
+            .args(["--yes", "wrangler@4.152.0", "login", "--browser=false"]);
+        let mut dirs = vec![node.parent().ok_or("runtime_missing")?.to_path_buf()];
+        if let Some(path) = std::env::var_os("PATH") {
+            dirs.extend(std::env::split_paths(&path));
+        }
+        command.env(
+            "PATH",
+            std::env::join_paths(dirs).map_err(|_| "runtime_missing")?,
+        );
+        command
+    } else if cfg!(debug_assertions) {
+        let executable = crate::process::resolve_tool("npx").ok_or("runtime_missing")?;
+        let mut command = if executable.with_extension("ps1").is_file() {
+            let mut command = crate::process::hidden_async_command("powershell.exe");
+            command
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+                .arg(executable.with_extension("ps1"));
+            command
+        } else {
+            crate::process::hidden_async_command(executable)
+        };
+        command.args(["--yes", "wrangler@4.152.0", "login", "--browser=false"]);
+        command
+    } else {
+        return Err("runtime_missing");
+    };
+    crate::process::remove_inherited_ai_secrets(&mut command);
+    command
+        .env_remove("WRANGLER_AUTH_URL")
+        .env_remove("WRANGLER_AUTH_DOMAIN")
+        .env_remove("WRANGLER_TOKEN_URL")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    run_login_process(command, cancel, |url| {
+        let app = app.clone();
+        async move {
+            crate::panel_browser::panel_browser_open_human(app, url.to_string())
+                .await
+                .map_err(|_| "browser_unavailable")
+        }
+    })
+    .await
+}
+
+async fn run_login_process<F, Fut>(
+    mut command: tokio::process::Command,
+    cancel: CancellationToken,
+    open: F,
+) -> Result<crate::process::ProcessOutput, &'static str>
+where
+    F: FnMut(reqwest::Url) -> Fut,
+    Fut: Future<Output = Result<(), &'static str>>,
+{
+    let mut child = command.spawn().map_err(|_| "wrangler_auth_unavailable")?;
+    let stdout = child.stdout.take().ok_or("wrangler_auth_unavailable")?;
+    let work = async {
+        let read = read_login_output(stdout, open);
+        let wait = async { child.wait().await.map_err(|_| "wrangler_auth_unavailable") };
+        let (_, status) = tokio::try_join!(read, wait)?;
+        Ok(crate::process::ProcessOutput {
+            success: status.success(),
+            stdout: String::new(),
+        })
+    };
+    tokio::select! {
+        _ = cancel.cancelled() => Err("cancelled"),
+        result = tokio::time::timeout(Duration::from_secs(300), work) => result.map_err(|_| "login_required")?,
+    }
+}
+
 struct R2Target {
     api: reqwest::Url,
     account: String,
@@ -450,6 +615,7 @@ pub(crate) async fn fake_wrangler_and_create(endpoint: &str) -> Result<String, &
 
 #[cfg(windows)]
 pub(crate) async fn connect_approved(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     chat_id: &str,
     permit: crate::setup_approval::SetupPermit,
@@ -479,7 +645,7 @@ pub(crate) async fn connect_approved(
     {
         return Err("invalid_bucket");
     }
-    if login_account(cancel.clone()).await? != details.account {
+    if login_account(app, cancel.clone()).await? != details.account {
         return Err("approval_stale");
     }
     // A newly approved account must never reuse a token from a prior login.
@@ -704,8 +870,28 @@ fn parse_single_account(success: bool, stdout: &str) -> Result<String, &'static 
     Ok(id.to_ascii_lowercase())
 }
 
-pub(crate) async fn login_account(cancel: CancellationToken) -> Result<String, &'static str> {
-    let output = run_wrangler(
+pub(crate) async fn login_account(
+    app: tauri::AppHandle,
+    cancel: CancellationToken,
+) -> Result<String, &'static str> {
+    login_account_with(cancel, run_wrangler, |cancel| {
+        run_interactive_login(app.clone(), cancel)
+    })
+    .await
+}
+
+async fn login_account_with<F, Fut, G, Gf>(
+    cancel: CancellationToken,
+    run: F,
+    login: G,
+) -> Result<String, &'static str>
+where
+    F: Fn(&'static [&'static str], Duration, CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = Result<crate::process::ProcessOutput, &'static str>>,
+    G: Fn(CancellationToken) -> Gf,
+    Gf: Future<Output = Result<crate::process::ProcessOutput, &'static str>>,
+{
+    let output = run(
         &["whoami", "--json"],
         Duration::from_secs(90),
         cancel.clone(),
@@ -714,12 +900,11 @@ pub(crate) async fn login_account(cancel: CancellationToken) -> Result<String, &
     match parse_single_account(output.success, &output.stdout) {
         Ok(account) => Ok(account),
         Err("login_required") => {
-            let output = run_wrangler(&["login"], Duration::from_secs(300), cancel.clone()).await?;
+            let output = login(cancel.clone()).await?;
             if !output.success {
                 return Err("login_required");
             }
-            let output =
-                run_wrangler(&["whoami", "--json"], Duration::from_secs(90), cancel).await?;
+            let output = run(&["whoami", "--json"], Duration::from_secs(90), cancel).await?;
             parse_single_account(output.success, &output.stdout)
         }
         Err(error) => Err(error),
@@ -1137,6 +1322,117 @@ mod tests {
             Err("wrangler_oauth_required")
         );
         assert_eq!(parse_single_account(false, ""), Err("login_required"));
+    }
+
+    #[tokio::test]
+    async fn login_required_uses_login_then_rechecks_single_account() {
+        use std::sync::{Arc, Mutex};
+        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let observed = calls.clone();
+        let runner = move |args: &'static [&'static str], _: Duration, _: CancellationToken| {
+            let calls = observed.clone();
+            async move {
+                let mut calls = calls.lock().unwrap();
+                calls.push(args.iter().map(|s| (*s).to_owned()).collect());
+                let stdout = if calls.len() == 1 {
+                    r#"{"loggedIn":false}"#.to_owned()
+                } else {
+                    serde_json::json!({"loggedIn":true,"authType":"OAuth Token","accounts":[{"id":"a".repeat(32)}]}).to_string()
+                };
+                Ok(crate::process::ProcessOutput {
+                    success: true,
+                    stdout,
+                })
+            }
+        };
+        let login_calls = calls.clone();
+        let login = move |_: CancellationToken| {
+            let calls = login_calls.clone();
+            async move {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push(vec!["login".into(), "--browser=false".into()]);
+                Ok(crate::process::ProcessOutput {
+                    success: true,
+                    stdout: String::new(),
+                })
+            }
+        };
+        assert_eq!(
+            login_account_with(CancellationToken::new(), runner, login)
+                .await
+                .unwrap(),
+            "a".repeat(32)
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                vec!["whoami", "--json"],
+                vec!["login", "--browser=false"],
+                vec!["whoami", "--json"]
+            ]
+        );
+        let target = R2Target::new("http://127.0.0.1:1234/", &"a".repeat(32), "basoon").unwrap();
+        assert_eq!(target.bucket, "momso-basoon");
+        for invalid in ["../other", "other/bucket", "UPPER"] {
+            assert!(R2Target::new("http://127.0.0.1:1234/", &"a".repeat(32), invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_oauth_output_opens_only_cloudflare_login() {
+        use tokio::io::AsyncWriteExt;
+        let good = "https://dash.cloudflare.com/oauth2/auth?response_type=code&state=fixture&redirect_uri=http%3A%2F%2Flocalhost%3A8976%2Foauth%2Fcallback";
+        for invalid in ["https://dash.cloudflare.com.evil.test/oauth2/auth?response_type=code&state=x&redirect_uri=http%3A%2F%2Flocalhost%3A8976%2Foauth%2Fcallback", "https://dash.cloudflare.com/oauth2/auth?response_type=code&state=x&redirect_uri=https%3A%2F%2Fevil.test", "https://dash.cloudflare.com/oauth2/auth?response_type=code&state=x&redirect_uri=http%3A%2F%2Flocalhost%3A8976%2Foauth%2Fcallback&redirect_uri=https%3A%2F%2Fevil.test"] {
+            assert!(login_url(&format!("Visit this link to authenticate: {invalid}")).is_none());
+        }
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let output = format!("fixture output\nVisit this link to authenticate: {good}\n");
+        tokio::spawn(async move {
+            writer.write_all(output.as_bytes()).await.unwrap();
+        });
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = opened.clone();
+        read_login_output(reader, move |url| {
+            capture.lock().unwrap().push(url);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(opened.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fake_wrangler_waits_for_owned_browser_without_default_browser() {
+        use std::process::Stdio;
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("opened");
+        let script = temp.path().join("fake-login.ps1");
+        std::fs::write(&script, r#"param($marker)
+[Console]::Out.WriteLine('Visit this link to authenticate: https://dash.cloudflare.com/oauth2/auth?response_type=code&state=fixture&redirect_uri=http%3A%2F%2Flocalhost%3A8976%2Foauth%2Fcallback')
+for ($i = 0; $i -lt 100; $i++) { if (Test-Path -LiteralPath $marker) { exit 0 }; Start-Sleep -Milliseconds 25 }
+exit 1
+"#).unwrap();
+        let mut command = crate::process::hidden_async_command("powershell.exe");
+        command
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-File"])
+            .arg(&script)
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let opened = marker.clone();
+        let result = run_login_process(command, CancellationToken::new(), move |url| {
+            assert_eq!(url.host_str(), Some("dash.cloudflare.com"));
+            std::fs::write(&opened, b"opened").unwrap();
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert!(result.success && result.stdout.is_empty() && marker.is_file());
     }
 
     #[tokio::test]

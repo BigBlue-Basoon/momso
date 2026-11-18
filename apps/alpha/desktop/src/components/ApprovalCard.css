@@ -294,3 +294,36 @@
 .approval-card.is-browser .approval-facts > div {
   grid-template-columns: 52px minmax(0, 1fr);
 }
+
+/* 보호 장치(샌드박스) 밖 실행을 묻는 카드(2026-11-18): 테두리와 경고 줄을 산호색으로. 명령은 접어 둔다. */
+.approval-card.is-danger {
+  border-color: var(--coral);
+}
+
+.approval-danger {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--coral-soft);
+  color: var(--coral);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.6;
+  word-break: keep-all;
+}
+
+.approval-more {
+  display: grid;
+  gap: 6px;
+}
+
+.approval-more > summary {
+  width: fit-content;
+  color: var(--ink-soft);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.approval-more[open] > summary {
+  margin-bottom: 6px;
+}

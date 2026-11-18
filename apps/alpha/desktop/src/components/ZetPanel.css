@@ -71,9 +71,10 @@
 
 .zet-panel-frame {
   position: relative;
-  display: grid;
-  /* 탭 줄의 높이는 대화 칸 맨 위 줄(56)과 같다. 패널 단추가 열릴 때와 닫힐 때 같은 높이에 있다. */
-  grid-template-rows: 56px minmax(0, 1fr);
+  /* 위에서부터: (오른쪽 패널만) 문서·브라우저 줄 56(대화 칸 맨 위 줄과 같은 높이), (문서를 읽는 중이면) 돌아가는 줄, 나머지는 본문.
+     문서 화면은 위 줄이 없고 줄 수가 바뀌어 grid 대신 세로 flex(2026-11-18). */
+  display: flex;
+  flex-direction: column;
   width: var(--zet-panel-width);
   height: 100%;
   border-left: 1px solid var(--line);
@@ -235,7 +236,11 @@
 .zet-panel-body {
   position: relative;
   min-height: 0;
+  flex: 1 1 auto;
 }
+
+.zet-panel-frame > .zet-tabbar { height: 56px; flex: none; }
+.zet-panel-frame > .zet-backbar { flex: none; }
 
 .zet-pane {
   position: absolute;
@@ -1145,3 +1150,264 @@ button.zet-link-row:hover {
 .zet-summarized-kind { color: var(--muted); font-size: 11.5px; font-weight: 600; }
 .zet-summarized-title { padding: 0; border: 0; background: none; color: var(--ink); font: inherit; font-size: 13.5px; font-weight: 650; cursor: pointer; text-align: left; }
 .zet-summarized-title:hover { text-decoration: underline; }
+
+/* 오른쪽 패널 브라우저(2026-11-17). 새 꼴 없이 지금 부품(zet-viewbar, zet-search, icon-button)에 자리만 잡는다. */
+.zet-pane.panel-browser-pane {
+  overflow: hidden;
+}
+
+.panel-browser {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+}
+
+.panel-browser-bar {
+  gap: 0;
+  padding: 6px 6px;
+}
+
+.panel-browser-address {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 30px;
+  margin: 0 4px;
+  padding: 0 8px;
+  overflow: hidden;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: text;
+}
+
+.panel-browser-address svg {
+  flex: 0 0 auto;
+}
+
+.panel-browser-address:disabled {
+  cursor: default;
+}
+
+/* 좁으면 이 말이 먼저 줄어든다(자물쇠와 호스트는 늘 보이게). 말 전체는 주소 칸의 풍선에도 있다. */
+.panel-browser-insecure {
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
+/* 넘치면 앞(하위 도메인)부터 잘라 끝(등록 도메인)이 늘 보이게. */
+.panel-browser-host {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  direction: rtl;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-browser-host bdi {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.panel-browser-spot {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* AI 가 패널을 쓰는 동안의 한 줄(2026-11-18). 맨 위 줄(zet-viewbar)과 같은 꼴, 글과 단추 하나. */
+.panel-agent-line {
+  justify-content: space-between;
+  padding: 6px 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 오른쪽 패널 위: 문서·브라우저 두 단추(2026-11-18). 패널 안 칸 고르기(chat-items-tabs)와 같은 꼴, 오른쪽 끝에 패널 단추. */
+.zet-modebar {
+  min-height: 44px;
+  justify-content: space-between;
+}
+
+.zet-modes {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--surface-muted);
+}
+
+.zet-modes button {
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.zet-modes button:hover { color: var(--ink); }
+.zet-modes button.is-active { background: var(--surface); color: var(--ink); box-shadow: 0 1px 2px rgba(35, 42, 38, 0.08); }
+.zet-modes button:focus-visible { outline: 2px solid #a4c8b2; outline-offset: 1px; }
+
+/* 문서를 보는 중: 목록으로 돌아가는 한 줄(선 없이). */
+.zet-backbar {
+  padding: 6px 10px 0;
+}
+
+.zet-back {
+  display: inline-flex;
+  height: 26px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px 0 4px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.zet-back:hover { background: var(--surface-muted); color: var(--ink); }
+
+.chat-items-heading { margin: 14px 16px 2px; color: var(--ink-soft); font-size: 12.5px; font-weight: 650; }
+
+/*
+ * 문서 화면의 폴더 꼴(2026-11-18): 왼쪽 접고 펴는 폴더 나무, 오른쪽 경로 줄과 지금 폴더의 폴더·문서 목록.
+ * 좁으면(640 아래) 나무를 숨기고 경로 줄로만 오간다. 선은 나무와 목록 사이 한 줄만.
+ */
+.zet-folders {
+  display: grid;
+  height: 100%;
+  min-height: 0;
+  grid-template-columns: 220px minmax(0, 1fr);
+  container-type: inline-size;
+}
+
+.zet-folders.is-flat { grid-template-columns: minmax(0, 1fr); }
+
+.zet-tree {
+  min-height: 0;
+  padding: 10px 6px;
+  overflow-y: auto;
+  border-right: 1px solid var(--line);
+}
+
+.zet-tree ul { margin: 0; padding: 0; list-style: none; }
+
+.zet-tree-row {
+  display: flex;
+  height: 30px;
+  align-items: center;
+  gap: 2px;
+  border-radius: 6px;
+}
+
+.zet-tree-row:hover { background: var(--surface-muted); }
+.zet-tree-row.is-current { background: var(--surface-muted); }
+.zet-tree-row.is-current .zet-tree-name { color: var(--ink); font-weight: 650; }
+
+.zet-tree-twist {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.zet-tree-twist svg { transition: transform 120ms ease; }
+.zet-tree-twist svg.is-open { transform: rotate(90deg); }
+
+.zet-tree-name {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  height: 100%;
+  align-items: center;
+  gap: 7px;
+  padding: 0 6px 0 2px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.zet-tree-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.zet-tree-name svg { flex: none; color: var(--muted); }
+
+.zet-folder-main { min-width: 0; min-height: 0; overflow-y: auto; }
+
+.zet-folder-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.zet-folder-bar .zet-search { flex: 0 1 260px; }
+
+.zet-crumbs {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  padding-left: 16px;
+}
+
+.zet-crumbs button {
+  max-width: 220px;
+  padding: 3px 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.zet-crumbs button:hover { background: var(--surface-muted); color: var(--ink); }
+.zet-crumbs button.is-current { color: var(--ink); font-weight: 650; }
+.zet-crumb { display: inline-flex; align-items: center; gap: 2px; color: var(--faint); }
+
+.zet-folder-row { gap: 4px; }
+.zet-folder-name { display: inline-flex; align-items: center; gap: 8px; }
+.zet-folder-name svg { color: var(--muted); }
+.zet-row-folder { display: inline-flex; align-items: center; gap: 3px; }
+
+@container (max-width: 640px) {
+  .zet-folders:not(.is-flat) { grid-template-columns: minmax(0, 1fr); }
+  .zet-tree { display: none; }
+}
+
+.zet-folder-bar { padding-top: 10px; }
+.zet-folder-bar .zet-search { margin: 0 12px 6px 0; }
+.zet-folders.is-flat .zet-folder-bar .zet-search { flex: 1; margin-left: 12px; }

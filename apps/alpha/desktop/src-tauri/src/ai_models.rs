@@ -69,11 +69,7 @@ fn fast(provider: &str, model: &str) -> Fast {
         _ => false,
     };
     Fast {
-        supported: if provider == "gemini" {
-            None
-        } else {
-            Some(supported)
-        },
+        supported: Some(supported),
         state: "unavailable",
         label: if provider == "claude" {
             "고속 모드"
@@ -620,7 +616,7 @@ async fn gemini() -> ProviderModels {
     let Some(executable) = gemini_access::executable() else {
         return empty("gemini", "unavailable");
     };
-    let mut command = tokio::process::Command::new(executable);
+    let mut command = crate::process::hidden_async_command(executable);
     command.args([
         "--settings",
         gemini_access::API_KEY_SESSION_SETTINGS,
@@ -837,6 +833,13 @@ mod tests {
         assert_eq!(p.state, "ok");
         assert_eq!(p.models[0].id, "m");
         assert_eq!(gemini_models("not a model").state, "unavailable");
+    }
+
+    #[test]
+    fn gemini_fast_mode_is_explicitly_unsupported() {
+        let value = fast("gemini", "gemini-3.1-pro");
+        assert_eq!(value.supported, Some(false));
+        assert_eq!(value.state, "unavailable");
     }
     #[cfg(windows)]
     #[tokio::test]

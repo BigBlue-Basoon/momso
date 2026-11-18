@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
 import { createDesktopArtifactMetadata } from './create-desktop-artifact-metadata.mjs'
@@ -56,7 +57,10 @@ test('writes a checksum and provenance manifest for one unsigned NSIS installer'
 
     assert.equal(checksum, `${expectedHash}  ${installerName}\n`)
     assert.equal(manifest.schemaVersion, 1)
-    assert.equal(manifest.product.version, '0.1.0')
+    const desktopPackage = JSON.parse(readFileSync(fileURLToPath(new URL('../apps/alpha/desktop/package.json', import.meta.url)), 'utf8'))
+    const tauriConfig = JSON.parse(readFileSync(fileURLToPath(new URL('../apps/alpha/desktop/src-tauri/tauri.conf.json', import.meta.url)), 'utf8'))
+    assert.equal(desktopPackage.version, tauriConfig.version)
+    assert.equal(manifest.product.version, desktopPackage.version)
     assert.equal(
       manifest.source.checkoutCommit,
       '0123456789abcdef0123456789abcdef01234567',

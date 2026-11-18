@@ -647,6 +647,94 @@
     return requestId
   }
   // 키를 넣기 전에 뒤쪽이 요청을 닫은 것처럼(5분 지남). window.__closeSecret('secret-1')
+  // ---- 패널 브라우저(가짜). 진짜 웹뷰 대신 받은 자리에 회색 상자를 그려 자리·숨김을 눈으로 본다. ?panelfail=1 이면 unavailable. ----
+  //   window.__panelDownload() 는 내려받기 알림, window.__panelGoogle(siteUrl) 은 Google 로그인 알림, window.__panelState 로 받은 값을 본다.
+  window.__panelState = { open: false, visible: false, bounds: null, url: null, history: [], calls: [] }
+  function panelBox() {
+    let box = document.getElementById('fake-panel-webview')
+    if (!box) {
+      box = document.createElement('div')
+      box.id = 'fake-panel-webview'
+      box.style.cssText = 'position:fixed;z-index:9999;background:#e9ecef;border:1px dashed #9aa5b1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:6px;font:12px sans-serif;color:#52606d;pointer-events:none'
+      document.body.appendChild(box)
+    }
+    const s = window.__panelState
+    box.style.display = s.open && s.visible && s.bounds ? 'flex' : 'none'
+    if (s.bounds) Object.assign(box.style, { left: s.bounds.x + 'px', top: s.bounds.y + 'px', width: s.bounds.width + 'px', height: s.bounds.height + 'px' })
+    box.textContent = '가짜 웹뷰 · ' + (s.url || '')
+    return box
+  }
+  function panelGo(url) {
+    const parsed = (() => { try { return new URL(url) } catch { return null } })()
+    if (!parsed || !/^https?:$/.test(parsed.protocol) || /^(localhost|127\.|\[::1\])/.test(parsed.hostname) || parsed.username) throw 'invalid_url'
+    if (parsed.hostname === 'accounts.google.com') { emit('panel-browser-google-login', { host: 'accounts.google.com', siteUrl: window.__panelState.url }); throw 'google_login_required' }
+    const s = window.__panelState
+    s.url = parsed.href
+    s.history = s.history.slice(0, (s.at ?? -1) + 1).concat([parsed.href]); s.at = s.history.length - 1
+    emit('panel-browser-page', { url: parsed.href, host: parsed.hostname, secure: parsed.protocol === 'https:', loading: true })
+    setTimeout(() => {
+      emit('panel-browser-page', { url: parsed.href, host: parsed.hostname, secure: parsed.protocol === 'https:', loading: false })
+      emit('panel-browser-title', { title: parsed.hostname === 'example.com' ? 'Example Domain' : parsed.hostname + ' 가짜 제목' })
+      emit('panel-browser-history', { canGoBack: s.at > 0, canGoForward: s.at < s.history.length - 1 })
+      panelBox()
+    }, 300)
+  }
+  function panelCommand(command, args) {
+    const s = window.__panelState
+    s.calls.push([command, JSON.stringify(args || {})])
+    if (query.get('panelfail') === '1') throw 'unavailable'
+    switch (command) {
+      case 'panel_browser_open':
+        if (s.open) throw 'already_open'
+        if (!(args.width > 0 && args.height > 0)) throw 'invalid_bounds'
+        panelGo(args.url)
+        Object.assign(s, { open: true, visible: true, bounds: { x: args.x, y: args.y, width: args.width, height: args.height } })
+        panelBox(); return null
+      case 'panel_browser_close': Object.assign(s, { open: false, visible: false, url: null, history: [], at: -1 }); panelBox(); return null
+      case 'panel_browser_visibility': if (!s.open) throw 'unavailable'; s.visible = args.visible; panelBox(); return null
+      case 'panel_browser_bounds': if (!s.open) throw 'unavailable'; s.bounds = { x: args.x, y: args.y, width: args.width, height: args.height }; panelBox(); return null
+      case 'panel_browser_navigate': if (!s.open) throw 'unavailable'; panelGo(args.url); return null
+      case 'panel_browser_action': {
+        if (!s.open) throw 'unavailable'
+        const step = args.action === 'back' ? -1 : args.action === 'forward' ? 1 : 0
+        if (step && s.history[s.at + step]) { s.at += step; const url = s.history[s.at]; s.history = s.history.slice(); s.url = url; const p = new URL(url); emit('panel-browser-page', { url, host: p.hostname, secure: p.protocol === 'https:', loading: false }); emit('panel-browser-title', { title: p.hostname + ' 가짜 제목' }); emit('panel-browser-history', { canGoBack: s.at > 0, canGoForward: s.at < s.history.length - 1 }); panelBox() }
+        return null
+      }
+      case 'panel_browser_open_human': if (query.get('humanmissing') === '1') throw 'browser_missing'; s.human = args.url; return null
+      case 'panel_browser_download_select': s.selected = args.path; return null
+      case 'panel_download_reveal': s.revealed = args.path; return null
+      case 'panel_browser_open_agent':
+        if (s.open) throw 'already_open'
+        Object.assign(s, { open: true, visible: true, url: null, agentOpened: true, bounds: { x: args.x, y: args.y, width: args.width, height: args.height } })
+        panelBox(); return null
+      case 'panel_agent_status': return { ownerChatId: s.agentOwner || null, humanControls: Boolean(s.agentHuman) }
+      case 'panel_agent_take_over': s.agentHuman = true; emit('panel-agent-control-changed', { chatId: args.chatId, state: 'human' }); return null
+      case 'panel_agent_resume':
+        if (s.agentLogin) {
+          if (query.get('agentlogin') === 'notyet') throw 'human_required'
+          s.agentLogin = false
+          emit('panel-agent-control-changed', { chatId: args.chatId, state: 'started', reason: null, provider: 'codex', chatTitle: null })
+          return null
+        }
+        s.agentHuman = false; emit('panel-agent-control-changed', { chatId: args.chatId, state: 'available' }); return null
+    }
+    return undefined
+  }
+  // 다운로드(새 꼴): window.__panelDownload('started'|'finished'|'blocked'|'failed', name)
+  window.__panelDownload = (state = 'finished', name = 'class-plan.pdf') => emit('panel-browser-download', { state, name, path: state === 'finished' ? 'D:/Downloads/' + name : null, size: state === 'finished' ? 182400 : null })
+  // AI 가 패널을 쓸 때(가짜): window.__panelAgentOpen(chatId), window.__panelAgent(chatId, 'started'|'ended'|'human'|'available'|'login', reason, chatTitle)
+  //   panel_agent_resume 은 ?agentlogin=notyet 이면 human_required, 아니면 login 뒤에는 started.
+  // 팝업(가짜): window.__panelPopup('opened'|'closed', host, openerHost, title)
+  window.__panelPopup = (state, host, openerHost, title) => emit('panel-browser-popup', { state, host, openerHost: openerHost ?? null, title: title ?? null, reason: state === 'closed' ? 'user' : null })
+  window.__panelAgentOpen = (chatId) => emit('panel-agent-open-request', { chatId })
+  // 회사가 다시 시도하는 중(가짜, 2026-11-18 계약): 지금 답을 쓰는 채팅방마다 chat-provider-retrying.
+  window.__chatRetrying = (kind = 'serviceUnavailable', attempt = 1, seconds = null) => Object.keys(running).forEach((chatId) => emit('chat-provider-retrying', { chatId, provider: 'gemini', attempt, kind, retryAfterSeconds: seconds }))
+  window.__panelAgent = (chatId, state, reason, chatTitle, loginUrl) => {
+    window.__panelState.agentOwner = chatId
+    window.__panelState.agentLogin = state === 'login'
+    emit('panel-agent-control-changed', { chatId, state, reason: reason ?? null, provider: 'codex', chatTitle: chatTitle ?? null, ...(loginUrl ? { loginUrl, siteUrl: 'https://smartplace.naver.com/' } : {}) })
+  }
+  window.__panelGoogle = (siteUrl) => emit('panel-browser-google-login', { host: 'accounts.google.com', siteUrl: siteUrl ?? null })
   window.__closeSecret = (requestId, reason) => emit('agent-setup-secret-closed', reason ? { requestId, chatId: null, reason } : { requestId, chatId: null })
 
   // ---- 미디어(화면 확인용 가짜). ?media=ok(기본) / none(명령 없음). 그림은 색 띠 SVG. ----
@@ -1002,6 +1090,15 @@
   window.__backupCalls = []
   function backupCommand(command, args) {
     window.__backupCalls.push([command, command === 'object_store_connect' ? { ...args, accessKeyId: '(가림)', secretAccessKey: '(가림)' } : args])
+    // 자동 백업(가짜): ?autobackup=retry 면 연속 실패 2번 · 4분 뒤, pending·running 도. window.__auto 로 바꿀 수 있다.
+      if (command === 'archive_auto_backup_get' || command === 'archive_auto_backup_set') {
+        if (!window.__auto) {
+          const mode = query.get('autobackup') || 'idle'
+          window.__auto = { enabled: mode !== 'off', state: mode === 'off' ? 'disabled' : mode === 'retry' ? 'retry_pending' : mode, consecutiveFailures: mode === 'retry' ? 2 : 0, reason: mode === 'retry' ? 'connection_failed' : null, retryInSeconds: mode === 'retry' ? 240 : null }
+        }
+        if (command === 'archive_auto_backup_set') Object.assign(window.__auto, { enabled: args.enabled, state: args.enabled ? 'pending' : 'disabled' })
+        return { ...window.__auto }
+      }
     if (command.startsWith('archive_remote_')) {
       if (remoteMode === 'none') throw `Command ${command} not found`
       if (command === 'archive_remote_connect') {
@@ -1012,6 +1109,8 @@
       // ?git=missing: 이 PC 에 Git 이 없어 GitHub 쪽이 막힘(reason git_missing). 설치가 끝나면(gitInstalled) 풀린다.
       if (command === 'archive_remote_status' && query.get('git') === 'missing' && !window.__gitInstalled) return { ...remote, state: 'unavailable', reason: 'git_missing' }
       // 다시 읽은 상태에도 conflictPaths(2026-11-17). ?statusdiverged=3 이면 그 수만큼, =null 이면 수 없이.
+      // ?remotereason=signed_out 등: 연결 전 상태가 unavailable + 그 까닭(2026-11-18). 다시 시도하면 window.__remoteFixed 가 true 일 때 연결 전으로.
+      if (command === 'archive_remote_status' && query.get('remotereason') && !window.__remoteFixed) return { ...remote, state: 'unavailable', reason: query.get('remotereason'), repo: null, signedInAs: null }
       if (command === 'archive_remote_status' && query.get('statusdiverged')) return { ...remote, reason: 'diverged', conflictPaths: query.get('statusdiverged') === 'null' ? null : Array.from({ length: Number(query.get('statusdiverged')) }, (_, i) => `zettels/${i}.md`) }
       // ?history=profile / rules / other: 올리기가 이력 때문에 막힘(T34·T35). reason 은 unsafe_history, historyReason 은 그 까닭(그 밖은 null).
       const held = { profile: 'profile_in_history', rules: 'profile_in_rules_history', other: null }
@@ -1211,6 +1310,13 @@
           }, 150)
         })
       }
+      // 뒤쪽이 여는 고르기 창(select_local_paths, 2026-11-17). purpose: conversation(내보낸 파일 하나) | source(첨부 여럿) | archive(폴더).
+      case 'select_local_paths': {
+        const bs = String.fromCharCode(92)
+        if (args.purpose === 'conversation') return [['D:', '내려받기', 'MyActivity.json'].join(bs)]
+        if (args.purpose === 'archive') return [['D:', 'momso-folder'].join(bs)]
+        return [['D:', '수업', '저녁 하타 전사.txt'].join(bs)]
+      }
       case 'plugin:dialog|open':
         // 폴더 고르기(몸소 폴더 옮기기)와 파일 고르기(클립, 여럿 고르기)를 가른다.
         // 대화 가져오기: 내보낸 파일 하나(zip·json 거르개).
@@ -1229,6 +1335,7 @@
       case 'voice_typing_open':
         window.__voiceCalls = (window.__voiceCalls || 0) + 1
         return { state: query.get('voiceopen') || 'requested' }
+      case 'archive_auto_backup_get': case 'archive_auto_backup_set':
       case 'archive_remote_status': case 'archive_remote_connect': case 'archive_remote_push': case 'archive_remote_pull': case 'archive_remote_disconnect': case 'archive_remote_create':
       case 'object_store_status': case 'object_store_connect': case 'object_store_disconnect': case 'object_store_backup': case 'object_store_restore': case 'app_state_backup': case 'app_state_restore':
       case 'user_owned_backup_overview': case 'export_backup_recovery_key': case 'confirm_backup_recovery_key': case 'import_backup_recovery_key':
@@ -1269,6 +1376,8 @@
         return mediaList()
       case 'source_asset_open': case 'source_asset_delete_preview': case 'source_asset_trash': case 'source_asset_restore_trashed': case 'source_asset_purge': case 'source_asset_deleted_list':
         return sourceCommand(command, args)
+      case 'panel_browser_open': case 'panel_browser_close': case 'panel_browser_visibility': case 'panel_browser_bounds': case 'panel_browser_navigate': case 'panel_browser_action': case 'panel_browser_open_human': case 'panel_browser_download_select': case 'panel_download_reveal': case 'panel_browser_open_agent': case 'panel_agent_status': case 'panel_agent_take_over': case 'panel_agent_resume':
+        return panelCommand(command, args)
       case 'chat_items':
         return chatItems(args.chatId)
       // ---- Git 설치(가짜, B12). ?git=missing 이면 approvalRequired, ?gitfail=networkFailed 처럼 실패를 흉내 낸다. ----
@@ -1325,8 +1434,11 @@
         // 2026-11-17 제미나이도 받는다(?geminifail=gemini_json_required|gemini_file_too_large).
         if (args.provider === 'gemini' && query.get('geminifail')) throw query.get('geminifail')
         if (query.get('importfail')) throw query.get('importfail')
+        // 2026-11-18 제미나이: groupingNotice(30분 규칙), ?geminihtml=1 이면 guidance(JSON 으로 골라 달라)만.
+        if (args.provider === 'gemini' && query.get('geminihtml') === '1') return { conversations: 0, alreadyImported: 0, unreadable: 0, oldest: null, newest: null, guidance: '구글 테이크아웃에서 ...' }
+        const geminiExtra = args.provider === 'gemini' ? { groupingNotice: '제미나이 기록은 ...' } : {}
         const empty = query.get('importpreview') === 'empty'
-        return new Promise((done) => setTimeout(() => done(empty
+        return new Promise((done) => setTimeout(() => done(args.provider === 'gemini' && !empty ? { conversations: 5, alreadyImported: 0, unreadable: 0, oldest: '2026-11-01T09:00:00+00:00', newest: '2026-11-10T12:00:00+00:00', ...geminiExtra } : empty
           ? { conversations: 0, alreadyImported: 0, unreadable: 0, oldest: null, newest: null }
           : { conversations: 40, alreadyImported: 3, unreadable: 1, oldest: '2024-03-02T09:00:00+00:00', newest: '2026-11-10T12:00:00+00:00' }), 400))
       }
@@ -1341,7 +1453,7 @@
             if (window.__importCancel[args.requestId]) { clearInterval(timer); fail('cancelled'); return }
             processed += 1
             emit('chat-import-progress', { requestId: args.requestId, processed })
-            if (processed >= 40) { clearInterval(timer); done({ imported: 36, duplicate: 3, skipped: 1, omittedNonTextMessages: 0, omittedAttachments: 0, updated: 2, addedMessages: 5, conflicts: 0 }) }
+            if (processed >= 40) { clearInterval(timer); done({ ...(args.provider === 'gemini' ? { groupingNotice: '제미나이 기록은 ...' } : {}), imported: 36, duplicate: 3, skipped: 1, omittedNonTextMessages: 0, omittedAttachments: 0, updated: 2, addedMessages: 5, conflicts: 0 }) }
           }, step)
         })
       }
@@ -1409,7 +1521,10 @@
       case 'chat_read': {
         const chat = chats[args.id]
         if (!chat) throw '대화를 읽지 못했습니다'
-        return JSON.parse(JSON.stringify(chat))
+        // ?msgattach=1 이면 첫 내 말에 첨부를 붙여 준다(뒤쪽에 요청한 chat_read messages[].attachments 꼴).
+        const copy = JSON.parse(JSON.stringify(chat))
+        if (query.get('msgattach') === '1') { const first = copy.messages.find((m) => m.role === 'user'); if (first) first.attachments = [{ assetId: 'sha256:' + 'a'.repeat(64), name: '수업 사진.jpg', mediaType: 'image/jpeg', deleted: false }, { assetId: 'sha256:' + 'b'.repeat(64), name: '저녁 하타 수업 녹음.m4a', mediaType: 'audio/mp4', deleted: false }, { assetId: 'sha256:' + 'c'.repeat(64), name: '수업 계획.txt', mediaType: 'text/plain', deleted: true }] }
+        return copy
       }
       case 'chat_append': {
         const chat = chats[args.id]

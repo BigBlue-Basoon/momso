@@ -112,7 +112,7 @@ fn opened_path_matches(_file: &fs::File, _expected: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn decode_cp949(bytes: &[u8]) -> Option<String> {
+pub(crate) fn decode_cp949(bytes: &[u8]) -> Option<String> {
     use windows_sys::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
     if bytes.is_empty() {
         return Some(String::new());
@@ -148,7 +148,7 @@ fn decode_cp949(bytes: &[u8]) -> Option<String> {
 }
 
 #[cfg(not(windows))]
-fn decode_cp949(_bytes: &[u8]) -> Option<String> {
+pub(crate) fn decode_cp949(_bytes: &[u8]) -> Option<String> {
     None
 }
 

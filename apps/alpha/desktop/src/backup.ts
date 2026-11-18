@@ -57,6 +57,31 @@ export type StoreProgress = { completedCount: number; completedBytes: number; to
 function need() { if (!isDesktopRuntime()) throw new Error('backup needs the desktop runtime') }
 
 export async function remoteStatus() { need(); return invoke<RemoteStatus>('archive_remote_status') }
+
+/**
+ * GitHub 자동 백업(2026-11-18, 뒤쪽 feat/desktop-github-auto-backup archive_auto_backup.rs, 아직 화면 폴더에 없음).
+ *   archive_auto_backup_get() / archive_auto_backup_set({ enabled }) → { enabled, state, consecutiveFailures, reason, retryInSeconds }
+ *   state: disabled | running | retry_pending | pending | idle. 바뀐 뒤 약 2분 묶어 올리고, 실패하면 1~30분 뒤 다시, 앱을 닫을 때 최대 20초.
+ *   이벤트는 없어 화면이 다시 묻는다. 기본은 켬.
+ */
+export type AutoBackupStatus = {
+  enabled: boolean
+  state: 'disabled' | 'running' | 'retry_pending' | 'pending' | 'idle' | string
+  consecutiveFailures: number
+  reason: string | null
+  retryInSeconds: number | null
+}
+function readAutoBackup(value: Partial<AutoBackupStatus> | null): AutoBackupStatus {
+  return {
+    enabled: value?.enabled !== false,
+    state: typeof value?.state === 'string' ? value.state : 'idle',
+    consecutiveFailures: typeof value?.consecutiveFailures === 'number' ? value.consecutiveFailures : 0,
+    reason: typeof value?.reason === 'string' && value.reason ? value.reason : null,
+    retryInSeconds: typeof value?.retryInSeconds === 'number' ? value.retryInSeconds : null,
+  }
+}
+export async function autoBackupGet() { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('archive_auto_backup_get')) }
+export async function autoBackupSet(enabled: boolean) { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('archive_auto_backup_set', { enabled })) }
 export async function remoteConnect(repo: string) { need(); return invoke<RemoteStatus>('archive_remote_connect', { repo }) }
 export async function remotePush() { need(); return invoke<RemoteStatus>('archive_remote_push') }
 export async function remotePull() { need(); return invoke<RemoteStatus>('archive_remote_pull') }

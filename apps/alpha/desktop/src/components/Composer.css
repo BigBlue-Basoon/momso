@@ -658,3 +658,7 @@
 /* 입력창이 좁으면(창 960, 패널 열림) 두 줄로 접어 넘치지 않게. */
 .composer-models-retry { flex: none; white-space: nowrap; }
 .composer-models-state.is-narrow .composer-models-text { max-width: 5.5em; overflow: hidden; text-overflow: ellipsis; }
+
+/* "다시 만들기"로 붙인 생성물 칩(스킬 조각과 같은 꼴, 앞에 작은 그림). */
+.composer-regenerate img { width: 18px; height: 18px; flex: none; border-radius: 4px; object-fit: cover; }
+.composer-regenerate { padding-left: 4px; }

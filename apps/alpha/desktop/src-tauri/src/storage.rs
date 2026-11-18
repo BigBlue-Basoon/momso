@@ -268,8 +268,13 @@ pub(crate) fn initialize_with_progress(
     let mut connection = open_connection(database_path)?;
     ensure_supported_schema(&connection)?;
 
-    let pending = pending_migrations(&connection, MIGRATIONS)?;
-    let has_pending_migrations = !pending.is_empty();
+    let legacy_public = is_public_v85_layout(&connection)?;
+    let pending = if legacy_public {
+        Vec::new()
+    } else {
+        pending_migrations(&connection, MIGRATIONS)?
+    };
+    let has_pending_migrations = legacy_public || !pending.is_empty();
     // A migration backup is checked before any migration runs. Rechecking the
     // unchanged source first would scan the same database twice.
     if had_existing_data && !has_pending_migrations {
@@ -294,6 +299,14 @@ pub(crate) fn initialize_with_progress(
     configure_writable_storage(&connection)?;
 
     emit(&mut progress, "migrating", 2, false);
+    if legacy_public {
+        migrate_public_v85_layout(&mut connection)?;
+    }
+    let pending = if legacy_public {
+        pending_migrations(&connection, MIGRATIONS)?
+    } else {
+        pending
+    };
     for migration in pending {
         apply_migration(&mut connection, migration)?;
     }
@@ -377,6 +390,9 @@ pub(crate) fn sanitize_user_owned_backup_snapshot(path: &Path) -> Result<(), Sto
 pub(crate) fn validate_snapshot_file(snapshot_path: &Path) -> Result<(), StorageError> {
     let connection = open_connection(snapshot_path)?;
     let version = ensure_supported_schema(&connection)?;
+    if is_public_v85_layout(&connection)? {
+        return check_integrity(&connection);
+    }
     let pending = pending_migrations(&connection, MIGRATIONS)?;
     let compatible_previous = (71..LATEST_SCHEMA_VERSION).contains(&version)
         && pending.iter().all(|migration| migration.version > version);
@@ -542,6 +558,9 @@ pub(crate) fn restore_snapshot_file_with_hook(
             let backup = Backup::new(&original, &mut copy)?;
             backup.run_to_completion(128, Duration::from_millis(10), None)?;
         }
+        if is_public_v85_layout(&copy)? {
+            migrate_public_v85_layout(&mut copy)?;
+        }
         for migration in pending_migrations(&copy, MIGRATIONS)? {
             apply_migration(&mut copy, migration)?;
         }
@@ -684,6 +703,108 @@ fn legacy_context_81_is_exact(connection: &Connection) -> Result<bool, StorageEr
         "provider_context_limits",
         include_str!("../migrations/0082_provider_context_limits.sql"),
     )
+}
+
+// The first published Windows build used 8..13 for migrations that were later
+// numbered 9..14. Only recognize its complete v85 ledger and original usage
+// table; arbitrary conflicting histories must continue to fail closed.
+fn is_public_v85_layout(connection: &Connection) -> Result<bool, StorageError> {
+    if schema_version(connection)? != 85 {
+        return Ok(false);
+    }
+    let ledger: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !ledger {
+        return Ok(false);
+    }
+    let first: Option<String> = connection
+        .query_row(
+            "SELECT description FROM app_schema_migrations WHERE version=8",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if first.as_deref() != Some("create rebuildable archive indexes") {
+        return Ok(false);
+    }
+    let expected: Vec<_> = MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version <= 85 && migration.version != 8)
+        .collect();
+    let count: u32 =
+        connection.query_row("SELECT count(*) FROM app_schema_migrations", [], |row| {
+            row.get(0)
+        })?;
+    if count as usize != expected.len() {
+        return Err(StorageError::Integrity(
+            "데이터베이스 변경 기록을 확인할 수 없습니다".into(),
+        ));
+    }
+    for migration in expected {
+        let version = if (9..=14).contains(&migration.version) {
+            migration.version - 1
+        } else {
+            migration.version
+        };
+        let description: Option<String> = connection
+            .query_row(
+                "SELECT description FROM app_schema_migrations WHERE version=?1",
+                [version],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if description.as_deref() != Some(migration.description) {
+            return Err(StorageError::Integrity(
+                "데이터베이스 변경 기록을 확인할 수 없습니다".into(),
+            ));
+        }
+    }
+    let original_usage = include_str!("../migrations/0007_ai_usage.sql")
+        .split(';')
+        .next()
+        .unwrap_or("");
+    let index_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_ai_usage_provider_auth_time' AND tbl_name='ai_usage_events')",
+        [], |row| row.get(0),
+    )?;
+    if !index_exists || !table_is_exact(connection, "ai_usage_events", original_usage)? {
+        return Err(StorageError::Integrity(
+            "데이터베이스 변경 기록을 확인할 수 없습니다".into(),
+        ));
+    }
+    Ok(true)
+}
+
+fn migrate_public_v85_layout(connection: &mut Connection) -> Result<(), StorageError> {
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !is_public_v85_layout(&tx)? {
+        return Err(StorageError::Integrity(
+            "데이터베이스 변경 기록을 확인할 수 없습니다".into(),
+        ));
+    }
+    for version in (8..=13).rev() {
+        if tx.execute(
+            "UPDATE app_schema_migrations SET version=?1 WHERE version=?2",
+            (version + 1, version),
+        )? != 1
+        {
+            return Err(StorageError::Integrity(
+                "데이터베이스 변경 기록을 확인할 수 없습니다".into(),
+            ));
+        }
+    }
+    tx.execute_batch(include_str!("../migrations/0008_gemini_usage.sql"))?;
+    tx.execute(
+        "INSERT INTO app_schema_migrations(version,description) VALUES(8,?1)",
+        ["allow Gemini API usage events"],
+    )?;
+    pending_migrations(&tx, MIGRATIONS)?;
+    check_integrity(&tx)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn table_is_exact(
@@ -856,6 +977,138 @@ fn prune_automated_backups(backups_path: &Path) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests {
+    fn first_public_v85_database(path: &std::path::Path) {
+        use super::*;
+        let mut conn = open_connection(path).unwrap();
+        configure_writable_storage(&conn).unwrap();
+        // The six shifted SQL files are byte-identical to the corresponding
+        // 9..14 files in the first published commit; only their ledger numbers differ.
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 85 && m.version != 8)
+        {
+            let original = Migration {
+                version: if (9..=14).contains(&migration.version) {
+                    migration.version - 1
+                } else {
+                    migration.version
+                },
+                description: migration.description,
+                sql: migration.sql,
+            };
+            apply_migration(&mut conn, &original).unwrap();
+        }
+        conn.execute("INSERT INTO chats(id,title,created_at,updated_at) VALUES('room','fixture room','now','now')", []).unwrap();
+        conn.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at) VALUES('msg','room','user','fixture message','now')", []).unwrap();
+        conn.execute("INSERT INTO ai_usage_events(id,request_id,provider,auth_mode,input_tokens) VALUES('usage','request','codex','subscription',17)", []).unwrap();
+    }
+
+    #[test]
+    fn first_public_v85_upgrades_and_preserves_chat_usage_and_backup() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("old.db");
+        let backups = temp.path().join("backups");
+        first_public_v85_database(&db);
+        let before = open_connection(&db).unwrap();
+        assert!(is_public_v85_layout(&before).unwrap());
+        assert!(pending_migrations(&before, MIGRATIONS).is_err());
+        drop(before);
+        initialize(&db, &backups, "fixture").unwrap();
+        let conn = open_connection(&db).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        let message: String = conn
+            .query_row("SELECT text FROM chat_messages WHERE id='msg'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(message, "fixture message");
+        let tokens: i64 = conn
+            .query_row(
+                "SELECT input_tokens FROM ai_usage_events WHERE id='usage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tokens, 17);
+        conn.execute("INSERT INTO ai_usage_events(id,request_id,provider,auth_mode) VALUES('new','new-request','gemini','api_key')", []).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(&backups)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let saved = open_connection(&entries[0]).unwrap();
+        assert_eq!(schema_version(&saved).unwrap(), 85);
+        assert!(is_public_v85_layout(&saved).unwrap());
+        assert_eq!(
+            saved
+                .query_row("SELECT text FROM chat_messages WHERE id='msg'", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "fixture message"
+        );
+    }
+
+    #[test]
+    fn first_public_v85_rejects_changed_ledger_without_mutating_it() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("old.db");
+        first_public_v85_database(&db);
+        let conn = open_connection(&db).unwrap();
+        conn.execute(
+            "UPDATE app_schema_migrations SET description='different' WHERE version=9",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(initialize(&db, &temp.path().join("backups"), "fixture").is_err());
+        let conn = open_connection(&db).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 85);
+        assert_eq!(
+            conn.query_row(
+                "SELECT description FROM app_schema_migrations WHERE version=9",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "different"
+        );
+        assert_eq!(
+            conn.query_row("SELECT text FROM chat_messages WHERE id='msg'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "fixture message"
+        );
+    }
+
+    #[test]
+    fn first_public_v85_snapshot_restores_without_changing_snapshot() {
+        use super::*;
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot = temp.path().join("old-snapshot.db");
+        let database = temp.path().join("current.db");
+        let backups = temp.path().join("backups");
+        first_public_v85_database(&snapshot);
+        initialize(&database, &backups, "fixture").unwrap();
+        validate_snapshot_file(&snapshot).unwrap();
+        restore_snapshot_file(&snapshot, &database, &backups).unwrap();
+        let conn = open_connection(&database).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            conn.query_row("SELECT text FROM chat_messages WHERE id='msg'", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "fixture message"
+        );
+        let old = open_connection(&snapshot).unwrap();
+        assert_eq!(schema_version(&old).unwrap(), 85);
+        assert!(is_public_v85_layout(&old).unwrap());
+    }
+
     #[tokio::test]
     async fn upgrading_existing_preview_keeps_four_documents_without_reindexing() {
         use super::*;

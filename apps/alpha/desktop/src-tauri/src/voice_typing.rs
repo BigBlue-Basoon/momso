@@ -47,10 +47,25 @@ fn microphone_status() -> &'static str {
 
 #[tauri::command]
 pub fn voice_typing_open(window: tauri::WebviewWindow) -> VoiceTypingOpen {
+    #[cfg(windows)]
+    let focused = window.hwnd().ok().is_some_and(|hwnd| {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetAncestor, GetForegroundWindow, GA_ROOT,
+        };
+        let foreground = unsafe { GetForegroundWindow() };
+        let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+        foreground_matches(hwnd.0 as usize, foreground as usize, root as usize)
+    });
+    #[cfg(not(windows))]
     let focused = window.is_focused().unwrap_or(false);
     VoiceTypingOpen {
         state: open(focused),
     }
+}
+
+#[cfg(any(windows, test))]
+fn foreground_matches(window: usize, foreground: usize, root: usize) -> bool {
+    window != 0 && foreground != 0 && (window == foreground || window == root)
 }
 
 #[cfg(not(windows))]
@@ -132,6 +147,13 @@ fn shortcut() -> [windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT; 4] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn foreground_accepts_own_root_and_child_only() {
+        assert!(super::foreground_matches(10, 10, 10));
+        assert!(super::foreground_matches(10, 11, 10));
+        assert!(!super::foreground_matches(10, 20, 20));
+        assert!(!super::foreground_matches(0, 0, 0));
+    }
     #[test]
     fn unavailable_window_does_not_send_input() {
         #[cfg(windows)]

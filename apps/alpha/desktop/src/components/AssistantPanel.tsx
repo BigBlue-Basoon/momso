@@ -1,4 +1,5 @@
-import { Check, Copy, Globe, Wand2 } from 'lucide-react'
+import { AudioLines, Check, Copy, FileText, Film, Globe, Image as ImageIcon, Wand2 } from 'lucide-react'
+import type { AttachedFile } from '../chat-items'
 import { ShortcutTip } from './ShortcutTip'
 import { W } from '../words'
 import { Fragment, memo, type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
@@ -8,7 +9,8 @@ import { ApprovalCard, type ApprovalItem } from './ApprovalCard'
 import { SecretRequestCard, type SecretItem } from './SecretRequestCard'
 import { MessageRail } from './MessageRail'
 import { ZetMarkdown } from './ZetMarkdown'
-import { openWebAddress } from '../archive'
+import { requestPanelBrowser } from '../panel-browser'
+import { observeSize } from '../resize-later'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 import './ChatColumn.css'
 
@@ -23,6 +25,8 @@ export type ChatViewMessage = {
   notHandedOver?: number
   /** 내 말에 고른 스킬의 이름(한글 이름, 모르면 부르는 이름). */
   skill?: string | null
+  /** 내 말에 붙여 보낸 첨부(파일 이름과 종류). */
+  attachments?: AttachedFile[]
   /** 끊긴 답이면 그 까닭(chat_read 의 finishReason, completed 가 아닌 것). 정상으로 끝났거나 옛 말이면 null. */
   endReason?: string | null
   /** 말을 보낸·받은 때(chat_read 의 createdAt). 말 아래 복사 단추 옆에 보인다. 없으면 적지 않는다. */
@@ -78,6 +82,8 @@ type AssistantPanelProps = {
   onCancelSecret?: (requestId: string) => void
   /** 답이 오지 않았을 때 채팅방 끝의 한 줄과 지금 할 수 있는 일(G18). 다음에 보내면 사라진다. */
   failure?: { text: string; actions: Array<{ id: string; label: string; run: () => void }> } | null
+  /** 회사가 스스로 다시 시도하는 중일 때 답 아래 조용한 한 줄(chat-provider-retrying). */
+  retrying?: string | null
 }
 
 /**
@@ -102,10 +108,12 @@ export function AssistantPanel({
   onSubmitSecret,
   onCancelSecret,
   failure = null,
+  retrying = null,
 }: AssistantPanelProps) {
   // 답은 보는 창과 같은 도구로 그린다(목록, 굵은 글씨, 제목, 코드, 표, 링크). 링크는 앱의 여는 방식(opener)으로.
   // 두 손잡이는 늘 같은 함수로 넘긴다: 입력창에 글자를 칠 때나 답이 흘러 들어올 때 지난 말들을 다시 그리지 않게(2026-11-17 많이 쌓였을 때 재기).
-  const openAddress = useCallback((address: string) => { void openWebAddress(address).catch(() => {}) }, [])
+  // 답 안의 바깥 링크는 오른쪽 패널의 브라우저 탭에서 연다(2026-11-17 본부). 패널이 닫혀 있으면 App 이 연다.
+  const openAddress = useCallback((address: string) => { requestPanelBrowser(address) }, [])
   const openDocumentRef = useRef(onOpenDocument)
   openDocumentRef.current = onOpenDocument
   const openDocument = useCallback((id: string) => openDocumentRef.current(id), [])
@@ -174,9 +182,8 @@ export function AssistantPanel({
     const panel = panelRef.current
     const dock = panel?.querySelector<HTMLElement>('.composer-dock')
     if (!panel || !dock) return
-    const observer = new ResizeObserver(() => panel.style.setProperty('--composer-space', `${dock.offsetHeight}px`))
-    observer.observe(dock)
-    return () => observer.disconnect()
+    panel.style.setProperty('--composer-space', `${dock.offsetHeight}px`)
+    return observeSize(dock, () => panel.style.setProperty('--composer-space', `${dock.offsetHeight}px`))
   }, [])
 
   return (
@@ -234,13 +241,14 @@ export function AssistantPanel({
           <div className="message assistant generating">
             {streamText ? (
               // 흘러 들어오는 중에도 같은 도구로 그린다. 닫히지 않은 굵은 글씨·코드 조각은 닫힐 때까지 글자 그대로 둔다.
-              <ZetMarkdown text={streamText} onOpenZet={onOpenDocument} onOpenAddress={openAddress} />
+              <ZetMarkdown text={streamText} onOpenZet={onOpenDocument} onOpenAddress={openAddress} streaming />
             ) : (
               // 두 앱처럼 흐린 글 한 줄(도는 그림 없음).
               <span className="thinking">{W.assistantPanel.text3}</span>
             )}
           </div>
         )}
+        {retrying && isGenerating && <div className="message-notice message-retrying" role="status">{retrying}</div>}
         {/* 답이 오지 않은 까닭 한 줄(있던 알림 줄 꼴)과 그 자리에서 할 수 있는 일(카드의 글자 단추 꼴). */}
         {failure && !isGenerating && (
           <div className="message-notice message-failure" role="alert">
@@ -296,6 +304,20 @@ const MessageItem = memo(function MessageItem({ message, always, hideEnd, onOpen
             <span className="message-skill" aria-label={W.skills.usedLabel(message.skill)}>
               <Wand2 size={12} aria-hidden />{message.skill}
             </span>
+          )}
+          {/* 붙여 보낸 첨부(2026-11-18 그의 말 "보낸 메시지에 같이 표시되어야"). 두 앱처럼 말풍선 위에 이름과 종류 그림. */}
+          {message.attachments && message.attachments.length > 0 && (
+            <ul className="message-attachments" aria-label={W.attach.sentLabel(message.attachments.length)}>
+              {message.attachments.map((file) => {
+                const Icon = file.mediaType?.startsWith('image/') ? ImageIcon : file.mediaType?.startsWith('audio/') ? AudioLines : file.mediaType?.startsWith('video/') ? Film : FileText
+                return (
+                  <li key={file.assetId} className={file.deleted ? 'message-attachment is-deleted' : 'message-attachment'} title={file.name}>
+                    <Icon size={13} aria-hidden />
+                    <span>{file.name}</span>
+                  </li>
+                )
+              })}
+            </ul>
           )}
           {message.text && <p>{message.text}</p>}
           {message.text && <MessageActions text={message.text} at={message.createdAt} side="user" />}

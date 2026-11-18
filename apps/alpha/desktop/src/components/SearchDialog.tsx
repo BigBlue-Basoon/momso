@@ -4,6 +4,7 @@ import { FileArchive, FileText, FolderOpen, MessageSquare, Search, Settings, Squ
 import { listZets, searchSources, type SourceSearchResult, type ZetListEntry } from '../archive'
 import { searchChatsPage, type ChatEntry, type ChatGroup, type ChatSearchResult } from '../chats'
 import { W } from '../words'
+import { usePanelBrowserHold } from '../panel-browser'
 import './SearchDialog.css'
 
 type Tab = 'all' | 'chats' | 'documents' | 'sources' | 'actions'
@@ -61,6 +62,8 @@ export function SearchDialog({
   /** 사진·소리·영상 원자료를 고르면 미디어 화면으로. */
   onOpenMedia?: () => void
 }) {
+  // 화면을 덮는 창이라 열려 있는 동안 패널 브라우저를 숨긴다.
+  usePanelBrowserHold()
   const [query, setQuery] = useState('')
   const [tab, setTab] = useState<Tab>('all')
   const [active, setActive] = useState(0)

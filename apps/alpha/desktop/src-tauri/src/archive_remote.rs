@@ -19,6 +19,11 @@ pub(crate) fn lock_remote_for_restore() -> Result<std::sync::MutexGuard<'static,
     REMOTE_LOCK.lock().map_err(|_| "busy")
 }
 
+pub(crate) fn try_lock_remote_for_auto() -> Result<std::sync::MutexGuard<'static, ()>, &'static str>
+{
+    REMOTE_LOCK.try_lock().map_err(|_| "busy")
+}
+
 pub(crate) fn lock_first_receive(db: &Path) -> Result<fs::File, &'static str> {
     let lock_path = db
         .parent()
@@ -403,7 +408,7 @@ struct GhReply {
 }
 
 fn run_gh(args: &[&str]) -> Result<GhReply, ()> {
-    let output = hidden(&mut Command::new("gh"))
+    let output = hidden(&mut crate::process::hidden_command("gh"))
         .env("GH_HOST", "github.com")
         .args(args)
         .stdin(Stdio::null())
@@ -722,11 +727,7 @@ async fn create_internal(
             let Ok((remote, _)) = github(repo) else {
                 return result;
             };
-            let branch = remote
-                .default_branch_ref
-                .as_ref()
-                .map(|x| x.name.as_str())
-                .unwrap_or("main");
+            let branch = remote.branch();
             let target = url(&remote.name_with_owner);
             if connect_local(&tool, &root, &target).is_err() {
                 return result;
@@ -762,6 +763,7 @@ pub(crate) struct RemoteStatus {
     history_reason: Option<&'static str>,
     repo: Option<String>,
     visibility: Option<String>,
+    empty: Option<bool>,
     last_pushed_at: Option<String>,
     ahead: Option<u64>,
     behind: Option<u64>,
@@ -774,6 +776,16 @@ pub(crate) struct RemoteStatus {
 }
 
 impl RemoteStatus {
+    pub(crate) fn automatic_result(&self) -> Result<(), &'static str> {
+        match (self.state, self.reason) {
+            ("connected", None) => Ok(()),
+            (_, Some(reason)) => Err(reason),
+            ("not_connected", None) => Err("not_connected"),
+            ("redactionPending", None) => Err("redaction_pending"),
+            _ => Err("unavailable"),
+        }
+    }
+
     fn new(state: &'static str, reason: Option<&'static str>) -> Self {
         Self {
             state,
@@ -782,6 +794,7 @@ impl RemoteStatus {
             history_reason: None,
             repo: None,
             visibility: None,
+            empty: None,
             last_pushed_at: None,
             ahead: None,
             behind: None,
@@ -817,11 +830,23 @@ impl RemoteStatus {
 struct Repository {
     name_with_owner: String,
     is_private: bool,
+    #[serde(default)]
+    is_empty: bool,
     default_branch_ref: Option<DefaultBranch>,
 }
 #[derive(Debug, Deserialize)]
 struct DefaultBranch {
     name: String,
+}
+
+impl Repository {
+    fn branch(&self) -> &str {
+        match self.default_branch_ref.as_ref() {
+            Some(branch) if branch.name.is_empty() && self.is_empty => "main",
+            Some(branch) => &branch.name,
+            None => "main",
+        }
+    }
 }
 
 fn valid_repo(repo: &str) -> bool {
@@ -853,7 +878,7 @@ fn git_path(_resources: &Path) -> Option<PathBuf> {
     crate::git_tool::resolve().map(|(path, _)| path)
 }
 fn git_output(tool: &Path, root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    hidden(&mut Command::new(tool))
+    hidden(&mut crate::process::hidden_command(tool))
         .current_dir(root)
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -946,7 +971,7 @@ pub(crate) fn git(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()>
 }
 
 fn git_index(tool: &Path, root: &Path, index: &Path, args: &[&str]) -> Result<String, ()> {
-    let output = hidden(&mut Command::new(tool))
+    let output = hidden(&mut crate::process::hidden_command(tool))
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(
@@ -978,7 +1003,7 @@ fn git_hash_object(tool: &Path, root: &Path, content: &[u8]) -> Result<String, (
 
 fn git_hash_typed(tool: &Path, root: &Path, kind: &str, content: &[u8]) -> Result<String, ()> {
     use std::io::Write;
-    let mut child = hidden(&mut Command::new(tool))
+    let mut child = hidden(&mut crate::process::hidden_command(tool))
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env(
@@ -1195,7 +1220,7 @@ fn merge_people(base: &str, local: &str, remote: &str) -> Result<(Vec<u8>, bool)
     Ok((bytes, conflicts))
 }
 fn gh_output(args: &[&str]) -> std::io::Result<std::process::Output> {
-    hidden(&mut Command::new("gh"))
+    hidden(&mut crate::process::hidden_command("gh"))
         .env("GH_HOST", "github.com")
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
@@ -1207,7 +1232,7 @@ fn gh_output(args: &[&str]) -> std::io::Result<std::process::Output> {
         .output()
 }
 fn signed_in() -> Result<String, &'static str> {
-    if hidden(&mut Command::new("gh"))
+    if hidden(&mut crate::process::hidden_command("gh"))
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1266,7 +1291,7 @@ fn github(repo: &str) -> Result<(Repository, String), &'static str> {
         "view",
         repo,
         "--json",
-        "nameWithOwner,isPrivate,defaultBranchRef",
+        "nameWithOwner,isPrivate,isEmpty,defaultBranchRef",
     ])
     .map_err(|_| "gh_missing")?;
     if !result.status.success() {
@@ -1451,6 +1476,16 @@ fn receive_first_locked(
     }
     if matches!(journal.phase.as_str(), "receiving" | "checkout") {
         let head = git(tool, root, &["rev-parse", "--verify", "HEAD"]).ok();
+        if head.is_none()
+            && journal.phase == "receiving"
+            && journal.revision.is_none()
+            && !receive_marker_present(root)
+            && relation(tool, root, target, branch)? == (0, 0)
+        {
+            finish_receive_journal(db)?;
+            report(receive_progress("empty", 0, false));
+            return Ok(());
+        }
         let transfer_result = if let Some(head) = head {
             // A completed checkout can be followed by local edits.  Do not
             // pull again or discard them; only accept the exact fetched head.
@@ -1686,6 +1721,7 @@ pub(crate) fn start_first_receive_recovery<R: tauri::Runtime>(
                             Repository {
                                 name_with_owner: repo.clone(),
                                 is_private: true,
+                                is_empty: false,
                                 default_branch_ref: None,
                             }
                         } else {
@@ -1694,10 +1730,7 @@ pub(crate) fn start_first_receive_recovery<R: tauri::Runtime>(
                         #[cfg(not(test))]
                         let remote = github(&repo)?.0;
                         remote_verified = true;
-                        journal.branch = remote
-                            .default_branch_ref
-                            .map(|b| b.name)
-                            .unwrap_or_else(|| "main".into());
+                        journal.branch = remote.branch().to_owned();
                         journal.phase = "receiving".into();
                         write_receive_journal(&db, journal)?;
                     }
@@ -1730,6 +1763,7 @@ pub(crate) fn start_first_receive_recovery<R: tauri::Runtime>(
                         Repository {
                             name_with_owner: repo.clone(),
                             is_private: true,
+                            is_empty: false,
                             default_branch_ref: None,
                         }
                     } else {
@@ -1737,10 +1771,7 @@ pub(crate) fn start_first_receive_recovery<R: tauri::Runtime>(
                     };
                     #[cfg(not(test))]
                     let remote = github(&repo)?.0;
-                    let actual = remote
-                        .default_branch_ref
-                        .map(|b| b.name)
-                        .unwrap_or_else(|| "main".into());
+                    let actual = remote.branch();
                     if actual != branch {
                         return Err("first_receive_interrupted");
                     }
@@ -2680,7 +2711,11 @@ fn fresh_archive(tool: &Path, root: &Path) -> bool {
     fresh_archive_with_local_files(tool, root, false)
 }
 
-fn fresh_archive_with_local_files(tool: &Path, root: &Path, allow_local_files: bool) -> bool {
+pub(crate) fn fresh_archive_with_local_files(
+    tool: &Path,
+    root: &Path,
+    allow_local_files: bool,
+) -> bool {
     let Ok(has_defaults) = crate::skills_write::fresh_builtin_state_mode(root) else {
         return false;
     };
@@ -3454,7 +3489,6 @@ fn transfer_with_redaction_check(
     merge_revision: &mut Option<String>,
     options: (Option<RedactionCheck<'_>>, Option<&Path>),
 ) -> Result<bool, &'static str> {
-    let (check, journal_db) = options;
     transfer_with_options(
         tool,
         root,
@@ -3462,7 +3496,10 @@ fn transfer_with_redaction_check(
         branch,
         action,
         merge_revision,
-        TransferOptions { journal_db, check },
+        TransferOptions {
+            journal_db: options.1,
+            check: options.0,
+        },
     )
 }
 
@@ -3675,11 +3712,9 @@ fn status(root: &Path, resources: &Path) -> RemoteStatus {
     };
     result.signed_in_as = Some(user);
     result.visibility = Some("private".into());
-    let branch = remote
-        .default_branch_ref
-        .map(|x| x.name)
-        .unwrap_or_else(|| "main".into());
-    match relation(&tool, root, &url(&remote.name_with_owner), &branch) {
+    result.empty = Some(remote.is_empty);
+    let branch = remote.branch();
+    match relation(&tool, root, &url(&remote.name_with_owner), branch) {
         Ok((ahead, behind)) => {
             apply_relation(&mut result, &tool, root, ahead, behind);
         }
@@ -3733,11 +3768,7 @@ async fn connect_impl(
             return RemoteStatus::new("unavailable", Some(e));
         }
         if git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).is_err() {
-            let branch = remote
-                .default_branch_ref
-                .as_ref()
-                .map(|x| x.name.as_str())
-                .unwrap_or("main");
+            let branch = remote.branch();
             if let Err(e) = receive_connected_with_progress(
                 &tool,
                 &root,
@@ -3756,16 +3787,18 @@ async fn connect_impl(
 }
 #[cfg(test)]
 #[derive(Clone)]
-struct TestRemote {
-    tool: PathBuf,
-    target: String,
+pub(crate) struct TestRemote {
+    pub(crate) tool: PathBuf,
+    pub(crate) target: String,
 }
 
-async fn run_transfer<R: tauri::Runtime>(
+pub(crate) async fn run_transfer<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, crate::AppState>,
     action: &'static str,
 ) -> RemoteStatus {
+    let automatic = action == "auto_push";
+    let action = if automatic { "push" } else { action };
     let Ok((root, resources, db)) = command_paths(&app, &state).await else {
         return RemoteStatus::new("unavailable", Some("local_state_unavailable"));
     };
@@ -3778,6 +3811,17 @@ async fn run_transfer<R: tauri::Runtime>(
     tauri::async_runtime::spawn_blocking(move || {
         let Ok(_guard) = REMOTE_LOCK.lock() else {
             return RemoteStatus::new("unavailable", Some("busy"));
+        };
+        if automatic && !crate::archive_auto_backup::enabled(&db).unwrap_or(false) {
+            return RemoteStatus::new("unavailable", Some("auto_backup_disabled"));
+        }
+        let _automatic_receive_lock = if automatic {
+            match lock_first_receive(&db) {
+                Ok(lock) => Some(lock),
+                Err(reason) => return RemoteStatus::new("unavailable", Some(reason)),
+            }
+        } else {
+            None
         };
         #[cfg(test)]
         let tool = test_remote
@@ -3805,6 +3849,7 @@ async fn run_transfer<R: tauri::Runtime>(
                 Repository {
                     name_with_owner: repo.clone(),
                     is_private: true,
+                    is_empty: false,
                     default_branch_ref: None,
                 },
                 "fixture".to_owned(),
@@ -3818,10 +3863,7 @@ async fn run_transfer<R: tauri::Runtime>(
             Ok(x) => x,
             Err(e) => return RemoteStatus::new("unavailable", Some(e)),
         };
-        let branch = remote
-            .default_branch_ref
-            .map(|x| x.name)
-            .unwrap_or_else(|| "main".into());
+        let branch = remote.branch().to_owned();
         let journal = match read_receive_journal(&db) {
             Ok(journal) => journal,
             Err(error) => return RemoteStatus::new("unavailable", Some(error)),
@@ -3829,6 +3871,16 @@ async fn run_transfer<R: tauri::Runtime>(
         let retry = journal.is_some() || receive_marker_present(&root);
         if action == "push" && retry {
             return RemoteStatus::new("unavailable", Some("first_receive_in_progress"));
+        }
+        if automatic {
+            if crate::skills_write::save_external_changes(&root, &resources).is_err() {
+                return RemoteStatus::new("unavailable", Some("unsaved_skill_changes"));
+            }
+            if let Err(error) = crate::archive::save(&root, &resources, &db) {
+                if error != "저장할 변경 사항이 없습니다" {
+                    return RemoteStatus::new("unavailable", Some("local_save_failed"));
+                }
+            }
         }
         let first_receive = action == "pull"
             && (retry || git(&tool, &root, &["rev-parse", "--verify", "HEAD"]).is_err());
@@ -4859,6 +4911,77 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn empty_github_repository_uses_main_for_first_push() {
+        let f = Fixture::new();
+        let remote: super::Repository = serde_json::from_str(
+            r#"{"nameWithOwner":"fixture/repository","isPrivate":true,"isEmpty":true,"defaultBranchRef":{"name":""}}"#,
+        )
+        .unwrap();
+        assert_eq!(remote.branch(), "main");
+        assert_eq!(
+            super::relation(&f.tool, &f.root, f.remote(), remote.branch()),
+            Ok((1, 0))
+        );
+        transfer(&f.tool, &f.root, f.remote(), remote.branch(), "push").unwrap();
+        assert_eq!(
+            super::relation(&f.tool, &f.root, f.remote(), remote.branch()),
+            Ok((0, 0))
+        );
+    }
+
+    #[test]
+    fn empty_first_receive_clears_interrupted_journal_and_preserves_local_files() {
+        let f = Fixture::new();
+        let root = f._dir.path().join("unborn");
+        fs::create_dir_all(&root).unwrap();
+        git(&f.tool, &root, &["init", "--initial-branch=main"]).unwrap();
+        fs::write(root.join("user-file.txt"), "keep").unwrap();
+        let db = f._dir.path().join("empty-receive.sqlite");
+        crate::storage::initialize(&db, &f._dir.path().join("backup"), "test").unwrap();
+        super::begin_receive_journal(&db, &root, f.remote(), "main").unwrap();
+        let mut progress = Vec::new();
+        super::receive_first_with_progress(
+            &f.tool,
+            &root,
+            &db,
+            f.remote(),
+            "main",
+            |event| progress.push(event.state.to_owned()),
+            || panic!("empty remote must not restore"),
+        )
+        .unwrap();
+        assert_eq!(progress.last().map(String::as_str), Some("empty"));
+        assert!(!super::first_receive_pending(&root, &db));
+        assert_eq!(
+            fs::read_to_string(root.join("user-file.txt")).unwrap(),
+            "keep"
+        );
+        assert!(git(&f.tool, &root, &["rev-parse", "--verify", "HEAD"]).is_err());
+    }
+
+    #[test]
+    fn github_repository_branch_selection_respects_existing_and_invalid_names() {
+        let f = Fixture::new();
+        let remote: super::Repository = serde_json::from_str(
+            r#"{"nameWithOwner":"fixture/repository","isPrivate":true,"isEmpty":true,"defaultBranchRef":{"name":"main"}}"#,
+        )
+        .unwrap();
+        transfer(&f.tool, &f.root, f.remote(), remote.branch(), "push").unwrap();
+        assert_eq!(
+            super::relation(&f.tool, &f.root, f.remote(), remote.branch()),
+            Ok((0, 0))
+        );
+        let bad: super::Repository = serde_json::from_str(
+            r#"{"nameWithOwner":"fixture/repository","isPrivate":true,"isEmpty":false,"defaultBranchRef":{"name":"bad branch"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            super::relation(&f.tool, &f.root, f.remote(), bad.branch()),
+            Err("invalid_branch")
+        );
     }
 
     #[test]

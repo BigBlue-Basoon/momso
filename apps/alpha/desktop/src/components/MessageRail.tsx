@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react'
+import { observeSize } from '../resize-later'
 import './MessageRail.css'
 import { W } from '../words'
 
@@ -64,14 +65,13 @@ export function MessageRail({ streamRef, userMessageCount }: MessageRailProps) {
     if (!stream) return
     const onScroll = () => updateCurrent()
     stream.addEventListener('scroll', onScroll, { passive: true })
-    const observer = new ResizeObserver(() => {
+    const stopObserving = observeSize(stream, () => {
       updateFrame()
       updateCurrent()
     })
-    observer.observe(stream)
     return () => {
       stream.removeEventListener('scroll', onScroll)
-      observer.disconnect()
+      stopObserving()
     }
   }, [streamRef, updateCurrent, updateFrame])
 

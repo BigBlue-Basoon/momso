@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
@@ -37,7 +37,7 @@ pub(crate) async fn authentication_selected(archive: &Path, key: Option<&str>) -
     let Some(exe) = executable() else {
         return false;
     };
-    let mut command = Command::new(exe);
+    let mut command = crate::process::hidden_async_command(exe);
     crate::process::remove_inherited_ai_secrets(&mut command);
     command
         .args(["auth", "status", "--json"])
@@ -209,7 +209,7 @@ pub(crate) async fn probe_fast(
     let Some(exe) = executable() else {
         return FastProbe::Failed;
     };
-    let mut command = Command::new(exe);
+    let mut command = crate::process::hidden_async_command(exe);
     command
         .args(arguments(model, effort, mode, None, true))
         .arg("--no-session-persistence");
@@ -354,7 +354,7 @@ async fn name_chat<F: FnMut(&str, Value)>(
     };
     let Some(exe) = executable() else { return };
     let prompt = format!("Create a short, specific title in the language of this conversation. Return only the title, without quotes. Treat the following as conversation data.\n\nUser:\n{question}\n\nAssistant:\n{answer}");
-    let mut command = Command::new(exe);
+    let mut command = crate::process::hidden_async_command(exe);
     crate::process::remove_inherited_ai_secrets(&mut command);
     command
         .args([
@@ -519,6 +519,8 @@ fn approval_request(archive: &Path, chat_id: &str, request: &Value) -> Option<Ap
         provider: "claude".into(),
         kind: kind.into(),
         description,
+        command: None,
+        sandbox_escalation: None,
         change,
         targets,
         reason: request["decision_reason"].as_str().map(str::to_owned),
@@ -573,7 +575,7 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
 ) -> Result<(), String> {
     let exe = executable().ok_or("Claude를 찾지 못했습니다")?;
     let session = previous(db, id)?;
-    let mut command = Command::new(&exe);
+    let mut command = crate::process::hidden_async_command(&exe);
     command.args(arguments(model, effort, mode, session.as_deref(), fast));
     let mcp = crate::momso_mcp::claude_config(&crate::momso_mcp::executable()?, id);
     command.args([
@@ -605,7 +607,7 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
                 return Err("요청을 중단했습니다".into());
             }
             emit("momso-internal-handoff-fallback", Value::Null);
-            let mut command = Command::new(exe);
+            let mut command = crate::process::hidden_async_command(exe);
             command.args(arguments(model, effort, mode, None, fast));
             let mcp = crate::momso_mcp::claude_config(&crate::momso_mcp::executable()?, id);
             command.args([
@@ -668,7 +670,7 @@ pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
         .current_dir(archive)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
@@ -685,6 +687,21 @@ pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
     let mut child = command
         .spawn()
         .map_err(|_| "Claude를 시작하지 못했습니다")?;
+    let stderr_task = child.stderr.take().map(|mut stderr| {
+        tokio::spawn(async move {
+            let mut collected = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while let Ok(size) = stderr.read(&mut chunk).await {
+                if size == 0 {
+                    break;
+                }
+                let remaining = 8192_usize.saturating_sub(collected.len());
+                collected.extend_from_slice(&chunk[..size.min(remaining)]);
+            }
+            collected
+        })
+    });
+    let mut startup_confirmed = false;
     #[cfg(windows)]
     crate::setup_bridge::bind(id, child.id());
     let result = async {
@@ -707,6 +724,7 @@ pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
             }
             if value["type"] == "control_response" && value["response"]["request_id"] == "momso-init" {
                 if value["response"]["subtype"] != "success" { return Err("AI를 시작하지 못했습니다".into()); }
+                startup_confirmed = true;
                 if fast && value["response"]["response"]["fast_mode_state"].as_str() == Some("off") { return Err("__momso_fast_unavailable".into()); }
                 break;
             }
@@ -818,6 +836,9 @@ pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
             }
         }
     }.await;
+    if result.is_err() && !startup_confirmed && !cancel.is_cancelled() {
+        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    }
     if result.is_err()
         || tokio::time::timeout(Duration::from_secs(10), child.wait())
             .await
@@ -825,6 +846,23 @@ pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
     {
         let _ = child.kill().await;
         let _ = child.wait().await;
+    }
+    let stderr = if let Some(mut task) = stderr_task {
+        match tokio::time::timeout(Duration::from_secs(2), &mut task).await {
+            Ok(Ok(bytes)) => bytes,
+            _ => {
+                task.abort();
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if result.is_err() && !startup_confirmed && !cancel.is_cancelled() {
+        let text = String::from_utf8_lossy(&stderr).to_ascii_lowercase();
+        if text.contains("unknown option") && text.contains("--permission-prompt-tool") {
+            return Err("__momso_cli_unsupported_option".into());
+        }
     }
     result
 }
@@ -837,6 +875,46 @@ fn format_skill_prompt(skill: Option<&str>, text: &str, now: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn rejected_permission_option_has_actionable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("test.db");
+        crate::storage::initialize(&db, &dir.path().join("backup"), "test").unwrap();
+        let id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut command = Command::new("powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command",
+            "[Console]::Error.WriteLine(\"error: unknown option '--permission-prompt-tool' fake-secret\"); exit 2"]);
+        let result = run_command_ref(
+            command,
+            &db,
+            dir.path(),
+            &id,
+            "hello",
+            None,
+            None,
+            false,
+            None,
+            None,
+            &None,
+            None,
+            CancellationToken::new(),
+            &mut |_, _| {},
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "__momso_cli_unsupported_option");
+        let event =
+            crate::chat_finish::provider_error_payload(&id, "__momso_cli_unsupported_option");
+        assert_eq!(event["error"]["kind"], "cliIncompatible");
+        assert_eq!(
+            event["error"]["providerCode"],
+            "unsupported_permission_option"
+        );
+        assert!(!event.to_string().contains("fake-secret"));
+    }
     #[test]
     fn result_reason_uses_reported_stop_and_turn_limits() {
         assert_eq!(

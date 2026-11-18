@@ -591,12 +591,27 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_snapshot_round_trip_preserves_current_state_before_restore() {
-        exercise_new_pc_round_trip(false).await;
+        exercise_new_pc_round_trip("s3_compatible").await;
     }
 
     #[tokio::test]
     async fn oauth_r2_new_pc_recovers_documents_sources_and_chat_state() {
-        exercise_new_pc_round_trip(true).await;
+        exercise_new_pc_round_trip("r2_oauth").await;
+    }
+
+    #[tokio::test]
+    async fn ncp_new_pc_recovers_documents_sources_and_chat_state() {
+        exercise_new_pc_round_trip("ncp").await;
+    }
+
+    #[tokio::test]
+    async fn aws_new_pc_recovers_documents_sources_and_chat_state() {
+        exercise_new_pc_round_trip("aws").await;
+    }
+
+    #[tokio::test]
+    async fn r2_key_new_pc_recovers_documents_sources_and_chat_state() {
+        exercise_new_pc_round_trip("cloudflare").await;
     }
 
     #[test]
@@ -690,7 +705,9 @@ mod tests {
         );
     }
 
-    async fn exercise_new_pc_round_trip(oauth: bool) {
+    async fn exercise_new_pc_round_trip(provider: &'static str) {
+        let oauth = provider == "r2_oauth";
+        let ncp = provider == "ncp";
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let database_path = root.join("momso.db");
@@ -1196,6 +1213,14 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                     }
                 };
                 let head = String::from_utf8(received[..end].to_vec()).unwrap();
+                if ncp {
+                    assert!(head.lines().any(|line| {
+                        line.to_ascii_lowercase()
+                            .starts_with("authorization: aws4-hmac-sha256 ")
+                            && line.contains("/kr-standard/s3/aws4_request")
+                    }));
+                    assert!(!head.to_ascii_lowercase().contains("if-none-match:"));
+                }
                 let mut line = head.lines().next().unwrap().split_whitespace();
                 let method = line.next().unwrap();
                 let path = line.next().unwrap();
@@ -1276,9 +1301,16 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             }
         });
         let config = object_store::Config {
-            provider: if oauth { "cloudflare" } else { "s3_compatible" }.into(),
+            provider: if oauth { "cloudflare" } else { provider }.into(),
             endpoint: format!("http://{address}"),
-            region: if oauth { "wrangleroauth" } else { "auto" }.into(),
+            region: if oauth {
+                "wrangleroauth"
+            } else if ncp {
+                "kr-standard"
+            } else {
+                "auto"
+            }
+            .into(),
             bucket: if oauth {
                 "momso-fixture".into()
             } else {
@@ -1286,7 +1318,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             },
             credential_id: "test".into(),
             last_backup_at: None,
-            write_safety: Some(if oauth {
+            write_safety: Some(if oauth || ncp {
                 object_store::WriteSafety::CheckThenWrite
             } else {
                 object_store::WriteSafety::Conditional
@@ -1569,6 +1601,10 @@ $null = [Console]::ReadLine()
             None,
         )
         .unwrap();
+        while !crate::chat_redaction_recheck::step(&archive_root, &new_paths)
+            .unwrap()
+            .available
+        {}
         crate::chat_archive_store::save_pending(&archive_root, &new_pc, &new_paths).unwrap();
         crate::archive_remote::transfer(
             &tool,

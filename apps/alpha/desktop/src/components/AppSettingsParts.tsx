@@ -192,14 +192,14 @@ export function AppInfoSettings({ update }: { update: AppUpdateState }) {
         </div>
       </div>
       {/* 저작권(2026-11-16 그의 말 "앱 정보에 … 저작권 그런거 문구도"). 글은 레포의 NOTICE·LICENSE 에서 가져와 짧게: 저작권 한 줄,
-          라이선스 이름과 전문 링크, 다른 회사 이름·로고는 각 회사의 것. 장식 선·작은 라벨 없이 흐린 글로. */}
+          라이선스 이름과 전문 링크. 장식 선·작은 라벨 없이 흐린 글로.
+          2026-11-18 "다른 회사 이름·로고는 각 회사의 것" 줄은 뺐다(그의 말 "이런건 안적어줘도 되지않나", 법으로 적어야 하는 글이 아님). */}
       <div className="app-legal">
         <p>{W.appSettingsParts.copyright}</p>
         <p>
           {W.appSettingsParts.license('PolyForm Shield 1.0.0')}{' '}
           <button className="app-legal-link" type="button" onClick={() => { void openWebAddress(LICENSE_URL).catch(() => {}) }}>{W.appSettingsParts.licenseLink}</button>
         </p>
-        <p>{W.appSettingsParts.otherMarks}</p>
       </div>
     </section>
   )

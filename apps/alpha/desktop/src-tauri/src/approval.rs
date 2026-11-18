@@ -49,6 +49,8 @@ pub(crate) struct ApprovalRequest {
     pub(crate) provider: String,
     pub(crate) kind: String,
     pub(crate) description: String,
+    pub(crate) command: Option<String>,
+    pub(crate) sandbox_escalation: Option<bool>,
     pub(crate) change: Option<ChangeKind>,
     pub(crate) targets: Vec<ApprovalTarget>,
     pub(crate) reason: Option<String>,
@@ -68,6 +70,8 @@ pub(crate) fn setup_request(
         provider: ai_provider.to_owned(),
         kind: "setup_change".into(),
         description: String::new(),
+        command: None,
+        sandbox_escalation: None,
         change: Some(ChangeKind::Create),
         targets: vec![ApprovalTarget {
             path: setup.resource_name.clone(),
@@ -97,6 +101,8 @@ pub(crate) fn browser_request(
         provider: provider.to_owned(),
         kind: "browser_action".into(),
         description: format!("{action} · {element_name}"),
+        command: None,
+        sandbox_escalation: None,
         change: Some(ChangeKind::Edit),
         targets: vec![ApprovalTarget {
             path: site.to_owned(),
@@ -137,6 +143,8 @@ pub(crate) fn dictionary_request(
         provider: provider.to_owned(),
         kind: "dictionary_change".into(),
         description,
+        command: None,
+        sandbox_escalation: None,
         change: Some(ChangeKind::Edit),
         targets: vec![ApprovalTarget {
             path: "dictionary/my-terms.json".into(),
@@ -176,6 +184,9 @@ impl ApprovalRequest {
             *value = crate::chat_archive_redact::redact_with_known(value, known).text;
         };
         clean(&mut self.description);
+        if let Some(command) = &mut self.command {
+            clean(command);
+        }
         for target in &mut self.targets {
             clean(&mut target.path);
         }
@@ -202,8 +213,10 @@ impl ApprovalRequest {
 }
 
 struct Pending {
-    options: Vec<ApprovalChoice>,
+    request: ApprovalRequest,
     sender: oneshot::Sender<ApprovalChoice>,
+    deadline: tokio::time::Instant,
+    cancellation: CancellationToken,
 }
 
 #[derive(Clone, Default)]
@@ -214,16 +227,41 @@ pub(crate) struct ApprovalBroker {
 impl ApprovalBroker {
     async fn register(
         &self,
-        id: String,
-        options: Vec<ApprovalChoice>,
+        request: ApprovalRequest,
+        cancellation: CancellationToken,
+        timeout: std::time::Duration,
     ) -> Result<oneshot::Receiver<ApprovalChoice>, String> {
         let mut pending = self.pending.lock().await;
-        if pending.contains_key(&id) || options.is_empty() {
+        if pending.contains_key(&request.request_id) || request.options.is_empty() {
             return Err("승인 요청을 등록하지 못했습니다".to_owned());
         }
         let (sender, receiver) = oneshot::channel();
-        pending.insert(id, Pending { options, sender });
+        pending.insert(
+            request.request_id.clone(),
+            Pending {
+                request,
+                sender,
+                deadline: tokio::time::Instant::now() + timeout,
+                cancellation,
+            },
+        );
         Ok(receiver)
+    }
+
+    pub(crate) async fn pending(&self, chat_id: Option<&str>) -> Vec<ApprovalRequest> {
+        let pending = self.pending.lock().await;
+        let mut requests: Vec<_> = pending
+            .values()
+            .filter(|entry| {
+                !entry.cancellation.is_cancelled()
+                    && !entry.sender.is_closed()
+                    && tokio::time::Instant::now() < entry.deadline
+                    && chat_id.is_none_or(|id| entry.request.chat_id.as_deref() == Some(id))
+            })
+            .map(|entry| entry.request.clone())
+            .collect();
+        requests.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        requests
     }
 
     pub(crate) async fn respond(&self, id: &str, choice: ApprovalChoice) -> Result<(), String> {
@@ -231,7 +269,13 @@ impl ApprovalBroker {
         let request = pending
             .get(id)
             .ok_or_else(|| "승인 요청을 찾을 수 없습니다".to_owned())?;
-        if !request.options.contains(&choice) {
+        if request.cancellation.is_cancelled()
+            || request.sender.is_closed()
+            || tokio::time::Instant::now() >= request.deadline
+        {
+            return Err("승인 요청을 찾을 수 없습니다".to_owned());
+        }
+        if !request.request.options.contains(&choice) {
             return Err("이 승인 요청에서 선택할 수 없는 응답입니다".to_owned());
         }
         let request = pending
@@ -299,7 +343,9 @@ impl ApprovalBroker {
     ) -> Result<ApprovalChoice, String> {
         let id = request.request_id.clone();
         let mut closed = request.closed();
-        let receiver = self.register(id.clone(), request.options.clone()).await?;
+        let receiver = self
+            .register(request.clone(), cancellation.clone(), timeout)
+            .await?;
         if !emit(&request) {
             self.pending.lock().await.remove(&id);
             return Err("승인 요청을 화면에 전달하지 못했습니다".to_owned());
@@ -552,6 +598,8 @@ mod tests {
             provider: "codex".into(),
             kind: "command".into(),
             description: "cmd".into(),
+            command: None,
+            sandbox_escalation: None,
             change: None,
             targets: vec![],
             reason: None,
@@ -575,8 +623,9 @@ mod tests {
         let broker = ApprovalBroker::default();
         let receiver = broker
             .register(
-                "a".into(),
-                vec![ApprovalChoice::AllowOnce, ApprovalChoice::Deny],
+                test_request("a", vec![ApprovalChoice::AllowOnce, ApprovalChoice::Deny]),
+                CancellationToken::new(),
+                std::time::Duration::from_secs(30),
             )
             .await
             .unwrap();
@@ -596,13 +645,96 @@ mod tests {
     async fn rejects_duplicate_and_empty_requests() {
         let broker = ApprovalBroker::default();
         let _receiver = broker
-            .register("a".into(), vec![ApprovalChoice::Deny])
+            .register(
+                test_request("a", vec![ApprovalChoice::Deny]),
+                CancellationToken::new(),
+                std::time::Duration::from_secs(30),
+            )
             .await
             .unwrap();
         assert!(broker
-            .register("a".into(), vec![ApprovalChoice::Deny])
+            .register(
+                test_request("a", vec![ApprovalChoice::Deny]),
+                CancellationToken::new(),
+                std::time::Duration::from_secs(30)
+            )
             .await
             .is_err());
-        assert!(broker.register("b".into(), vec![]).await.is_err());
+        assert!(broker
+            .register(
+                test_request("b", vec![]),
+                CancellationToken::new(),
+                std::time::Duration::from_secs(30)
+            )
+            .await
+            .is_err());
+    }
+
+    fn test_request(id: &str, options: Vec<ApprovalChoice>) -> ApprovalRequest {
+        let mut request = browser_request(
+            "chat-a",
+            "codex",
+            "https://example.test",
+            "click",
+            "scope",
+            "item",
+        );
+        request.request_id = id.into();
+        request.options = options;
+        request
+    }
+
+    #[tokio::test]
+    async fn pending_only_returns_live_unanswered_requests_for_chat() {
+        let broker = ApprovalBroker::default();
+        let timeout = std::time::Duration::from_secs(30);
+        let cancel = CancellationToken::new();
+        let _a = broker
+            .register(
+                test_request("a", vec![ApprovalChoice::Deny]),
+                CancellationToken::new(),
+                timeout,
+            )
+            .await
+            .unwrap();
+        let mut second = test_request("b", vec![ApprovalChoice::Deny]);
+        second.chat_id = Some("chat-b".into());
+        let _b = broker
+            .register(second, CancellationToken::new(), timeout)
+            .await
+            .unwrap();
+        let _c = broker
+            .register(
+                test_request("c", vec![ApprovalChoice::Deny]),
+                cancel.clone(),
+                timeout,
+            )
+            .await
+            .unwrap();
+        let _expired = broker
+            .register(
+                test_request("expired", vec![ApprovalChoice::Deny]),
+                CancellationToken::new(),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        cancel.cancel();
+        assert_eq!(
+            broker
+                .pending(Some("chat-a"))
+                .await
+                .iter()
+                .map(|r| r.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(broker.pending(None).await.len(), 2);
+        broker.respond("a", ApprovalChoice::Deny).await.unwrap();
+        assert!(broker.pending(Some("chat-a")).await.is_empty());
+        assert!(broker
+            .respond("expired", ApprovalChoice::Deny)
+            .await
+            .is_err());
     }
 }

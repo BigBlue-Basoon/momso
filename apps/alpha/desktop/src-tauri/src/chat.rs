@@ -1,7 +1,7 @@
 use chrono::{Local, SecondsFormat};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 use uuid::Uuid;
 
 pub(crate) fn canonical_provider(value: Option<&str>) -> Option<&str> {
@@ -44,6 +44,17 @@ pub(crate) struct ChatMessage {
     not_handed_over: Option<i64>,
     finish_reason: Option<FinishReason>,
     auth_method: Option<String>,
+    attachments: Vec<ChatReadAttachment>,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatReadAttachment {
+    asset_id: String,
+    name: String,
+    media_type: Option<String>,
+    deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -385,6 +396,7 @@ fn message(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatMessage> {
             .map(FinishReason::from_db)
             .transpose()?,
         auth_method: row.get(12)?,
+        attachments: Vec::new(),
     })
 }
 const SELECT_SUMMARY: &str = "SELECT c.id,c.title,NULLIF(c.created_at,''),NULLIF(c.updated_at,''),(SELECT count(*) FROM chat_messages m WHERE m.chat_id=c.id),c.group_id,c.pinned_order,(SELECT source_provider FROM chat_imports i WHERE i.chat_id=c.id) FROM chats c";
@@ -459,9 +471,15 @@ pub(crate) fn read(path: &Path, id: &str) -> Result<ChatDetail, String> {
     let rows = q
         .query_map([id], message)
         .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
-    let messages = rows
+    let mut messages = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    let mut attachments = read_attachments(&c, id)?;
+    for message in &mut messages {
+        if message.role == Role::User {
+            message.attachments = attachments.remove(&message.id).unwrap_or_default();
+        }
+    }
     Ok(ChatDetail {
         id: h.id,
         title: h.title,
@@ -470,6 +488,58 @@ pub(crate) fn read(path: &Path, id: &str) -> Result<ChatDetail, String> {
         imported_from: h.imported_from,
         messages,
     })
+}
+
+fn read_attachments(
+    c: &Connection,
+    chat_id: &str,
+) -> Result<HashMap<String, Vec<ChatReadAttachment>>, String> {
+    let has_attachments: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_attachments')", [], |row| row.get(0))
+        .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    if !has_attachments {
+        return Ok(HashMap::new());
+    }
+    let has_pending: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_archive_pending_attachment')", [], |row| row.get(0))
+        .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    let query = if has_pending {
+        "SELECT a.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id),0 AS source_order,a.rowid AS attachment_order FROM chat_attachments a JOIN momso_source_assets s ON s.id=a.asset_id WHERE a.chat_id=?1 AND a.message_id IS NOT NULL UNION ALL SELECT p.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id),1 AS source_order,p.rowid AS attachment_order FROM chat_archive_pending_attachment p JOIN momso_source_assets s ON s.id=p.asset_id WHERE p.chat_id=?1 AND p.message_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM chat_attachments a WHERE a.receipt_id=p.receipt_id) ORDER BY source_order,attachment_order"
+    } else {
+        "SELECT a.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id) FROM chat_attachments a JOIN momso_source_assets s ON s.id=a.asset_id WHERE a.chat_id=?1 AND a.message_id IS NOT NULL ORDER BY a.rowid"
+    };
+    let mut q = c
+        .prepare(query)
+        .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    let rows = q
+        .query_map([chat_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })
+        .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    let mut result: HashMap<String, Vec<ChatReadAttachment>> = HashMap::new();
+    for row in rows {
+        let (message, hash, name, media_type, integrity, deleted) =
+            row.map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+        let asset_id = format!("sha256:{hash}");
+        if !crate::archive_zet::valid_asset_id(&asset_id) {
+            return Err("채팅방을 읽지 못했습니다".into());
+        }
+        let path = (!deleted && integrity == "active")
+            .then(|| format!("objects/sha256/{}/{}", &hash[..2], hash));
+        result.entry(message).or_default().push(ChatReadAttachment {
+            asset_id,
+            name,
+            media_type,
+            deleted,
+            path,
+        });
+    }
+    Ok(result)
 }
 #[cfg(test)]
 pub(crate) fn append(
@@ -685,15 +755,16 @@ fn append_internal(
         not_handed_over: None,
         finish_reason,
         auth_method: None,
+        attachments: Vec::new(),
     })
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MessageAttachment {
-    path: String,
-    name: String,
-    media_type: Option<String>,
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) media_type: Option<String>,
 }
 
 pub(crate) fn message_attachment_paths(
@@ -1029,6 +1100,72 @@ pub(crate) fn set_codex_thread(path: &Path, id: &str, thread: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_keeps_attachments_on_the_sent_message_through_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("test.db");
+        crate::storage::initialize(&path, &temp.path().join("backups"), "test").unwrap();
+        let id = serde_json::to_value(create(&path).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let c = db(&path).unwrap();
+        for (asset, ch, name, media) in [
+            ("one", 'a', "lesson.txt", "text/plain"),
+            ("two", 'b', "photo.png", "image/png"),
+        ] {
+            let hash = ch.to_string().repeat(64);
+            c.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,media_type,captured_by,created_at) VALUES(?1,'other',?2,4,?3,?4,?5,'test','now')", params![asset, hash, format!("sha256/{ch}{ch}/{hash}"), name, media]).unwrap();
+            c.execute(
+                "INSERT INTO chat_attachments(receipt_id,chat_id,asset_id) VALUES(?1,?2,?3)",
+                params![format!("receipt-{asset}"), id, asset],
+            )
+            .unwrap();
+        }
+        drop(c);
+        let sent = append_for_send(&path, &id, "first", None).unwrap();
+        append(&path, &id, Role::Assistant, "answer", None, None).unwrap();
+        append_for_send(&path, &id, "second", None).unwrap();
+        let read_json = || serde_json::to_value(read(&path, &id).unwrap()).unwrap();
+        let value = read_json();
+        assert_eq!(value["messages"][0]["id"], sent.id);
+        assert_eq!(
+            value["messages"][0]["attachments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            value["messages"][0]["attachments"][0]["assetId"],
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(value["messages"][0]["attachments"][0]["name"], "lesson.txt");
+        assert_eq!(
+            value["messages"][0]["attachments"][1]["mediaType"],
+            "image/png"
+        );
+        assert_eq!(
+            value["messages"][0]["attachments"][1]["path"],
+            format!("objects/sha256/bb/{}", "b".repeat(64))
+        );
+        assert_eq!(value["messages"][1]["attachments"], serde_json::json!([]));
+        assert_eq!(value["messages"][2]["attachments"], serde_json::json!([]));
+        let c = db(&path).unwrap();
+        c.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('one','fixture-one','trashed','now','later')", []).unwrap();
+        c.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('two','fixture-two','purged','now','later')", []).unwrap();
+        c.execute("UPDATE momso_source_assets SET original_file_name='deleted',media_type=NULL WHERE id='two'", []).unwrap();
+        drop(c);
+        let value = read_json();
+        let attachments = value["messages"][0]["attachments"].as_array().unwrap();
+        assert_eq!(attachments[0]["name"], "lesson.txt");
+        assert_eq!(attachments[0]["deleted"], true);
+        assert!(attachments[0].get("path").is_none());
+        assert_eq!(attachments[1]["deleted"], true);
+        assert_eq!(attachments[1]["name"], "deleted");
+        assert!(attachments[1].get("path").is_none());
+    }
 
     #[tokio::test]
     async fn deletion_cleans_database_and_preserves_archive_files() {

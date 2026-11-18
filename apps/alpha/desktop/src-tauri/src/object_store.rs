@@ -678,7 +678,11 @@ pub(crate) async fn probe_connection(
         keys,
         reqwest::Method::GET,
         "",
-        &[("list-type", "2"), ("max-keys", "1")],
+        if config.provider == "ncp" {
+            &[("max-keys", "1")]
+        } else {
+            &[("list-type", "2"), ("max-keys", "1")]
+        },
         vec![],
     )
     .await?;
@@ -917,7 +921,11 @@ pub(crate) async fn object_store_status(
                 &keys,
                 reqwest::Method::GET,
                 "",
-                &[("list-type", "2"), ("max-keys", "1")],
+                if config.provider == "ncp" {
+                    &[("max-keys", "1")]
+                } else {
+                    &[("list-type", "2"), ("max-keys", "1")]
+                },
                 vec![],
             )
             .await

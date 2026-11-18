@@ -63,6 +63,11 @@ fn declined_approval(chat_id: &str, method: &str, params: &Value) -> Option<Appr
         provider: "codex".into(),
         kind: kind.into(),
         description: description.into(),
+        command: (kind == "command").then(|| description.to_owned()),
+        sandbox_escalation: (kind == "command"
+            && params.get("reason").and_then(Value::as_str)
+                == Some("command failed; retry without sandbox?"))
+        .then_some(true),
         change,
         targets,
         reason: params
@@ -85,6 +90,7 @@ fn emit_declined_request<F: FnMut(&str, Value)>(
         request.redact_sensitive(known);
     } else {
         request.description.clear();
+        request.command = None;
         request.targets.clear();
         request.reason = None;
     }
@@ -119,6 +125,30 @@ fn declined_approval_event_never_exposes_known_secrets() {
         .is_some());
         assert!(!events[0].to_string().contains(secret));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn sandbox_retry_exposes_redacted_command_and_explicit_flag() {
+    let params =
+        json!({"command":"echo fixture-secret", "reason":"command failed; retry without sandbox?"});
+    let mut request =
+        interactive_approval("chat", "item/commandExecution/requestApproval", &params).unwrap();
+    assert_eq!(request.sandbox_escalation, Some(true));
+    request.redact_sensitive(&["fixture-secret"]);
+    let event = serde_json::to_value(request).unwrap();
+    assert_eq!(event["sandboxEscalation"], true);
+    assert!(!event["command"]
+        .as_str()
+        .unwrap()
+        .contains("fixture-secret"));
+    let other = interactive_approval(
+        "chat",
+        "item/commandExecution/requestApproval",
+        &json!({"command":"echo test", "reason":"sandbox access"}),
+    )
+    .unwrap();
+    assert_eq!(other.sandbox_escalation, None);
 }
 pub(crate) type ApprovalChannel = Box<
     dyn Fn(
@@ -359,7 +389,7 @@ where
     std::fs::metadata(archive.join("AGENTS.md"))
         .map_err(|_| "몸소 폴더 규칙을 읽지 못했습니다".to_string())?;
     let previous = chat::codex_thread(db, chat_id)?;
-    let mut command = Command::new(exe);
+    let mut command = crate::process::hidden_async_command(exe);
     for option in crate::momso_mcp::codex_config(&crate::momso_mcp::executable()?, chat_id)? {
         command.arg("-c").arg(option);
     }

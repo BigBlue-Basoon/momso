@@ -63,7 +63,7 @@ struct ListResponse {
     contents: Vec<ListEntry>,
     #[serde(rename = "IsTruncated")]
     truncated: bool,
-    #[serde(rename = "NextContinuationToken")]
+    #[serde(rename = "NextContinuationToken", alias = "NextMarker")]
     next: Option<String>,
 }
 
@@ -225,9 +225,19 @@ pub(crate) async fn list_keys(
     let mut continuation: Option<String> = None;
     let mut seen_tokens = std::collections::HashSet::new();
     loop {
-        let mut query = vec![("list-type", "2"), ("prefix", prefix)];
+        let mut query = vec![("prefix", prefix)];
+        if config.provider != "ncp" {
+            query.push(("list-type", "2"));
+        }
         if let Some(token) = &continuation {
-            query.push(("continuation-token", token));
+            query.push((
+                if config.provider == "ncp" {
+                    "marker"
+                } else {
+                    "continuation-token"
+                },
+                token,
+            ));
         }
         let response =
             object_store::request(config, keys, reqwest::Method::GET, "", &query, vec![]).await?;
@@ -1707,6 +1717,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ncp_v1_listing_uses_marker_and_refuses_missing_marker() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (index, body) in [
+                "<ListBucketResult><IsTruncated>true</IsTruncated><NextMarker>next</NextMarker><Contents><Key>momso/object-store/v1/manifests/a.age</Key></Contents></ListBucketResult>",
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>momso/object-store/v1/manifests/b.age</Key></Contents></ListBucketResult>",
+                "<ListBucketResult><IsTruncated>true</IsTruncated><Contents><Key>momso/object-store/v1/manifests/a.age</Key></Contents></ListBucketResult>",
+            ].iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut request = [0u8; 8192];
+                let read = stream.read(&mut request).unwrap();
+                let head = String::from_utf8_lossy(&request[..read]);
+                assert!(!head.contains("list-type=2"));
+                assert!(!head.contains("continuation-token="));
+                if index == 1 { assert!(head.contains("marker=next")); }
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let config = object_store::Config {
+            provider: "ncp".into(),
+            endpoint: format!("http://{address}"),
+            region: "kr-standard".into(),
+            bucket: "bucket".into(),
+            credential_id: "test".into(),
+            last_backup_at: None,
+            write_safety: Some(object_store::WriteSafety::CheckThenWrite),
+        };
+        let keys = object_store::Keys {
+            access_key_id: "TEST".into(),
+            secret_access_key: "test".into(),
+        };
+        let prefix = "momso/object-store/v1/manifests/";
+        assert_eq!(
+            list_keys(&config, &keys, prefix).await.unwrap(),
+            vec![format!("{prefix}a.age"), format!("{prefix}b.age")]
+        );
+        assert!(matches!(
+            list_keys(&config, &keys, prefix).await,
+            Err("remote_list_failed")
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn s3_listing_refuses_incomplete_or_outside_pages() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -1784,6 +1840,7 @@ mod tests {
         let server_stop = Arc::clone(&stop);
         let google = provider == "gcp";
         let oauth = provider == "r2_oauth";
+        let ncp = provider == "ncp";
         let server = std::thread::spawn(move || {
             let mut failed_once = false;
             while !server_stop.load(Ordering::Relaxed) {
@@ -1806,6 +1863,13 @@ mod tests {
                     }
                 };
                 let head = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                if ncp {
+                    assert!(head.lines().any(|line| {
+                        line.to_ascii_lowercase()
+                            .starts_with("authorization: aws4-hmac-sha256 ")
+                            && line.contains("/kr-standard/s3/aws4_request")
+                    }));
+                }
                 if oauth {
                     assert!(head
                         .lines()
@@ -1815,6 +1879,10 @@ mod tests {
                 let mut fields = line.split_whitespace();
                 let method = fields.next().unwrap();
                 let path = fields.next().unwrap();
+                if ncp && method == "GET" && path.starts_with("/bucket?") {
+                    assert!(!path.contains("list-type="));
+                    assert!(!path.contains("continuation-token="));
+                }
                 let length = head
                     .lines()
                     .find_map(|l| {
@@ -1947,7 +2015,14 @@ mod tests {
         let config = object_store::Config {
             provider: if oauth { "cloudflare" } else { provider }.into(),
             endpoint: format!("http://{address}"),
-            region: if oauth { "wrangleroauth" } else { "auto" }.into(),
+            region: if oauth {
+                "wrangleroauth"
+            } else if ncp {
+                "kr-standard"
+            } else {
+                "auto"
+            }
+            .into(),
             bucket: if oauth { "momso-fixture" } else { "bucket" }.into(),
             credential_id: "test".into(),
             last_backup_at: None,

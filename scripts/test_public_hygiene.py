@@ -9,6 +9,20 @@ spec.loader.exec_module(hygiene)
 
 
 class PublicHygieneTest(unittest.TestCase):
+    def test_public_notice_exceptions_are_exact_and_private_terms_still_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            notice = root / "apps/alpha/desktop/third-party/ego-tree-0.10.0-LICENSE"
+            notice.parent.mkdir(parents=True)
+            notice.write_text("june" + "@" + "causal.agency\n", encoding="utf-8")
+            self.assertEqual(hygiene.findings(root, []), [])
+            self.assertEqual(hygiene.findings(root, ["causal.agency"])[0][2], "private_term")
+            notice.write_text("someone" + "@" + "example.net\n", encoding="utf-8")
+            self.assertEqual(hygiene.findings(root, [])[0][2], "email")
+            other = notice.parent / "other-LICENSE"
+            other.write_text("june" + "@" + "causal.agency\n", encoding="utf-8")
+            self.assertEqual(len(hygiene.findings(root, [])), 2)
+
     def test_patterns_and_external_terms(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

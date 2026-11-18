@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useAvoidPanelBrowser } from '../panel-browser'
 import { createPortal } from 'react-dom'
 import {
   SLOW_PROVIDERS,
@@ -240,6 +241,8 @@ export function UsageMeter({ auth }: { auth?: ProviderAuth[] | null }) {
   }, [openId])
 
   const openProvider = PROVIDERS.find((provider) => provider.id === openId)
+  // 쓴 양 창이 패널 웹뷰와 겹치면 열린 동안 웹뷰를 숨긴다.
+  useAvoidPanelBrowser(panel, Boolean(openId))
 
   return (
     <>

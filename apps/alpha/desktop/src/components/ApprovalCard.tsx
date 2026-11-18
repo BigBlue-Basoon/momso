@@ -76,8 +76,18 @@ function useZetTitle(request: ApprovalRequest, path: string | null, change: Appr
   return title
 }
 
+/**
+ * 코덱스가 보호 장치(샌드박스) 밖에서 명령을 다시 실행하려고 묻는지(2026-11-18 실제 앱 점검 B67).
+ * 뒤쪽(chat_codex.rs)은 이것을 따로 알리는 값 없이 코덱스의 까닭 글(reason, 예: "command failed; retry without sandbox?")만 넘긴다.
+ * 그래서 지금은 그 글로 가린다. 뒤쪽이 값을 주면 그것으로 바꾼다.
+ */
+function isOutsideSandbox(request: ApprovalRequest) {
+  return request.provider === 'codex' && request.kind === 'command' && /sandbox/i.test(request.reason ?? '')
+}
+
 function headline(request: ApprovalRequest, title: string | null, change: ApprovalChange | null, count: number, place: 'file' | 'folder' | 'none') {
   const name = providerName(request.provider)
+  if (isOutsideSandbox(request)) return W.approvalCard.outsideSandbox(name)
   if (request.kind === 'command') return W.approvalCard.text1(name)
   if (request.kind !== 'file_change') return W.approvalCard.text4(name)
   if (count > 1) return W.approvalCard.many(name, count)
@@ -258,16 +268,28 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
   }
 
   const choices = orderedChoices(request.options, request)
-  const primary = choices.find((choice) => choice === 'allow_once' || choice === 'allow_session')
+  const outside = isOutsideSandbox(request)
+  // 보호 장치 밖 실행은 허락 단추를 앞세우지 않는다(위험한 쪽을 기본으로 두지 않음).
+  const primary = outside ? undefined : choices.find((choice) => choice === 'allow_once' || choice === 'allow_session')
   const mark = MARK[request.provider as AiProvider]
 
   return (
-    <section className="approval-card" role="group" aria-label={W.approvalCard.aria1} aria-busy={item.status === 'sending'}>
+    <section className={outside ? 'approval-card is-danger' : 'approval-card'} role="group" aria-label={W.approvalCard.aria1} aria-busy={item.status === 'sending'}>
       <div className="approval-head">
         {mark && <ProviderMark provider={mark} className="approval-mark" />}
         <strong>{headline(request, title, change, targets.length, place)}</strong>
       </div>
-      {request.kind === 'command' ? (
+      {outside ? (
+        <>
+          <p className="approval-danger" role="alert">{W.approvalCard.outsideSandboxWarn}</p>
+          {/* 명령과 코덱스가 보낸 글(영어)은 접어 둔다. 펼치면 받은 그대로. */}
+          <details className="approval-more">
+            <summary>{W.approvalCard.showCommand}</summary>
+            <pre className="approval-command">{command}</pre>
+            {request.reason && <p className="approval-reason">{request.reason}</p>}
+          </details>
+        </>
+      ) : request.kind === 'command' ? (
         <pre className="approval-command">{command}</pre>
       ) : targets.length > 1 ? (
         <ul className="approval-targets">
@@ -283,7 +305,7 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
       ) : (
         request.description.trim() && <p className="approval-subject is-plain">{request.description}</p>
       )}
-      {request.reason && <p className="approval-reason">{request.reason}</p>}
+      {request.reason && !outside && <p className="approval-reason">{request.reason}</p>}
       {item.error && <p className="approval-error" role="alert">{item.error}</p>}
       <div className="approval-actions">
         {choices.map((choice) => (

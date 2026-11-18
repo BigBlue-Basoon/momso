@@ -1,7 +1,7 @@
 //! Open only ordinary web addresses; never connect to local or credentialed URLs.
 use tauri_plugin_opener::OpenerExt;
 
-fn validate(address: &str) -> Result<(), &'static str> {
+pub(crate) fn validate(address: &str) -> Result<(), &'static str> {
     let url = reqwest::Url::parse(address).map_err(|_| "invalid_url")?;
     if !matches!(url.scheme(), "http" | "https")
         || !url.username().is_empty()

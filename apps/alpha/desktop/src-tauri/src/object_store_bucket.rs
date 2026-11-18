@@ -663,6 +663,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ncp_create_then_probe_ignored_condition_uses_check_then_write() {
+        let (endpoint, thread) = server(vec![
+            ("200 OK", EMPTY),
+            ("200 OK", ""),
+            ("200 OK", ""),
+            ("200 OK", ""),
+            ("200 OK", ""),
+            ("200 OK", "second"),
+        ]);
+        let mut c = config("ncp", endpoint);
+        c.region = "kr-standard".into();
+        ensure_s3(&c, &keys()).await.unwrap();
+        assert_eq!(
+            super::super::probe_connection(&c, &keys()).await,
+            Ok(WriteSafety::CheckThenWrite)
+        );
+        let requests = thread.join().unwrap();
+        assert!(requests[1].starts_with("PUT /momso-alice "));
+        assert!(requests[1].ends_with("\r\n\r\n"));
+        assert!(requests[1].contains("/kr-standard/s3/aws4_request"));
+        assert!(requests[2].starts_with("GET /momso-alice?max-keys=1 "));
+        assert!(!requests[2].contains("list-type="));
+        assert!(requests[4]
+            .to_ascii_lowercase()
+            .contains("if-none-match: *"));
+    }
+
+    #[tokio::test]
     async fn created_bucket_is_probed_before_connection() {
         for provider in ["aws", "cloudflare", "ncp", "gcp"] {
             let gcp = provider == "gcp";

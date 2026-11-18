@@ -82,6 +82,7 @@ fn info(state: &'static str, version: &str) -> UpdateInfo {
     }
 }
 fn check_failed(version: &str, reason: &'static str) -> UpdateInfo {
+    log::warn!("lifecycle update_check_failed reason={reason}");
     let mut result = info("failed", version);
     result.reason = Some(reason);
     result
@@ -262,6 +263,10 @@ pub(crate) async fn update_restart(
     state: State<'_, UpdateState>,
     workspace: State<'_, crate::AppState>,
 ) -> Result<Stage, String> {
+    log::info!(
+        "lifecycle update_restart_requested pid={}",
+        std::process::id()
+    );
     if settings(&app).is_none() {
         return Ok(Stage {
             state: "unavailable",
@@ -298,6 +303,10 @@ pub(crate) async fn update_restart(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
         install_after_backup(&database, &backups, || {
+            log::info!(
+                "lifecycle update_installer_starting pid={}",
+                std::process::id()
+            );
             update.install(bytes).map_err(|_| ())
         })
     })
@@ -322,6 +331,7 @@ pub(crate) async fn update_restart(
                 state: "failed",
                 reason: Some(reason),
             };
+            log::warn!("lifecycle update_restart_failed reason={reason}");
             let _ = app.emit("update-failed", stage.clone());
             Ok(stage)
         }

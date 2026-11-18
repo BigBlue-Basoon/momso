@@ -120,6 +120,26 @@ pub(crate) fn incomplete_reply(payload: &Value) -> bool {
     )
 }
 pub(crate) fn provider_error_payload(chat_id: &str, error: &str) -> Value {
+    if let Some(delay) = error.strip_prefix("__momso_gemini_rate_limited:") {
+        let seconds = delay.parse::<u64>().ok().filter(|n| *n <= 604800);
+        let mut detail = classified(
+            "rateLimited",
+            "rateLimitExceeded",
+            &["wait", "retry", "switchProvider"],
+        );
+        let reason = if let Some(seconds) = seconds {
+            detail["retryAt"] = serde_json::json!(chrono::Utc::now()
+                .timestamp()
+                .saturating_add(seconds as i64));
+            format!(
+                "제미나이 사용 한도에 걸렸습니다. {}분 뒤 다시 해 주세요",
+                seconds.div_ceil(60).max(1)
+            )
+        } else {
+            "제미나이 사용 한도에 걸렸습니다. 잠시 뒤 다시 해 주세요".to_owned()
+        };
+        return serde_json::json!({"chatId":chat_id,"reason":reason,"error":detail});
+    }
     match error {
         "__momso_fast_unavailable" => {
             serde_json::json!({"chatId":chat_id,"status":"fast_unavailable","reason":""})
@@ -129,6 +149,12 @@ pub(crate) fn provider_error_payload(chat_id: &str, error: &str) -> Value {
         }
         "__momso_tool_missing" => {
             serde_json::json!({"chatId":chat_id,"status":"unavailable","reason":"","error":classified("toolMissing", "tool_missing", &["install", "switchProvider"])})
+        }
+        "__momso_cli_unsupported_option" => {
+            serde_json::json!({"chatId":chat_id,"status":"unavailable","reason":"","error":classified("cliIncompatible", "unsupported_permission_option", &["update", "switchProvider"])})
+        }
+        "__momso_gemini_service_unavailable" => {
+            serde_json::json!({"chatId":chat_id,"reason":"제미나이에 연결하지 못했습니다. 잠시 뒤 다시 해 주세요","error":classified("serviceUnavailable", "serverOverloaded", &["retry", "wait", "switchProvider"])})
         }
         "AI 연결이 끊겼습니다" => {
             serde_json::json!({"chatId":chat_id,"reason":"","error":classified("connectionClosed", "connection_closed", &["retry", "switchProvider"])})

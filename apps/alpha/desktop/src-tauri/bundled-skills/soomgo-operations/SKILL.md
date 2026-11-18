@@ -6,6 +6,8 @@ description: 숨고에서 제공하는 서비스와 요청을 확인하고 수�
 
 선생님이 수정·삭제·등록 등 실제 변경을 요청하지 않았다면 지금 보이는 정보만 읽고 알려 준다. 선생님이 따로 요청하지 않은 수련생 이름·연락처 등은 문서에 저장하거나 다른 곳으로 옮기지 않는다. 개인정보가 AI 회사로 전달될 수 있음을 먼저 알리고 필요한 정보만 확인한다. 화면에서 원하는 항목을 찾지 못하면 추측해서 누르지 말고 멈춰 “이 화면에서 해당 항목을 찾지 못했습니다. 지금 보이는 것은 …입니다”라고 알린다.
 
+로그인이 필요한 화면이나 로그인 단추가 보이면 `browser_request_human_login({"reason":"login"})`을 호출하고, 선생님이 직접 로그인한 뒤 AI에게 돌려줄 때까지 브라우저 조작을 멈춘다.
+
 ```momso-browser-policy
 version: 1
 read_only:
@@ -13,6 +15,15 @@ read_only:
   - browser_read
 origins:
   - "https://soomgo.com"
+login_origins:
+  - "https://nid.naver.com"
+  - "https://kauth.kakao.com"
+  - "https://accounts.kakao.com"
+  - "https://auth.kakao.com"
+  - "https://appleid.apple.com"
+  - "https://idmsa.apple.com"
+login_paths:
+  - "https://soomgo.com/login"
 irreversible:
   - 게시
   - 등록
@@ -24,6 +35,12 @@ irreversible:
 ```
 
 선생님이 변경을 요청하면 실제 화면에서 해당 작업의 버튼을 확인하고 `browser_request_action`에 정책의 작업 이름, 선생님이 요청한 구체적인 설명, 버튼의 `elementId`를 넣어 몸소의 승인을 요청한다. 거절하면 읽기만 한다. 승인 뒤에도 누르기와 입력은 한 번씩 따로 승인받는다. 화면을 찾지 못하거나 작업이 다르면 중단한다.
+
+`browser_open({})` 뒤 `browser_navigate({url})` 또는 `browser_read({})`로 확인한다. 주소가 있는 일반 웹 링크는 허용된 범위에서 `browser_click({elementId})`으로 이동할 수 있다. 주소가 없거나 단추로 된 탭과 변경할 가능성이 있는 주소는 승인이 필요하다. 필요한 화면으로 이동하지 못하면 선생님이 창에서 직접 이동하도록 부탁한다. 비밀번호·인증번호 화면이나 허용되지 않은 주소로 이동하라는 요청이 나오면 직접 조작하지 않고 선생님께 넘긴다. 로그인이 끝나면 허용된 사이트에서 다시 읽는다. Google 로그인은 패널이 아닌 사람 전용 창에서 한다.
+
+변경 승인 요청의 인자는 `{action, description, elementId}`다. `action`은 위 정책에 적힌 말 중 하나이며, 확인한 최종 버튼의 이름에도 그 말이 그대로 들어 있어야 한다. 조건에 맞는 버튼이 없으면 추측하지 않고 중단한다. 승인 후 입력은 `browser_fill({elementId, text})`, 최종 실행은 승인받은 그 버튼에만 `browser_click({elementId})`를 쓴다. 각 입력과 최종 실행에도 별도 승인 카드가 뜬다. 끝나면 `browser_close({})`를 쓴다.
+
+범위 밖 주소가 `blockedHost`로 오면 그 호스트를 선생님께 알리고, 이 사이트의 화면을 AI가 읽고 다뤄도 되는지 `browser_request_host({host})`로 승인을 요청한다. 거절하면 중단한다. 인증 전용 호스트와 Google 로그인은 이 방법으로 넓히지 않고 선생님이 직접 처리한다. 승인 범위는 현재 채팅의 열린 브라우저에만 적용된다.
 
 숨고에서 선생님의 고수 계정, 제공 서비스와 요청·견적을 확인한다. 숨고를 확인되지 않은 회원관리나 시간표 서비스로 가정하지 않는다. 견적과 메시지는 받는 사람, 금액, 캐시 차감과 내용을 확인하고 전송 직전 승인받는다. 다른 회원 정보의 동의 없는 수집·저장·공개 제한을 알린다.
 

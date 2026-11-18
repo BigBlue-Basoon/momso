@@ -42,11 +42,13 @@
 .model-name { white-space: nowrap; }
 .model-name-version { margin-left: 0.35em; color: var(--muted); font-size: 0.9em; font-variant-numeric: tabular-nums; }
 
+/* 최소 폭을 여기서 960 으로 묶으면 창이 그보다 좁아질 때(화면 반쪽 맞춤, 2026-11-18 실제 앱 점검) 오른쪽 패널과 창 단추가 잘렸다.
+   창의 최소 크기는 tauri.conf 가 지키고, 화면은 창 폭에 맞춘다. */
 html,
 body,
 #root {
   width: 100%;
-  min-width: 960px;
+  min-width: 0;
   height: 100%;
   min-height: 660px;
   margin: 0;
@@ -530,7 +532,7 @@ button:disabled {
   border-color: rgba(49, 95, 143, 0.36);
   background: rgba(255, 255, 255, 0.82);
   box-shadow: 0 14px 32px rgba(35, 42, 38, 0.12), 0 4px 10px rgba(35, 42, 38, 0.07), 0 0 0 3px rgba(49, 95, 143, 0.07), 0 1px 0 #ffffff inset;
-  transform: translateY(-2px);
+  /* 2026-11-18: 떠오르기(translateY -2px)를 뺐다. 아래 드롭다운을 고를 때마다 칸이 위아래로 움직였다(Codex·Claude 앱은 제자리). */
 }
 
 .prompt-composer[data-skill='vocabulary'] {
@@ -1333,3 +1335,19 @@ button:disabled {
 .workbench-toast-action { margin-left: 10px; }
 .backup-inline-retry { margin-left: 8px; }
 .empty-queue .secondary-button { margin-top: 8px; }
+
+/* GitHub 자동 백업 한 줄(2026-11-18): 왼쪽에 이름과 형편, 오른쪽에 켜고 끄기. */
+.backup-auto {
+  align-items: center;
+  justify-content: space-between;
+}
+.backup-auto-text {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.backup-auto-state {
+  color: var(--muted);
+  font-size: 12px;
+}

@@ -7,6 +7,10 @@ use std::path::Path;
 pub(crate) struct Policy {
     version: u32,
     origins: Vec<String>,
+    #[serde(default)]
+    login_origins: Vec<String>,
+    #[serde(default)]
+    login_paths: Vec<String>,
     irreversible: Vec<String>,
     #[serde(default)]
     read_only: Vec<String>,
@@ -35,7 +39,7 @@ impl Policy {
         if policy.version != 1 || policy.origins.is_empty() || policy.irreversible.is_empty() {
             return Err("browser_policy_invalid");
         }
-        for origin in &policy.origins {
+        for origin in policy.origins.iter().chain(&policy.login_origins) {
             let url = reqwest::Url::parse(origin).map_err(|_| "browser_policy_invalid")?;
             if url.scheme() != "https"
                 || url.host_str().is_none()
@@ -44,6 +48,27 @@ impl Policy {
                 || url.path() != "/"
                 || url.query().is_some()
                 || url.fragment().is_some()
+            {
+                return Err("browser_policy_invalid");
+            }
+        }
+        if policy
+            .login_origins
+            .iter()
+            .any(|value| policy.origins.contains(value))
+        {
+            return Err("browser_policy_invalid");
+        }
+        for path in &policy.login_paths {
+            let url = reqwest::Url::parse(path).map_err(|_| "browser_policy_invalid")?;
+            if url.scheme() != "https"
+                || url.path() == "/"
+                || url.path().ends_with('/')
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !policy.origins.contains(&url.origin().ascii_serialization())
             {
                 return Err("browser_policy_invalid");
             }
@@ -63,10 +88,19 @@ impl Policy {
             return false;
         }
         let value = url.origin().ascii_serialization();
-        self.origins.iter().any(|origin| origin == &value)
+        self.origins
+            .iter()
+            .chain(&self.login_origins)
+            .any(|origin| origin == &value)
     }
     pub(crate) fn origins(&self) -> &[String] {
         &self.origins
+    }
+    pub(crate) fn login_origins(&self) -> &[String] {
+        &self.login_origins
+    }
+    pub(crate) fn login_paths(&self) -> &[String] {
+        &self.login_paths
     }
     pub(crate) fn allows_read_only(&self, method: &str) -> bool {
         matches!(method, "browser_navigate" | "browser_read")
@@ -80,9 +114,23 @@ impl Policy {
         Self {
             version: 1,
             origins: vec![origin],
+            login_origins: vec![],
+            login_paths: vec![],
             irreversible: vec!["게시".into()],
             read_only: vec!["browser_navigate".into(), "browser_read".into()],
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn add_test_origin(&mut self, origin: String) {
+        self.origins.push(origin);
+    }
+    #[cfg(test)]
+    pub(crate) fn add_test_login_origin(&mut self, origin: String) {
+        self.login_origins.push(origin);
+    }
+    #[cfg(test)]
+    pub(crate) fn add_test_login_path(&mut self, path: String) {
+        self.login_paths.push(path);
     }
     pub(crate) fn effect(&self, name: &str) -> &'static str {
         let value = name.to_lowercase();
@@ -261,6 +309,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(policy.allows("https://smartplace.naver.com/path"));
+        assert!(policy
+            .login_origins()
+            .contains(&"https://nid.naver.com".to_string()));
+        assert!(policy.allows("https://nid.naver.com/"));
         for url in [
             "https://smartplace.naver.com.evil.test/",
             "https://smartplace.naver.com@evil.test/",
@@ -297,6 +349,27 @@ mod tests {
             assert!(policy.allows_read_only("browser_read"));
             assert!(!policy.allows_read_only("browser_click"));
             assert!(!policy.allows_read_only("browser_fill"));
+            if name == "frip-host-operations" {
+                assert_eq!(policy.origins()[0], "https://frip.host");
+                assert!(policy
+                    .login_paths()
+                    .contains(&"https://www.frip.co.kr/login".into()));
+            }
+            if name == "sssd-host-operations" {
+                assert!(policy
+                    .login_paths()
+                    .contains(&"https://www.sssd.co.kr/host".into()));
+            }
+            if name == "soomgo-operations" {
+                assert!(policy
+                    .login_paths()
+                    .contains(&"https://soomgo.com/login".into()));
+            }
+            if name == "onstudio-operations" {
+                assert!(policy
+                    .login_paths()
+                    .contains(&"https://onstudio.kr/login".into()));
+            }
         }
     }
 
@@ -356,10 +429,66 @@ mod tests {
         }
     }
     #[test]
+    fn each_bundled_skill_policy_handles_fake_login_read_and_denial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut count = 0;
+        for &(name, content) in crate::skills::BUNDLED_SKILLS {
+            if !builtin_browser_name(name) {
+                continue;
+            }
+            count += 1;
+            let path = tmp.path().join("skills").join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("SKILL.md"), content).unwrap();
+            let policy = Policy::from_skill(tmp.path(), name).unwrap().unwrap();
+            let origin = policy.origins()[0].clone();
+            let clicked = Arc::new(AtomicUsize::new(0));
+            let closed = Arc::new(AtomicUsize::new(0));
+            let mut gateway = Gateway {
+                policy,
+                driver: FakeDriver {
+                    page: PageState {
+                        origin: origin.clone(),
+                        title: "가짜 목록".into(),
+                        text: "가짜 수업".into(),
+                        elements: vec![Element {
+                            id: "publish".into(),
+                            name: "게시".into(),
+                            kind: "normal".into(),
+                        }],
+                    },
+                    clicked: clicked.clone(),
+                    closed: closed.clone(),
+                    login: true,
+                    mutate_target: false,
+                },
+            };
+            assert!(matches!(
+                gateway.navigate(&origin),
+                Err(DriverError::HumanRequired("login"))
+            ));
+            assert!(gateway.navigate(&origin).is_ok());
+            assert_eq!(gateway.read().unwrap().text, "가짜 수업");
+            assert!(!gateway.policy.allows_read_only("browser_click"));
+            assert_eq!(
+                gateway.click("publish", |_, _| false),
+                Err(DriverError::Refused)
+            );
+            assert_eq!(clicked.load(Ordering::SeqCst), 0);
+            assert!(gateway.click("publish", |_, _| true).is_ok());
+            assert_eq!(clicked.load(Ordering::SeqCst), 1);
+            drop(gateway);
+            assert_eq!(closed.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(count, 6);
+    }
+    #[test]
     fn fake_session_human_login_approval_deny_target_change_and_close() {
         let policy = Policy {
             version: 1,
             origins: vec!["https://studio.example".into()],
+            login_origins: vec![],
+            login_paths: vec![],
             irreversible: vec!["게시".into()],
             read_only: vec!["browser_navigate".into(), "browser_read".into()],
         };
@@ -452,6 +581,8 @@ mod tests {
                 policy: Policy {
                     version: 1,
                     origins: vec!["https://studio.example".into()],
+                    login_origins: vec![],
+                    login_paths: vec![],
                     irreversible: vec!["게시".into()],
                     read_only: vec!["browser_navigate".into(), "browser_read".into()],
                 },
@@ -533,6 +664,8 @@ mod tests {
                 policy: Policy {
                     version: 1,
                     origins: vec!["https://studio.example".into()],
+                    login_origins: vec![],
+                    login_paths: vec![],
                     irreversible: vec!["게시".into()],
                     read_only: vec!["browser_navigate".into(), "browser_read".into()],
                 },

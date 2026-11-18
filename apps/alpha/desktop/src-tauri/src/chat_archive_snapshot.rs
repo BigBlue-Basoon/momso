@@ -1271,6 +1271,47 @@ mod tests {
     }
 
     #[test]
+    fn sent_attachment_reappears_after_copy_and_source_metadata_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.sqlite");
+        let second = dir.path().join("second.sqlite");
+        crate::storage::initialize(&first, &dir.path().join("first-backups"), "test").unwrap();
+        crate::storage::initialize(&second, &dir.path().join("second-backups"), "test").unwrap();
+        let id = serde_json::to_value(crate::chat::create(&first).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let hash = "a".repeat(64);
+        let insert_asset = |path: &Path| {
+            let db = Connection::open(path).unwrap();
+            db.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,media_type,captured_by,created_at) VALUES('asset-test','other',?1,5,?2,'lesson.txt','text/plain','test','now')", rusqlite::params![hash, format!("sha256/aa/{hash}")]).unwrap();
+        };
+        insert_asset(&first);
+        let db = Connection::open(&first).unwrap();
+        db.execute("INSERT INTO chat_attachments(receipt_id,chat_id,asset_id) VALUES('receipt-test',?1,'asset-test')", [&id]).unwrap();
+        drop(db);
+        crate::chat::append_for_send(&first, &id, "fixture", None).unwrap();
+        let copy = snapshot(&first, &id).unwrap();
+        assert!(!copy.to_string().contains("lesson.txt"));
+        restore_new(&second, &copy).unwrap();
+        insert_asset(&second);
+        let restored = serde_json::to_value(crate::chat::read(&second, &id).unwrap()).unwrap();
+        assert_eq!(
+            restored["messages"][0]["attachments"][0]["name"],
+            "lesson.txt"
+        );
+        assert_eq!(
+            restored["messages"][0]["attachments"][0]["assetId"],
+            format!("sha256:{hash}")
+        );
+        resolve_pending(&second).unwrap();
+        assert_eq!(
+            serde_json::to_value(crate::chat::read(&second, &id).unwrap()).unwrap(),
+            restored
+        );
+    }
+
+    #[test]
     fn prototype_roundtrip_via_local_bare_git_keeps_chat() {
         use std::process::Command;
         let dir = tempfile::tempdir().unwrap();
