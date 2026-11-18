@@ -1411,3 +1411,64 @@ button.zet-link-row:hover {
 .zet-folder-bar { padding-top: 10px; }
 .zet-folder-bar .zet-search { margin: 0 12px 6px 0; }
 .zet-folders.is-flat .zet-folder-bar .zet-search { flex: 1; margin-left: 12px; }
+
+/* 폴더 만들기·옮기기(2026-11-18): 줄 끝 … 메뉴(첨부파일 줄과 같은 자리), 끌어 놓을 폴더 표시, 끄는 동안 이름표, 옮길 폴더 고르기 목록. */
+.zet-folder-tools { display: flex; min-width: 0; align-items: center; gap: 8px; margin-right: 12px; }
+.zet-folder-tools .secondary-button { display: inline-flex; flex: none; align-items: center; gap: 6px; margin-bottom: 6px; }
+.zet-folder-tools .zet-search { flex: 0 1 240px; margin: 0 0 6px; }
+.zet-folder-item { position: relative; }
+.zet-folder-item > .chat-more { position: absolute; top: 10px; right: 10px; opacity: 0; }
+.zet-folder-item:hover > .chat-more,
+.zet-folder-item > .chat-more:focus-visible,
+.zet-folder-item > .chat-more[aria-expanded='true'] { opacity: 1; }
+.zet-folder-item > .zet-row { padding-right: 40px; }
+.zet-row.is-drop,
+.zet-tree-row.is-drop,
+.zet-crumbs button.is-drop { background: #e4efe7; outline: 2px solid #a4c8b2; outline-offset: -2px; }
+.zet-folder-row.is-renaming { cursor: default; }
+.zet-folder-row.is-renaming input {
+  min-width: 0;
+  width: min(320px, 100%);
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.zet-drag-ghost {
+  position: fixed;
+  z-index: 80;
+  max-width: 240px;
+  padding: 4px 10px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--ink);
+  color: var(--surface);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.zet-move-targets { max-height: 280px; margin: 4px 0 0; padding: 0; overflow-y: auto; list-style: none; }
+.zet-move-targets button {
+  display: flex;
+  width: 100%;
+  height: 32px;
+  align-items: center;
+  gap: 8px;
+  padding-right: 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.zet-move-targets button:hover:not(:disabled) { background: var(--surface-muted); color: var(--ink); }
+.zet-move-targets button:disabled { color: var(--faint); cursor: default; }

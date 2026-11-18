@@ -3,7 +3,24 @@
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
-    if args.next().is_some_and(|arg| arg == "--momso-mcp-stdio") {
+    let first = args.next();
+    #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
+    if first
+        .as_ref()
+        .is_some_and(|arg| arg == "--momso-g62-test-probe")
+    {
+        momso_desktop_lib::g61_test_probe::run_g62();
+        return;
+    }
+    #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
+    if first
+        .as_ref()
+        .is_some_and(|arg| arg == "--momso-g61-test-probe")
+    {
+        momso_desktop_lib::g61_test_probe::run();
+        return;
+    }
+    if first.is_some_and(|arg| arg == "--momso-mcp-stdio") {
         let pipe = match args.next() {
             Some(flag) if flag == "--momso-setup-pipe" => {
                 args.next().and_then(|v| v.into_string().ok())

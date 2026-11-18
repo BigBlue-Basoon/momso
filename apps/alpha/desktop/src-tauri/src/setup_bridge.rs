@@ -142,6 +142,154 @@ pub(crate) fn start(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "uses the user's authorized Codex account and an isolated fixture"]
+    async fn real_codex_document_and_browser_tool_probe() {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let executable = std::env::var_os("MOMSO_T71B_CODEX").expect("Codex executable");
+        let app =
+            std::path::PathBuf::from(std::env::var_os("MOMSO_T71B_APP").expect("app executable"));
+        let list = crate::process::hidden_command(&executable)
+            .args(["mcp", "list", "--json"])
+            .output()
+            .unwrap();
+        assert!(list.status.success());
+        let servers: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+        let temp =
+            tempfile::tempdir_in(std::env::var_os("CARGO_TARGET_DIR").expect("target directory"))
+                .unwrap();
+        let root = temp.path().join("archive");
+        std::fs::create_dir_all(root.join("zettels")).unwrap();
+        let skill_dir = temp.path().join(".agents/skills/naver-smartplace");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            include_str!("../bundled-skills/naver-smartplace/SKILL.md"),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("AGENTS.md"),
+            include_str!("archive_rules.md"),
+        )
+        .unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let mut all_called = true;
+        for (label, prompt) in [
+            ("document", "몸소 문서로 '시험' 제목 문서를 만들어 줘."),
+            (
+                "browser",
+                "네이버 스마트플레이스 스킬로 브라우저를 열어 줘.",
+            ),
+        ] {
+            let observed = Arc::new(AtomicBool::new(false));
+            let called = observed.clone();
+            let fixture_root = root.clone();
+            let fixture_db = db.clone();
+            let handler: Handler = Arc::new(move |input| {
+                let observed = called.clone();
+                let root = fixture_root.clone();
+                let db = fixture_db.clone();
+                Box::pin(async move {
+                    match input["method"].as_str().unwrap_or("") {
+                        "momso_document_create" => {
+                            let ask: crate::browser_runtime::Ask = Arc::new(move |request, _| {
+                                observed.store(request.kind == "file_change", Ordering::SeqCst);
+                                Box::pin(async { false })
+                            });
+                            crate::momso_document_write::dispatch(
+                                (root, db),
+                                "fixture",
+                                "codex",
+                                "momso_document_create",
+                                input["arguments"].clone(),
+                                ask,
+                                CancellationToken::new(),
+                            )
+                            .await
+                        }
+                        "browser_open" => {
+                            observed.store(true, Ordering::SeqCst);
+                            serde_json::json!({"status":"panel_not_opened"})
+                        }
+                        _ => serde_json::json!({"status":"unavailable"}),
+                    }
+                })
+            });
+            let chat = format!("g60-{}", uuid::Uuid::new_v4());
+            let guard = start(&chat, CancellationToken::new(), handler).unwrap();
+            let mut command = crate::process::hidden_async_command(&executable);
+            for server in servers.as_array().unwrap() {
+                let name = server["name"].as_str().unwrap();
+                // These two are injected only into the parent Codex session. Adding
+                // an enabled-only table for them creates an invalid child config.
+                if matches!(name, "codex_app" | "cua_repl") {
+                    continue;
+                }
+                assert!(name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'));
+                command
+                    .arg("-c")
+                    .arg(format!("mcp_servers.{name}.enabled=false"));
+            }
+            for option in crate::momso_mcp::codex_config(&app, &chat).unwrap() {
+                command.arg("-c").arg(option);
+            }
+            command
+                .args([
+                    "exec",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--json",
+                    "-s",
+                    "read-only",
+                    prompt,
+                ])
+                .current_dir(temp.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            let child = command.spawn().unwrap();
+            bind(&chat, child.id());
+            let output = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+                .await
+                .expect("Codex timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let answer = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|v| v["item"]["type"] == "agent_message")
+                .filter_map(|v| v["item"]["text"].as_str().map(str::to_owned))
+                .next_back();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let sandbox = stderr.contains("registered Core launch requires an installed app");
+            let cleaned = crate::chat_archive_redact::redact_with_known(&stderr, &[]).text;
+            let profile = std::env::var("USERPROFILE").unwrap_or_default();
+            let cleaned = if profile.is_empty() {
+                cleaned
+            } else {
+                cleaned.replace(&profile, "<사용자 폴더>")
+            };
+            println!(
+                "G60_REAL {label} stderr={}",
+                cleaned.chars().take(1500).collect::<String>()
+            );
+            println!(
+                "G60_REAL {label} status={} tool={} registered_core_error={} answer={}",
+                output.status,
+                observed.load(Ordering::SeqCst),
+                sandbox,
+                answer.as_deref().unwrap_or("<no answer>")
+            );
+            all_called &= observed.load(Ordering::SeqCst);
+            drop(guard);
+        }
+        assert!(all_called, "real Codex did not reach both tool handlers");
+    }
     #[tokio::test]
     #[ignore = "requires an explicitly authorized real Codex account and a built app executable"]
     async fn real_codex_calls_document_list_ephemerally() {
@@ -269,10 +417,47 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "momso_document_read"));
+        assert!(tools.iter().any(|tool| tool["name"] == "momso_skill_read"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "momso_archive_list"));
         let found = crate::momso_mcp::test_response(&serde_json::json!({"id":2,"method":"tools/call","params":{"name":"momso_document_search","arguments":{"query":"균형"}}}), &mut ready, &mut client).unwrap();
         assert!(found.to_string().contains(&id));
         let read = crate::momso_mcp::test_response(&serde_json::json!({"id":3,"method":"tools/call","params":{"name":"momso_document_read","arguments":{"id":id}}}), &mut ready, &mut client).unwrap();
         assert!(read.to_string().contains("호흡과 균형"));
+        let skill = crate::momso_mcp::test_response(&serde_json::json!({"id":4,"method":"tools/call","params":{"name":"momso_skill_read","arguments":{"name":"sample"}}}), &mut ready, &mut client).unwrap();
+        assert!(skill.to_string().contains("fixture-skill-body"));
+        if std::env::var_os("MOMSO_TEST_ALL_SKILLS").is_some() {
+            for &(name, source) in crate::skills::BUNDLED_SKILLS {
+                let (tool, args) = match name {
+                    "conversation-import" => (
+                        "momso_import_conversations",
+                        serde_json::json!({"provider":"chatgpt"}),
+                    ),
+                    "github-connect" => ("momso_github_connect", serde_json::json!({})),
+                    "object-store-connect" => {
+                        ("momso_object_store_r2_connect", serde_json::json!({}))
+                    }
+                    _ => ("browser_open", serde_json::json!({})),
+                };
+                assert!(
+                    source.contains(tool),
+                    "{provider}: {name} does not describe {tool}"
+                );
+                let read = crate::momso_mcp::test_response(&serde_json::json!({"id":6,"method":"tools/call","params":{"name":"momso_skill_read","arguments":{"name":name}}}), &mut ready, &mut client).unwrap();
+                assert!(
+                    read.to_string().contains(tool),
+                    "{provider}: {name} did not return its instructions"
+                );
+                let call = crate::momso_mcp::test_response(&serde_json::json!({"id":7,"method":"tools/call","params":{"name":tool,"arguments":args}}), &mut ready, &mut client).unwrap();
+                assert!(
+                    call.get("error").is_none() && call.to_string().contains("denied"),
+                    "{provider}: {name} failed before host"
+                );
+            }
+        }
+        let files = crate::momso_mcp::test_response(&serde_json::json!({"id":5,"method":"tools/call","params":{"name":"momso_archive_list","arguments":{"folder":"zettels"}}}), &mut ready, &mut client).unwrap();
+        assert!(files.to_string().contains(&id));
     }
 
     #[tokio::test]
@@ -296,6 +481,12 @@ mod tests {
             },
         )
         .unwrap();
+        std::fs::create_dir_all(root.join("skills/sample")).unwrap();
+        std::fs::write(
+            root.join("skills/sample/SKILL.md"),
+            "---\nname: sample\ntitle: Test\ndescription: Test\n---\nfixture-skill-body\n",
+        )
+        .unwrap();
         for provider in ["codex", "claude", "gemini"] {
             let chat = format!("test-{}", uuid::Uuid::new_v4());
             let handler_root = root.clone();
@@ -304,6 +495,33 @@ mod tests {
                 let root = handler_root.clone();
                 let db = handler_db.clone();
                 Box::pin(async move {
+                    if matches!(
+                        input["method"].as_str(),
+                        Some(
+                            "github_connect"
+                                | "object_store_r2_connect"
+                                | "import_conversations"
+                                | "browser_open"
+                        )
+                    ) {
+                        return serde_json::json!({"status":"denied"});
+                    }
+                    if matches!(
+                        input["method"].as_str(),
+                        Some(
+                            "momso_skill_read"
+                                | "momso_archive_list"
+                                | "momso_archive_search"
+                                | "momso_archive_read_file"
+                        )
+                    ) {
+                        return crate::momso_archive_read::dispatch(
+                            &root,
+                            input["method"].as_str().unwrap_or(""),
+                            &input["arguments"],
+                            &[],
+                        );
+                    }
                     crate::momso_document_read::dispatch(
                         &root,
                         &db,
@@ -333,6 +551,7 @@ mod tests {
                 .env("MOMSO_TEST_DOCUMENT_ID", &id)
                 .env("MOMSO_TEST_DOCUMENT_PROVIDER", provider)
                 .env("MOMSO_TEST_DOCUMENT_CONFIG", config)
+                .env("MOMSO_TEST_ALL_SKILLS", "1")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)

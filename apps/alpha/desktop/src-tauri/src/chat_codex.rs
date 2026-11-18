@@ -286,9 +286,18 @@ pub(crate) async fn archive_thread(thread_id: &str) -> Result<(), ()> {
     .map_err(|_| ())
 }
 fn thread_params(archive: &Path, settings: &CodexSettings, now: &str) -> Value {
-    json!({"cwd":archive,"sandbox":settings.sandbox,"approvalPolicy":settings.approval_policy,
+    let params = json!({"cwd":archive,"sandbox":settings.sandbox,"approvalPolicy":settings.approval_policy,
            "config":{"approvals_reviewer":settings.reviewer},
-           "developerInstructions":format!("지금 시각: {now}")})
+           "developerInstructions":format!("지금 시각: {now}")});
+    #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
+    let params = {
+        let mut params = params;
+        if std::env::var_os("MOMSO_G62_PROBE").is_some() {
+            params["ephemeral"] = json!(true);
+        }
+        params
+    };
+    params
 }
 async fn terminate(child: &mut Child) {
     let _ = child.kill().await;
@@ -315,7 +324,7 @@ where
 {
     run_with_skill_auth(
         db, archive, chat_id, text, model, effort, None, None, None, None, settings, approvals,
-        cancel, emit,
+        cancel, None, emit,
     )
     .await
 }
@@ -354,6 +363,7 @@ where
         settings,
         approvals,
         cancel,
+        None,
         emit,
     )
     .await
@@ -374,6 +384,7 @@ pub(crate) async fn run_with_skill_auth<F>(
     settings: &CodexSettings,
     approvals: Option<ApprovalChannel>,
     cancel: CancellationToken,
+    output_dir: Option<&Path>,
     mut emit: F,
 ) -> Result<(), String>
 where
@@ -428,6 +439,7 @@ where
         } else {
             "openai"
         }),
+        output_dir,
         &mut emit,
     )
     .await?;
@@ -472,6 +484,7 @@ pub(crate) async fn run_command<F>(
     cancel: CancellationToken,
     previous: Option<String>,
     expected_provider: Option<&str>,
+    output_dir: Option<&Path>,
     mut emit: F,
 ) -> Result<(), String>
 where
@@ -504,6 +517,13 @@ where
             if line.len() > 2 * 1024 * 1024 { return Err("AI의 답을 읽지 못했습니다".into()); }
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue; };
             if let Some(method) = v.get("method").and_then(Value::as_str) {
+                #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
+                if std::env::var_os("MOMSO_G62_PROBE").is_some()
+                    && method == "item/started"
+                    && v.pointer("/params/item/type").and_then(Value::as_str) == Some("commandExecution")
+                {
+                    emit("g62-probe-shell", json!({"chatId":chat_id}));
+                }
                 if let Some(id) = v.get("id") {
                     let mut approval_params = v["params"].clone();
                     if method == "item/fileChange/requestApproval" {
@@ -612,9 +632,9 @@ where
                     if let Some(effort) = &actual_effort { emit("momso-internal-observed-effort", json!(effort)); }
                     chat::set_codex_thread(db, chat_id, id)?;
                     active_thread=Some(id.to_owned());
-                    let selected=skill.map(|name| format!("${name} ")).unwrap_or_default();
+                    let selected=skill.map(|name| format!("선택된 몸소 스킬은 {name}입니다. 셸 대신 momso_skill_read 도구로 이 스킬을 읽고 따르세요.\n\n")).unwrap_or_default();
                     let prompt=format!("{selected}{turn_text}");
-                    let sandbox = if settings.sandbox_type == "workspaceWrite" {json!({"type":"workspaceWrite","writableRoots":[archive]})} else {json!({"type":"dangerFullAccess"})};
+                    let sandbox = turn_sandbox(settings.sandbox_type, archive, output_dir);
                     let mut params=json!({"threadId":id,"cwd":archive,"approvalPolicy":settings.approval_policy,"sandboxPolicy":sandbox,"input":[{"type":"text","text":prompt}]});
                     if let Some(m)=model.filter(|x| !x.trim().is_empty()) { params["model"]=json!(m); }
                     if let Some(e)=effort.filter(|e| !e.trim().is_empty()) { params["effort"]=json!(e); }
@@ -627,6 +647,18 @@ where
     }.await;
     terminate(&mut child).await;
     result
+}
+
+pub(crate) fn turn_sandbox(sandbox_type: &str, archive: &Path, output_dir: Option<&Path>) -> Value {
+    if sandbox_type == "workspaceWrite" {
+        let mut roots = vec![archive];
+        if let Some(path) = output_dir {
+            roots.push(path);
+        }
+        json!({"type":"workspaceWrite","writableRoots":roots})
+    } else {
+        json!({"type":"dangerFullAccess"})
+    }
 }
 
 fn service_tier_for_turn(fast: Option<bool>) -> Option<&'static str> {
@@ -758,6 +790,7 @@ if (-not $text.Contains('previous-question') -or -not $text.Contains('previous-a
             CancellationToken::new(),
             None,
             Some("openai"),
+            None,
             |_, _| {},
         )
         .await
@@ -830,6 +863,7 @@ switch ($env:MOMSO_FAKE_RESULT) {
                 cancel,
                 previous,
                 Some("momso_api"),
+                None,
                 |name, value| {
                     capture.observe(name, &value);
                     if mode == "stop" && name == "chat-stream" {

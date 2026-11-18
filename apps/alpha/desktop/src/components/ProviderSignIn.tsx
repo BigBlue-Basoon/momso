@@ -24,7 +24,8 @@ import { QuestionDialog } from './ZetPanel'
 const MARK: Record<AiProvider, ProviderMarkId> = { codex: 'chatgpt', claude: 'claude', gemini: 'gemini' }
 
 /** provider_auth_status 가 있는지 알아본다. 있으면 그 목록, 없으면 null(예전 연결 칸을 그대로 보인다). */
-export function useProviderAuth() {
+/** enabled 가 false 인 동안은 묻지 않는다(첫 실행 판정 중 작업 화면용 조회가 같은 상태를 한 번 더 묻지 않게, 2026-11-18 G71). */
+export function useProviderAuth(enabled = true) {
   const [list, setList] = useState<ProviderAuth[] | null | undefined>(undefined)
   // 명령은 있는데 읽지 못했으면(명령이 없는 것과 다르게) 설정 "AI 연결"에서 알리고 다시 시도하게 한다(2026-11-17 틀렸을 때 점검).
   const [failed, setFailed] = useState(false)
@@ -32,12 +33,13 @@ export function useProviderAuth() {
     getProviderAuth().then((value) => { setList(value); setFailed(false) }).catch((error) => { setList(null); setFailed(!isMissingCommand(error)) })
   }, [])
   useEffect(() => {
+    if (!enabled) return
     refresh()
     let stop: (() => void) | undefined
     let disposed = false
     void listenProviderAuth(() => refresh()).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
-  }, [refresh])
+  }, [refresh, enabled])
   return { list, refresh, failed }
 }
 

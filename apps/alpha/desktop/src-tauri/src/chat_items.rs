@@ -348,8 +348,8 @@ pub(crate) fn open_source(
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ChatLink {
-    id: String,
-    title: Option<String>,
+    pub(crate) id: String,
+    pub(crate) title: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -522,7 +522,9 @@ pub(crate) fn enrich_media(
                 })
                 .optional()
                 .map_err(|_| "unavailable")?;
-            chats.insert(chat.clone(), title);
+            if let Some(title) = title {
+                chats.insert(chat.clone(), Some(title));
+            }
             if event.attachment {
                 item.how = Some("attached");
                 item.by = Some(ChatItemBy::User);
@@ -977,8 +979,7 @@ mod tests {
             .unwrap();
         enrich_media(&root, &db, &mut items).unwrap();
         let result = serde_json::to_value(&items).unwrap();
-        assert_eq!(result[0]["chats"][0]["id"], "chat_20261115_120000");
-        assert!(result[0]["chats"][0]["title"].is_null());
+        assert!(result[0]["chats"].as_array().unwrap().is_empty());
         assert!(root.join("receipts/rec_20261115_120002.md").exists());
     }
 }

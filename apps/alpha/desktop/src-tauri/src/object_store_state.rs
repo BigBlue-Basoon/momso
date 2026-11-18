@@ -855,6 +855,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             tokio_util::sync::CancellationToken::new(),
             None,
             None,
+            None,
             |name, value| events.push((name.to_owned(), value)),
         )
         .await
@@ -1159,7 +1160,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             .unwrap()
             .available
         {}
-        crate::chat_archive_store::save_pending(&archive_root, root, &paths).unwrap();
+        crate::chat_archive_store::save_pending_for_push(&archive_root, root, &paths).unwrap();
         crate::archive_remote::transfer(
             &tool,
             &archive_root,
@@ -1580,6 +1581,7 @@ $null = [Console]::ReadLine()
             tokio_util::sync::CancellationToken::new(),
             None,
             None,
+            None,
             |_, _| {},
         )
         .await
@@ -1605,7 +1607,8 @@ $null = [Console]::ReadLine()
             .unwrap()
             .available
         {}
-        crate::chat_archive_store::save_pending(&archive_root, &new_pc, &new_paths).unwrap();
+        crate::chat_archive_store::save_pending_for_push(&archive_root, &new_pc, &new_paths)
+            .unwrap();
         crate::archive_remote::transfer(
             &tool,
             &archive_root,
@@ -1656,7 +1659,8 @@ $null = [Console]::ReadLine()
             .unwrap()
             .available
         {}
-        crate::chat_archive_store::save_pending(&source_archive_root, root, &paths).unwrap();
+        crate::chat_archive_store::save_pending_for_push(&source_archive_root, root, &paths)
+            .unwrap();
         crate::archive_remote::transfer(
             &tool,
             &source_archive_root,

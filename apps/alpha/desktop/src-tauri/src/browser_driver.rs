@@ -26,6 +26,16 @@ pub(crate) struct PageState {
     pub elements: Vec<Element>,
     pub data_provenance: &'static str,
 }
+
+fn has_login_button(page: &PageState) -> bool {
+    page.elements.iter().any(|element| {
+        matches!(element.role.as_str(), "a" | "button")
+            && matches!(
+                element.name.trim().to_lowercase().as_str(),
+                "로그인" | "sign in" | "log in"
+            )
+    })
+}
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DriverError {
     Unavailable,
@@ -732,8 +742,14 @@ impl Session {
         }
         let old_url = self.panel_expected_url.replace(url);
         let old_armed = std::mem::replace(&mut self.panel_armed, true);
-        match self.read() {
-            Ok(_) => Ok(()),
+        match self.read().and_then(|page| {
+            if has_login_button(&page) {
+                Err(DriverError::HumanRequired("login"))
+            } else {
+                Ok(())
+            }
+        }) {
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.panel_expected_url = old_url;
                 self.panel_armed = old_armed;
@@ -1240,6 +1256,25 @@ mod tests {
             Arc,
         },
     };
+
+    #[test]
+    fn login_button_alone_prevents_resume() {
+        let mut page = PageState {
+            origin: "https://example.test".into(),
+            title: String::new(),
+            text: String::new(),
+            elements: vec![Element {
+                id: "login".into(),
+                role: "button".into(),
+                name: "로그인".into(),
+                kind: "normal",
+            }],
+            data_provenance: "fixture",
+        };
+        assert!(has_login_button(&page));
+        page.elements[0].name = "내 계정".into();
+        assert!(!has_login_button(&page));
+    }
 
     struct FakeSite {
         url: String,

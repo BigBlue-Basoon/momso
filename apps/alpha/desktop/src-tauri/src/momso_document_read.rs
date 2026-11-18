@@ -2,7 +2,7 @@
 use serde_json::{json, Value};
 use std::{io::Read, path::Path};
 
-fn read_current(
+pub(crate) fn read_current(
     root: &Path,
     id: &str,
 ) -> Result<(crate::archive_zet::ZetHead, String), &'static str> {
@@ -213,12 +213,15 @@ pub(crate) fn dispatch(root: &Path, database: &Path, method: &str, args: &Value)
             };
             match document {
                 Ok((head, body)) => {
+                    let content_hash = crate::archive_zet::render(&head, &body)
+                        .ok()
+                        .map(|text| crate::archive_zet::content_hash(&text));
                     let length = body.chars().count();
                     if cursor > length {
                         return json!({"status":"invalid_arguments"});
                     }
                     let next = (cursor + 4000 < length).then_some(cursor + 4000);
-                    json!({"status":"ok","kind":"untrusted_document_data","document":{"id":head.id,"revision":revision,"title":head.title.chars().take(200).collect::<String>(),"summary":head.summary.chars().take(400).collect::<String>(),"body":body.chars().skip(cursor).take(4000).collect::<String>(),"nextCursor":next}})
+                    json!({"status":"ok","kind":"untrusted_document_data","document":{"id":head.id,"revision":revision,"contentHash":content_hash,"title":head.title.chars().take(200).collect::<String>(),"summary":head.summary.chars().take(400).collect::<String>(),"body":body.chars().skip(cursor).take(4000).collect::<String>(),"nextCursor":next}})
                 }
                 Err(state) => json!({"status":state}),
             }

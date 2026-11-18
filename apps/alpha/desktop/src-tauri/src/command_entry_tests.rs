@@ -47,7 +47,7 @@ fn approved_and_manual_documents_reappear_in_mcp_and_recent_list() {
     let manual = invoke(
         &window,
         "zet_create",
-        json!({"input":{"title":"Manual fixture","summary":"note","kind":"note","body":"manual text","assets":[],"edges":[]}}),
+        json!({"input":{"title":"Manual fixture","summary":"note","kind":"note","body":"manual text","assets":[],"edges":[],"folder":"Classes/November"}}),
     );
     let manual_id = manual.as_str().unwrap();
     let ai_id = "zet_20990101_120000";
@@ -134,6 +134,16 @@ fn approved_and_manual_documents_reappear_in_mcp_and_recent_list() {
     let recent = invoke(&window, "zet_list", json!({}));
     assert_eq!(recent.as_array().unwrap().len(), 2);
     assert_eq!(recent[0]["id"], ai_id);
+    assert_eq!(
+        recent
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|doc| doc["id"] == manual_id)
+            .unwrap()["folder"],
+        "Classes/November"
+    );
+    assert_eq!(recent[0]["folder"], "");
     assert_eq!(std::fs::read(manual_path).unwrap(), original_manual);
     assert_eq!(std::fs::read(ai_path).unwrap(), original_ai);
 }
@@ -154,6 +164,63 @@ pub(crate) fn invoke(window: &tauri::WebviewWindow<MockRuntime>, cmd: &str, body
     .unwrap_or_else(|error| panic!("{cmd}: {error}"))
     .deserialize()
     .unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn fake_claude_r2_child() {
+    use std::io::{BufRead, Write};
+    let Some(pipe) = std::env::var_os("MOMSO_TEST_R2_PIPE") else {
+        return;
+    };
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut line = String::new();
+    input.read_line(&mut line).unwrap();
+    println!("\n{{\"type\":\"control_response\",\"response\":{{\"request_id\":\"momso-init\",\"subtype\":\"success\"}}}}");
+    std::io::stdout().flush().unwrap();
+    line.clear();
+    input.read_line(&mut line).unwrap();
+    assert!(line.contains("/object-store-connect"));
+    println!("{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"fake-r2-session\"}}");
+    std::io::stdout().flush().unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pipe)
+        .unwrap();
+    let mut client = crate::momso_mcp::test_bridge(file);
+    let mut ready = true;
+    let tools = crate::momso_mcp::test_response(
+        &json!({"id":0,"method":"tools/list"}),
+        &mut ready,
+        &mut client,
+    )
+    .unwrap();
+    assert!(tools.to_string().contains("momso_object_store_r2_connect"));
+    let result = crate::momso_mcp::test_response(
+        &json!({"id":1,"method":"tools/call","params":{"name":"momso_object_store_r2_connect","arguments":{}}}),
+        &mut ready, &mut client,
+    ).unwrap();
+    assert!(result.to_string().contains("success"), "{result}");
+    let marker = std::env::var_os("MOMSO_TEST_R2_FINISHED").unwrap();
+    for _ in 0..1200 {
+        if std::path::Path::new(&marker).is_file() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        std::path::Path::new(&marker).is_file(),
+        "backup and purge did not finish"
+    );
+    println!("{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"OK\"}}}}}}");
+    println!("{{\"type\":\"result\",\"is_error\":false}}");
+    std::io::stdout().flush().unwrap();
+    line.clear();
+    input.read_line(&mut line).unwrap();
+    println!("{{\"type\":\"control_response\",\"response\":{{\"request_id\":\"momso-context\",\"subtype\":\"success\",\"response\":{{\"model\":\"fake\",\"totalTokens\":1,\"maxTokens\":1000}}}}}}");
+    std::io::stdout().flush().unwrap();
 }
 
 #[test]
@@ -334,6 +401,16 @@ fn disconnect_object_store_keeps_local_and_remote_fixture() {
 
 #[test]
 fn oauth_r2_commands_import_backup_purge_and_retry() {
+    oauth_r2_flow(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn claude_r2_login_approval_backup_and_remote_purge() {
+    oauth_r2_flow(true);
+}
+
+fn oauth_r2_flow(with_claude: bool) {
     use std::{
         collections::BTreeMap,
         io::{Read, Write},
@@ -343,6 +420,20 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
             Mutex,
         },
     };
+    #[cfg(windows)]
+    struct ClaudeCleanup {
+        marker: std::path::PathBuf,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    #[cfg(windows)]
+    impl Drop for ClaudeCleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.marker, b"done");
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
     struct Cleanup {
         root: std::path::PathBuf,
         credential: String,
@@ -376,7 +467,9 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
     let objects = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let fail = Arc::new(AtomicBool::new(false));
+    let bucket_created = Arc::new(AtomicBool::new(false));
     let (remote, stopped, fail_delete) = (objects.clone(), stop.clone(), fail.clone());
+    let created = bucket_created.clone();
     let server = std::thread::spawn(move || {
         let base = format!(
             "/client/v4/accounts/{}/r2/buckets/momso-basoon/objects",
@@ -402,12 +495,14 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
                 }
             };
             let head = String::from_utf8(raw[..end].to_vec()).unwrap();
-            assert!(head
-                .lines()
-                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token")));
             let mut parts = head.lines().next().unwrap().split_whitespace();
             let method = parts.next().unwrap();
             let path = parts.next().unwrap();
+            if !path.starts_with("/oauth/callback?") {
+                assert!(head
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token")));
+            }
             let len = head
                 .lines()
                 .find_map(|line| {
@@ -422,7 +517,27 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
                 raw.extend_from_slice(&buffer[..n]);
             }
             let mut map = remote.lock().unwrap();
-            let (status, body) = if method == "GET" && path.starts_with(&format!("{base}?")) {
+            let bucket_base = format!("/client/v4/accounts/{}/r2/buckets", "a".repeat(32));
+            let (status, body) = if path == "/oauth/callback?code=fixture&state=fixture"
+                && method == "GET"
+            {
+                ("200 OK", b"ok".to_vec())
+            } else if path == format!("{bucket_base}/momso-basoon") && method == "GET" {
+                if created.load(Ordering::SeqCst) {
+                    ("200 OK", b"{}".to_vec())
+                } else {
+                    ("404 Not Found", vec![])
+                }
+            } else if path == bucket_base && method == "POST" {
+                let value: Value = serde_json::from_slice(&raw[end..end + len]).unwrap();
+                assert_eq!(value, json!({"name":"momso-basoon"}));
+                created.store(true, Ordering::SeqCst);
+                (
+                    "200 OK",
+                    serde_json::to_vec(&json!({"success":true,"result":{"name":"momso-basoon"}}))
+                        .unwrap(),
+                )
+            } else if method == "GET" && path.starts_with(&format!("{base}?")) {
                 let part = if path.contains("data%2F") {
                     "/data/"
                 } else {
@@ -472,21 +587,139 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
         stop,
         server: Some(server),
     };
-    object_store::register_test_config(
-        root,
-        object_store::Config {
-            provider: "cloudflare".into(),
-            endpoint: format!("http://{address}"),
-            region: "wrangleroauth".into(),
-            bucket: "momso-basoon".into(),
-            credential_id: uuid::Uuid::new_v4().to_string(),
-            last_backup_at: None,
-            write_safety: Some(object_store::WriteSafety::CheckThenWrite),
-        },
-    );
     let archive = archive_location::ArchiveLocation::load(db.clone(), root, vec![]).unwrap();
     let archive_root = root.join("momso");
     archive::initialize(&archive_root, root).unwrap();
+    #[cfg(windows)]
+    let mut claude_completion = None;
+    #[cfg(windows)]
+    if with_claude {
+        assert_eq!(
+            serde_json::to_value(archive_remote::username_set_db(&db, "basoon".into())).unwrap()
+                ["state"],
+            "ok"
+        );
+        let chat_id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let endpoint = format!("http://{address}/");
+        let test_root = root.to_path_buf();
+        let test_db = db.clone();
+        let handler_chat = chat_id.clone();
+        let broker = approval::ApprovalBroker::default();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let handler: setup_bridge::Handler = Arc::new(move |input| {
+            let root = test_root.clone();
+            let database = test_db.clone();
+            let endpoint = endpoint.clone();
+            let chat_id = handler_chat.clone();
+            let broker = broker.clone();
+            let ready = ready_tx.clone();
+            Box::pin(async move {
+                assert_eq!(input, json!({"method":"object_store_r2_connect"}));
+                let result = r2_oauth::fake_setup_for_flow_test(
+                    &root,
+                    &database,
+                    &endpoint,
+                    &chat_id,
+                    &broker,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+                let _ = ready.send(result);
+                json!({"status":setup_actions::r2_tool_status(result)})
+            })
+        });
+        let marker = root.join("fake-claude-finished");
+        let child_marker = marker.clone();
+        let child_db = db.clone();
+        let child_archive = archive_root.clone();
+        let handle = std::thread::spawn(move || {
+            tauri::async_runtime::block_on(async move {
+                let guard = setup_bridge::start(
+                    &chat_id,
+                    tokio_util::sync::CancellationToken::new(),
+                    handler,
+                )
+                .unwrap();
+                let pipe = setup_bridge::name(&chat_id).unwrap();
+                let mut command = process::hidden_async_command(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "command_entry_tests::fake_claude_r2_child",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env("MOMSO_TEST_R2_PIPE", pipe)
+                    .env("MOMSO_TEST_R2_FINISHED", child_marker);
+                let mut emit = |_: &str, _: Value| {};
+                chat_claude::run_command_ref(
+                    command,
+                    &child_db,
+                    &child_archive,
+                    &chat_id,
+                    "원자료 저장소 연결",
+                    Some("haiku"),
+                    Some("low"),
+                    false,
+                    Some("object-store-connect"),
+                    None,
+                    &None,
+                    None,
+                    tokio_util::sync::CancellationToken::new(),
+                    &mut emit,
+                )
+                .await
+                .unwrap();
+                drop(guard);
+            })
+        });
+        claude_completion = Some(ClaudeCleanup {
+            marker,
+            handle: Some(handle),
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(90))
+            .unwrap()
+            .unwrap();
+        assert!(bucket_created.load(Ordering::SeqCst));
+        let config: object_store::Config =
+            serde_json::from_slice(&std::fs::read(root.join("object-store.json")).unwrap())
+                .unwrap();
+        assert_eq!(config.bucket, "momso-basoon");
+        object_store::register_test_config(root, config);
+    } else {
+        object_store::register_test_config(
+            root,
+            object_store::Config {
+                provider: "cloudflare".into(),
+                endpoint: format!("http://{address}"),
+                region: "wrangleroauth".into(),
+                bucket: "momso-basoon".into(),
+                credential_id: uuid::Uuid::new_v4().to_string(),
+                last_backup_at: None,
+                write_safety: Some(object_store::WriteSafety::CheckThenWrite),
+            },
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = with_claude;
+        object_store::register_test_config(
+            root,
+            object_store::Config {
+                provider: "cloudflare".into(),
+                endpoint: format!("http://{address}"),
+                region: "wrangleroauth".into(),
+                bucket: "momso-basoon".into(),
+                credential_id: uuid::Uuid::new_v4().to_string(),
+                last_backup_at: None,
+                write_safety: Some(object_store::WriteSafety::CheckThenWrite),
+            },
+        );
+    }
     let paths = RuntimePaths {
         data_root: root.to_path_buf(),
         database_path: db.clone(),
@@ -564,6 +797,7 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
     );
     let mut target_keys = Vec::new();
     let mut other_keys = Vec::new();
+    let mut state_keys = Vec::new();
     for (key, value) in objects
         .lock()
         .unwrap()
@@ -572,10 +806,9 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
     {
         let decoded = object_store_transfer::decrypt_bytes(value, &identity, 1024 * 1024).unwrap();
         let manifest: object_store_transfer::Manifest = serde_json::from_slice(&decoded).unwrap();
-        if manifest.kind == "app_state" {
-            continue;
-        }
-        let dest = if manifest.sha256 == imported[0]["contentSha256"].as_str().unwrap() {
+        let dest = if manifest.kind == "app_state" {
+            &mut state_keys
+        } else if manifest.sha256 == imported[0]["contentSha256"].as_str().unwrap() {
             &mut target_keys
         } else {
             &mut other_keys
@@ -585,7 +818,7 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
             (0..manifest.chunks.len()).map(|i| object_store_transfer::chunk_key(&manifest, i)),
         );
     }
-    assert!(!target_keys.is_empty() && !other_keys.is_empty());
+    assert!(!target_keys.is_empty() && !other_keys.is_empty() && !state_keys.is_empty());
     let id = imported[0]["id"].as_str().unwrap();
     let preview = invoke(
         &window,
@@ -639,6 +872,13 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
     let map = objects.lock().unwrap();
     assert!(target_keys.iter().all(|key| !map.contains_key(key)));
     assert!(other_keys.iter().all(|key| map.contains_key(key)));
+    assert!(state_keys.iter().all(|key| map.contains_key(key)));
+    drop(map);
+    #[cfg(windows)]
+    if let Some(mut completion) = claude_completion {
+        std::fs::write(&completion.marker, b"done").unwrap();
+        completion.handle.take().unwrap().join().unwrap();
+    }
 }
 
 #[test]
@@ -978,6 +1218,46 @@ fn source_purge_without_remote_delete(oauth_r2: bool) {
         json!({"before":null,"limit":10}),
     );
     assert_eq!(listed["items"], json!([]));
+}
+
+#[test]
+fn fresh_folder_list_before_archive_initialization_is_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let database_path = root.join("momso.db");
+    let backups_path = root.join("backups");
+    std::fs::create_dir_all(&backups_path).unwrap();
+    storage::initialize(&database_path, &backups_path, "test").unwrap();
+    let archive =
+        archive_location::ArchiveLocation::load(database_path.clone(), root, vec![]).unwrap();
+    let paths = RuntimePaths {
+        data_root: root.to_path_buf(),
+        database_path,
+        objects_path: root.join("momso/objects"),
+        exports_path: root.join("exports"),
+        backups_path,
+        logs_path: root.join("logs"),
+        archive,
+        archive_lease: None,
+    };
+    let app = mock_builder()
+        .manage(AppState {
+            paths,
+            approvals: Default::default(),
+            setup_secrets: Default::default(),
+            usage_monitor: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage_cache: Default::default(),
+            chat_active: Default::default(),
+            browser: Default::default(),
+            selections: Default::default(),
+        })
+        .invoke_handler(tauri::generate_handler![zet_folders])
+        .build(mock_context(noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    assert_eq!(invoke(&window, "zet_folders", json!({})), json!([]));
 }
 
 #[test]

@@ -247,6 +247,7 @@ where
 
 async fn run_interactive_login(
     app: tauri::AppHandle,
+    chat_id: &str,
     cancel: CancellationToken,
 ) -> Result<crate::process::ProcessOutput, &'static str> {
     use std::process::Stdio;
@@ -290,12 +291,28 @@ async fn run_interactive_login(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    let panel = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let opened = panel.clone();
+    let panel_cancel = cancel.clone();
+    let chat_id = chat_id.to_owned();
     run_login_process(command, cancel, |url| {
         let app = app.clone();
+        let panel = opened.clone();
+        let cancel = panel_cancel.clone();
+        let chat_id = chat_id.clone();
         async move {
-            crate::panel_browser::panel_browser_open_human(app, url.to_string())
+            match crate::panel_browser::open_oauth_panel(app.clone(), &chat_id, url.clone(), cancel)
                 .await
-                .map_err(|_| "browser_unavailable")
+            {
+                Ok(guard) => {
+                    *panel.lock().map_err(|_| "browser_unavailable")? = Some(guard);
+                    Ok(())
+                }
+                Err("cancelled") => Err("cancelled"),
+                Err(_) => crate::panel_browser::panel_browser_open_human(app, url.to_string())
+                    .await
+                    .map_err(|_| "browser_unavailable"),
+            }
         }
     })
     .await
@@ -621,6 +638,75 @@ pub(crate) async fn connect_approved(
     permit: crate::setup_approval::SetupPermit,
     cancel: CancellationToken,
 ) -> Result<(), &'static str> {
+    let paths = state.paths.scoped().await;
+    ApprovedConnection {
+        data_root: &paths.data_root,
+        database: &paths.database_path,
+        api: "https://api.cloudflare.com/",
+        chat_id,
+        cancel,
+    }
+    .execute(
+        permit,
+        |cancel| login_account(app.clone(), chat_id, cancel),
+        |cancel| async move {
+            // A newly approved account must never reuse a token from a prior login.
+            clear_token_cache().await;
+            current_token(cancel).await
+        },
+    )
+    .await
+}
+
+#[cfg(windows)]
+struct ApprovedConnection<'a> {
+    data_root: &'a std::path::Path,
+    database: &'a std::path::Path,
+    api: &'a str,
+    chat_id: &'a str,
+    cancel: CancellationToken,
+}
+
+#[cfg(windows)]
+impl ApprovedConnection<'_> {
+    async fn execute<F, Fut, G, Gf>(
+        self,
+        permit: crate::setup_approval::SetupPermit,
+        login: F,
+        fetch_token: G,
+    ) -> Result<(), &'static str>
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = Result<String, &'static str>>,
+        G: FnOnce(CancellationToken) -> Gf,
+        Gf: Future<Output = Result<OAuthToken, &'static str>>,
+    {
+        let details = consume_approval(permit, self.chat_id, &self.cancel)?;
+        let _guard = crate::object_store::CONNECTION_LOCK.lock().await;
+        if crate::object_store::load_config(self.data_root)?.is_some() {
+            return Err("already_connected");
+        }
+        let username = crate::archive_remote::username_get_db(self.database)
+            .map_err(|_| "unavailable")?
+            .ok_or("username_missing")?;
+        let target = approved_target(&details, &username, self.api)?;
+        if login(self.cancel.clone()).await? != details.account {
+            return Err("approval_stale");
+        }
+        let token = fetch_token(self.cancel.clone()).await?;
+        if self.cancel.is_cancelled() {
+            return Err("cancelled");
+        }
+        complete_connection(self.data_root, target, token, self.cancel).await
+    }
+}
+
+#[cfg(windows)]
+fn consume_approval(
+    permit: crate::setup_approval::SetupPermit,
+    chat_id: &str,
+    cancel: &CancellationToken,
+) -> Result<crate::approval::SetupApproval, &'static str> {
     let details = permit.consume(chat_id)?;
     if details.service != "cloudflare"
         || details.region.as_deref() != Some("auto")
@@ -628,15 +714,16 @@ pub(crate) async fn connect_approved(
     {
         return Err("unavailable");
     }
-    let paths = state.paths.scoped().await;
-    let _guard = crate::object_store::CONNECTION_LOCK.lock().await;
-    if crate::object_store::load_config(&paths.data_root)?.is_some() {
-        return Err("already_connected");
-    }
-    let username = crate::archive_remote::username_get_db(&paths.database_path)
-        .map_err(|_| "unavailable")?
-        .ok_or("username_missing")?;
-    let target = R2Target::new("https://api.cloudflare.com/", &details.account, &username)?;
+    Ok(details)
+}
+
+#[cfg(windows)]
+fn approved_target(
+    details: &crate::approval::SetupApproval,
+    username: &str,
+    api: &str,
+) -> Result<R2Target, &'static str> {
+    let target = R2Target::new(api, &details.account, username)?;
     if target.bucket != details.resource_name {
         return Err("approval_stale");
     }
@@ -645,22 +732,27 @@ pub(crate) async fn connect_approved(
     {
         return Err("invalid_bucket");
     }
-    if login_account(app, cancel.clone()).await? != details.account {
-        return Err("approval_stale");
-    }
-    // A newly approved account must never reuse a token from a prior login.
-    clear_token_cache().await;
-    let token = current_token(cancel.clone()).await?;
-    if cancel.is_cancelled() {
-        return Err("cancelled");
-    }
+    Ok(target)
+}
+
+#[cfg(windows)]
+async fn complete_connection(
+    data_root: &std::path::Path,
+    target: R2Target,
+    token: OAuthToken,
+    cancel: CancellationToken,
+) -> Result<(), &'static str> {
     create_exact_bucket(&target, &token).await?;
     if cancel.is_cancelled() {
         return Err("created_not_connected");
     }
     let config = crate::object_store::Config {
         provider: "cloudflare".into(),
-        endpoint: format!("https://{}.r2.cloudflarestorage.com", target.account),
+        endpoint: if cfg!(test) && target.api.scheme() == "http" {
+            target.api.as_str().trim_end_matches('/').to_owned()
+        } else {
+            format!("https://{}.r2.cloudflarestorage.com", target.account)
+        },
         region: "wrangleroauth".into(),
         bucket: target.bucket,
         credential_id: uuid::Uuid::new_v4().to_string(),
@@ -706,7 +798,7 @@ pub(crate) async fn connect_approved(
     if cancel.is_cancelled() {
         return Err("created_not_connected");
     }
-    crate::object_store::save_config(&paths.data_root, &config).map_err(|_| "created_not_connected")
+    crate::object_store::save_config(data_root, &config).map_err(|_| "created_not_connected")
 }
 
 #[cfg(test)]
@@ -872,10 +964,11 @@ fn parse_single_account(success: bool, stdout: &str) -> Result<String, &'static 
 
 pub(crate) async fn login_account(
     app: tauri::AppHandle,
+    chat_id: &str,
     cancel: CancellationToken,
 ) -> Result<String, &'static str> {
     login_account_with(cancel, run_wrangler, |cancel| {
-        run_interactive_login(app.clone(), cancel)
+        run_interactive_login(app.clone(), chat_id, cancel)
     })
     .await
 }
@@ -909,6 +1002,129 @@ where
         }
         Err(error) => Err(error),
     }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) async fn fake_setup_for_flow_test(
+    root: &std::path::Path,
+    database: &std::path::Path,
+    endpoint: &str,
+    chat_id: &str,
+    broker: &crate::approval::ApprovalBroker,
+    cancel: CancellationToken,
+) -> Result<(), &'static str> {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use tokio::io::AsyncWriteExt;
+    let logged_in = Arc::new(AtomicBool::new(false));
+    let runner_state = logged_in.clone();
+    let runner = move |_: &'static [&'static str], _: Duration, _: CancellationToken| {
+        let logged_in = runner_state.clone();
+        async move {
+            let stdout = if logged_in.load(Ordering::SeqCst) {
+                serde_json::json!({"loggedIn":true,"authType":"OAuth Token","accounts":[{"id":"a".repeat(32)}]}).to_string()
+            } else {
+                serde_json::json!({"loggedIn":false}).to_string()
+            };
+            Ok(crate::process::ProcessOutput {
+                success: true,
+                stdout,
+            })
+        }
+    };
+    let fake_endpoint = endpoint.to_owned();
+    let login_state = logged_in.clone();
+    let login = move |_: CancellationToken| {
+        let logged_in = login_state.clone();
+        let endpoint = fake_endpoint.clone();
+        async move {
+            let (mut writer, reader) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                let _ = writer.write_all(b"Visit this link to authenticate: https://dash.cloudflare.com/oauth2/auth?response_type=code&state=fixture&redirect_uri=http%3A%2F%2Flocalhost%3A8976%2Foauth%2Fcallback\n").await;
+            });
+            read_login_output(reader, move |url| {
+                let endpoint = endpoint.clone();
+                let logged_in = logged_in.clone();
+                async move {
+                    let state = url
+                        .query_pairs()
+                        .find(|(key, _)| key == "state")
+                        .ok_or("invalid_url")?
+                        .1
+                        .into_owned();
+                    let callback = format!("{endpoint}oauth/callback?code=fixture&state={state}");
+                    let response = reqwest::get(callback).await.map_err(|_| "unavailable")?;
+                    if !response.status().is_success() {
+                        return Err("unavailable");
+                    }
+                    logged_in.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await?;
+            Ok(crate::process::ProcessOutput {
+                success: true,
+                stdout: String::new(),
+            })
+        }
+    };
+    let username = crate::archive_remote::username_get_db(database)
+        .map_err(|_| "unavailable")?
+        .ok_or("username_missing")?;
+    let responder = broker.clone();
+    crate::setup_actions::run_r2_flow(
+        username,
+        cancel,
+        move |cancel| login_account_with(cancel, runner, login),
+        move |plan, cancel| async move {
+            plan.authorize_with(
+                broker,
+                chat_id,
+                "claude",
+                cancel,
+                move |request| {
+                    assert_eq!(
+                        request.setup.as_ref().unwrap().resource_name,
+                        "momso-basoon"
+                    );
+                    let id = request.request_id.clone();
+                    tokio::spawn(async move {
+                        responder
+                            .respond(&id, crate::approval::ApprovalChoice::AllowOnce)
+                            .await
+                            .unwrap();
+                    });
+                    true
+                },
+                |_| {},
+            )
+            .await
+        },
+        move |permit, cancel| async move {
+            ApprovedConnection {
+                data_root: root,
+                database,
+                api: endpoint,
+                chat_id,
+                cancel,
+            }
+            .execute(
+                permit,
+                move |_| async move {
+                    if logged_in.load(Ordering::SeqCst) {
+                        Ok("a".repeat(32))
+                    } else {
+                        Err("login_required")
+                    }
+                },
+                |_| async { Ok(OAuthToken("test-token".into())) },
+            )
+            .await
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

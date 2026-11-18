@@ -216,6 +216,32 @@ pub(crate) fn plan_import(
     Ok(prepare_import(database_path, objects_path, proposal)?.plan)
 }
 
+pub(crate) fn import_generated(
+    database_path: &Path,
+    objects_path: &Path,
+    source: &Path,
+    provider: &str,
+) -> Result<String, SourceAssetError> {
+    let proposal = SourceAssetImportProposal {
+        source_path: source.to_string_lossy().into_owned(),
+        asset_kind: SourceAssetKind::Other,
+        media_type: None,
+        record_link: None,
+        actor: provider.to_owned(),
+    };
+    let plan = plan_import(database_path, objects_path, proposal.clone())?;
+    let asset = apply_import(
+        database_path,
+        objects_path,
+        ApplySourceAssetImportInput {
+            proposal,
+            plan_digest: plan.plan_digest,
+            import_confirmed: true,
+        },
+    )?;
+    Ok(format!("sha256:{}", asset.content_sha256))
+}
+
 pub(crate) fn cleanup_staging(objects_path: &Path) -> Result<usize, SourceAssetError> {
     let data_root = objects_path.parent().ok_or_else(|| {
         SourceAssetError::Validation("objects directory has no data root".to_owned())

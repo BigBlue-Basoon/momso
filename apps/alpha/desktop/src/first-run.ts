@@ -44,6 +44,10 @@ export type FirstRunCheck = {
  * AI 상태를 읽지 못하면 연결을 확인할 수 없으니 첫 실행 화면을 보인다(그 화면에서 다시 읽기를 할 수 있다. 뒤쪽 노트 293줄).
  */
 export async function checkFirstRun(): Promise<FirstRunCheck> {
+  // AI 연결 확인(회사 CLI 확인, 길면 십여 초)은 이름 읽기와 함께 시작한다. 결과가 필요 없으면 기다리지 않는다(2026-11-18 G71).
+  const marked = firstRunMarked()
+  const eligible = marked ? null : firstRunEligible()
+  eligible?.catch(() => {})
   let username: string | null = null
   let nameStep = false
   try {
@@ -53,10 +57,12 @@ export async function checkFirstRun(): Promise<FirstRunCheck> {
       nameStep = true
     }
   } catch { /* 이름 명령이 없다 */ }
-  if (username && firstRunMarked()) return { show: false, username, nameStep }
+  if (username && marked) return { show: false, username, nameStep }
+  // 이름을 받아야 하면 어차피 첫 실행 화면이다: AI 확인을 기다리지 않고 곧바로 보인다(AI 단계가 다시 확인한다).
+  if (nameStep && !username) return { show: true, username, nameStep }
   let connected = false
   try {
-    connected = await firstRunEligible()
+    connected = await (eligible ?? firstRunEligible())
   } catch {
     return { show: true, username, nameStep }
   }

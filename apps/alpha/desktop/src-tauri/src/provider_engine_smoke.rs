@@ -508,6 +508,7 @@ async fn fake_round(
                 cancel,
                 chat::codex_thread(db, id).unwrap(),
                 None,
+                None,
                 &mut emit,
             )
             .await
@@ -728,6 +729,7 @@ async fn gemini_one_turn() {
         key,
         None,
         CancellationToken::new(),
+        None,
         &mut |name, value| events.push((name.to_owned(), value)),
     )
     .await;

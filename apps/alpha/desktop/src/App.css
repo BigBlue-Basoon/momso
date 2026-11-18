@@ -1351,3 +1351,9 @@ button:disabled {
   color: var(--muted);
   font-size: 12px;
 }
+
+/* 화면 한 부분을 그리지 못했을 때(오류 경계, 2026-11-18): 원래 그 부분이 놓이던 칸에 한 줄과 다시 시도. */
+.screen-error { display: flex; min-width: 0; min-height: 0; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--muted); font-size: 13px; background: var(--surface); }
+.screen-error-main { grid-column: 2 / -1; }
+.screen-error-panel { width: var(--zet-panel-width, 360px); border-left: 1px solid var(--line); }
+.screen-error-hidden { display: none; }

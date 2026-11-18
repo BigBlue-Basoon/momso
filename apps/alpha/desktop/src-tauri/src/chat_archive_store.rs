@@ -597,14 +597,19 @@ pub(crate) fn save_pending_for_push(
     save_pending_inner(root, resources, paths, true)
 }
 
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
 fn save_pending_inner(
     root: &Path,
     resources: &Path,
     paths: &crate::runtime::RuntimePaths,
     wait_for_credentials: bool,
 ) -> Result<(), &'static str> {
-    static SAVE_LOCK: Mutex<()> = Mutex::new(());
-    let _save = SAVE_LOCK.lock().map_err(|_| "unavailable")?;
+    let _save = if wait_for_credentials {
+        SAVE_LOCK.lock().map_err(|_| "unavailable")?
+    } else {
+        SAVE_LOCK.try_lock().map_err(|_| "redaction_pending")?
+    };
     crate::chat_archive_tracking::ensure_tracking(&paths.database_path)?;
     let proof_key = crate::chat_archive_tracking::proof_key()?;
     let _credentials = if wait_for_credentials {
@@ -994,6 +999,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nonblocking_save_returns_pending_when_another_save_holds_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_owned();
+        let archive = root.join("momso");
+        let db = root.join("momso.db");
+        crate::storage::initialize(&db, &root.join("backups"), "fixture").unwrap();
+        let location =
+            crate::archive_location::ArchiveLocation::load(db.clone(), &root, vec![]).unwrap();
+        let paths = crate::runtime::RuntimePaths {
+            data_root: root.clone(),
+            database_path: db,
+            objects_path: archive.join("objects"),
+            exports_path: root.join("exports"),
+            backups_path: root.join("backups"),
+            logs_path: root.join("logs"),
+            archive: location,
+            archive_lease: None,
+        };
+        let guard = SAVE_LOCK.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(save_pending(&archive, &root, &paths));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), Err("redaction_pending"));
+    }
+
+    #[test]
     fn empty_credentials_wait_for_short_lock_contention() {
         let temp = tempfile::tempdir().unwrap();
         let db = temp.path().join("momso.db");
@@ -1085,7 +1120,7 @@ mod tests {
             .unwrap()
             .available
         {}
-        save_pending(&archive, root, &paths).unwrap();
+        save_pending_for_push(&archive, root, &paths).unwrap();
         assert!(crate::chat_archive_tracking::changes(&db)
             .unwrap()
             .is_empty());
@@ -1118,7 +1153,7 @@ mod tests {
             .unwrap()
             .available
         {}
-        save_pending(&archive, root, &paths).unwrap();
+        save_pending_for_push(&archive, root, &paths).unwrap();
         assert!(!fs::read_to_string(&untouched).unwrap().contains(&fake_key));
         fs::write(archive.join("outside-stage"), "fixture").unwrap();
         crate::archive_remote::git(&git, &archive, &["add", "--", "outside-stage"]).unwrap();
@@ -1127,7 +1162,7 @@ mod tests {
         let dirty = crate::chat_archive_tracking::changes(&db).unwrap();
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].0, id1);
-        save_pending(&archive, root, &paths).unwrap();
+        save_pending_for_push(&archive, root, &paths).unwrap();
         assert!(crate::chat_archive_tracking::changes(&db)
             .unwrap()
             .is_empty());
@@ -1157,7 +1192,7 @@ mod tests {
         crate::chat::apply_deletion_in_transaction(&tx, id1, "2026-11-17T00:00:00Z").unwrap();
         tx.commit().unwrap();
         drop(conn);
-        save_pending(&archive, root, &paths).unwrap();
+        save_pending_for_push(&archive, root, &paths).unwrap();
         let tombstone = crate::archive_remote::git(
             &git,
             &archive,

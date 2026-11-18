@@ -352,6 +352,11 @@ export type ChatEventHandlers = {
    * 끝내 실패하면 chat-error 가 따로 온다.
    */
   onRetrying?: (event: ChatRetrying) => void
+  /**
+   * "다시 만들기"의 결과(2026-11-18 뒤쪽 6b21644 media_generation.rs, 계약 C52): chat-media-regeneration { chatId, userMessageId, status }.
+   * status: recorded(새 판을 기록함) | not_detected(자동으로 찾지 못함, 생성물이 없다는 확정은 아님) | unavailable.
+   */
+  onMediaRegeneration?: (event: { chatId: string; status: string }) => void
 }
 export type ChatRetrying = { chatId: string; provider: string | null; attempt: number | null; kind: string | null; retryAfterSeconds: number | null }
 
@@ -363,6 +368,10 @@ export async function listenChatEvents(handlers: ChatEventHandlers) {
     listen<ChatErrorEvent>('chat-error', (event) => handlers.onError(event.payload)),
     listen<{ chatId: string; context?: ChatContext | null }>('chat-context-updated', (event) => handlers.onContext?.(event.payload)),
     listen<{ chatId: string }>('chat-compacted', (event) => handlers.onCompacted?.(event.payload)),
+    listen<{ chatId?: unknown; status?: unknown }>('chat-media-regeneration', (event) => {
+      const p = event.payload ?? {}
+      if (typeof p.chatId === 'string' && typeof p.status === 'string') handlers.onMediaRegeneration?.({ chatId: p.chatId, status: p.status })
+    }),
     listen<{ chatId?: unknown; provider?: unknown; attempt?: unknown; kind?: unknown; retryAfterSeconds?: unknown }>('chat-provider-retrying', (event) => {
       const p = event.payload ?? {}
       if (typeof p.chatId !== 'string') return

@@ -200,17 +200,24 @@ export function PanelBrowserView({
         .catch(() => { sending.current = false })
     }
   }
+  // 자리가 바뀔 수 있을 때만 잰다(2026-11-18 G71: 매 그림·250ms 시계가 빈 패널에서 CPU 를 썼다).
+  //   자리 칸의 크기 바뀜(ResizeObserver: 창 크기·최대화·패널 폭·위 줄 생김), 창 크기·배율 바뀜, 패널이 밀려 들어오는 움직임이 끝남,
+  //   그리고 이 부품이 다시 그려질 때(아래 useLayoutEffect, 그림이 멈춘 창에서도 돈다).
   useEffect(() => {
-    if (!visible) return
-    let frame = 0
-    const tick = () => {
-      follow.current()
-      frame = window.requestAnimationFrame(tick)
+    if (!visible || !spot.current) return
+    const run = () => follow.current()
+    const observer = new ResizeObserver(run)
+    observer.observe(spot.current)
+    window.addEventListener('resize', run)
+    document.addEventListener('transitionend', run, true)
+    document.addEventListener('animationend', run, true)
+    run()
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', run)
+      document.removeEventListener('transitionend', run, true)
+      document.removeEventListener('animationend', run, true)
     }
-    frame = window.requestAnimationFrame(tick)
-    // 창이 숨겨지거나 가려져 화면 그림이 멈춰도 따라가도록 시계로도 잰다(그때 브라우저는 1초쯤으로 늦춘다).
-    const timer = window.setInterval(() => follow.current(), 250)
-    return () => { window.cancelAnimationFrame(frame); window.clearInterval(timer) }
   }, [visible])
   // 패널 위 줄(AI 가 쓰는 중·로그인 안내·팝업 출처)이 생기거나 사라지면 그 그림 전에 곧바로 웹뷰를 내리거나 올린다(2026-11-18 실제 앱 B71).
   // 화면 그림마다 도는 것만으로는, 창이 가려졌거나 숨겨져 그림이 멈추면 웹뷰가 옛 자리에 남아 줄을 덮었다.
@@ -249,8 +256,13 @@ export function PanelBrowserView({
         if (state === 'started') setAgent({ chatId: owner, state: 'ai', reason: null, title: chatTitle })
         else if (state === 'human') setAgent({ chatId: owner, state: 'human', reason: null, title: chatTitle })
         else if (state === 'login') setAgent({ chatId: owner, state: 'login', reason, title: chatTitle, loginUrl })
-        else if (state === 'ended' || state === 'available') setAgent(null)
+        // AI 의 턴이 끝나도(ended, 뒤쪽 close_panel_turn) 사람이 로그인해야 하는 줄은 남긴다(2026-11-18 실제 앱: 코덱스는 답이 끝나며 줄이 사라졌다).
+        // 사람이 [AI에게 돌려주기](→ available), 다른 턴 시작(started), 직접 쓰기(human), 패널 닫기 때 거둔다.
+        else if (state === 'ended') setAgent((current) => (current && current.state === 'login' && current.chatId === owner && reason !== 'panel_not_opened' ? current : null))
+        else if (state === 'available') setAgent(null)
       },
+      // [AI에게 돌려주기] 뒤 이어 하기 턴이 시작됨(G68): 줄을 "AI가 이 패널을 쓰고 있습니다"로.
+      onResumeStarted: ({ chatId: owner }) => setAgent((current) => ({ chatId: owner, state: 'ai', reason: null, title: current?.chatId === owner ? current.title : null })),
       // 몸소 브라우저의 "사람이 해야 함"이 패널 AI 의 채팅방에서 오면 같은 로그인 줄로(까닭 이름은 panel-agent-control-changed 의 것으로 맞춤).
       onHumanRequired: (owner, reason, loginUrl) => {
         const mapped = reason === 'external_login' ? 'google_login_external'
@@ -279,7 +291,11 @@ export function PanelBrowserView({
       .catch((error) => {
         const code = String(error)
         // 로그인 뒤 돌려줬는데 뒤쪽이 아직 로그인 전으로 보면 human_required.
-        callbacks.current.onNotice(code.includes('panel_busy') ? B.agentBusy : code.includes('human_required') ? B.agentLoginNotYet : B.agentControlFailed)
+        // 이어 하기 오류(G68): login_incomplete 는 아직 로그인 화면, 그 밖은 까닭별 말.
+        const known = Object.keys(B.resumeFailed).find((key) => code.includes(key))
+        callbacks.current.onNotice(code.includes('panel_busy') ? B.agentBusy
+          : code.includes('human_required') || code.includes('login_incomplete') ? B.agentLoginNotYet
+            : known ? B.resumeFailed[known] : B.agentControlFailed)
       })
       .finally(() => setAgentWorking(false))
   }

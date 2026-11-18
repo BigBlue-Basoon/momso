@@ -41,6 +41,33 @@ const SAMPLES: Sample[] = [
 ]
 
 const edits = new Map<string, { title: string; summary: string; body: string; at: string }>()
+// 옮긴 폴더와 만든 빈 폴더(메모리에서만).
+const moved = new Map<string, string>()
+const madeFolders = new Set<string>()
+const folderOf = (item: Sample) => moved.get(item.id) ?? item.folder
+
+export function devSampleFolders() {
+  const all = new Set<string>(madeFolders)
+  for (const item of SAMPLES) {
+    const parts = folderOf(item).split('/').filter(Boolean)
+    for (let i = 1; i <= parts.length; i += 1) all.add(parts.slice(0, i).join('/'))
+  }
+  return [...all]
+}
+export function createDevFolder(folder: string) {
+  const parts = folder.split('/').filter(Boolean)
+  for (let i = 1; i <= parts.length; i += 1) madeFolders.add(parts.slice(0, i).join('/'))
+}
+export function setDevFolder(id: string, folder: string) {
+  moved.set(id, folder)
+}
+export function renameDevFolder(from: string, to: string) {
+  const swap = (path: string) => (path === from ? to : path.startsWith(`${from}/`) ? `${to}${path.slice(from.length)}` : path)
+  for (const item of SAMPLES) moved.set(item.id, swap(folderOf(item)))
+  const made = [...madeFolders]
+  madeFolders.clear()
+  made.forEach((path) => madeFolders.add(swap(path)))
+}
 
 export function isDevSampleDocument(id: string) {
   return id.startsWith('dev-doc-')
@@ -49,7 +76,7 @@ export function isDevSampleDocument(id: string) {
 export function devSampleEntries(): ZetListEntry[] {
   return SAMPLES.map((item) => {
     const edited = edits.get(item.id)
-    return { id: item.id, title: edited?.title ?? item.title, summary: edited?.summary ?? item.summary, kind: item.kind, status: item.status, createdAt: stamp(item.day, 9), updatedAt: edited?.at ?? stamp(item.day), folder: item.folder }
+    return { id: item.id, title: edited?.title ?? item.title, summary: edited?.summary ?? item.summary, kind: item.kind, status: item.status, createdAt: stamp(item.day, 9), updatedAt: edited?.at ?? stamp(item.day), folder: folderOf(item) }
   })
 }
 

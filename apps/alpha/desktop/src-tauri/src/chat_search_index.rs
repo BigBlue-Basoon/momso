@@ -144,6 +144,8 @@ mod tests {
         let path = dir.path().join("app.db");
         crate::storage::initialize(&path, &dir.path().join("backup"), "fixture").unwrap();
         let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE generated_output_turns; DROP TABLE media_generation;")
+            .unwrap();
         db.execute_batch("DROP TRIGGER chat_message_search_insert; DROP TRIGGER chat_message_search_delete; DROP TRIGGER chat_message_search_move; DROP TRIGGER chat_message_search_update; DROP TABLE chat_message_search_vocab; DROP TABLE chat_message_search; DROP TABLE chat_message_search_map; DROP TABLE chat_search_index_state; DROP INDEX chat_search_page_order; DROP TABLE chat_archive_changes; DROP TRIGGER chat_archive_room_insert; DROP TRIGGER chat_archive_room_update; DROP TRIGGER chat_archive_room_delete; DROP TRIGGER chat_archive_message_insert; DROP TRIGGER chat_archive_message_update; DROP TRIGGER chat_archive_message_delete; DROP TRIGGER chat_archive_import_insert; DROP TRIGGER chat_archive_import_update; DROP TRIGGER chat_archive_import_delete; DROP TRIGGER chat_archive_attachment_insert; DROP TRIGGER chat_archive_attachment_update; DROP TRIGGER chat_archive_attachment_delete; DROP TRIGGER chat_archive_group_update; DELETE FROM app_schema_migrations WHERE version>=89; PRAGMA user_version=88;").unwrap();
         db.execute(
             "INSERT INTO chats(id,title,created_at,updated_at) VALUES('room','test','x','x')",
