@@ -37,12 +37,12 @@ try {
     if ((Test-Path -LiteralPath $isolatedProfile) -or (Test-Path -LiteralPath $isolatedTemp)) {
         throw 'Snapshot contains an isolation directory; refusing to reuse it.'
     }
-    foreach ($path in @($isolatedProfile, $isolatedTemp, (Join-Path $isolatedProfile 'Roaming'), (Join-Path $isolatedProfile 'Local'))) {
+    foreach ($path in @($isolatedProfile, $isolatedTemp, (Join-Path $isolatedProfile 'AppData/Roaming'), (Join-Path $isolatedProfile 'AppData/Local'))) {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
     $env:USERPROFILE = $isolatedProfile
-    $env:APPDATA = Join-Path $isolatedProfile 'Roaming'
-    $env:LOCALAPPDATA = Join-Path $isolatedProfile 'Local'
+    $env:APPDATA = Join-Path $isolatedProfile 'AppData/Roaming'
+    $env:LOCALAPPDATA = Join-Path $isolatedProfile 'AppData/Local'
     $env:TEMP = $isolatedTemp
     $env:TMP = $isolatedTemp
     $env:GIT_CONFIG_NOSYSTEM = '1'
@@ -74,10 +74,16 @@ try {
     Write-Host "Clean copy and target: $copy"
     Push-Location $copy
     try {
-        $os = Get-CimInstance Win32_OperatingSystem
-        $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-        if ($os.FreePhysicalMemory / 1MB -lt 4 -or $disk.FreeSpace / 1GB -lt 60) {
-            throw 'Insufficient available memory or disk space before cargo.'
+        while ($true) {
+            $running = @(Get-CimInstance Win32_Process -Filter "Name='cargo.exe'")
+            $ids = @($running | ForEach-Object { $_.ProcessId })
+            $topLevel = @($running | Where-Object { $_.ParentProcessId -notin $ids })
+            $os = Get-CimInstance Win32_OperatingSystem
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+            if ($disk.FreeSpace / 1GB -lt 60) { throw 'Insufficient disk space before cargo.' }
+            if ($topLevel.Count -lt 2 -and $os.FreePhysicalMemory / 1MB -ge 4) { break }
+            Write-Host 'Waiting for a cargo slot and available memory.'
+            Start-Sleep -Seconds 60
         }
         & $cargo test --locked --manifest-path 'apps/alpha/desktop/src-tauri/Cargo.toml' -j 1 -- --test-threads=2
         if ($LASTEXITCODE -ne 0) { throw "Cargo tests failed with exit code $LASTEXITCODE." }

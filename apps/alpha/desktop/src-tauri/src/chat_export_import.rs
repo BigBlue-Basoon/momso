@@ -40,6 +40,10 @@ fn import_storage_error(error: rusqlite::Error) -> &'static str {
 const MAX_ENTRIES: usize = 100_000;
 const GEMINI_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const GEMINI_GROUP_MINUTES: i64 = 30;
+pub(crate) const GEMINI_GROUPING_NOTICE: &str = "제미나이 기록은 대화 단위 정보가 없어 같은 UTC 날짜에서 항목 사이가 30분 이내인 기록을 한 채팅방으로 나눴습니다.";
+pub(crate) const GEMINI_JSON_GUIDANCE: &str =
+    "구글 테이크아웃에서 '내 활동'의 형식을 JSON으로 골라 내보내 주세요.";
+const GEMINI_HTML_NEEDS_JSON: &str = "gemini_html_needs_json";
 static RUNNING: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 fn running() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
     RUNNING.get_or_init(|| Mutex::new(HashMap::new()))
@@ -100,6 +104,10 @@ pub(crate) struct ResultCounts {
     updated: u64,
     added_messages: u64,
     conflicts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) grouping_notice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) guidance: Option<&'static str>,
 }
 
 struct ImportedMessage {
@@ -713,27 +721,41 @@ fn gemini_record(value: &Value) -> Option<GeminiTurn> {
     if !is_gemini {
         return None;
     }
+    let details = value.get("details").and_then(Value::as_array);
+    let detail = |name: &str| {
+        details.and_then(|items| {
+            items.iter().find_map(|item| {
+                (item.get("name").and_then(Value::as_str) == Some(name))
+                    .then(|| item.get("value").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+    };
     let title = value.get("title")?.as_str()?.trim();
-    let prompt = title.strip_prefix("Prompted ").unwrap_or(title).trim();
+    let prompt = detail("Request")
+        .unwrap_or_else(|| title.strip_prefix("Prompted ").unwrap_or(title))
+        .trim();
     let time = DateTime::parse_from_rfc3339(value.get("time")?.as_str()?)
         .ok()?
         .with_timezone(&Utc);
-    if prompt.is_empty() {
+    if prompt.is_empty() || (detail("Request").is_none() && title == "Used Gemini Apps") {
         return None;
     }
-    let answer = value
-        .get("safeHtmlItem")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.get("html").and_then(Value::as_str))
-                .map(gemini_html_text)
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|s| !s.is_empty());
+    let answer = detail("Response").map(str::to_owned).or_else(|| {
+        value
+            .get("safeHtmlItem")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.get("html").and_then(Value::as_str))
+                    .map(gemini_html_text)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|s| !s.is_empty())
+    });
     Some(GeminiTurn {
         time,
         prompt: prompt.to_owned(),
@@ -762,6 +784,107 @@ fn gemini_parse<R: Read>(reader: R) -> Result<(Vec<GeminiTurn>, u64), String> {
     }
     if turns.is_empty() {
         return Err("unsupported_format".into());
+    }
+    turns.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.prompt.cmp(&b.prompt)));
+    Ok((turns, skipped))
+}
+
+// Google documents HTML activity records but not Gemini's HTML schema. This
+// deliberately accepts only the publicly observed English Prompted layout.
+fn gemini_html_time(value: &str) -> Option<DateTime<Utc>> {
+    let normalized = value.replace(['\u{a0}', '\u{202f}'], " ");
+    let (date, zone) = normalized.trim().rsplit_once(' ')?;
+    let offset = match zone {
+        "UTC" | "GMT" => "+0000".to_owned(),
+        "PST" => "-0800".to_owned(),
+        "PDT" => "-0700".to_owned(),
+        "EST" => "-0500".to_owned(),
+        "EDT" => "-0400".to_owned(),
+        "KST" => "+0900".to_owned(),
+        _ if zone.starts_with("GMT+") || zone.starts_with("GMT-") => zone[3..].replace(':', ""),
+        _ => return None,
+    };
+    let text = format!("{} {}", date.replace("Sept ", "Sep "), offset);
+    ["%b %e, %Y, %I:%M:%S %p %z", "%e %b %Y, %H:%M:%S %z"]
+        .iter()
+        .find_map(|format| DateTime::parse_from_str(&text, format).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn gemini_parse_html<R: Read>(reader: R) -> Result<(Vec<GeminiTurn>, u64), String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(GEMINI_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "file_error")?;
+    if bytes.len() as u64 > GEMINI_MAX_BYTES {
+        return Err("gemini_file_too_large".into());
+    }
+    let html = std::str::from_utf8(&bytes).map_err(|_| GEMINI_HTML_NEEDS_JSON)?;
+    let document = scraper::Html::parse_document(html);
+    let selector =
+        scraper::Selector::parse(".outer-cell .content-cell").map_err(|_| "unsupported_format")?;
+    let mut turns = Vec::new();
+    let mut skipped = 0;
+    let mut unknown_korean = false;
+    for cell in document.select(&selector) {
+        let mut text = String::new();
+        for node in cell.descendants() {
+            match node.value() {
+                scraper::Node::Text(value) => text.push_str(value),
+                scraper::Node::Element(value)
+                    if matches!(value.name(), "br" | "p") && !text.ends_with('\n') =>
+                {
+                    text.push('\n')
+                }
+                _ => {}
+            }
+        }
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let Some(first) = lines.first() else { continue };
+        let Some(prompt) = first
+            .strip_prefix("Prompted ")
+            .or_else(|| first.strip_prefix("Prompted\u{a0}"))
+        else {
+            unknown_korean |= first.chars().any(|ch| ('가'..='힣').contains(&ch));
+            if lines.iter().any(|line| gemini_html_time(line).is_some()) {
+                skipped += 1;
+            }
+            continue;
+        };
+        let Some((index, time)) = lines
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(i, line)| gemini_html_time(line).map(|time| (i, time)))
+        else {
+            skipped += 1;
+            continue;
+        };
+        let mut prompt = prompt.trim().to_owned();
+        for line in &lines[1..index] {
+            if *line != "Audio included." {
+                prompt.push('\n');
+                prompt.push_str(line);
+            }
+        }
+        if prompt.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let answer = lines[index + 1..].join("\n");
+        turns.push(GeminiTurn {
+            time,
+            prompt,
+            answer: (!answer.is_empty()).then_some(answer),
+        });
+    }
+    if turns.is_empty() || unknown_korean || skipped != 0 {
+        return Err(GEMINI_HTML_NEEDS_JSON.into());
     }
     turns.sort_by(|a, b| a.time.cmp(&b.time).then_with(|| a.prompt.cmp(&b.prompt)));
     Ok((turns, skipped))
@@ -806,7 +929,8 @@ fn gemini_load(file: &Path) -> Result<(Vec<Value>, u64), String> {
         .and_then(|s| s.to_str())
         .is_some_and(|s| s.eq_ignore_ascii_case("html") || s.eq_ignore_ascii_case("htm"))
     {
-        return Err("gemini_json_required".into());
+        let (turns, skipped) = gemini_parse_html(f)?;
+        return Ok((gemini_groups(turns), skipped));
     }
     if !file
         .extension()
@@ -823,37 +947,58 @@ fn gemini_load(file: &Path) -> Result<(Vec<Value>, u64), String> {
     let mut all = Vec::new();
     let mut skipped = 0;
     let mut total_bytes: u64 = 0;
-    let mut has_html = false;
-    for i in 0..zip.len() {
-        let entry = zip.by_index(i).map_err(|_| "unsupported_format")?;
-        let name = entry.name().rsplit('/').next().unwrap_or("");
-        if name.eq_ignore_ascii_case("MyActivity.html")
-            || name.eq_ignore_ascii_case("MyActivity.htm")
-        {
-            has_html = true;
+    let mut html_needs_json = false;
+    for json_pass in [true, false] {
+        if !json_pass && !all.is_empty() {
+            break;
         }
-        if !name.eq_ignore_ascii_case("MyActivity.json") {
-            continue;
-        }
-        total_bytes = total_bytes.saturating_add(entry.size());
-        if total_bytes > GEMINI_MAX_BYTES {
-            return Err("gemini_file_too_large".into());
-        }
-        if entry.size() > GEMINI_MAX_BYTES {
-            return Err("gemini_file_too_large".into());
-        }
-        match gemini_parse(entry) {
-            Ok((mut turns, count)) => {
-                all.append(&mut turns);
-                skipped += count;
+        for i in 0..zip.len() {
+            let entry = zip.by_index(i).map_err(|_| "unsupported_format")?;
+            let name = entry.name().rsplit('/').next().unwrap_or("");
+            let is_json = name.eq_ignore_ascii_case("MyActivity.json");
+            let is_html = name.eq_ignore_ascii_case("MyActivity.html")
+                || name.eq_ignore_ascii_case("MyActivity.htm")
+                || name == "내활동.html";
+            if (json_pass && !is_json) || (!json_pass && !is_html) {
+                continue;
             }
-            Err(e) if e == "unsupported_format" => continue,
-            Err(e) => return Err(e),
+            if !json_pass
+                && entry.name().contains('/')
+                && !entry
+                    .name()
+                    .split('/')
+                    .any(|part| part.to_lowercase().contains("gemini") || part.contains("제미나이"))
+            {
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(entry.size());
+            if total_bytes > GEMINI_MAX_BYTES {
+                return Err("gemini_file_too_large".into());
+            }
+            if entry.size() > GEMINI_MAX_BYTES {
+                return Err("gemini_file_too_large".into());
+            }
+            match if is_json {
+                gemini_parse(entry)
+            } else {
+                gemini_parse_html(entry)
+            } {
+                Ok((mut turns, count)) => {
+                    all.append(&mut turns);
+                    skipped += count;
+                }
+                Err(e) if e == "unsupported_format" => continue,
+                Err(e) if e == GEMINI_HTML_NEEDS_JSON => {
+                    html_needs_json = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
     if all.is_empty() {
-        if has_html {
-            return Err("gemini_json_required".into());
+        if html_needs_json {
+            return Err(GEMINI_HTML_NEEDS_JSON.into());
         }
         return Err("unsupported_format".into());
     }
@@ -1034,7 +1179,15 @@ pub(crate) fn import_controlled(
     let mut counts = ResultCounts::default();
     let mut processed = 0;
     if provider == "gemini" {
-        let (groups, skipped) = gemini_load(file)?;
+        counts.grouping_notice = Some(GEMINI_GROUPING_NOTICE);
+        let (groups, skipped) = match gemini_load(file) {
+            Ok(value) => value,
+            Err(error) if error == GEMINI_HTML_NEEDS_JSON => {
+                counts.guidance = Some(GEMINI_JSON_GUIDANCE);
+                return Ok(counts);
+            }
+            Err(error) => return Err(error),
+        };
         let partition = gemini_partition(&tx, groups)?;
         counts.skipped = skipped;
         counts.duplicate = partition.duplicate;
@@ -1127,6 +1280,10 @@ pub(crate) struct Preview {
     gemini_duplicate_items: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gemini_conflicting_items: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grouping_notice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) guidance: Option<&'static str>,
 }
 
 struct PreviewSeed<'a> {
@@ -1269,10 +1426,20 @@ pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview,
     let db = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(import_storage_error)?;
     if provider == "gemini" {
-        let (groups, unreadable) = gemini_load(file)?;
+        let (groups, unreadable) = match gemini_load(file) {
+            Ok(value) => value,
+            Err(error) if error == GEMINI_HTML_NEEDS_JSON => {
+                return Ok(Preview {
+                    guidance: Some(GEMINI_JSON_GUIDANCE),
+                    ..Preview::default()
+                })
+            }
+            Err(error) => return Err(error),
+        };
         let mut result = Preview {
             unreadable,
             conversations: groups.len() as u64,
+            grouping_notice: Some(GEMINI_GROUPING_NOTICE),
             ..Preview::default()
         };
         for group in &groups {
@@ -1519,6 +1686,37 @@ mod tests {
     }
 
     #[test]
+    fn gemini_details_export_imports_request_response_and_time() {
+        let (dir, db) = fixture();
+        let file = dir.path().join("MyActivity.json");
+        std::fs::write(&file, serde_json::json!([{
+            "header":"Gemini", "title":"Used Gemini Apps",
+            "titleUrl":"https://gemini.google.com/app/c/example",
+            "time":"2024-02-17T22:05:10.123Z", "products":["Gemini Apps"],
+            "details":[{"name":"Request","value":"A question"},{"name":"Response","value":"An answer"}]
+        }]).to_string()).unwrap();
+        assert_eq!(import(&db, &file, "gemini").unwrap().imported, 1);
+        let c = Connection::open(&db).unwrap();
+        let mut q = c
+            .prepare("SELECT role,text,created_at FROM chat_messages ORDER BY rowid")
+            .unwrap();
+        let messages: Vec<(String, String, String)> = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!((&*messages[0].0, &*messages[0].1), ("user", "A question"));
+        assert_eq!(
+            (&*messages[1].0, &*messages[1].1),
+            ("assistant", "An answer")
+        );
+        assert!(messages
+            .iter()
+            .all(|m| m.2.starts_with("2024-02-17T22:05:10.123")));
+    }
+
+    #[test]
     fn gemini_rejects_empty_broken_and_other_google_activity() {
         for bytes in [
             &b"[]"[..],
@@ -1633,8 +1831,20 @@ mod tests {
         use std::io::Write;
         let (dir, db) = fixture();
         let html = dir.path().join("MyActivity.html");
-        std::fs::write(&html, "<html></html>").unwrap();
-        assert!(matches!(preview(&db, &html, "gemini"), Err(e) if e == "gemini_json_required"));
+        std::fs::write(&html, "<html lang='ko'><div class='outer-cell'><div class='content-cell'>알 수 없는 활동<br>2026. 1. 1. 오후 1:00:00</div></div></html>").unwrap();
+        let result = preview(&db, &html, "gemini").unwrap();
+        assert_eq!(result.guidance, Some(GEMINI_JSON_GUIDANCE));
+        assert_eq!(result.conversations, 0);
+        let result = import(&db, &html, "gemini").unwrap();
+        assert_eq!(result.guidance, Some(GEMINI_JSON_GUIDANCE));
+        assert_eq!(result.imported, 0);
+        assert_eq!(
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM chats", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         let zip_path = dir.path().join("activity.zip");
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
         zip.start_file(
@@ -1644,10 +1854,71 @@ mod tests {
         .unwrap();
         write!(zip, "<html></html>").unwrap();
         zip.finish().unwrap();
-        assert!(matches!(gemini_load(&zip_path), Err(e) if e == "gemini_json_required"));
+        assert_eq!(
+            preview(&db, &zip_path, "gemini").unwrap().guidance,
+            Some(GEMINI_JSON_GUIDANCE)
+        );
+        assert_eq!(
+            import(&db, &zip_path, "gemini").unwrap().guidance,
+            Some(GEMINI_JSON_GUIDANCE)
+        );
         assert!(
             matches!(gemini_parse(std::io::repeat(b'x').take(GEMINI_MAX_BYTES+1)), Err(e) if e == "gemini_file_too_large")
         );
+    }
+
+    #[test]
+    fn gemini_html_import_is_deduplicated_and_reports_grouping() {
+        use std::io::Write;
+        let (dir, db) = fixture();
+        let html = "<div class='outer-cell'><div class='content-cell'>Prompted\u{a0}How are you?<br>Mar 10, 2026, 10:25:03 PM PDT<br><p>I am well.</p></div><div class='content-cell'>meta</div></div>";
+        let file = dir.path().join("MyActivity.html");
+        std::fs::write(&file, html).unwrap();
+        let preview = serde_json::to_value(preview(&db, &file, "gemini").unwrap()).unwrap();
+        assert_eq!(preview["groupingNotice"], GEMINI_GROUPING_NOTICE);
+        let first = import(&db, &file, "gemini").unwrap();
+        assert_eq!(first.imported, 1);
+        assert_eq!(first.grouping_notice, Some(GEMINI_GROUPING_NOTICE));
+        let second = import(&db, &file, "gemini").unwrap();
+        assert_eq!((second.imported, second.duplicate), (0, 1));
+        let c = Connection::open(&db).unwrap();
+        let mut q = c
+            .prepare("SELECT role,text,created_at FROM chat_messages ORDER BY rowid")
+            .unwrap();
+        let messages: Vec<(String, String, String)> = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!((&*messages[0].0, &*messages[0].1), ("user", "How are you?"));
+        assert_eq!(
+            (&*messages[1].0, &*messages[1].1),
+            ("assistant", "I am well.")
+        );
+        assert!(messages
+            .iter()
+            .all(|m| m.2.starts_with("2026-03-11T05:25:03")));
+        let path = dir.path().join("activity.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
+        zip.start_file(
+            "Takeout/My Activity/Search/MyActivity.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        write!(
+            zip,
+            "[{{\"header\":\"Search\",\"title\":\"Searched\",\"time\":\"2026-03-01T00:00:00Z\"}}]"
+        )
+        .unwrap();
+        zip.start_file(
+            "Takeout/My Activity/Gemini Apps/MyActivity.html",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        write!(zip, "{html}").unwrap();
+        zip.finish().unwrap();
+        assert_eq!(import(&db, &path, "gemini").unwrap().duplicate, 1);
     }
 
     #[test]

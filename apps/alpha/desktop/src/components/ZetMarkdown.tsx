@@ -2,6 +2,7 @@ import { Fragment, isValidElement, memo, type CSSProperties, type ReactNode } fr
 import Markdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { findZetId, isWebAddress } from '../archive'
+import { closeOpenBold, cjkFriendlyMarkdown, remarkStripZeroWidth } from '../markdown-cjk'
 import { W } from '../words'
 
 type MarkdownNode = {
@@ -55,6 +56,8 @@ type ZetMarkdownProps = {
   onOpenZet: (id: string) => void
   /** 본문 안의 바깥 주소(http, https)를 눌렀을 때. */
   onOpenAddress: (address: string) => void
+  /** 답이 오는 중이면 닫는 ** 가 아직 안 와도 굵게 그린다. */
+  streaming?: boolean
 }
 
 // 굵은 글 화자: 추정이면 (시각 )?물음표+이름, 확인된 화자는 시각+이름(`**00:00 강사**`).
@@ -195,11 +198,13 @@ function ZetLink({
 /**
  * 글 본문(마크다운)을 그린다. 본문 안의 HTML 은 실행하지 않고 글자로 보여 준다.
  */
-export const ZetMarkdown = memo(function ZetMarkdown({ text, onOpenZet, onOpenAddress }: ZetMarkdownProps) {
+export const ZetMarkdown = memo(function ZetMarkdown({ text, onOpenZet, onOpenAddress, streaming = false }: ZetMarkdownProps) {
+  // 한국어 조사 앞에서 **…** 가 깨지지 않게 맞춘 뒤 그린다(markdown-cjk.ts, 2026-11-18).
+  const source = cjkFriendlyMarkdown(streaming ? closeOpenBold(text) : text)
   return (
     <div className="zet-md">
-      <Markdown remarkPlugins={[remarkGfm, remarkSoftBreaks]} components={buildComponents(onOpenZet, onOpenAddress, findSpeakers(text))}>
-        {text}
+      <Markdown remarkPlugins={[remarkGfm, remarkSoftBreaks, remarkStripZeroWidth]} components={buildComponents(onOpenZet, onOpenAddress, findSpeakers(text))}>
+        {source}
       </Markdown>
     </div>
   )

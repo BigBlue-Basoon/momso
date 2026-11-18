@@ -1,17 +1,20 @@
 mod ai_import;
 mod ai_models;
+mod app_lifecycle;
 mod app_updates;
 mod approval;
 mod archive;
+mod archive_auto_backup;
 mod archive_location;
 mod archive_receipt;
 mod archive_remote;
 mod archive_zet;
 mod backup;
 mod backup_profile;
-mod backup_remote;
+mod browser_choice;
 mod browser_driver;
 mod browser_gateway;
+mod browser_pipe;
 #[cfg(test)]
 mod browser_policy;
 mod browser_runtime;
@@ -47,12 +50,23 @@ mod credentials;
 #[allow(dead_code)] // The terminology dictionary is retained for its future interface.
 mod dictionary;
 mod gemini_access;
+mod gemini_api_relay;
 mod git_tool;
+mod hidden_process;
 #[cfg(test)]
 mod instagram_preview_contract_tests;
 mod install_staging;
 mod media;
+mod momso_document_read;
 mod momso_mcp;
+mod panel_browser;
+pub mod panel_cdp;
+mod panel_download;
+pub mod panel_navigation;
+pub mod panel_ownership;
+pub mod panel_worker;
+#[cfg(test)]
+mod provider_engine_smoke;
 mod redaction_wait;
 #[cfg(test)]
 mod scale_benchmark;
@@ -384,6 +398,21 @@ async fn archive_reindex(state: State<'_, AppState>) -> Result<archive::ReindexR
 }
 
 #[tauri::command]
+async fn panel_browser_download_select(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let path = std::path::PathBuf::from(path);
+    if !path.is_file() || !panel_download::take_completed(&path) {
+        return Err("selection_required".into());
+    }
+    state
+        .selections
+        .remember(&[path], selection_grants::Purpose::Source);
+    Ok(())
+}
+
+#[tauri::command]
 async fn chat_attach_asset<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
@@ -659,10 +688,25 @@ async fn zet_list(
     kind: Option<String>,
     status: Option<String>,
 ) -> Result<Vec<archive_zet::ZetListEntry>, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
     let database = state.paths.database_path.clone();
-    tauri::async_runtime::spawn_blocking(move || archive_zet::list(&database, kind, status))
-        .await
-        .map_err(|_| "글 목록을 읽지 못했습니다".to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        if matches!(
+            std::fs::symlink_metadata(root.join("zettels")),
+            Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+        ) {
+            let existing = archive_zet::list(&database, None, None)?;
+            return if existing.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err("unavailable".to_owned())
+            };
+        }
+        momso_document_read::sync_document_index(&root, &database).map_err(str::to_owned)?;
+        archive_zet::list(&database, kind, status)
+    })
+    .await
+    .map_err(|_| "글 목록을 읽지 못했습니다".to_string())?
 }
 
 #[tauri::command]
@@ -754,19 +798,22 @@ async fn chat_import_export<R: tauri::Runtime>(
     let paths = state.paths.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let result = chat_export_import::import(&db, std::path::Path::new(&path), &provider)?;
-        report_chat_archive(&app, None, chat_archive_store::write_all(&lease, &paths));
+        if result.guidance.is_none() {
+            report_chat_archive(&app, None, chat_archive_store::write_all(&lease, &paths));
+        }
         Ok(result)
     })
     .await
     .map_err(|_| "unavailable".to_string())?;
-    if result.is_ok() {
+    if result.as_ref().is_ok_and(|value| value.guidance.is_none()) {
         selection.succeed();
     }
     result
 }
 
 #[tauri::command]
-async fn chat_import_export_preview(
+async fn chat_import_export_preview<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     path: String,
     provider: String,
@@ -778,7 +825,12 @@ async fn chat_import_export_preview(
     let lease = state.paths.archive.current.clone().read_owned().await;
     tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
-        chat_export_import::preview(&db, std::path::Path::new(&path), &provider)
+        let preview = chat_export_import::preview(&db, std::path::Path::new(&path), &provider)?;
+        if let Some(guidance) = preview.guidance {
+            use tauri_plugin_dialog::DialogExt;
+            app.dialog().message(guidance).blocking_show();
+        }
+        Ok::<_, String>(preview)
     })
     .await
     .map_err(|_| "unavailable".to_string())?
@@ -813,12 +865,14 @@ async fn chat_import_export_progress<R: tauri::Runtime>(
                 );
             },
         )?;
-        report_chat_archive(&app, None, chat_archive_store::write_all(&lease, &paths));
+        if result.guidance.is_none() {
+            report_chat_archive(&app, None, chat_archive_store::write_all(&lease, &paths));
+        }
         Ok(result)
     })
     .await
     .map_err(|_| "unavailable".to_string())?;
-    if result.is_ok() {
+    if result.as_ref().is_ok_and(|value| value.guidance.is_none()) {
         selection.succeed();
     }
     result
@@ -1496,7 +1550,48 @@ async fn chat_send(
         let browser_skill = skill.clone();
         let browser_root = state.paths.data_root.clone();
         let browser_broker = state.approvals.clone();
+        let read_paths = state.paths.clone();
         let handler: setup_bridge::Handler = Arc::new(move |input| {
+            if input
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|method| {
+                    matches!(
+                        method,
+                        "momso_document_read"
+                            | "momso_document_search"
+                            | "momso_document_list"
+                            | "momso_dictionary_search"
+                    )
+                })
+            {
+                let paths = read_paths.clone();
+                return Box::pin(async move {
+                    let paths = paths.scoped().await;
+                    let method = input
+                        .get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let args = input
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let Some(root) = paths.objects_path.parent() else {
+                            return serde_json::json!({"status":"unavailable"});
+                        };
+                        crate::momso_document_read::dispatch(
+                            root,
+                            &paths.database_path,
+                            &method,
+                            &args,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|_| serde_json::json!({"status":"unavailable"}))
+                });
+            }
             if input
                 .get("method")
                 .and_then(serde_json::Value::as_str)
@@ -1558,6 +1653,7 @@ async fn chat_send(
     active.insert(chat_id.clone(), cancel.clone());
     drop(active);
     let active = state.chat_active.clone();
+    let turn_browser = state.browser.clone();
     let approval_app = app.clone();
     let approval_broker = state.approvals.clone();
     let stopped_by_approval = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1675,6 +1771,7 @@ async fn chat_send(
                 &archive,
                 &chat_id,
                 &provider_text,
+                &attachment_paths,
                 model.as_deref(),
                 effort.as_deref(),
                 &permission_mode,
@@ -1894,6 +1991,9 @@ async fn chat_send(
                 if payload["error"]["kind"] == "authentication" && method == "apiKey" {
                     payload["error"]["actions"] =
                         serde_json::json!(["checkApiKey", "switchProvider"]);
+                    if provider == "gemini" {
+                        payload["reason"] = serde_json::json!("제미나이 키를 확인해 주세요");
+                    }
                     if let Some(fingerprint) = sent_key_fingerprint {
                         provider_auth::reject_unverified_key(&app, &provider, fingerprint);
                     }
@@ -1911,6 +2011,13 @@ async fn chat_send(
                 let _ = app.emit("chat-error", payload);
             }
         }
+        let event_app = app.clone();
+        let browser_notify: browser_runtime::Notify = Arc::new(move |name, payload| {
+            let _ = event_app.emit(name, payload);
+        });
+        turn_browser
+            .close_panel_turn(&chat_id, &browser_notify)
+            .await;
         report_chat_archive(
             &app,
             Some(&chat_id),
@@ -1946,6 +2053,75 @@ async fn browser_session_status(
 ) -> Result<serde_json::Value, String> {
     let open = state.browser.is_open(&chat_id).await;
     Ok(serde_json::json!({"chatId":chat_id,"open":open}))
+}
+
+#[tauri::command]
+fn panel_agent_status(
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<serde_json::Value, &'static str> {
+    Ok(
+        serde_json::json!({"ownerChatId":state.browser.panel_ownership.owner()?, "humanControls":state.browser.panel_ownership.human_controls(&chat_id)?}),
+    )
+}
+
+#[tauri::command]
+async fn panel_agent_take_over(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<(), &'static str> {
+    state.browser.panel_ownership.take_over_chat(&chat_id)?;
+    if let Some(token) = state.chat_active.lock().await.get(&chat_id).cloned() {
+        token.cancel();
+    }
+    let event_app = app.clone();
+    let notify: browser_runtime::Notify = Arc::new(move |name, payload| {
+        let _ = event_app.emit(name, payload);
+    });
+    state.browser.close(&chat_id, &notify).await;
+    let _ = app.emit(
+        "panel-agent-control-changed",
+        state.browser.panel_event(&chat_id, "human", None),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn panel_agent_resume(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<(), &'static str> {
+    state.browser.panel_ownership.resume(&chat_id)?;
+    let event_app = app.clone();
+    let notify: browser_runtime::Notify = Arc::new(move |name, payload| {
+        let _ = event_app.emit(name, payload);
+    });
+    if state.browser.resume_after_login(&chat_id, &notify).await? {
+        return Ok(());
+    }
+    let _ = app.emit(
+        "panel-agent-control-changed",
+        state.browser.panel_event(&chat_id, "available", None),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn browser_choice_get(
+    state: State<'_, AppState>,
+) -> Result<browser_choice::BrowserChoice, &'static str> {
+    browser_choice::read(&state.paths.data_root)
+}
+
+#[tauri::command]
+fn browser_choice_set(
+    state: State<'_, AppState>,
+    choice: browser_choice::BrowserChoice,
+) -> Result<browser_choice::BrowserChoice, &'static str> {
+    browser_choice::write(&state.paths.data_root, choice)?;
+    Ok(choice)
 }
 
 #[tauri::command]
@@ -2264,6 +2440,14 @@ async fn chat_search_page(
 }
 
 #[tauri::command]
+async fn approvals_pending(
+    state: State<'_, AppState>,
+    chat_id: Option<String>,
+) -> Result<Vec<approval::ApprovalRequest>, String> {
+    Ok(state.approvals.pending(chat_id.as_deref()).await)
+}
+
+#[tauri::command]
 async fn agent_approval_respond(
     state: State<'_, AppState>,
     request_id: String,
@@ -2457,6 +2641,10 @@ fn prepare_archive_for_start(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            log::info!(
+                "lifecycle single_instance_activation pid={}",
+                std::process::id()
+            );
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
@@ -2482,15 +2670,22 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_webview_event(|webview, event| {
-            if webview.label() == "main" {
-                if let tauri::WebviewEvent::DragDrop(event) = event {
-                    if let Some(state) = webview.app_handle().try_state::<AppState>() {
-                        state.selections.record_drop(event);
-                    }
-                }
+            if let Some(state) = webview.app_handle().try_state::<AppState>() {
+                state
+                    .selections
+                    .record_webview_event(webview.label(), event);
             }
         })
         .on_window_event(|window, event| {
+            match event {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    log::info!("lifecycle window_close_requested label={}", window.label())
+                }
+                tauri::WindowEvent::Destroyed => {
+                    log::info!("lifecycle window_destroyed label={}", window.label())
+                }
+                _ => {}
+            }
             if window.label() != "main" {
                 return;
             }
@@ -2514,23 +2709,33 @@ pub fn run() {
                 let paths = state.paths.clone();
                 let window = window.clone();
                 tauri::async_runtime::spawn(async move {
-                    let root = paths.archive.current.clone().read_owned().await;
-                    let result = tauri::async_runtime::spawn_blocking(move || {
-                        chat_archive_store::save_pending(&root, &resources, &paths)
-                    })
-                    .await;
-                    if let Err(error) = result.unwrap_or(Err("unavailable")) {
+                    if let archive_auto_backup::CloseResult::Finished(Some(error)) =
+                        archive_auto_backup::close_backup(app.clone(), paths, resources).await
+                    {
                         if error != "redaction_pending" {
                             report_chat_archive(&app, None, Err(error));
                         }
                     }
-                    let _ = window.destroy();
+                    log::info!("lifecycle main_window_destroy_requested");
+                    if let Err(error) = window.destroy() {
+                        log::warn!("lifecycle main_window_destroy_failed error={error}");
+                    }
                     CLOSING.store(false, std::sync::atomic::Ordering::SeqCst);
                 });
             }
         })
         .setup(|app| {
+            log::info!("lifecycle setup_started pid={}", std::process::id());
+            if let Some(view) = app.get_webview("main") {
+                app_lifecycle::observe_webview(&view);
+            }
             let (paths, status) = RuntimePaths::prepare(app.handle())?;
+            panel_browser::start_cache_maintenance(app.handle().clone());
+            if let Ok(root) = app.path().app_data_dir() {
+                if let Err(error) = panel_download::cleanup_staging(&root) {
+                    log::warn!("Panel download staging cleanup failed: {error}");
+                }
+            }
             chat_search_index::start(paths.database_path.clone());
             git_tool::configure(paths.data_root.clone());
             let resources = app.path().resource_dir()?;
@@ -2557,6 +2762,8 @@ pub fn run() {
                 paths.clone(),
                 resources.clone(),
             );
+            let browser = Arc::new(browser_runtime::BrowserManager::default());
+            browser.bind_app(app.handle().clone());
             app.manage(AppState {
                 paths,
                 approvals: approval::ApprovalBroker::default(),
@@ -2564,9 +2771,11 @@ pub fn run() {
                 usage_monitor: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 usage_cache: Arc::new(usage_status::UsageCache::default()),
                 chat_active: Default::default(),
-                browser: Default::default(),
+                browser,
                 selections: Default::default(),
             });
+            app.manage(archive_auto_backup::AutoBackup::default());
+            archive_auto_backup::start(app.handle().clone());
             chat_redaction_recheck::start(
                 app.handle().clone(),
                 app.state::<AppState>().paths.clone(),
@@ -2583,6 +2792,17 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            panel_browser::panel_browser_open,
+            panel_browser::panel_browser_open_agent,
+            panel_browser::panel_browser_open_human,
+            panel_browser::panel_browser_close,
+            panel_browser::panel_browser_clear_data,
+            panel_browser::panel_browser_visibility,
+            panel_browser::panel_browser_bounds,
+            panel_browser::panel_browser_navigate,
+            panel_browser::panel_browser_action,
+            panel_browser_download_select,
+            panel_download::panel_download_reveal,
             external_url::open_external_url,
             selection_grants::select_local_paths,
             runtime::runtime_startup_status,
@@ -2601,6 +2821,8 @@ pub fn run() {
             media::media_list,
             archive_status,
             archive_remote::archive_remote_status,
+            archive_auto_backup::archive_auto_backup_get,
+            archive_auto_backup::archive_auto_backup_set,
             archive_remote::momso_username_get,
             archive_remote::momso_username_set,
             archive_remote::archive_remote_create,
@@ -2675,6 +2897,11 @@ pub fn run() {
             skills_write::skill_remove,
             chat_cancel,
             browser_session_status,
+            panel_agent_status,
+            panel_agent_take_over,
+            panel_agent_resume,
+            browser_choice_get,
+            browser_choice_set,
             chat_delete,
             chat_pin,
             chat_archive,
@@ -2695,6 +2922,7 @@ pub fn run() {
             chat_search_page,
             chat_list_page,
             agent_approval_respond,
+            approvals_pending,
             setup_secret_submit,
             agent_setup_secret_cancel,
             permission_mode_get,
@@ -2726,9 +2954,13 @@ pub fn run() {
             chat_import_export_progress,
             chat_import_export_cancel,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the momso desktop application");
+        .build(tauri::generate_context!())
+        .expect("error while building the momso desktop application")
+        .run(|_app, event| app_lifecycle::log_run_event(&event));
 }
+
+#[cfg(test)]
+mod panel_browser_security_tests;
 
 #[cfg(test)]
 mod feedback_retention_tests {

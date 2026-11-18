@@ -1,6 +1,7 @@
 import { type DragEvent, memo, type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Archive, ChevronDown, ChevronRight, FolderPlus, MoreHorizontal, Pin, PinOff, SquarePen } from 'lucide-react'
+import { useAvoidPanelBrowser } from '../panel-browser'
 import type { ChatEntry, ChatGroup } from '../chats'
 import { GROUP_WORD, W } from '../words'
 import { progressPercent, type RestoreProgress } from '../restore-progress'
@@ -274,6 +275,8 @@ export function RowMenu({ label, children }: { label: string; children: (close: 
   const button = useRef<HTMLButtonElement>(null)
   const menu = useRef<HTMLDivElement>(null)
   const [place, setPlace] = useState({ top: 0, left: 0 })
+  // 메뉴가 패널 웹뷰와 겹치면 열린 동안 웹뷰를 숨긴다.
+  useAvoidPanelBrowser(menu, open)
 
   useLayoutEffect(() => {
     if (!open || !button.current) return

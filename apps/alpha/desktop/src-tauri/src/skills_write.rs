@@ -191,7 +191,21 @@ fn state_path(root: &Path, name: &str) -> Result<PathBuf, &'static str> {
 }
 
 fn git(tool: &Path, root: &Path, args: &[&str]) -> Result<String, &'static str> {
-    crate::archive::run_storage_tool(tool, root, args).map_err(|_| "save_failed")
+    crate::archive::run_storage_tool(tool, root, args).map_err(|error| {
+        let operation = if args.contains(&"commit") {
+            "commit"
+        } else if args.contains(&"add") {
+            "add"
+        } else if args.contains(&"ls-files") {
+            "ls-files"
+        } else if args.contains(&"diff") {
+            "diff"
+        } else {
+            "check"
+        };
+        log::warn!("Skill storage {operation} failed: {error}");
+        "save_failed"
+    })
 }
 
 fn transact(
@@ -501,6 +515,152 @@ pub(crate) fn reconcile(root: &Path, name: &str) -> Result<(), &'static str> {
         return Err("conflict");
     }
     apply(&edits)
+}
+
+pub(crate) fn save_external_changes(root: &Path, resources: &Path) -> Result<(), &'static str> {
+    let tool = crate::archive::storage_tool(resources)
+        .map_err(|_| "save_failed")?
+        .0;
+    let folders = ["skills/", ".agents/skills/", ".claude/skills/"];
+    let mut status_args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
+    status_args.extend(folders);
+    if git(&tool, root, &status_args)?.is_empty() {
+        return Ok(());
+    }
+    let deleted = if git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok() {
+        git(
+            &tool,
+            root,
+            &[
+                "diff",
+                "--name-only",
+                "--diff-filter=D",
+                "HEAD",
+                "--",
+                "skills/",
+            ],
+        )?
+    } else {
+        String::new()
+    };
+    let dir = root.join("skills");
+    for entry in fs::read_dir(dir).map_err(|_| "io_error")? {
+        let entry = entry.map_err(|_| "io_error")?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|_| "io_error")?;
+        if crate::archive_location::is_link_or_reparse(&metadata) {
+            return Err("conflict");
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "invalid_name")?;
+        if !skills::valid_name(&name) {
+            return Err("invalid_name");
+        }
+        let paths = [
+            relative(&name),
+            format!(".agents/skills/{name}/SKILL.md"),
+            format!(".claude/skills/{name}/SKILL.md"),
+        ];
+        let mut args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        if git(&tool, root, &args)?.is_empty() {
+            continue;
+        }
+        let _lock = crate::archive_zet::WRITE_LOCK
+            .lock()
+            .map_err(|_| "io_error")?;
+        let path = skills::skill_path(root, "skills", &name)?;
+        let content = match snapshot(&path)? {
+            Some(content) => content,
+            None if deleted.lines().any(|deleted_path| deleted_path == paths[0]) => continue,
+            None => return Err("not_found"),
+        };
+        let text = std::str::from_utf8(&content).map_err(|_| "invalid_format")?;
+        skills::parse(&name, text)?;
+        let hash = crate::archive_zet::content_hash(text);
+        let state_file = state_path(root, &name)?;
+        let meta = state(root, &name, &hash)?;
+        for folder in [".agents/skills", ".claude/skills"] {
+            if snapshot(&skills::skill_path(root, folder, &name)?)?.is_some() != meta.enabled {
+                return Err("conflict");
+            }
+        }
+        let mut edits = copies(root, &name, &meta.hash, &content, meta.enabled)?;
+        edits.insert(
+            0,
+            Change {
+                path,
+                before: Some(content.clone()),
+                after: Some(content),
+            },
+        );
+        edits.push(change(
+            state_file,
+            Some(
+                serde_json::to_vec(&State {
+                    hash,
+                    enabled: meta.enabled,
+                })
+                .map_err(|_| "io_error")?,
+            ),
+        )?);
+        transact(root, resources, &name, edits, true, false)?;
+    }
+    for path in deleted.lines() {
+        let name = path
+            .strip_prefix("skills/")
+            .and_then(|value| value.strip_suffix("/SKILL.md"))
+            .ok_or("unsaved_skill_changes")?;
+        if !skills::valid_name(name) || skills::is_builtin(name) {
+            return Err("conflict");
+        }
+        let _lock = crate::archive_zet::WRITE_LOCK
+            .lock()
+            .map_err(|_| "io_error")?;
+        let canonical = skills::skill_path(root, "skills", name)?;
+        if snapshot(&canonical)?.is_some() {
+            return Err("conflict");
+        }
+        let state_file = state_path(root, name)?;
+        let raw = snapshot(&state_file)?.ok_or("conflict")?;
+        let meta: State = serde_json::from_slice(&raw).map_err(|_| "invalid_state")?;
+        let mut edits = vec![Change {
+            path: canonical,
+            before: None,
+            after: None,
+        }];
+        for folder in [".agents/skills", ".claude/skills"] {
+            let path = skills::skill_path(root, folder, name)?;
+            let before = snapshot(&path)?;
+            if let Some(bytes) = &before {
+                let text = std::str::from_utf8(bytes).map_err(|_| "conflict")?;
+                if !meta.enabled || crate::archive_zet::content_hash(text) != meta.hash {
+                    return Err("conflict");
+                }
+            } else if meta.enabled {
+                return Err("conflict");
+            }
+            edits.push(Change {
+                path,
+                before,
+                after: None,
+            });
+        }
+        edits.push(Change {
+            path: state_file,
+            before: Some(raw),
+            after: None,
+        });
+        transact(root, resources, name, edits, true, false)?;
+    }
+    if !git(&tool, root, &status_args)?.is_empty() {
+        return Err("unsaved_skill_changes");
+    }
+    Ok(())
 }
 
 fn copies(

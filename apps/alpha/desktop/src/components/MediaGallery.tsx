@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { AudioLines, ChevronLeft, ChevronRight, Play, X } from 'lucide-react'
+import { AudioLines, ChevronLeft, ChevronRight, Copy, Layers, MessageSquare, Play, RefreshCw, X } from 'lucide-react'
 import { mediaChat, mediaSrc, type MediaItem } from '../media'
 import { PROVIDER_NAME } from '../ai-models'
 import { W } from '../words'
 import { SourceDeleteDialog, type SourceNotice } from './SourceDelete'
 import { ModelName } from './ModelName'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
+import { usePanelBrowserHold } from '../panel-browser'
+import { observeSize } from '../resize-later'
 import './MediaGallery.css'
 
 const MARK: Record<'codex' | 'claude' | 'gemini', ProviderMarkId> = { codex: 'chatgpt', claude: 'claude', gemini: 'gemini' }
@@ -25,62 +27,91 @@ function ratioOf(item: MediaItem) {
   return item.kind === 'audio' ? 1.6 : item.kind === 'video' ? 16 / 9 : 1
 }
 
-type Row = { items: Array<{ item: MediaItem; index: number; width: number }>; height: number }
+const whenOf = (item: MediaItem) => item.at ?? item.createdAt
 
 /**
- * 같은 높이의 줄로 사진을 꽉 채운다(Google 포토·Windows 사진의 격자처럼 가로세로 비를 그대로 두고 줄 끝을 맞춤).
+ * 생성물 하나 = 같은 묶음(lineageId)의 버전들(2026-11-18, AI 생성 도구들처럼: 같은 프롬프트로 다시 만든 것·고친 것을 한 칸에).
+ * 묶음 값이 없으면 한 장이 한 생성물이다. 버전은 차례(version, 없으면 만든 때)대로, 칸에는 마지막 버전이 보인다.
+ */
+export type Creation = { key: string; versions: MediaItem[]; cover: MediaItem }
+
+export function toCreations(items: MediaItem[]): Creation[] {
+  const groups = new Map<string, MediaItem[]>()
+  for (const item of items) {
+    const key = item.lineageId ? `lineage:${item.lineageId}` : `item:${item.id}`
+    const list = groups.get(key)
+    if (list) list.push(item)
+    else groups.set(key, [item])
+  }
+  const out: Creation[] = []
+  for (const [key, list] of groups) {
+    const versions = [...list].sort((a, b) => (a.version ?? 0) - (b.version ?? 0) || whenOf(a).localeCompare(whenOf(b)))
+    out.push({ key, versions, cover: versions[versions.length - 1] })
+  }
+  return out.sort((a, b) => whenOf(b.cover).localeCompare(whenOf(a.cover)))
+}
+
+type Row = { items: Array<{ creation: Creation; index: number; width: number }>; height: number }
+
+/**
+ * 같은 높이의 줄로 칸을 꽉 채운다(Google 포토·Windows 사진의 격자처럼 가로세로 비를 그대로 두고 줄 끝을 맞춤).
  * 마지막 줄은 늘리지 않는다.
  */
-function justify(list: Array<{ item: MediaItem; index: number }>, width: number, target: number, gap: number): Row[] {
+function justify(list: Array<{ creation: Creation; index: number }>, width: number, target: number, gap: number): Row[] {
   const rows: Row[] = []
-  let current: Array<{ item: MediaItem; index: number; ratio: number }> = []
+  let current: Array<{ creation: Creation; index: number; ratio: number }> = []
   let sum = 0
   for (const entry of list) {
-    const ratio = ratioOf(entry.item)
+    const ratio = ratioOf(entry.creation.cover)
     current.push({ ...entry, ratio })
     sum += ratio
     const natural = sum * target + gap * (current.length - 1)
     if (natural >= width) {
       const height = (width - gap * (current.length - 1)) / sum
-      rows.push({ height, items: current.map((c) => ({ item: c.item, index: c.index, width: c.ratio * height })) })
+      rows.push({ height, items: current.map((c) => ({ creation: c.creation, index: c.index, width: c.ratio * height })) })
       current = []
       sum = 0
     }
   }
-  if (current.length > 0) rows.push({ height: target, items: current.map((c) => ({ item: c.item, index: c.index, width: c.ratio * target })) })
+  if (current.length > 0) rows.push({ height: target, items: current.map((c) => ({ creation: c.creation, index: c.index, width: c.ratio * target })) })
   return rows
 }
 
 /**
- * 누가 만들었는지: AI 면 회사 CI 와 모델 이름, 그리고 뒤쪽이 적은 how("만듦"/"첨부").
+ * 누가 만들었는지: AI 면 회사 CI 와 모델 이름, 그리고 뒤쪽이 적은 how("생성"/"수정"/"첨부").
  * by·how 가 null 이면(뒤쪽이 아직 모름) 그 칸은 그리지 않는다. 화면이 짐작해 넣지 않는다(2026-11-16 옮긴 것 절).
  */
-export function MediaBy({ item, small = false }: { item: MediaItem; small?: boolean }) {
+export function MediaBy({ item, small = false, onDark = true }: { item: MediaItem; small?: boolean; onDark?: boolean }) {
   const by = item.by
   const how = item.how ? W.gallery.how[item.how] ?? null : null
   if (by?.kind !== 'ai' && !how) return null
   return (
     <span className={small ? 'media-by is-small' : 'media-by'}>
-      {by?.kind === 'ai' && <ProviderMark provider={MARK[by.provider]} className="media-by-mark" onDark />}
+      {by?.kind === 'ai' && <ProviderMark provider={MARK[by.provider]} className="media-by-mark" onDark={onDark} />}
       {by?.kind === 'ai' && <span>{by.model ? <ModelName label={by.model} /> : PROVIDER_NAME[by.provider]}</span>}
       {how && <span className="media-by-how">{how}</span>}
     </span>
   )
 }
 
+/** 지울 수 있는 것: 몸소 폴더 안의 원자료(로컬 경로)만. 웹 주소로 보이는 것(개발 앱의 예시 등)은 지우기를 두지 않는다. */
+const deletable = (item: MediaItem) => !/^(https?:|data:|blob:)/.test(item.path)
+
 /**
- * 사진·동영상·소리 갤러리. 미디어 화면(날짜별 묶음)과 오른쪽 패널(작은 칸)이 같이 쓴다.
- * 칸 위에 올리면 어느 채팅방에서, 언제, 누가 만들었는지가 사진을 가리지 않게 아래에 드러나고, 누르면 크게 본다.
+ * 사진과 동영상 갤러리(사진과 동영상 화면). 날짜별로 묶고, 생성물마다 한 칸(버전이 여럿이면 칸 모서리에 수).
+ * 칸에 올리면 어느 채팅방에서, 언제, 누가 만들었는지가 사진을 가리지 않게 아래에 드러나고, 누르면 크게 본다.
  */
-export function MediaGallery({ items, rowHeight, groupByDay, onOpenChat, onNotice, onChanged }: {
+export function MediaGallery({ items, rowHeight, groupByDay, onOpenChat, onNotice, onChanged, onRegenerate }: {
   items: MediaItem[]
   rowHeight: number
   groupByDay: boolean
   onOpenChat?: (chatId: string) => void
-  /** 있으면 크게 보기의 아랫줄에 "삭제"를 둔다(잘못 첨부한 원자료 지우기). */
+  /** 있으면 크게 보기에 "삭제"를 둔다(잘못 첨부한 원자료 지우기). 프롬프트를 복사했다는 알림도 이것으로. */
   onNotice?: SourceNotice
   /** 지우거나 되살린 뒤 목록을 다시 읽는다. */
   onChanged?: () => void
+  /** "다시 만들기": 원래 채팅방으로 가서 프롬프트를 채우고 생성물을 붙인다(2026-11-18 그의 결정). */
+  onRegenerate?: (item: MediaItem) => void
 }) {
   const [openIndex, setOpenIndex] = useState<number | null>(null)
   // 지울 원자료. 묻는 창은 크게 보기 밖에 두어(창 안을 눌러도 크게 보기가 닫히지 않게) 크게 보기 위에 뜬다.
@@ -91,22 +122,23 @@ export function MediaGallery({ items, rowHeight, groupByDay, onOpenChat, onNotic
 
   useLayoutEffect(() => {
     if (!box.current) return
-    const observer = new ResizeObserver(([entry]) => setWidth(Math.floor(entry.contentRect.width)))
-    observer.observe(box.current)
-    return () => observer.disconnect()
+    // 처음 폭은 곧바로 잰다(그림이 멈춘 창에서도 칸이 그려지게). 그 뒤 바뀌는 폭은 아래 관찰로.
+    setWidth(Math.floor(box.current.getBoundingClientRect().width))
+    // 줄을 다시 짜면 높이가 바뀌어 스크롤 막대가 생기고 폭이 또 바뀐다. 다음 그림으로 미룬다(2026-11-18).
+    return observeSize(box.current, (entry) => setWidth(Math.floor(entry.contentRect.width)))
   }, [])
 
-  const sorted = useMemo(() => [...items].sort((a, b) => (b.at ?? b.createdAt).localeCompare(a.at ?? a.createdAt)), [items])
+  const creations = useMemo(() => toCreations(items), [items])
   const groups = useMemo(() => {
-    const out: Array<{ day: string | null; entries: Array<{ item: MediaItem; index: number }> }> = []
-    sorted.forEach((item, index) => {
-      const day = groupByDay ? dayFormat.format(new Date(item.createdAt)) : null
+    const out: Array<{ day: string | null; entries: Array<{ creation: Creation; index: number }> }> = []
+    creations.forEach((creation, index) => {
+      const day = groupByDay ? dayFormat.format(new Date(whenOf(creation.cover))) : null
       const last = out[out.length - 1]
-      if (last && last.day === day) last.entries.push({ item, index })
-      else out.push({ day, entries: [{ item, index }] })
+      if (last && last.day === day) last.entries.push({ creation, index })
+      else out.push({ day, entries: [{ creation, index }] })
     })
     return out
-  }, [sorted, groupByDay])
+  }, [creations, groupByDay])
 
   return (
     <div ref={box} className={rowHeight < 140 ? 'media-gallery is-compact' : 'media-gallery'} style={{ ['--media-gap' as string]: `${gap}px` }}>
@@ -115,21 +147,23 @@ export function MediaGallery({ items, rowHeight, groupByDay, onOpenChat, onNotic
           {group.day && <h2>{group.day}</h2>}
           {justify(group.entries, width, rowHeight, gap).map((row, rowIndex) => (
             <div key={rowIndex} className="media-row" style={{ height: row.height, ['--row-height' as string]: `${Math.round(row.height)}px` }}>
-              {row.items.map(({ item, index, width: tileWidth }) => (
-                <MediaTile key={item.id} item={item} width={tileWidth} onOpen={() => setOpenIndex(index)} />
+              {row.items.map(({ creation, index, width: tileWidth }) => (
+                <MediaTile key={creation.key} creation={creation} width={tileWidth} onOpen={() => setOpenIndex(index)} />
               ))}
             </div>
           ))}
         </section>
       ))}
-      {openIndex !== null && sorted[openIndex] && (
-        <MediaLightbox
-          items={sorted}
+      {openIndex !== null && creations[openIndex] && (
+        <MediaDetail
+          creations={creations}
           index={openIndex}
           onIndex={setOpenIndex}
           onClose={() => setOpenIndex(null)}
           onOpenChat={onOpenChat ? (id) => { setOpenIndex(null); onOpenChat(id) } : undefined}
           onDelete={onNotice ? (item) => setDeleting(item) : undefined}
+          onNotice={onNotice}
+          onRegenerate={onRegenerate ? (item) => { setOpenIndex(null); onRegenerate(item) } : undefined}
           paused={deleting !== null}
         />
       )}
@@ -146,13 +180,15 @@ export function MediaGallery({ items, rowHeight, groupByDay, onOpenChat, onNotic
   )
 }
 
-function MediaTile({ item, width, onOpen }: { item: MediaItem; width: number; onOpen: () => void }) {
+function MediaTile({ creation, width, onOpen }: { creation: Creation; width: number; onOpen: () => void }) {
+  const item = creation.cover
   const chat = mediaChat(item)
-  const when = timeFormat.format(new Date(item.at ?? item.createdAt))
-  const label = item.title ?? (item.kind === 'video' ? W.mediaView.aria2 : item.kind === 'audio' ? W.gallery.audio : W.mediaView.aria3)
+  const when = timeFormat.format(new Date(whenOf(item)))
+  const label = item.title ?? item.prompt ?? mediaLabel(item)
   const picture = item.kind === 'video' ? item.posterPath : item.kind === 'image' ? item.path : null
+  const count = creation.versions.length
   return (
-    <button className={`media-tile is-${item.kind}`} type="button" style={{ width }} onClick={onOpen} aria-label={label}>
+    <button className={`media-tile is-${item.kind}`} type="button" style={{ width }} onClick={onOpen} aria-label={count > 1 ? `${label}, ${W.mediaView.versions(count)}` : label}>
       {picture ? (
         <img src={mediaSrc(picture) ?? undefined} alt="" loading="lazy" decoding="async" draggable={false} />
       ) : (
@@ -161,36 +197,53 @@ function MediaTile({ item, width, onOpen }: { item: MediaItem; width: number; on
           <span>{item.title}</span>
         </span>
       )}
-      {(item.kind === 'video' || item.kind === 'audio') && duration(item.durationSec) && (
-        <span className="media-length">
-          {item.kind === 'video' && <Play size={10} fill="currentColor" aria-hidden />}
-          {duration(item.durationSec)}
+      {(count > 1 || ((item.kind === 'video' || item.kind === 'audio') && duration(item.durationSec))) && (
+        <span className="media-badges" aria-hidden>
+          {count > 1 && <span className="media-badge"><Layers size={10} />{count}</span>}
+          {(item.kind === 'video' || item.kind === 'audio') && duration(item.durationSec) && (
+            <span className="media-badge">
+              {item.kind === 'video' && <Play size={10} fill="currentColor" />}
+              {duration(item.durationSec)}
+            </span>
+          )}
         </span>
       )}
       <span className="media-info" aria-hidden>
         {chat?.title && <span className="media-info-chat">{chat.title}</span>}
         <span className="media-info-line">
           <MediaBy item={item} small />
-          <time dateTime={item.at ?? item.createdAt}>{when}</time>
+          <time dateTime={whenOf(item)}>{when}</time>
         </span>
       </span>
     </button>
   )
 }
 
-function MediaLightbox({ items, index, onIndex, onClose, onOpenChat, onDelete, paused = false }: {
-  items: MediaItem[]
+/**
+ * 크게 보기(2026-11-18, AI 생성 도구들의 꼴): 왼쪽에 크게, 오른쪽 칸에 프롬프트·누가·언제·버전·채팅방·삭제를 한 번씩.
+ * 왼쪽·오른쪽 화살표는 다른 생성물로, 버전은 오른쪽 칸의 작은 그림 줄에서 고른다.
+ */
+function MediaDetail({ creations, index, onIndex, onClose, onOpenChat, onDelete, onNotice, onRegenerate, paused = false }: {
+  creations: Creation[]
   index: number
   onIndex: (index: number) => void
   onClose: () => void
   onOpenChat?: (chatId: string) => void
   onDelete?: (item: MediaItem) => void
+  onNotice?: SourceNotice
+  onRegenerate?: (item: MediaItem) => void
   /** 위에 묻는 창이 떠 있으면 Esc·화살표를 받지 않는다. */
   paused?: boolean
 }) {
-  const item = items[index]
+  // 화면 가득 덮으므로 열려 있는 동안 패널 브라우저를 숨긴다.
+  usePanelBrowserHold()
+  const creation = creations[index]
+  // 처음에는 마지막 버전. 다른 생성물로 넘어가면 그 생성물의 마지막 버전으로.
+  const [versionIndex, setVersionIndex] = useState(creation.versions.length - 1)
+  useEffect(() => { setVersionIndex(creations[index].versions.length - 1) }, [creations, index])
+  const item = creation.versions[Math.min(versionIndex, creation.versions.length - 1)]
   const chat = mediaChat(item)
-  const go = useCallback((step: number) => onIndex((index + step + items.length) % items.length), [index, items.length, onIndex])
+  const go = useCallback((step: number) => onIndex((index + step + creations.length) % creations.length), [index, creations.length, onIndex])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -203,34 +256,85 @@ function MediaLightbox({ items, index, onIndex, onClose, onOpenChat, onDelete, p
     return () => window.removeEventListener('keydown', onKey, true)
   }, [go, onClose, paused])
 
+  function copyPrompt() {
+    if (!item.prompt) return
+    void navigator.clipboard.writeText(item.prompt)
+      .then(() => onNotice?.(W.mediaView.copied))
+      .catch(() => onNotice?.(W.mediaView.copyFailed))
+  }
+
   return createPortal(
     <div className="media-lightbox" role="dialog" aria-modal="true" aria-label={item.title ?? W.mediaView.aria4} onClick={onClose}>
-      <figure key={item.id} className="media-lightbox-body" onClick={(event) => event.stopPropagation()}>
-        {item.kind === 'video' ? (
-          <video src={mediaSrc(item.path) ?? undefined} poster={mediaSrc(item.posterPath) ?? undefined} controls />
-        ) : item.kind === 'audio' ? (
-          <div className="media-lightbox-audio">
-            <AudioLines size={40} aria-hidden />
-            <audio src={mediaSrc(item.path) ?? undefined} controls />
-          </div>
-        ) : (
-          <img src={mediaSrc(item.path) ?? undefined} alt={item.title ?? ''} />
-        )}
-        <figcaption className="media-lightbox-caption">
-          {item.title && <strong>{item.title}</strong>}
-          <span className="media-lightbox-meta">
-            {chat && (onOpenChat ? (
-              <button className="media-lightbox-chat" type="button" title={W.gallery.openChat} onClick={() => onOpenChat(chat.id)}>
-                {chat.title ?? W.chatRoom}
+      <div key={creation.key} className="media-detail" onClick={(event) => event.stopPropagation()}>
+        <figure className="media-stage">
+          {item.kind === 'video' ? (
+            <video key={item.id} src={mediaSrc(item.path) ?? undefined} poster={mediaSrc(item.posterPath) ?? undefined} controls />
+          ) : item.kind === 'audio' ? (
+            <div className="media-lightbox-audio">
+              <AudioLines size={40} aria-hidden />
+              <audio key={item.id} src={mediaSrc(item.path) ?? undefined} controls />
+            </div>
+          ) : (
+            <img key={item.id} src={mediaSrc(item.path) ?? undefined} alt={item.title ?? item.prompt ?? ''} />
+          )}
+        </figure>
+        <aside className="media-side">
+          {item.title && <h2 className="media-side-title">{item.title}</h2>}
+          {item.prompt && (
+            <div className="media-prompt">
+              <p>{item.prompt}</p>
+              <button className="media-side-button" type="button" onClick={copyPrompt}>
+                <Copy size={13} aria-hidden />{W.mediaView.copyPrompt}
               </button>
-            ) : chat.title && <span>{chat.title}</span>)}
-            <MediaBy item={item} />
-            <time dateTime={item.at ?? item.createdAt}>{timeFormat.format(new Date(item.at ?? item.createdAt))}</time>
-            {onDelete && <button className="media-lightbox-delete" type="button" onClick={() => onDelete(item)}>{W.sourceDelete.trash}</button>}
-          </span>
-        </figcaption>
-      </figure>
-      {items.length > 1 && (
+            </div>
+          )}
+          <p className="media-side-meta">
+            <MediaBy item={item} onDark={false} />
+            <time dateTime={whenOf(item)}>{timeFormat.format(new Date(whenOf(item)))}</time>
+          </p>
+          {creation.versions.length > 1 && (
+            <div className="media-versions" role="group" aria-label={W.mediaView.versions(creation.versions.length)}>
+              {creation.versions.map((version, at) => {
+                const picture = version.kind === 'video' ? version.posterPath : version.kind === 'image' ? version.path : null
+                const name = W.mediaView.version(version.version ?? at + 1)
+                const how = version.versionHow ? W.mediaView.versionHow[version.versionHow] : null
+                return (
+                  <button
+                    key={version.id}
+                    type="button"
+                    className={version.id === item.id ? 'media-version is-current' : 'media-version'}
+                    aria-pressed={version.id === item.id}
+                    aria-label={how ? `${name}, ${how}` : name}
+                    title={how ? `${name} · ${how}` : name}
+                    onClick={() => setVersionIndex(at)}
+                  >
+                    {picture ? <img src={mediaSrc(picture) ?? undefined} alt="" draggable={false} /> : <AudioLines size={16} aria-hidden />}
+                    <span>{version.version ?? at + 1}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+          {item.versionHow && <p className="media-version-how">{W.mediaView.version(item.version ?? versionIndex + 1)} · {W.mediaView.versionHow[item.versionHow]}</p>}
+          <div className="media-side-actions">
+            {/* 다시 만들기: 원래 채팅방이 있을 때만 누를 수 있다(없거나 지워졌으면 꺼 둠). */}
+            {onRegenerate && (
+              <button className="media-side-button is-primary" type="button" disabled={!chat} title={chat ? undefined : W.mediaView.regenerateNoChat} onClick={() => onRegenerate(item)}>
+                <RefreshCw size={13} aria-hidden />{W.mediaView.regenerate}
+              </button>
+            )}
+            {chat && onOpenChat && (
+              <button className="media-side-button" type="button" title={W.gallery.openChat} onClick={() => onOpenChat(chat.id)}>
+                <MessageSquare size={13} aria-hidden />{chat.title ?? W.chatRoom}
+              </button>
+            )}
+            {onDelete && deletable(item) && (
+              <button className="media-side-button" type="button" onClick={() => onDelete(item)}>{W.sourceDelete.trash}</button>
+            )}
+          </div>
+        </aside>
+      </div>
+      {creations.length > 1 && (
         <>
           <button className="media-lightbox-nav is-prev" type="button" aria-label={W.mediaView.aria5} onClick={(event) => { event.stopPropagation(); go(-1) }}>
             <ChevronLeft size={22} aria-hidden />
@@ -248,7 +352,7 @@ function MediaLightbox({ items, index, onIndex, onClose, onOpenChat, onDelete, p
   )
 }
 
-/** 이름이 없는 미디어의 이름(칸의 화면 읽기 이름과 같은 말). */
+/** 이름이 없는 것의 이름(칸의 화면 읽기 이름과 같은 말). */
 function mediaLabel(item: MediaItem) {
   return item.kind === 'video' ? W.mediaView.aria2 : item.kind === 'audio' ? W.gallery.audio : W.mediaView.aria3
 }

@@ -33,7 +33,7 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn git_bytes(git: &Path, root: &Path, object: &str) -> Result<Vec<u8>, String> {
-    let output = std::process::Command::new(git)
+    let output = crate::process::hidden_command(git)
         .args(["show", object])
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")

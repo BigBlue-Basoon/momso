@@ -80,10 +80,16 @@
   -webkit-line-clamp: 2;
 }
 
-.media-length {
+/* 칸 오른쪽 위: 버전 수(둘 이상일 때만)와 동영상·소리 길이. */
+.media-badges {
   position: absolute;
   top: 6px;
   right: 6px;
+  display: inline-flex;
+  gap: 4px;
+}
+
+.media-badge {
   display: inline-flex;
   align-items: center;
   gap: 3px;
@@ -271,10 +277,142 @@
   to { opacity: 1; }
 }
 
+/*
+ * 크게 보기(2026-11-18): 왼쪽에 크게, 오른쪽에 밝은 정보 칸(AI 생성 도구들의 꼴). 좁은 창에서는 위아래로.
+ * 정보 칸: 프롬프트(복사), 누가·언제, 버전 그림 줄, 채팅방·삭제.
+ */
+.media-detail {
+  display: grid;
+  width: min(100%, 1280px);
+  height: min(100%, 860px);
+  grid-template-columns: minmax(0, 1fr) 320px;
+  overflow: hidden;
+  border-radius: 10px;
+  background: #121413;
+  animation: media-fade 180ms ease both;
+}
+
+.media-stage {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 20px;
+  place-items: center;
+}
+
+.media-stage img,
+.media-stage video {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 4px;
+  object-fit: contain;
+}
+
+.media-side {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px 18px;
+  overflow-y: auto;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.media-side-title { margin: 0; font-size: 14px; font-weight: 650; }
+
+.media-prompt { display: grid; gap: 8px; justify-items: start; }
+.media-prompt p { margin: 0; line-height: 1.65; white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; }
+
+.media-side-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.media-side-meta .media-by { color: var(--ink-soft); }
+
+.media-versions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.media-version {
+  position: relative;
+  display: grid;
+  width: 64px;
+  height: 64px;
+  padding: 0;
+  place-items: center;
+  overflow: hidden;
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: var(--surface-muted);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.media-version img { width: 100%; height: 100%; object-fit: cover; }
+.media-version span {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #ffffff;
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+}
+.media-version:hover { border-color: var(--line-strong); }
+.media-version.is-current { border-color: var(--ink); }
+.media-version:focus-visible { outline: 2px solid #a4c8b2; outline-offset: 1px; }
+
+.media-version-how { margin: -6px 0 0; color: var(--muted); font-size: 12px; }
+
+.media-side-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
+
+.media-side-button {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  height: 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 12.5px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.media-side-button:hover { background: var(--surface-muted); color: var(--ink); }
+
+@media (max-width: 900px) {
+  .media-detail { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+  .media-side { max-height: 40vh; }
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .media-detail { animation: none; }
   .media-lightbox, .media-lightbox-body { animation: none; }
   .media-tile img, .media-info { transition: none; }
 }
 
 /* 크게 보기 위에서 원자료를 지울 때 묻는 창이 크게 보기 위에 뜨게(그때만). */
 body:has(.media-lightbox) .zet-confirm-backdrop { z-index: 72; }
+
+.media-side-button.is-primary { border-color: var(--ink); background: var(--ink); color: var(--surface); }
+.media-side-button.is-primary:hover { background: var(--ink-soft); color: var(--surface); }
+.media-side-button:disabled { cursor: default; opacity: 0.45; }
+.media-side-button.is-primary:disabled:hover { background: var(--ink); }

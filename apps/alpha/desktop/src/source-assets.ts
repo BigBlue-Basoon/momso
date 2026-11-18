@@ -63,19 +63,32 @@ export async function previewSourceDelete(assetId: string) {
   } satisfies SourceDeletePreview
 }
 
+/**
+ * 원자료가 삭제·되돌리기·완전히 삭제로 바뀌었다고 화면 전체에 알린다(2026-11-18).
+ * 뒤쪽은 이때 chat-items-updated 를 보내지 않아, 설정에서 되돌린 원자료가 채팅방을 옮긴 뒤에야 첨부 목록에 보였다.
+ * App 이 지금 채팅방의 첨부 목록과 말풍선의 첨부 표시를 다시 그린다. 어느 화면에서 바꿨든 이 세 함수를 거치므로 한곳에서 알린다.
+ */
+export type SourceChange = { assetId: string; deleted: boolean }
+function announce(change: SourceChange) {
+  window.dispatchEvent(new CustomEvent<SourceChange>('momso:source-changed', { detail: change }))
+}
+
 export async function trashSource(assetId: string, planDigest: string) {
   need()
   await invoke('source_asset_trash', { assetId, planDigest })
+  announce({ assetId, deleted: true })
 }
 
 export async function restoreTrashedSource(assetId: string) {
   need()
   await invoke('source_asset_restore_trashed', { assetId })
+  announce({ assetId, deleted: false })
 }
 
 export async function purgeSource(assetId: string, planDigest: string) {
   need()
   const value = await invoke<Partial<SourcePurgeResult> | null>('source_asset_purge', { assetId, planDigest, confirmed: true })
+  announce({ assetId, deleted: true })
   return {
     state: value?.state ?? 'partial',
     localRemaining: Array.isArray(value?.localRemaining) ? value.localRemaining : [],

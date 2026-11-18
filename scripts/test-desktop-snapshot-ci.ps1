@@ -46,12 +46,12 @@ $temp = Join-Path $copy 'isolated-temp'
 if ((Test-Path -LiteralPath $profile) -or (Test-Path -LiteralPath $temp)) {
     throw 'Snapshot contains an isolation directory; refusing to reuse it.'
 }
-foreach ($path in @($profile, $temp, (Join-Path $profile 'Roaming'), (Join-Path $profile 'Local'))) {
+foreach ($path in @($profile, $temp, (Join-Path $profile 'AppData/Roaming'), (Join-Path $profile 'AppData/Local'))) {
     New-Item -ItemType Directory -Path $path -Force | Out-Null
 }
 $env:USERPROFILE = $profile
-$env:APPDATA = Join-Path $profile 'Roaming'
-$env:LOCALAPPDATA = Join-Path $profile 'Local'
+$env:APPDATA = Join-Path $profile 'AppData/Roaming'
+$env:LOCALAPPDATA = Join-Path $profile 'AppData/Local'
 $env:TEMP = $temp
 $env:TMP = $temp
 $env:GIT_CONFIG_NOSYSTEM = '1'

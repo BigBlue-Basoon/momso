@@ -13,7 +13,10 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { ArrowLeft, Check, FileText, PanelRight, Pencil, Plus, RefreshCw, ScrollText, Search, Undo2, X } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, FileText, Folder, Globe, PanelRight, Pencil, RefreshCw, Search, Undo2 } from 'lucide-react'
+import { PanelBrowserView } from './PanelBrowser'
+import { usePanelBrowserHold } from '../panel-browser'
+import { observeSize } from '../resize-later'
 import { MenuItem, RowMenu } from './ChatSidebar'
 import { SourceDeleteDialog, type SourceNotice } from './SourceDelete'
 import { openSourceAsset } from '../source-assets'
@@ -23,7 +26,6 @@ import {
   isChangedMeanwhileError,
   isUnsavedError,
   listZets,
-  openWebAddress,
   deleteReceipt,
   readReceipt,
   readZet,
@@ -50,7 +52,6 @@ import { W } from '../words'
 import { ModelName } from './ModelName'
 import { PROVIDER_NAME } from '../ai-models'
 import type { ChatDocumentItem, ChatItems, ItemBy } from '../chat-items'
-import { MediaGallery } from './MediaGallery'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 import { ShortcutTip } from './ShortcutTip'
 
@@ -67,6 +68,9 @@ function leftWidth(bodyWidth: number, listHidden: boolean) {
 const CENTER_WIDTH_MIN = 360
 // 패널이 줄어들 수 있는 가장 좁은 너비. 창이 이보다도 좁으면 기록 보기 칸이 더 좁아진다.
 const PANEL_WIDTH_MIN = 240
+// 창이 아주 좁을 때(화면 반쪽 맞춤 등, 2026-11-18 실제 앱 점검): 패널은 200 까지 더 줄어 대화 칸에 300 을 남긴다.
+const PANEL_WIDTH_NARROW = 200
+const CENTER_WIDTH_NARROW = 300
 const PANEL_WIDTH_DEFAULT = 400
 const PANEL_WIDTH_KEY = 'momso.zet-panel-width'
 const MOVE_MS = 300
@@ -170,16 +174,30 @@ export function useZetPanelFrame(open: boolean, listHidden = false) {
   const [resizing, setResizing] = useState(false)
   const [moving, setMoving] = useState(false)
 
+  // 앱이 첫 실행 확인 화면부터 그리면 처음에는 이 칸이 없다. 그때 한 번만 재면 너비를 영영 몰라 패널이 가장 좁은 너비에 갇힌다(2026-11-17 찾음).
+  // 그래서 칸이 생기거나 바뀔 때마다 다시 붙여 잰다.
+  const observed = useRef<HTMLDivElement | null>(null)
+  const stopObserving = useRef<(() => void) | null>(null)
   useEffect(() => {
     const element = bodyRef.current
+    if (element === observed.current) return
+    stopObserving.current?.()
+    observed.current = element
+    stopObserving.current = null
     if (!element) return
-    const observer = new ResizeObserver(([entry]) => setBodyWidth(entry.contentRect.width))
-    observer.observe(element)
-    return () => observer.disconnect()
-  }, [])
+    // 알림 안에서 곧바로 너비를 바꾸면 패널 폭이 같은 그림 안에서 칸을 다시 바꿔 경고가 났다(2026-11-18). 다음 그림으로 미룬다.
+    setBodyWidth(element.getBoundingClientRect().width)
+    stopObserving.current = observeSize(element, (entry) => setBodyWidth(entry.contentRect.width))
+  })
+  // 떼어 낼 때(개발 모드의 두 번 붙이기 포함) 잰 칸도 잊어야 다시 붙일 때 새로 잰다.
+  useEffect(() => () => { stopObserving.current?.(); stopObserving.current = null; observed.current = null }, [])
 
-  const maxWidth = Math.max(PANEL_WIDTH_MIN, bodyWidth - leftWidth(bodyWidth, listHidden) - CENTER_WIDTH_MIN)
-  const width = clamp(preferredWidth, PANEL_WIDTH_MIN, maxWidth)
+  const room = bodyWidth - leftWidth(bodyWidth, listHidden)
+  const minWidth = room - CENTER_WIDTH_MIN >= PANEL_WIDTH_MIN
+    ? PANEL_WIDTH_MIN
+    : clamp(room - CENTER_WIDTH_NARROW, PANEL_WIDTH_NARROW, PANEL_WIDTH_MIN)
+  const maxWidth = Math.max(minWidth, room - CENTER_WIDTH_MIN)
+  const width = clamp(preferredWidth, minWidth, maxWidth)
 
   // 열고 닫을 때만 움직임을 켠다. 늘 켜 두면 창 크기를 바꾸거나 경계를 끌 때 화면이 뒤늦게 따라온다.
   // 바뀌는 바로 그 장면부터 켜져 있어야 움직임이 걸리므로, 바뀐 것을 그리는 중에 바로 알아챈다.
@@ -194,16 +212,18 @@ export function useZetPanelFrame(open: boolean, listHidden = false) {
   }, [open])
 
   const changeWidth = useCallback((next: number) => {
-    const clamped = clamp(Math.round(next), PANEL_WIDTH_MIN, maxWidth)
+    const clamped = clamp(Math.round(next), minWidth, maxWidth)
     setPreferredWidth(clamped)
+    // 좁은 창에서만 되는 너비(240 아래)는 기억하지 않는다. 창을 넓히면 보통 너비로 돌아온다.
+    if (clamped < PANEL_WIDTH_MIN) return
     try {
       window.localStorage.setItem(PANEL_WIDTH_KEY, String(clamped))
     } catch {
       // 너비를 기억하지 못해도 패널은 그대로 쓴다.
     }
-  }, [maxWidth])
+  }, [minWidth, maxWidth])
 
-  return { bodyRef, width, maxWidth, moving: (moving || changed) && !resizing, resizing, setResizing, changeWidth }
+  return { bodyRef, width, minWidth, maxWidth, moving: (moving || changed) && !resizing, resizing, setResizing, changeWidth }
 }
 
 type Loadable<T> =
@@ -257,6 +277,9 @@ type PanelTab =
   | { key: string; kind: 'zet'; id: string; scope: string }
   | { key: string; kind: 'receipt'; id: string; scope: string }
   | { key: string; kind: 'file'; id: string; title: string; scope: string }
+  /** 브라우저 탭(2026-11-17): 앱 전체에 하나. 채팅방을 바꿔도 남는다(scope 'web'). seq 가 바뀌면 같은 주소라도 다시 연다. */
+  /** url 이 null 이면 AI 가 열어 달라고 한 빈 패널(panel_browser_open_agent). */
+  | { key: 'web'; kind: 'web'; url: string | null; seq: number; title: string | null; host: string | null; scope: 'web' }
 
 const listTab = (scope: string): PanelTab => ({ key: `${scope}|list`, kind: 'list', scope })
 
@@ -286,6 +309,8 @@ type ZetPanelProps = {
   /** side: 홈의 오른쪽 패널. page: 문서 화면에서 화면 가득(너비 조절과 패널 단추 없음). */
   variant?: 'side' | 'page'
   width: number
+  /** 좁은 창에서는 240 아래로 내려간다(useZetPanelFrame). */
+  minWidth?: number
   maxWidth: number
   onWidthChange: (width: number) => void
   onResizingChange: (resizing: boolean) => void
@@ -310,6 +335,7 @@ export function ZetPanel({
   open,
   variant = 'side',
   width,
+  minWidth = PANEL_WIDTH_MIN,
   maxWidth,
   onWidthChange,
   onResizingChange,
@@ -320,7 +346,6 @@ export function ZetPanel({
   chatItems,
   chatItemsFailed = false,
   onRetryChatItems,
-  onOpenChat,
   onOpenMedia,
 }: ZetPanelProps) {
   const byChat = variant === 'side' && chatItems !== undefined
@@ -333,7 +358,8 @@ export function ZetPanel({
   const setActiveKey = useCallback((key: string) => {
     setActiveByScope((current) => (current[scopeRef.current] === key ? current : { ...current, [scopeRef.current]: key }))
   }, [])
-  const shown = tabs.filter((tab) => tab.scope === scope)
+  // 브라우저 탭은 어느 채팅방에서나 보인다(로그인하다 채팅방을 바꿔도 끊기지 않게).
+  const shown = tabs.filter((tab) => tab.scope === scope || tab.kind === 'web')
   const [knownTitles, setKnownTitles] = useState<Record<string, string>>({})
   // 패널을 연 횟수. 열 때마다 글 목록을 새로 읽는다.
   const [openCount, setOpenCount] = useState(0)
@@ -344,6 +370,13 @@ export function ZetPanel({
   activeKeyRef.current = activeKey
   // 고치는 중인 글: 탭마다 저장하지 않은 내용이 있는지와, 저장하거나 버리는 방법을 글 화면이 알려 준다.
   const [dirtyKeys, setDirtyKeys] = useState<ReadonlySet<string>>(new Set())
+  const dirtyKeysRef = useRef(dirtyKeys)
+  dirtyKeysRef.current = dirtyKeys
+  // 오른쪽 패널(side)은 문서 하나와 브라우저 하나만 둔다(2026-11-18 그의 말: "우측패널에 브라우저, 그 문서보는거 그정도"). 탭 줄 대신 둘 사이를 오가는 단추.
+  // 문서 하나씩만(오른쪽 패널과 문서 화면 모두). 다른 문서를 열면 고친 내용이 없는 앞 문서를 바꾼다.
+  const single = true
+  // 문서 화면의 지금 폴더(몸소 폴더 안 경로, 맨 위는 ''). 문서를 읽다 돌아오면 그 폴더로.
+  const [folder, setFolder] = useState('')
   const editors = useRef(new Map<string, ZetEditor>())
   // 저장하지 않은 내용이 있는 탭이나 패널을 닫으려 할 때 띄우는 물음.
   const [leaving, setLeaving] = useState<Leaving | null>(null)
@@ -364,8 +397,10 @@ export function ZetPanel({
     // 이 자리(채팅방)에 열린 탭이 없으면 고르는 탭으로 시작한다. 채팅방을 바꾸면 그 채팅방의 탭이 돌아온다.
     if (!tabsRef.current.some((tab) => tab.scope === scope)) {
       const first = listTab(scope)
-      setTabs((current) => [...current, first])
-      setActiveKey(first.key)
+      // 개발 모드의 두 번 실행이나 연이은 열기에서 같은 목록 탭이 두 번 들어가지 않게 지금 목록으로 다시 본다(같은 key 경고, 2026-11-18).
+      setTabs((current) => (current.some((tab) => tab.key === first.key) ? current : [...current, first]))
+      // 링크로 패널을 열었으면 브라우저 탭이 이미 골라져 있다. 그때는 고른 탭을 바꾸지 않는다.
+      if (!activeKeyRef.current) setActiveKey(first.key)
     }
   }, [open, scope, setActiveKey])
 
@@ -384,6 +419,7 @@ export function ZetPanel({
     setTabs((current) => {
       if (current.some((tab) => tab.key === key)) return current
       const next: PanelTab = { key, kind, id, scope: where }
+      if (single) return [...keepForNextDocument(current, where), next]
       // 글을 고르는 탭에서 고르면 그 탭이 고른 글로 바뀐다. 글 안에서 눌렀으면 옆에 새 탭으로 열린다.
       const activeIndex = current.findIndex((tab) => tab.key === activeKeyRef.current)
       if (activeIndex >= 0 && current[activeIndex].kind === 'list') {
@@ -393,12 +429,30 @@ export function ZetPanel({
       return [...current.slice(0, insertAt), next, ...current.slice(insertAt)]
     })
     setActiveKey(key)
-  }, [setActiveKey])
+  }, [setActiveKey, single])
 
-  // 바깥 주소는 기본 브라우저에서 연다. 열지 못하면 그 사실만 알린다.
-  const openAddress = useCallback((address: string) => {
-    openWebAddress(address).catch(() => onNotice(W.zetPanel.text18))
-  }, [onNotice])
+  // 바깥 주소는 패널의 브라우저 탭에서 연다(2026-11-17 본부: "우측 패널에서 인터넷"). 탭이 있으면 그 탭에서 이동한다.
+  const openWeb = useCallback((url: string | null) => {
+    setTabs((current) => {
+      const web = current.find((tab) => tab.kind === 'web')
+      // AI 의 열기 요청(url null)은 이미 있는 브라우저 탭을 그대로 쓴다(보던 페이지를 바꾸지 않는다).
+      if (web && web.kind === 'web') return url === null ? current : current.map((tab) => (tab.kind === 'web' ? { ...web, url, seq: web.seq + 1 } : tab))
+      return [...current, { key: 'web', kind: 'web', url, seq: 0, title: null, host: null, scope: 'web' }]
+    })
+    setActiveKey('web')
+  }, [setActiveKey])
+  const openAddress = useCallback((url: string) => openWeb(url), [openWeb])
+  useEffect(() => {
+    const onOpen = (event: Event) => {
+      const detail = (event as CustomEvent<{ url: string | null }>).detail
+      if (detail && (typeof detail.url === 'string' || detail.url === null)) openWeb(detail.url)
+    }
+    window.addEventListener('momso:open-web', onOpen)
+    return () => window.removeEventListener('momso:open-web', onOpen)
+  }, [openWeb])
+  const setWebTitle = useCallback((title: string | null, host: string | null) => {
+    setTabs((current) => current.map((tab) => (tab.kind === 'web' && (tab.title !== title || tab.host !== host) ? { ...tab, title, host } : tab)))
+  }, [])
 
   const openZet = useCallback((id: string) => openDocument('zet', id), [openDocument])
 
@@ -420,13 +474,14 @@ export function ZetPanel({
     setTabs((current) => {
       if (current.some((tab) => tab.key === key)) return current
       const next: PanelTab = { key, kind: 'file', id, title, scope: where }
+      if (single) return [...keepForNextDocument(current, where), next]
       const activeIndex = current.findIndex((tab) => tab.key === activeKeyRef.current)
       if (activeIndex >= 0 && current[activeIndex].kind === 'list') return current.map((tab, index) => (index === activeIndex ? next : tab))
       const insertAt = activeIndex >= 0 ? activeIndex + 1 : current.length
       return [...current.slice(0, insertAt), next, ...current.slice(insertAt)]
     })
     setActiveKey(key)
-  }, [setActiveKey])
+  }, [setActiveKey, single])
 
   // 원자료 열기(2026-11-17, source_asset_open): 글이면 첨부파일과 같은 길(패널의 새 탭), 사진·소리·영상이면 미디어 화면.
   const openSource = useCallback((id: string, name: string | null) => {
@@ -438,6 +493,25 @@ export function ZetPanel({
       onNotice(W.sourceDelete.openFailed)
     }).catch(() => onNotice(W.sourceDelete.openFailed))
   }, [onNotice, onOpenMedia, openFile])
+
+  // 문서를 하나 더 열 때 남길 탭: 다른 채팅방의 것, 목록, 브라우저, 고친 내용이 있는 문서(버리지 않게).
+  function keepForNextDocument(current: PanelTab[], where: string) {
+    return current.filter((tab) => tab.scope !== where || tab.kind === 'list' || tab.kind === 'web' || dirtyKeysRef.current.has(tab.key))
+  }
+  const activeTab = shown.find((tab) => tab.key === activeKey)
+  const mode: 'documents' | 'browser' = activeTab?.kind === 'web' ? 'browser' : 'documents'
+  // 문서로 돌아오면 마지막에 보던 문서(없으면 목록).
+  const lastDocument = useRef<Record<string, string>>({})
+  if (activeTab && activeTab.kind !== 'web') lastDocument.current[scope] = activeTab.key
+  function showDocuments() {
+    const last = lastDocument.current[scope]
+    if (last && shown.some((tab) => tab.key === last)) setActiveKey(last)
+    else showList()
+  }
+  function showBrowser() {
+    if (shown.some((tab) => tab.kind === 'web')) setActiveKey('web')
+    else openWeb(null)
+  }
 
   function showList() {
     const first = listTab(scope)
@@ -473,16 +547,6 @@ export function ZetPanel({
       return
     }
     if (key === activeKey) setActiveKey(next[Math.min(index, next.length - 1)].key)
-  }
-
-  // 저장하지 않은 내용이 있는 탭은 닫기 전에 한 번 묻는다.
-  function closeTab(key: string) {
-    if (dirtyKeys.has(key)) {
-      setActiveKey(key)
-      setLeaving({ key, then: 'close-tab' })
-      return
-    }
-    removeTab(key)
   }
 
   // 패널이나 앱 창을 닫을 때도 저장하지 않은 내용이 있는 글이 있으면 그 글을 보여 주고 묻는다.
@@ -553,6 +617,7 @@ export function ZetPanel({
     if (tab.kind === 'list') return byChat ? W.gallery.chatTab : W.document
     if (tab.kind === 'receipt') return W.workLog
     if (tab.kind === 'file') return tab.title
+    if (tab.kind === 'web') return tab.title ?? tab.host ?? (tab.url === null ? W.panelBrowser.newTab : W.panelBrowser.loading)
     return titleOf(tab.id) ?? W.document
   }
 
@@ -594,7 +659,7 @@ export function ZetPanel({
           role="separator"
           aria-orientation="vertical"
           aria-label={W.zetPanel.aria1}
-          aria-valuemin={PANEL_WIDTH_MIN}
+          aria-valuemin={Math.round(minWidth)}
           aria-valuemax={Math.round(maxWidth)}
           aria-valuenow={Math.round(width)}
           tabIndex={0}
@@ -605,55 +670,28 @@ export function ZetPanel({
           onKeyDown={resizeWithKeys}
         />
 
-        <header className="zet-tabbar">
-          <div className="zet-tabs" role="tablist" aria-label={W.zetPanel.aria2} onKeyDown={moveBetweenTabs}>
-            {shown.map((tab) => {
-              const title = tabTitle(tab)
-              const isActive = tab.key === activeKey
-              return (
-                <div
-                  key={tab.key}
-                  className={isActive ? 'zet-tab active' : 'zet-tab'}
-                  onAuxClick={(event) => {
-                    if (event.button === 1) closeTab(tab.key)
-                  }}
-                >
-                  <button
-                    className="zet-tab-label"
-                    type="button"
-                    role="tab"
-                    aria-selected={isActive}
-                    title={title}
-                    onClick={() => setActiveKey(tab.key)}
-                  >
-                    {tab.kind === 'receipt'
-                      ? <ScrollText size={13} strokeWidth={1.75} aria-hidden />
-                      : tab.kind === 'zet' || tab.kind === 'file'
-                        ? <FileText size={13} strokeWidth={1.75} aria-hidden />
-                        : null}
-                    <span>{title}</span>
-                    {dirtyKeys.has(tab.key) && <i className="zet-tab-dirty" role="img" aria-label={W.zetPanel.aria3} />}
-                  </button>
-                  <button
-                    className="zet-tab-close"
-                    type="button"
-                    aria-label={W.zetPanel.aria4(title)}
-                    title={W.zetPanel.tip1}
-                    onClick={() => closeTab(tab.key)}
-                  >
-                    <X size={13} strokeWidth={1.75} aria-hidden />
-                  </button>
-                </div>
-              )
-            })}
-          </div>
-          {!shown.some((tab) => tab.kind === 'list') && (
-            <button className="icon-button zet-tab-add" type="button" aria-label={W.zetPanel.aria5} title={W.zetPanel.aria5} onClick={showList}>
-              <Plus size={16} aria-hidden />
+        {/* 오른쪽 패널: 위에 문서·브라우저 두 단추. 문서 화면(가득 보기)은 탭 줄 없이 폴더 목록 → 문서(2026-11-18 그의 말: "문서x 이건 필요 없는거잖아"). */}
+        {variant === 'side' && (
+        <header className="zet-tabbar zet-modebar">
+          <div className="zet-modes" role="tablist" aria-label={W.zetPanel.aria2} onKeyDown={moveBetweenTabs}>
+            <button type="button" role="tab" aria-selected={mode === 'documents'} className={mode === 'documents' ? 'is-active' : undefined} onClick={showDocuments}>
+              <FileText size={14} strokeWidth={1.75} aria-hidden />{W.document}
             </button>
-          )}
-          {open && variant === 'side' && <ZetPanelToggle open onToggle={() => closeAll('close-panel')} />}
+            <button type="button" role="tab" aria-selected={mode === 'browser'} className={mode === 'browser' ? 'is-active' : undefined} onClick={showBrowser}>
+              <Globe size={14} strokeWidth={1.75} aria-hidden />{W.zetPanel.browser}
+            </button>
+          </div>
+          {open && <ZetPanelToggle open onToggle={() => closeAll('close-panel')} />}
         </header>
+        )}
+        {/* 오른쪽 패널에서 문서를 보는 중이면 목록으로 돌아가는 한 줄. */}
+        {single && activeTab && (activeTab.kind === 'zet' || activeTab.kind === 'file' || activeTab.kind === 'receipt') && (
+          <div className="zet-backbar">
+            <button className="zet-back" type="button" onClick={showList}>
+              <ArrowLeft size={15} strokeWidth={1.75} aria-hidden />{variant === 'page' ? (folder ? folder.split('/').pop() : W.document) : W.zetPanel.backToList}
+            </button>
+          </div>
+        )}
 
         {leaving && (
           <QuestionDialog
@@ -671,11 +709,25 @@ export function ZetPanel({
 
         <div className="zet-panel-body">
           {tabs.map((tab) => (
-            <section key={tab.key} className="zet-pane" role="tabpanel" aria-label={tabTitle(tab)} hidden={tab.scope !== scope || tab.key !== activeKey}>
-              {tab.kind === 'list' ? (
+            <section key={tab.key} className={tab.kind === 'web' ? 'zet-pane panel-browser-pane' : 'zet-pane'} role="tabpanel" aria-label={tabTitle(tab)} hidden={(tab.kind !== 'web' && tab.scope !== scope) || tab.key !== activeKey}>
+              {tab.kind === 'web' ? (
+                <PanelBrowserView
+                  url={tab.url}
+                  seq={tab.seq}
+                  chatId={chatId}
+                  active={open && tab.key === activeKey}
+                  onTitle={setWebTitle}
+                  onOpenFailed={(code) => {
+                    removeTab(tab.key)
+                    // Google 로그인은 뒤쪽 이벤트가 따로 알린다.
+                    if (code !== 'google_login_required') onNotice(code === 'invalid_url' ? W.panelBrowser.cannotOpen : W.panelBrowser.openFailed)
+                  }}
+                  onNotice={onNotice}
+                />
+              ) : tab.kind === 'list' ? (
                 byChat && tab.scope !== 'all'
-                  ? (tab.scope === scope ? <ChatItemsView items={chatItems ?? null} failed={chatItemsFailed} onRetry={onRetryChatItems} onOpenZet={openZet} onOpenFile={openFile} onOpenChat={onOpenChat} onNotice={onNotice} /> : null)
-                  : <ZetListView list={list} onOpen={openZet} onReload={reloadList} />
+                  ? (tab.scope === scope ? <ChatItemsView items={chatItems ?? null} failed={chatItemsFailed} onRetry={onRetryChatItems} onOpenZet={openZet} onOpenFile={openFile} onNotice={onNotice} /> : null)
+                  : <ZetFolderView list={list} folder={folder} onFolder={setFolder} onOpen={openZet} onReload={reloadList} />
               ) : tab.kind === 'zet' ? (
                 <ZetDocumentView
                   id={tab.id}
@@ -734,7 +786,6 @@ function ItemDid({ how, by, at }: { how: string | null; by: ItemBy | null; at: s
   )
 }
 
-type ChatItemsTab = 'documents' | 'media' | 'files'
 
 /**
  * 오른쪽 패널의 첫 탭(홈): 지금 연 채팅방에서 다룬 문서, 미디어, 첨부파일만. 둘 이상 있으면 위에 탭(문서 / 미디어 / 첨부파일).
@@ -742,57 +793,27 @@ type ChatItemsTab = 'documents' | 'media' | 'files'
  * 첨부파일(T42 files, 글 파일 등)은 Codex 앱의 "소스" 패널처럼 파일 이름과 "첨부", 때를 한 줄씩 보이고,
  * 누르면 그 글이 패널의 새 탭으로 열린다(attachment_text_read, 2026-11-16 그의 말 "txt나 md가 오른쪽 패널에 보여야").
  */
-function ChatItemsView({ items, failed = false, onRetry, onOpenZet, onOpenFile, onOpenChat, onNotice }: {
+function ChatItemsView({ items, failed = false, onRetry, onOpenZet, onOpenFile, onNotice }: {
   items: ChatItems | null
   failed?: boolean
   onRetry?: () => void
   onOpenZet: (id: string) => void
   onOpenFile: (id: string, title: string) => void
-  onOpenChat?: (chatId: string) => void
   onNotice?: SourceNotice
 }) {
-  const [view, setView] = useState<ChatItemsTab>('documents')
   // 잘못 첨부한 파일 지우기(첨부파일 줄의 메뉴). 지우거나 되살리면 이 채팅방에서 다룬 것을 다시 읽는다.
   const [deleting, setDeleting] = useState<{ id: string; name: string } | null>(null)
   // 읽지 못했으면 "불러오는 중"에 멈춰 있지 않게 그 줄과 다시 불러오기, 읽는 동안은 "불러오는 중"(2026-11-17 본부 결정).
   if (!items && failed) return <PaneMessage text={W.zetPanel.chatItemsFailed} onRetry={onRetry} />
   if (!items) return <PaneMessage text={W.zetPanel.chatItemsLoading} />
-  const counts: Record<ChatItemsTab, number> = { documents: items.documents.length, media: items.media.length, files: items.files.length }
-  const present = (['documents', 'media', 'files'] as const).filter((id) => counts[id] > 0)
-  if (present.length === 0) return <PaneMessage text={W.gallery.chatEmpty} />
-  const current = present.includes(view) ? view : present[0]
+  // 사진과 동영상은 따로 화면이 있어 패널에서는 문서와 첨부파일만 보인다(2026-11-18 그의 말: 패널은 브라우저와 문서 보기).
+  if (items.documents.length === 0 && items.files.length === 0) return <PaneMessage text={W.gallery.chatEmpty} />
   const docs = [...items.documents].sort((a: ChatDocumentItem, b: ChatDocumentItem) => (b.at ?? b.updatedAt ?? '').localeCompare(a.at ?? a.updatedAt ?? ''))
   const files = [...items.files].sort((a, b) => (b.at ?? b.createdAt ?? '').localeCompare(a.at ?? a.createdAt ?? ''))
-  const tabName: Record<ChatItemsTab, string> = { documents: W.document, media: W.mediaView.aria1, files: W.gallery.files }
+  // 문서와 첨부파일을 한 목록에(문서 먼저). 위쪽의 "문서" 단추와 같은 말이 두 번 보이지 않게 칸 고르기를 두지 않는다(2026-11-18).
   return (
     <div className="chat-items">
-      {present.length > 1 && (
-        <div className="chat-items-tabs" role="tablist" onKeyDown={moveBetweenTabs}>
-          {present.map((id) => (
-            <button key={id} type="button" role="tab" aria-selected={current === id} className={current === id ? 'is-active' : undefined} onClick={() => setView(id)}>
-              {tabName[id]}
-              <span className="chat-items-count">{counts[id]}</span>
-            </button>
-          ))}
-        </div>
-      )}
-      {current === 'files' ? (
-        <ul className="zet-rows chat-item-rows chat-file-rows">
-          {files.map((entry) => (
-            <li key={entry.id} className="chat-file-item">
-              <button className="zet-row chat-file-row" type="button" onClick={() => onOpenFile(entry.id, entry.title)}>
-                <span className="chat-file-name"><FileText size={14} strokeWidth={1.75} aria-hidden /><strong>{entry.title}</strong></span>
-                <span className="zet-row-meta"><ItemDid how={entry.how} by={entry.by} at={entry.at ?? entry.createdAt} /></span>
-              </button>
-              {onNotice && (
-                <RowMenu label={W.sourceDelete.menu(entry.title)}>
-                  {(close) => <MenuItem close={close} onSelect={() => setDeleting({ id: entry.id, name: entry.title })}>{W.sourceDelete.trash}</MenuItem>}
-                </RowMenu>
-              )}
-            </li>
-          ))}
-        </ul>
-      ) : current === 'documents' ? (
+      {docs.length > 0 && (
         <ul className="zet-rows chat-item-rows">
           {docs.map((entry) => (
             <li key={`${entry.id}-${entry.how}`}>
@@ -804,10 +825,26 @@ function ChatItemsView({ items, failed = false, onRetry, onOpenZet, onOpenFile, 
             </li>
           ))}
         </ul>
-      ) : (
-        <div className="chat-items-media">
-          <MediaGallery items={items.media} rowHeight={104} groupByDay={false} onOpenChat={onOpenChat} onNotice={onNotice} onChanged={onRetry} />
-        </div>
+      )}
+      {files.length > 0 && (
+        <>
+          {docs.length > 0 && <h3 className="chat-items-heading">{W.gallery.files}</h3>}
+          <ul className="zet-rows chat-item-rows chat-file-rows">
+            {files.map((entry) => (
+              <li key={entry.id} className="chat-file-item">
+                <button className="zet-row chat-file-row" type="button" onClick={() => onOpenFile(entry.id, entry.title)}>
+                  <span className="chat-file-name"><FileText size={14} strokeWidth={1.75} aria-hidden /><strong>{entry.title}</strong></span>
+                  <span className="zet-row-meta"><ItemDid how={entry.how} by={entry.by} at={entry.at ?? entry.createdAt} /></span>
+                </button>
+                {onNotice && (
+                  <RowMenu label={W.sourceDelete.menu(entry.title)}>
+                    {(close) => <MenuItem close={close} onSelect={() => setDeleting({ id: entry.id, name: entry.title })}>{W.sourceDelete.trash}</MenuItem>}
+                  </RowMenu>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
       )}
       {deleting && onNotice && (
         <SourceDeleteDialog assetId={deleting.id} name={deleting.name} onClose={() => setDeleting(null)} onNotice={onNotice} onChanged={() => onRetry?.()} />
@@ -922,59 +959,193 @@ function PaneMessage({ text, onRetry }: { text: string; onRetry?: () => void }) 
   )
 }
 
-function ZetListView({
+type FolderNode = { name: string; path: string; children: FolderNode[]; docs: ZetListEntry[]; total: number }
+
+/** 문서들의 folder 값으로 폴더 나무를 만든다. 폴더 값이 없으면 맨 위. 폴더는 이름 차례, 문서는 새로 고친 것부터. */
+function folderTree(entries: ZetListEntry[]): FolderNode {
+  const root: FolderNode = { name: '', path: '', children: [], docs: [], total: 0 }
+  const byPath = new Map<string, FolderNode>([['', root]])
+  const nodeFor = (path: string): FolderNode => {
+    const found = byPath.get(path)
+    if (found) return found
+    const cut = path.lastIndexOf('/')
+    const parent = nodeFor(cut < 0 ? '' : path.slice(0, cut))
+    const node: FolderNode = { name: cut < 0 ? path : path.slice(cut + 1), path, children: [], docs: [], total: 0 }
+    parent.children.push(node)
+    byPath.set(path, node)
+    return node
+  }
+  for (const entry of entries) {
+    const path = (entry.folder ?? '').split('/').map((part) => part.trim()).filter(Boolean).join('/')
+    nodeFor(path).docs.push(entry)
+  }
+  const finish = (node: FolderNode): number => {
+    node.children.sort((a, b) => a.name.localeCompare(b.name, 'ko-KR', { numeric: true }))
+    node.docs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    node.total = node.docs.length + node.children.reduce((sum, child) => sum + finish(child), 0)
+    return node.total
+  }
+  finish(root)
+  return root
+}
+
+function findFolder(root: FolderNode, path: string): FolderNode | null {
+  if (!path) return root
+  let node: FolderNode | undefined = root
+  for (const part of path.split('/')) {
+    node = node?.children.find((child) => child.name === part)
+    if (!node) return null
+  }
+  return node ?? null
+}
+
+/**
+ * 문서 화면(2026-11-18, 그의 말 "구글드라이브? 그런 트리구조처럼"): 왼쪽에 접고 펴는 폴더 나무, 오른쪽에 지금 폴더의 경로 줄과
+ * 그 안의 폴더·문서 목록(Windows 탐색기·Finder·Drive 의 흔한 꼴). 찾기는 모든 폴더에서 하고, 결과마다 폴더를 적는다.
+ * 창이 좁으면 나무를 숨기고 경로 줄로만 오간다. 폴더가 하나도 없으면 나무 없이 목록만.
+ */
+function ZetFolderView({
   list,
+  folder,
+  onFolder,
   onOpen,
   onReload,
 }: {
   list: Loadable<ZetListEntry[]>
+  folder: string
+  onFolder: (path: string) => void
   onOpen: (id: string) => void
   onReload: () => void
 }) {
   const [query, setQuery] = useState('')
+  // 펼친 폴더. 처음에는 맨 위 폴더들과 지금 폴더까지.
+  const [openFolders, setOpenFolders] = useState<ReadonlySet<string>>(new Set())
+  const entries = list.state === 'ready' ? list.value : null
+  const root = useMemo(() => folderTree(entries ?? []), [entries])
+  useEffect(() => {
+    if (!folder) return
+    setOpenFolders((current) => {
+      const next = new Set(current)
+      const parts = folder.split('/')
+      for (let i = 1; i <= parts.length; i += 1) next.add(parts.slice(0, i).join('/'))
+      return next.size === current.size ? current : next
+    })
+  }, [folder])
 
   if (list.state === 'error') return <PaneMessage text={list.message} onRetry={onReload} />
   if (list.state !== 'ready') return <PaneMessage text={W.zetPanel.text26} />
   if (list.value.length === 0) return <PaneMessage text={W.zetPanel.text27} />
 
+  const current = findFolder(root, folder) ?? root
+  const hasFolders = root.children.length > 0
   const normalized = query.trim().toLocaleLowerCase('ko-KR')
-  const visible = normalized
-    ? list.value.filter((entry) => (
-        `${entry.title} ${entry.summary}`.toLocaleLowerCase('ko-KR').includes(normalized)
-      ))
-    : list.value
+  const found = normalized
+    ? list.value
+      .filter((entry) => `${entry.title} ${entry.summary}`.toLocaleLowerCase('ko-KR').includes(normalized))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    : null
+  const crumbs = folder ? folder.split('/') : []
+  const toggle = (path: string) => setOpenFolders((now) => {
+    const next = new Set(now)
+    if (next.has(path)) next.delete(path)
+    else next.add(path)
+    return next
+  })
+
+  const renderTree = (nodes: FolderNode[], depth: number): ReactNode => nodes.map((node) => {
+    const expanded = openFolders.has(node.path)
+    return (
+      <li key={node.path} role="treeitem" aria-expanded={node.children.length > 0 ? expanded : undefined} aria-selected={node.path === current.path}>
+        <div className={node.path === current.path ? 'zet-tree-row is-current' : 'zet-tree-row'} style={{ paddingLeft: 6 + depth * 14 }}>
+          {node.children.length > 0 ? (
+            <button className="zet-tree-twist" type="button" aria-label={expanded ? W.zetPanel.folderCollapse(node.name) : W.zetPanel.folderExpand(node.name)} onClick={() => toggle(node.path)}>
+              <ChevronRight size={13} strokeWidth={1.75} aria-hidden className={expanded ? 'is-open' : undefined} />
+            </button>
+          ) : <span className="zet-tree-twist" aria-hidden />}
+          <button className="zet-tree-name" type="button" onClick={() => { setQuery(''); onFolder(node.path) }}>
+            <Folder size={14} strokeWidth={1.75} aria-hidden />
+            <span>{node.name}</span>
+          </button>
+        </div>
+        {expanded && node.children.length > 0 && <ul role="group">{renderTree(node.children, depth + 1)}</ul>}
+      </li>
+    )
+  })
+
+  const docRow = (entry: ZetListEntry, showFolder: boolean) => (
+    <li key={entry.id}>
+      <button className="zet-row" type="button" onClick={() => onOpen(entry.id)}>
+        <strong>{entry.title}</strong>
+        <span className="zet-row-summary">{entry.summary}</span>
+        <span className="zet-row-meta">
+          {showFolder && entry.folder && <span className="zet-row-folder"><Folder size={12} strokeWidth={1.75} aria-hidden />{entry.folder.split('/').join(' › ')}</span>}
+          <span>{KIND_LABEL[entry.kind] ?? entry.kind}</span>
+          <span className={`zet-status ${entry.status}`}>{STATUS_LABEL[entry.status] ?? entry.status}</span>
+          <time dateTime={entry.updatedAt}>{formatDay(entry.updatedAt)}</time>
+        </span>
+      </button>
+    </li>
+  )
 
   return (
-    <div className="zet-list">
-      <label className="zet-search">
-        <Search size={15} aria-hidden />
-        <span className="sr-only">{W.zetPanel.text28}</span>
-        <input
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder={W.zetPanel.text28}
-          type="search"
-        />
-      </label>
-      {visible.length === 0 ? (
-        <PaneMessage text={W.zetPanel.text29} />
-      ) : (
-        <ul className="zet-rows">
-          {visible.map((entry) => (
-            <li key={entry.id}>
-              <button className="zet-row" type="button" onClick={() => onOpen(entry.id)}>
-                <strong>{entry.title}</strong>
-                <span className="zet-row-summary">{entry.summary}</span>
-                <span className="zet-row-meta">
-                  <span>{KIND_LABEL[entry.kind] ?? entry.kind}</span>
-                  <span className={`zet-status ${entry.status}`}>{STATUS_LABEL[entry.status] ?? entry.status}</span>
-                  <time dateTime={entry.updatedAt}>{formatDay(entry.updatedAt)}</time>
-                </span>
-              </button>
+    <div className={hasFolders ? 'zet-folders' : 'zet-folders is-flat'}>
+      {hasFolders && (
+        <nav className="zet-tree" aria-label={W.zetPanel.folders}>
+          <ul role="tree">
+            <li role="treeitem" aria-selected={current.path === ''}>
+              <div className={current.path === '' ? 'zet-tree-row is-current' : 'zet-tree-row'} style={{ paddingLeft: 6 }}>
+                <span className="zet-tree-twist" aria-hidden />
+                <button className="zet-tree-name" type="button" onClick={() => { setQuery(''); onFolder('') }}>
+                  <FileText size={14} strokeWidth={1.75} aria-hidden />
+                  <span>{W.document}</span>
+                </button>
+              </div>
             </li>
-          ))}
-        </ul>
+            {renderTree(root.children, 0)}
+          </ul>
+        </nav>
       )}
+      <div className="zet-list zet-folder-main">
+        <div className="zet-folder-bar">
+          {found === null && hasFolders ? (
+            <nav className="zet-crumbs" aria-label={W.zetPanel.folderPath}>
+              <button type="button" className={crumbs.length === 0 ? 'is-current' : undefined} aria-current={crumbs.length === 0 ? 'page' : undefined} onClick={() => onFolder('')}>{W.document}</button>
+              {crumbs.map((part, index) => {
+                const path = crumbs.slice(0, index + 1).join('/')
+                const last = index === crumbs.length - 1
+                return (
+                  <span key={path} className="zet-crumb">
+                    <ChevronRight size={13} strokeWidth={1.75} aria-hidden />
+                    <button type="button" className={last ? 'is-current' : undefined} aria-current={last ? 'page' : undefined} onClick={() => onFolder(path)}>{part}</button>
+                  </span>
+                )
+              })}
+            </nav>
+          ) : <span />}
+          <label className="zet-search">
+            <Search size={15} aria-hidden />
+            <span className="sr-only">{W.zetPanel.text28}</span>
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={W.zetPanel.text28} type="search" />
+          </label>
+        </div>
+        {found !== null ? (
+          found.length === 0 ? <PaneMessage text={W.zetPanel.text29} /> : <ul className="zet-rows">{found.map((entry) => docRow(entry, true))}</ul>
+        ) : current.children.length === 0 && current.docs.length === 0 ? (
+          <PaneMessage text={W.zetPanel.folderEmpty} />
+        ) : (
+          <ul className="zet-rows">
+            {current.children.map((child) => (
+              <li key={child.path}>
+                <button className="zet-row zet-folder-row" type="button" onClick={() => onFolder(child.path)}>
+                  <span className="zet-folder-name"><Folder size={15} strokeWidth={1.75} aria-hidden /><strong>{child.name}</strong></span>
+                  <span className="zet-row-meta"><span>{W.zetPanel.folderCount(child.total)}</span></span>
+                </button>
+              </li>
+            ))}
+            {current.docs.map((entry) => docRow(entry, false))}
+          </ul>
+        )}
+      </div>
     </div>
   )
 }
@@ -1362,6 +1533,8 @@ export function QuestionDialog({
   const titleId = useId()
   const textId = useId()
   const dialog = useRef<HTMLDivElement>(null)
+  // 화면 가운데를 덮는 창이라, 열려 있는 동안 패널 브라우저(따로 뜨는 층)를 숨긴다.
+  usePanelBrowserHold()
 
   function handleKeys(event: ReactKeyboardEvent<HTMLDivElement>) {
     if (event.key === 'Escape' && !working) {

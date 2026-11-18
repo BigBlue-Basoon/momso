@@ -107,8 +107,9 @@ function AiStep({ onBack, onDone }: { onBack: (() => void) | null; onDone: () =>
   return (
     <div className="first-run-step is-wide">
       <div className="first-run-head">
-        <h1 ref={heading} tabIndex={-1}>{W.firstRun.aiTitle}</h1>
-        <p>{W.firstRun.aiText(a, b, c)}</p>
+        {/* 이미 하나 이상 연결됐으면(뒤쪽의 시작 가능 값) 연결해 달라는 제목을 두지 않는다(2026-11-18 점검). */}
+        <h1 ref={heading} tabIndex={-1}>{connected ? W.firstRun.aiTitleReady : W.firstRun.aiTitle}</h1>
+        <p>{connected ? W.firstRun.aiTextReady : W.firstRun.aiText(a, b, c)}</p>
       </div>
       {list === undefined && (
         <p className="first-run-checking" role="status"><LoaderCircle size={15} className="is-spinning" aria-hidden />{W.firstRun.checking}</p>

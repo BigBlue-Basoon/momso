@@ -163,7 +163,7 @@ pub(crate) async fn install_external_provider(app: AppHandle, provider: String) 
 }
 
 pub(crate) async fn executable_works(path: &Path) -> bool {
-    let mut command = tokio::process::Command::new(path);
+    let mut command = crate::process::hidden_async_command(path);
     command
         .arg("--version")
         .env_remove("OPENAI_API_KEY")
@@ -208,7 +208,7 @@ async fn run_install(
         let Ok(path) = std::env::join_paths(paths) else {
             return Err("unavailable");
         };
-        let mut cmd = tokio::process::Command::new(node);
+        let mut cmd = crate::process::hidden_async_command(node);
         cmd.env("PATH", path);
         cmd.env(
             "npm_config_userconfig",
@@ -232,7 +232,7 @@ async fn run_install(
             .arg(package);
         cmd
     } else if provider == "gemini" {
-        let mut cmd = tokio::process::Command::new("powershell.exe");
+        let mut cmd = crate::process::hidden_async_command("powershell.exe");
         let local = temporary.path().join("local");
         std::fs::create_dir(&local).map_err(filesystem_error)?;
         cmd.env("LOCALAPPDATA", local);

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::{Command as SyncCommand, Stdio},
+    process::Stdio,
     sync::OnceLock,
     time::Duration,
 };
@@ -14,6 +14,12 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 static LOCAL_AI_TOOLS: OnceLock<PathBuf> = OnceLock::new();
+
+pub(crate) use crate::hidden_process::hidden_command;
+
+pub(crate) fn hidden_async_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::from(hidden_command(program))
+}
 
 pub(crate) fn remove_inherited_ai_secrets(command: &mut Command) {
     for name in [
@@ -127,7 +133,7 @@ pub(crate) fn resolve_tool(name: &str) -> Option<PathBuf> {
     if let Some(path) = managed_ai_tool(name) {
         return Some(path);
     }
-    let output = SyncCommand::new("where.exe").arg(name).output().ok()?;
+    let output = hidden_command("where.exe").arg(name).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -264,7 +270,7 @@ pub(crate) async fn run_resolved_tool_cancellable(
         .unwrap_or(false);
 
     let mut command = if is_script && executable.with_extension("ps1").is_file() {
-        let mut command = Command::new("powershell.exe");
+        let mut command = hidden_async_command("powershell.exe");
         command
             .args([
                 "-NoLogo",
@@ -284,11 +290,11 @@ pub(crate) async fn run_resolved_tool_cancellable(
         {
             return Err(ProcessError::UnsafeScriptArgument);
         }
-        let mut command = Command::new(executable);
+        let mut command = hidden_async_command(executable);
         command.args(args);
         command
     } else {
-        let mut command = Command::new(executable);
+        let mut command = hidden_async_command(executable);
         command.args(args);
         command
     };
@@ -379,11 +385,11 @@ pub(crate) async fn run_json_rpc_tool(
         {
             return Err(ProcessError::UnsafeScriptArgument);
         }
-        let mut command = Command::new(executable);
+        let mut command = hidden_async_command(executable);
         command.args(args);
         command
     } else {
-        let mut command = Command::new(executable);
+        let mut command = hidden_async_command(executable);
         command.args(args);
         command
     };
@@ -510,6 +516,72 @@ pub(crate) fn empty_environment() -> HashMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn gui_parent_launches_cli_without_console_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("gui-fixture.exe");
+        let report = temp.path().join("result.txt");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/fixtures/hidden_console_gui.rs");
+        let status = super::hidden_command("rustc")
+            .args(["--edition=2021", "-o"])
+            .arg(&executable)
+            .arg(fixture)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = super::hidden_command(&executable)
+            .arg(&report)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(report).unwrap(), "ok");
+    }
+    #[test]
+    fn product_subprocesses_use_hidden_constructors() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_str().unwrap();
+            if matches!(
+                name,
+                "process.rs"
+                    | "hidden_process.rs"
+                    | "chat_conformance.rs"
+                    | "scale_benchmark.rs"
+                    | "provider_engine_smoke.rs"
+                    | "command_entry_tests.rs"
+                    | "capability_security_tests.rs"
+                    | "instagram_preview_contract_tests.rs"
+            ) {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let product = source.split("\nmod tests {").next().unwrap();
+            let pattern = ["Command", "::new("].concat();
+            assert!(
+                !product.contains(&pattern),
+                "{name} uses an unwrapped process constructor"
+            );
+        }
+        let source = include_str!("process.rs");
+        let product = source
+            .split("pub(crate) fn remove_inherited_ai_secrets")
+            .nth(1)
+            .unwrap()
+            .split("\nmod tests {")
+            .next()
+            .unwrap();
+        let pattern = ["Command", "::new("].concat();
+        assert!(
+            !product.contains(&pattern),
+            "process.rs uses an unwrapped process constructor"
+        );
+    }
     use super::*;
 
     #[test]

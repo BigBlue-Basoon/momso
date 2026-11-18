@@ -285,7 +285,10 @@ fn list_deleted(
 }
 
 fn remote_deletion_supported(config: &crate::object_store::Config) -> bool {
-    crate::object_store_lock::supported(config) || crate::r2_oauth::uses_oauth(config)
+    crate::object_store_lock::supported(config)
+        || crate::r2_oauth::uses_oauth(config)
+        || (matches!(config.provider.as_str(), "ncp" | "cloudflare")
+            && config.write_safety.is_some())
 }
 
 fn list_deleted_with_target(
@@ -352,8 +355,17 @@ fn list_deleted_with_target(
             record_versions: references.record_versions.len(),
         };
         let total = counts.documents + counts.receipts + counts.chats + counts.record_versions;
+        let remote_changed = references
+            .remote_remaining
+            .as_deref()
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.starts_with("remote_object_changed:"))
+            });
         let state = match references.state.as_str() {
             "purge_pending" if local_retry => "local_retry_pending".to_owned(),
+            "purge_pending" if remote_changed => "remote_object_changed".to_owned(),
             "purge_pending" => "remote_retry_pending".to_owned(),
             _ => references.state,
         };
@@ -625,19 +637,19 @@ async fn delete_remote_keys(
     let mut removed = Vec::new();
     let mut remaining = Vec::new();
     for (key, hash) in &plan.data_keys {
-        if delete_remote_key(config, keys, key, hash).await {
-            removed.push(key.clone());
-        } else {
-            remaining.push(key.clone());
+        match delete_planned_key(config, keys, key, hash).await {
+            PlannedDelete::Removed => removed.push(key.clone()),
+            PlannedDelete::Changed => remaining.push(format!("remote_object_changed:{key}")),
+            PlannedDelete::Retry => remaining.push(key.clone()),
         }
     }
     // Keep all manifests discoverable if even one exclusive chunk could not be deleted.
     if remaining.is_empty() {
         for (key, hash) in &plan.manifest_keys {
-            if delete_remote_key(config, keys, key, hash).await {
-                removed.push(key.clone());
-            } else {
-                remaining.push(key.clone());
+            match delete_planned_key(config, keys, key, hash).await {
+                PlannedDelete::Removed => removed.push(key.clone()),
+                PlannedDelete::Changed => remaining.push(format!("remote_object_changed:{key}")),
+                PlannedDelete::Retry => remaining.push(key.clone()),
             }
         }
     } else {
@@ -645,6 +657,96 @@ async fn delete_remote_keys(
     }
     remaining.extend(plan.shared_keys.iter().map(|key| format!("shared:{key}")));
     (removed, remaining)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PlannedDelete {
+    Removed,
+    Changed,
+    Retry,
+}
+
+async fn delete_planned_key(
+    config: &crate::object_store::Config,
+    keys: &crate::object_store::Keys,
+    key: &str,
+    expected_hash: &str,
+) -> PlannedDelete {
+    if !matches!(config.provider.as_str(), "ncp" | "cloudflare")
+        || crate::r2_oauth::uses_oauth(config)
+    {
+        return if delete_remote_key(config, keys, key, expected_hash).await {
+            PlannedDelete::Removed
+        } else {
+            PlannedDelete::Retry
+        };
+    }
+    let head = |response: &reqwest::Response| {
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)?
+            .to_str()
+            .ok()?
+            .to_owned();
+        let length = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        (!etag.is_empty() && length <= 128 * 1024 * 1024).then_some((etag, length))
+    };
+    let first =
+        match crate::object_store::request(config, keys, reqwest::Method::HEAD, key, &[], vec![])
+            .await
+        {
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                return PlannedDelete::Removed
+            }
+            Ok(response) if response.status().is_success() => match head(&response) {
+                Some(value) => value,
+                None => return PlannedDelete::Retry,
+            },
+            _ => return PlannedDelete::Retry,
+        };
+    let body =
+        match crate::object_store_transfer::get_bytes(config, keys, key, first.1 as usize).await {
+            Ok(Some(body)) => body,
+            Ok(None) => return PlannedDelete::Removed,
+            Err("invalid_remote_object") => return PlannedDelete::Changed,
+            Err(_) => return PlannedDelete::Retry,
+        };
+    if body.len() as u64 != first.1 || crate::object_store::digest(&body) != expected_hash {
+        return PlannedDelete::Changed;
+    }
+    match crate::object_store::request(config, keys, reqwest::Method::HEAD, key, &[], vec![]).await
+    {
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+            return PlannedDelete::Removed
+        }
+        Ok(response) if response.status().is_success() => match head(&response) {
+            Some(current) if current == first => (),
+            Some(_) => return PlannedDelete::Changed,
+            None => return PlannedDelete::Retry,
+        },
+        _ => return PlannedDelete::Retry,
+    }
+    let deleted =
+        crate::object_store::request(config, keys, reqwest::Method::DELETE, key, &[], vec![]).await;
+    if !deleted.is_ok_and(|response| {
+        response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND
+    }) {
+        return PlannedDelete::Retry;
+    }
+    if crate::object_store::request(config, keys, reqwest::Method::HEAD, key, &[], vec![])
+        .await
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::NOT_FOUND)
+    {
+        PlannedDelete::Removed
+    } else {
+        PlannedDelete::Retry
+    }
 }
 
 pub(crate) async fn delete_remote_key(
@@ -1229,13 +1331,16 @@ fn finish_purge(
         "other_stores_unverified".to_owned(),
         "app_state_backups_may_contain_metadata".to_owned(),
     ];
-    let (removed_remote_keys, retry_remote, remote_complete) = match remote {
+    let (removed_remote_keys, retry_remote, remote_complete, remote_changed) = match remote {
         Ok((removed, remaining)) => {
             let retry =
                 remote_deletable && remaining.iter().any(|item| !item.starts_with("shared:"));
             let complete = remaining.is_empty();
+            let changed = remaining
+                .iter()
+                .any(|item| item.starts_with("remote_object_changed:"));
             remote_remaining.extend(remaining);
-            (removed, retry, complete)
+            (removed, retry, complete, changed)
         }
         Err(reason) => {
             remote_remaining.push(format!("remote_access:{reason}"));
@@ -1243,6 +1348,7 @@ fn finish_purge(
                 Vec::new(),
                 remote_deletable
                     && !matches!(reason, "remote_target_changed" | "remote_plan_invalid"),
+                false,
                 false,
             )
         }
@@ -1255,6 +1361,8 @@ fn finish_purge(
     };
     let result_state = if retry_local {
         "local_retry_pending"
+    } else if remote_changed {
+        "remote_object_changed"
     } else if retry_remote {
         "remote_retry_pending"
     } else {
@@ -1311,6 +1419,19 @@ pub(crate) async fn retry_pending_for_backup(
     };
     let root = paths.objects_path.parent().ok_or("unavailable")?;
     for (asset_id, hash, operation, state, remote_json) in rows {
+        if state == "purge_pending"
+            && remote_json.as_deref().is_some_and(|json| {
+                serde_json::from_str::<Vec<String>>(json)
+                    .ok()
+                    .is_some_and(|values| {
+                        values
+                            .iter()
+                            .any(|value| value.starts_with("remote_object_changed:"))
+                    })
+            })
+        {
+            continue;
+        }
         if state == "purged" {
             let Some(json) = remote_json else { continue };
             let remaining: Vec<String> = serde_json::from_str(&json).map_err(|_| "unavailable")?;
@@ -1498,6 +1619,71 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_r2_upload_purge_failure_and_retry_preserves_other_assets() {
+        exercise_key_and_oauth_purge("r2_oauth").await;
+    }
+
+    #[tokio::test]
+    async fn ncp_and_r2_key_upload_purge_failure_and_retry() {
+        for provider in ["ncp", "cloudflare"] {
+            exercise_key_and_oauth_purge(provider).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ncp_and_r2_key_changed_etag_before_delete_stops() {
+        use std::io::{Read, Write};
+        for provider in ["ncp", "cloudflare"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                for (method, etag) in [("HEAD", "old"), ("GET", "old"), ("HEAD", "new")] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = [0u8; 8192];
+                    let n = stream.read(&mut request).unwrap();
+                    assert!(
+                        String::from_utf8_lossy(&request[..n]).starts_with(&format!("{method} "))
+                    );
+                    write!(stream, "HTTP/1.1 200 OK\r\nETag: \"{etag}\"\r\nContent-Length: 4\r\nConnection: close\r\n\r\n").unwrap();
+                    if method == "GET" {
+                        stream.write_all(b"data").unwrap();
+                    }
+                }
+                listener.set_nonblocking(true).unwrap();
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+            });
+            let config = crate::object_store::Config {
+                provider: provider.into(),
+                endpoint: format!("http://{address}"),
+                region: "kr-standard".into(),
+                bucket: "bucket".into(),
+                credential_id: "test".into(),
+                last_backup_at: None,
+                write_safety: Some(crate::object_store::WriteSafety::CheckThenWrite),
+            };
+            let keys = crate::object_store::Keys {
+                access_key_id: "TEST".into(),
+                secret_access_key: "test".into(),
+            };
+            assert_eq!(
+                delete_planned_key(
+                    &config,
+                    &keys,
+                    "fixture",
+                    &crate::object_store::digest(b"data")
+                )
+                .await,
+                PlannedDelete::Changed
+            );
+            server.join().unwrap();
+        }
+    }
+
+    async fn exercise_key_and_oauth_purge(provider: &'static str) {
         use std::{
             collections::BTreeMap,
             io::{Read, Write},
@@ -1528,10 +1714,15 @@ mod tests {
         let (server_objects, server_stop, server_failed) =
             (objects.clone(), stop.clone(), failed.clone());
         let server = std::thread::spawn(move || {
-            let base = format!(
-                "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects",
-                "a".repeat(32)
-            );
+            let oauth = provider == "r2_oauth";
+            let base = if oauth {
+                format!(
+                    "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects",
+                    "a".repeat(32)
+                )
+            } else {
+                "/momso-fixture".to_owned()
+            };
             while !server_stop.load(Ordering::Relaxed) {
                 let Ok((mut stream, _)) = listener.accept() else {
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1552,9 +1743,11 @@ mod tests {
                     }
                 };
                 let head = String::from_utf8(request[..head_end].to_vec()).unwrap();
-                assert!(head
-                    .lines()
-                    .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token")));
+                if oauth {
+                    assert!(head
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token")));
+                }
                 let mut first = head.lines().next().unwrap().split_whitespace();
                 let method = first.next().unwrap();
                 let path = first.next().unwrap();
@@ -1578,7 +1771,16 @@ mod tests {
                         .filter(|key| key.contains("/manifests/"))
                         .map(|key| serde_json::json!({"key":key}))
                         .collect();
-                    ("200 OK", serde_json::to_vec(&serde_json::json!({"success":true,"result":entries,"result_info":{"is_truncated":false}})).unwrap())
+                    if oauth {
+                        ("200 OK", serde_json::to_vec(&serde_json::json!({"success":true,"result":entries,"result_info":{"is_truncated":false}})).unwrap())
+                    } else {
+                        let items = map
+                            .keys()
+                            .filter(|key| key.contains("/manifests/"))
+                            .map(|key| format!("<Contents><Key>{key}</Key></Contents>"))
+                            .collect::<String>();
+                        ("200 OK", format!("<ListBucketResult><IsTruncated>false</IsTruncated>{items}</ListBucketResult>").into_bytes())
+                    }
                 } else {
                     let key = path
                         .strip_prefix(&format!("{base}/"))
@@ -1592,6 +1794,10 @@ mod tests {
                             .get(key)
                             .map(|value| ("200 OK", value.clone()))
                             .unwrap_or(("404 Not Found", vec![])),
+                        "HEAD" => map
+                            .get(key)
+                            .map(|value| ("200 OK", value.clone()))
+                            .unwrap_or(("404 Not Found", vec![])),
                         "DELETE" if !server_failed.swap(true, Ordering::SeqCst) => {
                             ("403 Forbidden", vec![])
                         }
@@ -1602,19 +1808,34 @@ mod tests {
                         _ => panic!("unexpected method"),
                     }
                 };
+                let etag = format!("\"{}\"", crate::object_store::digest(&body));
                 write!(
                     stream,
-                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nETag: {}\r\nConnection: close\r\n\r\n",
+                    body.len(), etag
                 )
                 .unwrap();
-                stream.write_all(&body).unwrap();
+                if method != "HEAD" {
+                    stream.write_all(&body).unwrap();
+                }
             }
         });
         let config = crate::object_store::Config {
-            provider: "cloudflare".into(),
+            provider: if provider == "r2_oauth" {
+                "cloudflare"
+            } else {
+                provider
+            }
+            .into(),
             endpoint: format!("http://{address}"),
-            region: "wrangleroauth".into(),
+            region: if provider == "r2_oauth" {
+                "wrangleroauth"
+            } else if provider == "ncp" {
+                "kr-standard"
+            } else {
+                "auto"
+            }
+            .into(),
             bucket: "momso-fixture".into(),
             credential_id: "test".into(),
             last_backup_at: None,
@@ -1627,21 +1848,44 @@ mod tests {
         let identity = age::x25519::Identity::generate();
         let mut target_keys = Vec::new();
         let mut other_keys = Vec::new();
+        let shared_upload = uuid::Uuid::new_v4().to_string();
+        let mut shared_key = String::new();
         for (name, source_hash, bytes) in [
             ("target", hash.clone(), b"target cipher".to_vec()),
             ("other", "b".repeat(64), b"other cipher".to_vec()),
         ] {
             let manifest = crate::object_store_transfer::Manifest {
-                version: 1,
+                version: 2,
                 kind: "object".into(),
                 relative_path: name.into(),
                 sha256: source_hash,
                 size: 1,
-                upload_id: uuid::Uuid::new_v4().to_string(),
-                chunks: vec![crate::object_store::digest(&bytes)],
+                upload_id: shared_upload.clone(),
+                chunks: vec![
+                    crate::object_store::digest(&bytes),
+                    crate::object_store::digest(b"shared cipher"),
+                ],
                 created_at: "2026-01-01T00:00:00Z".into(),
             };
             let data_key = crate::object_store_transfer::chunk_key(&manifest, 0);
+            let common_key = crate::object_store_transfer::chunk_key(&manifest, 1);
+            if shared_key.is_empty() {
+                shared_key = common_key.clone();
+                assert!(crate::object_store::request(
+                    &config,
+                    &keys,
+                    reqwest::Method::PUT,
+                    &common_key,
+                    &[],
+                    b"shared cipher".to_vec()
+                )
+                .await
+                .unwrap()
+                .status()
+                .is_success());
+            } else {
+                assert_eq!(shared_key, common_key);
+            }
             let manifest_key = format!("{}/manifests/{name}.age", crate::object_store::PREFIX);
             let encrypted = crate::object_store_transfer::encrypt_bytes(
                 &serde_json::to_vec(&manifest).unwrap(),
@@ -1668,10 +1912,52 @@ mod tests {
                 other_keys.extend([data_key, manifest_key]);
             }
         }
-        let (removed, remaining) =
-            purge_remote(&database, "asset", &hash, None, &config, &keys, &identity)
-                .await
-                .unwrap();
+        let mut first_plan = None;
+        if provider != "r2_oauth" {
+            objects
+                .lock()
+                .unwrap()
+                .insert(target_keys[0].clone(), b"changed cipher".to_vec());
+            let (removed, remaining) =
+                purge_remote(&database, "asset", &hash, None, &config, &keys, &identity)
+                    .await
+                    .unwrap();
+            assert!(removed.is_empty());
+            assert!(remaining
+                .iter()
+                .any(|value| value.starts_with("remote_object_changed:")));
+            assert_eq!(
+                finish_purge(&database, "asset", vec![], Ok((removed, remaining)), true)
+                    .unwrap()
+                    .state,
+                "remote_object_changed"
+            );
+            let page = list_deleted_with_target(
+                &root,
+                &database,
+                None,
+                40,
+                Some(&remote_target(&config, &identity)),
+            )
+            .unwrap();
+            assert_eq!(page.items[0].deletion_state, "remote_object_changed");
+            assert!(!page.items[0].can_purge);
+            assert!(!failed.load(Ordering::SeqCst));
+            assert_eq!(
+                objects.lock().unwrap().get(&target_keys[0]).unwrap(),
+                b"changed cipher"
+            );
+            objects
+                .lock()
+                .unwrap()
+                .insert(target_keys[0].clone(), b"target cipher".to_vec());
+            first_plan = Some(crate::storage::open_writable_connection(&database).unwrap().query_row("SELECT remote_plan_json FROM source_asset_deletions WHERE asset_id='asset'", [], |row| row.get::<_, String>(0)).unwrap());
+        }
+        let (removed, remaining) = purge_remote(
+            &database, "asset", &hash, first_plan, &config, &keys, &identity,
+        )
+        .await
+        .unwrap();
         assert!(!remaining.is_empty());
         assert_eq!(
             finish_purge(&database, "asset", vec![], Ok((removed, remaining)), true)
@@ -1701,7 +1987,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, vec![format!("shared:{shared_key}")]);
         finish_purge(&database, "asset", vec![], Ok((removed, remaining)), true).unwrap();
         assert!(
             list_deleted_with_target(&root, &database, None, 40, Some(&target))
@@ -1712,6 +1998,7 @@ mod tests {
         let map = objects.lock().unwrap();
         assert!(target_keys.iter().all(|key| !map.contains_key(key)));
         assert!(other_keys.iter().all(|key| map.contains_key(key)));
+        assert_eq!(map.get(&shared_key).unwrap(), b"shared cipher");
         drop(map);
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();

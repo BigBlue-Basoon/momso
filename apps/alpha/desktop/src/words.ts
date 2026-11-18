@@ -30,7 +30,7 @@ const ko = {
   /** 모델 계열 이름(열쇠는 소문자 영어 계열 이름). 모델 이름을 짜 맞출 때 이 낱말로 바꾼다. */
   family: { fable: '페이블', opus: '오푸스', sonnet: '소넷', haiku: '하이쿠', terra: '테라', sol: '솔', luna: '루나', astra: '아스트라' } as Record<string, string>,
   /** 단추 풍선. 이름표보다 하는 일이 드러나는 한국어 프로그램의 표준 문구. */
-  tip: { home: '대화하기', documents: '문서', media: '미디어', settings: '설정', back: '뒤로 가기', forward: '앞으로 가기' },
+  tip: { home: '대화하기', documents: '문서', media: '사진과 동영상', settings: '설정', back: '뒤로 가기', forward: '앞으로 가기' },
 
   // ---- 권한 단계(열쇠: '회사:백엔드 id'). 회사 앱의 공식 한국어(김성균 개발자가 찍어 준 사진). 없는 단계는 회사 원문 그대로. ----
   permission: {
@@ -94,7 +94,7 @@ const ko = {
       checksumMismatch: '받은 파일이 원래 파일과 달라 설치하지 않았습니다. 다시 시도해 주세요.',
     } as Record<string, string>,
     // 2026-11-16 본부: 그가 채팅방도 올리기로 정했으므로 그의 글 꼴을 지켜 "채팅방"만 더함(본부가 그에게 알림).
-    githubNotice: '수업 글과 채팅방이 내 GitHub 비공개 저장소에 올라간다',
+    githubNotice: '문서와 채팅방이 내 GitHub 비공개 저장소에 업로드됩니다.',
     repoLabel: '저장소',
     connect: '연결',
     push: '업로드',
@@ -122,9 +122,17 @@ const ko = {
     storeDisconnectText: '스토리지에 올린 원자료는 지워지지 않습니다.',
     restoreTitle: '백업에서 복원할까요?',
     restoreText: '앱의 목록을 마지막 백업 때로 되돌리고, 이 기기에 없는 원자료를 받아옵니다. 되돌리기 전에 지금 상태를 따로 남겨 둡니다.',
-    cancel: '그만두기',
+    cancel: '취소',
     done: '끝났습니다',
     failed: '하지 못했습니다',
+    /** GitHub 자동 백업(2026-11-18). 새로 씀, 그의 확인 전. */
+    autoBackup: '자동 백업',
+    autoPending: '바뀐 내용을 곧 업로드합니다',
+    autoRunning: '자동으로 업로드하는 중',
+    autoRetry: (a: unknown) => `업로드하지 못해 ${a}분 뒤에 다시 시도합니다`,
+    autoRetrySoon: '업로드하지 못해 곧 다시 시도합니다',
+    /** GitHub 칸: 글을 정해 두지 않은 까닭이 오면 그 값을 그대로 붙인다(무엇이 안 됐는지 알 수 있게). 2026-11-18 새로 씀, 그의 확인 전. */
+    unknownReason: (a: unknown) => `GitHub 상태를 확인하지 못했습니다(${a})`,
     /** 뒤쪽 상태 값 → 쉬운 말(실패 알림). */
     /** 원자료 저장소 회사 이름: 영어 그대로(2026-11-16 김성균 개발자가 정함, "저거는 그냥 AWS GCP 이렇게 적고"). */
     storeName: { aws: 'AWS', gcp: 'GCP', cloudflare: 'Cloudflare', ncp: 'NCP' } as Record<'aws' | 'gcp' | 'cloudflare' | 'ncp', string>,
@@ -152,6 +160,19 @@ const ko = {
       authentication_unavailable: 'GitHub 연결과 계정 상태를 확인하고 다시 시도해 주세요',
       account_unavailable: 'GitHub 연결과 계정 상태를 확인하고 다시 시도해 주세요',
       remote_unavailable: 'GitHub 연결과 계정 상태를 확인하고 다시 시도해 주세요',
+      // GitHub 상태·연결에서 뒤쪽이 주는데 글이 없던 까닭(archive_remote.rs, 2026-11-18). 새로 씀, 그의 확인 전.
+      local_state_unavailable: '몸소 폴더의 상태를 읽지 못했습니다. 다시 시도해 주세요',
+      git_unavailable: 'Git을 실행하지 못했습니다. 다시 시도해 주세요',
+      unsafe_git_configuration: '이 PC의 Git 설정이 GitHub 주소를 바꾸고 있어 멈췄습니다. Git 설정을 확인해 주세요',
+      unsafe_history: '기록에 확인할 수 없는 부분이 있어 멈췄습니다',
+      redaction_required: '기록에 가려야 할 값이 있어 업로드하지 않았습니다',
+      first_receive_in_progress: 'GitHub에서 처음 받아 오는 중입니다. 끝난 뒤에 다시 해 주세요',
+      merge_report_unavailable: '합친 결과를 확인하지 못했습니다. 다시 시도해 주세요',
+      reindex_failed: '받은 문서를 목록에 반영하지 못했습니다. 다시 시도해 주세요',
+      credentials_unavailable: '저장된 키를 읽지 못해 멈췄습니다. 다시 시도해 주세요',
+      fast_forward_failed: 'GitHub의 새 내용을 반영하지 못했습니다. 다시 시도해 주세요',
+      invalid_branch: '이 저장소의 기본 브랜치 이름은 쓸 수 없습니다',
+      unavailable: 'GitHub 상태를 확인하지 못했습니다. 다시 시도해 주세요',
       // 원자료 버킷 자동 만들기(2026-11-16 새로 쓴 글)
       username_required: '사용자 이름이 없어 버킷 이름을 정하지 못했습니다. 버킷 이름을 적어 주세요',
       invalid_username_for_bucket: '사용자 이름으로는 버킷 이름을 만들 수 없습니다. 버킷 이름을 적어 주세요',
@@ -240,7 +261,7 @@ const ko = {
     login: { claude: '클로드 코드에서 로그인', codex: '코덱스에서 로그인' } as Partial<Record<'codex' | 'claude' | 'gemini', string>>,
     loggingIn: '로그인 중',
     browserHint: '브라우저에서 로그인을 마치면 여기에 나타납니다.',
-    cancel: '그만두기',
+    cancel: '취소',
     logout: '로그아웃',
     apiKey: 'API 키',
     keyPlaceholder: 'API 키 넣기',
@@ -274,14 +295,14 @@ const ko = {
     /** 입력 칸에서 / 를 쳤을 때 뜨는 목록의 화면 읽기 이름. */
     pickerLabel: '스킬 선택',
     /** 입력 칸 안 스킬 조각의 지우기 단추. */
-    removeChip: (a: unknown) => `${a} 빼기`,
+    removeChip: (a: unknown) => `${a} 제거`,
     /** 보낸 말 위에 붙는 표시의 화면 읽기 이름. */
     usedLabel: (a: unknown) => `스킬: ${a}`,
     /** 설정 쪽 */
     settingsIntro: '자주 시키는 일을 한 번 적어 두고, 입력창에서 / 를 쳐서 불러 씁니다.',
     empty: '스킬은 자주 시키는 일을 한 번 적어 두는 것입니다. 입력창에서 / 를 치면 선택해 쓸 수 있습니다.',
     add: '새 스킬',
-    builtin: '처음부터 있던 것',
+    builtin: '기본 제공',
     mine: '내가 만든 것',
     conflict: '다른 곳에서 수정한 내용과 다릅니다',
     enable: (a: unknown) => `${a} 켜기`,
@@ -292,7 +313,7 @@ const ko = {
     fieldBody: '내용',
     bodyHint: 'AI가 이 스킬을 쓸 때 따를 내용을 적어 주세요.',
     save: '저장',
-    cancel: '그만두기',
+    cancel: '취소',
     remove: '삭제',
     back: '스킬 목록',
     removeTitle: (a: unknown) => `“${a}” 스킬을 삭제할까요?`,
@@ -312,7 +333,7 @@ const ko = {
     loading: '스킬 목록 불러오는 중',
     toggleFailed: '스킬을 켜거나 끄지 못했습니다',
     // 2026-11-16 쓸 수 있는지(skill_list 의 available·unavailableReason). 새로 씀, 그의 확인 전.
-    unavailableTag: '쓸 수 없음',
+    unavailableTag: '사용할 수 없음',
     unavailableReason: {
       skill_conflict: '다른 곳에서 수정한 내용과 달라 지금은 쓸 수 없습니다.',
       policy_modified: '처음 내용에서 수정되어 이 스킬로 브라우저를 열 수 없습니다.',
@@ -330,6 +351,8 @@ const ko = {
     failed: '파일을 첨부하지 못했습니다',
     /** 폴더를 끌어 놓았을 때(source_folder_not_allowed). 2026-11-17 새로 씀, 그의 확인 전. */
     folderNotAllowed: '폴더는 첨부할 수 없습니다. 파일을 놓아 주세요',
+    /** 내 말풍선 위 첨부 목록의 화면 읽기 이름. 2026-11-18 새로 씀, 그의 확인 전. */
+    sentLabel: (a: unknown) => `첨부 ${a}개`,
   },
   // ---- 채팅방 고정·보관(왼쪽 목록)과 설정의 보관된 채팅방. 2026-11-16 새로 쓴 글(그가 아직 정하지 않음, 낱말 목록에 올림). ----
   chatKeep: {
@@ -353,7 +376,7 @@ const ko = {
     /** 2026-11-17 본부 결정으로 고침(뒤쪽 대조 3): 삭제는 GitHub 백업으로 다른 컴퓨터에도 가고, 예전에 올린 기록에는 남을 수 있다. */
     removeText: '삭제하면 되돌릴 수 없습니다. GitHub에 백업하고 있으면 다른 컴퓨터에서도 지워지고, 예전에 업로드한 기록에는 남아 있을 수 있습니다.',
     removeFailed: '영구 삭제하지 못했습니다',
-    cancel: '그만두기',
+    cancel: '취소',
   },
   // ---- 빠른 모드 단추의 이름. 2026-11-16 김성균 개발자가 정함: 회사와 관계없이 "고속 모드"("'Fast mode' 저거는 고속 모드"). ----
   fastName: { claude: '고속 모드', codex: '고속 모드', gemini: '고속 모드' } as Partial<Record<'codex' | 'claude' | 'gemini', string>>,
@@ -374,7 +397,7 @@ const ko = {
     /** 오른쪽 패널의 첫 탭 이름(그 채팅방에서 다룬 문서와 미디어). */
     chatTab: '이 채팅방',
     /** 그 채팅방에서 다룬 것이 없을 때 패널의 한 줄(본부가 든 예를 따름). */
-    chatEmpty: '이 채팅방에서 다룬 문서와 미디어, 첨부파일이 여기에 모입니다.',
+    chatEmpty: '이 채팅방에서 다룬 문서와 첨부파일이 여기에 모입니다.',
     /** 오른쪽 패널의 첨부파일 탭(글 파일처럼 미디어가 아닌 첨부, T42). 2026-11-16 새로 쓴 글. */
     files: '첨부파일',
     /** 2026-11-16 새로 씀(그의 확인 전): 첨부파일 글을 패널에서 열었을 때(attachment_text_read 의 state). */
@@ -411,15 +434,71 @@ const ko = {
   // ---- components/DeletedSourcesSettings.tsx: 설정 "삭제한 원자료"(2026-11-17 본부 결정, "보관된 채팅방"과 같은 꼴). 새로 씀, 그의 확인 전. ----
   deletedSources: {
     settingsTitle: '삭제한 원자료',
-    settingsIntro: '삭제한 원자료는 첨부파일과 미디어에 보이지 않습니다. 되돌리면 다시 보입니다.',
+    settingsIntro: '삭제한 원자료는 첨부파일, 사진과 동영상에 보이지 않습니다. 되돌리면 다시 보입니다.',
     empty: '삭제한 원자료가 없습니다.',
     loading: '삭제한 원자료 불러오는 중',
     loadFailed: '삭제한 원자료를 읽지 못했습니다',
-    usedCount: (a: unknown) => `쓰던 곳 ${a}개`,
+    usedCount: (a: unknown) => `사용처 ${a}개`,
     purgeFailed: '완전히 삭제하지 못했습니다',
     // (지움) purgedName '완전히 삭제한 원자료': 뒤쪽이 다 지운 것을 목록에서 빼게 되어 걷어 냄(2026-11-17).
     /** 완전히 삭제를 눌렀지만 아직 다 지우지 못한 줄의 둘째 줄(local_retry_pending·remote_retry_pending). 2026-11-17 새로 씀, 그의 확인 전. */
     retryPending: '아직 다 지우지 못했습니다. 완전히 삭제를 다시 눌러 주세요',
+  },
+  // ---- components/PanelBrowser.tsx: 오른쪽 패널 브라우저(2026-11-17 본부 결정). 새로 씀, 그의 확인 전. ----
+  panelBrowser: {
+    /** 탭 이름: 제목도 호스트도 아직 없을 때. */
+    loading: '웹 페이지 불러오는 중',
+    reload: '새로 고침',
+    stop: '불러오기 멈추기',
+    address: '주소',
+    insecure: '안전하지 않은 연결',
+    openExternal: '기본 브라우저로 열기',
+    openFailed: '웹 페이지를 열지 못했습니다',
+    /** 링크의 주소를 뒤쪽이 거절했을 때(invalid_url). */
+    cannotOpen: '이 주소는 몸소 안에서 열 수 없습니다',
+    // (지움) download '몸소 안에서는 파일을 내려받을 수 없습니다…': 뒤쪽이 다운로드를 받게 되어 아래 글로 바꿈(2026-11-18).
+    /** 다운로드 알림 줄(panel-browser-download 의 state). 앱의 낱말 "다운로드". 2026-11-18 새로 씀, 그의 확인 전. */
+    downloading: (a: unknown) => `${a} 다운로드하는 중`,
+    downloadingFile: '파일 다운로드하는 중',
+    // 파일 이름은 확장자(영문)로 끝나 조사가 어긋나기 쉬워 쌍점 뒤에 둔다.
+    downloaded: (a: unknown) => `다운로드 폴더에 저장했습니다: ${a}`,
+    downloadedFile: '파일을 다운로드 폴더에 저장했습니다',
+    attachDownload: '채팅방에 첨부',
+    /** 2026-11-18 panel_download_reveal. 새로 씀, 그의 확인 전. */
+    revealDownload: '폴더에서 보기',
+    revealFailed: '폴더를 열지 못했습니다',
+    /** 팝업이 열려 있는 동안 패널 위쪽 한 줄(panel-browser-popup). 호스트는 쌍점 뒤에(조사 어긋남 피함). 새로 씀, 그의 확인 전. */
+    popupFrom: (a: unknown, b: unknown) => `${a}에서 연 창: ${b}`,
+    popupOpen: (a: unknown) => `열린 창: ${a}`,
+    downloadBlocked: (a: unknown) => `실행될 수 있는 파일이라 다운로드하지 않았습니다: ${a}`,
+    downloadBlockedFile: '실행될 수 있는 파일이라 다운로드하지 않았습니다',
+    downloadFailed: (a: unknown) => `다운로드하지 못했습니다: ${a}`,
+    downloadFailedFile: '파일을 다운로드하지 못했습니다',
+    google: '구글 계정 로그인은 오른쪽 패널에서 할 수 없습니다. 몸소 브라우저 창에서 열어 주세요',
+    googleNoSite: '구글 계정 로그인은 오른쪽 패널에서 할 수 없습니다',
+    openHuman: '몸소 브라우저 창에서 열기',
+    browserMissing: 'Edge나 Chrome이 없어 몸소 브라우저 창을 열지 못했습니다',
+    humanFailed: '몸소 브라우저 창을 열지 못했습니다',
+    /** AI 가 패널을 쓸 때 맨 위 한 줄(panel-agent-control-changed). 2026-11-18 새로 씀, 그의 확인 전. */
+    agentUsing: 'AI가 이 패널을 쓰고 있습니다',
+    /** 설정·미디어를 보는 중에 AI 가 패널을 열어 달라고 할 때 알림 줄(누를 때까지 남음). 2026-11-18 본부 임시안, 그의 확인 전. */
+    agentWants: 'AI가 브라우저를 쓰려고 합니다',
+    agentOpenPanel: '패널 열기',
+    /** AI 가 연 빈 패널의 탭 이름(브라우저의 빈 탭과 같은 말). */
+    newTab: '새 탭',
+    agentTakeOver: '직접 쓰기',
+    agentHuman: '직접 쓰는 중입니다. AI는 기다립니다',
+    agentResume: 'AI에게 돌려주기',
+    agentBusy: '다른 채팅방의 AI가 이 패널을 쓰고 있습니다',
+    agentControlFailed: '패널을 넘기지 못했습니다',
+    /** 2026-11-18 G57b: 다른 채팅방의 AI 가 쓸 때, 로그인·인증을 사람이 해야 할 때. 새로 씀, 그의 확인 전. */
+    agentOther: (a: unknown) => `“${a}” 채팅방의 AI가 이 패널을 쓰고 있습니다`,
+    agentLogin: '로그인은 직접 해 주세요. 끝나면 AI에게 돌려주세요',
+    agentCode: '인증 코드는 직접 입력해 주세요. 끝나면 AI에게 돌려주세요',
+    agentCheck: '확인 절차는 직접 해 주세요. 끝나면 AI에게 돌려주세요',
+    agentLoginOutside: '구글 로그인은 몸소 브라우저 창에서 해 주세요. 끝나면 AI에게 돌려주세요',
+    agentOpenOutside: '열기',
+    agentLoginNotYet: '아직 로그인이 끝나지 않았습니다',
   },
   // ---- 작업 내역 지우기(2026-11-17 본부 결정, 오른쪽 패널 작업 내역 탭 머리의 ⋯ 메뉴). 새로 씀, 그의 확인 전. ----
   receiptDelete: {
@@ -435,9 +514,9 @@ const ko = {
     purge: '완전히 삭제',
     menu: (a: unknown) => `${a} 메뉴`,
     title: (a: unknown) => `“${a}” 원자료를 삭제할까요?`,
-    checking: '쓰는 곳 확인하는 중',
-    checkFailed: '쓰는 곳을 확인하지 못해 삭제하지 않았습니다',
-    usedBy: (a: unknown) => `이 원자료를 쓰는 곳: ${a}.`,
+    checking: '사용처 확인하는 중',
+    checkFailed: '사용처를 확인하지 못해 삭제하지 않았습니다',
+    usedBy: (a: unknown) => `이 원자료의 사용처: ${a}.`,
     unused: '이 원자료를 쓰는 문서나 채팅방이 없습니다.',
     documents: (a: unknown) => `문서 ${a}개`,
     receipts: (a: unknown) => `작업 내역 ${a}개`,
@@ -447,7 +526,7 @@ const ko = {
     unnamedDocument: '이름 없는 문서',
     /** 2026-11-17 본부 결정으로 고침: 삭제한 원자료는 스스로 지워지지 않는다(기한 없음). 기한 대신 되돌리는 곳을 말한다. 쪽 이름은 deletedSources.settingsTitle 과 같게, 꼴은 "설정의 저장공간에서"처럼. */
     trashText: '삭제해도 설정의 삭제한 원자료에서 되돌릴 수 있습니다.',
-    changed: '쓰는 곳이 바뀌어 다시 확인했습니다.',
+    changed: '사용처가 바뀌어 다시 확인했습니다.',
     purgeTitle: (a: unknown) => `“${a}” 원자료를 완전히 삭제할까요?`,
     purgeText: '이 컴퓨터에서 되살릴 수 없게 지웁니다. 연결한 저장소나 다른 곳의 사본은 남아 있을 수 있습니다.',
     trashed: '원자료를 삭제했습니다',
@@ -465,7 +544,7 @@ const ko = {
     /** 2026-11-16 새로 씀(그의 확인 전): update_check 가 failed 일 때 설정 앱 정보의 흐린 한 줄. 릴리스가 없을 때도, 연결이 안 될 때도 오므로 까닭을 적지 않는다. */
     notChecked: '지금은 새 버전을 확인하지 못했습니다.',
     text2: '업데이트를 받지 못했습니다',
-    text3: '다시 켜서 업데이트 마치기',
+    text3: '다시 시작해 업데이트 완료',
     text4: '업데이트 받는 중',
     text5: (a: unknown) => `업데이트${a}`,
   },
@@ -473,11 +552,11 @@ const ko = {
   app: {
     /** 몸소 브라우저에서 선생님이 직접 해야 할 때(browser-human-required 의 reason). 채팅방 끝 한 줄. 2026-11-16 새로 씀, 그의 확인 전. */
     browserHuman: {
-      login: '브라우저 창에서 직접 로그인해 주세요.',
-      password: '브라우저 창에서 비밀번호를 직접 넣어 주세요.',
-      one_time_code: '브라우저 창에서 인증 번호를 직접 넣어 주세요.',
-      captcha: '브라우저 창에서 사람인지 확인하는 문제를 직접 풀어 주세요.',
-      verification: '브라우저 창에서 본인 확인을 직접 해 주세요.',
+      login: '브라우저에서 직접 로그인해 주세요.',
+      password: '브라우저에서 비밀번호를 직접 넣어 주세요.',
+      one_time_code: '브라우저에서 인증 번호를 직접 넣어 주세요.',
+      captcha: '브라우저에서 사람인지 확인하는 문제를 직접 풀어 주세요.',
+      verification: '브라우저에서 본인 확인을 직접 해 주세요.',
     } as Record<string, string>,
     browserHumanAfter: '끝나면 이 채팅방에 알려 주세요.',
     /** "다시 보내기"를 눌렀는데 그 말을 다시 보낼 수 없을 때(chat_send → retry_unavailable). 2026-11-16 새로 씀, 그의 확인 전. */
@@ -497,8 +576,8 @@ const ko = {
     text6: '권한 단계를 바꾸지 못했습니다',
     text7: 'AI 의 답을 받지 못했습니다',
     text8: '답을 보내지 못했습니다',
-    text9: '말을 저장하지 못했습니다',
-    text10: '말을 보내지 못했습니다',
+    text9: '메시지를 저장하지 못했습니다',
+    text10: '메시지를 보내지 못했습니다',
     /** 2026-11-16 새로 씀(그의 확인 전): 그 회사의 로그인·키가 받아들여지지 않았을 때(status auth_failed). */
     /**
      * 2026-11-16 새로 씀(그의 확인 전): 답이 오지 않았을 때 채팅방 끝의 한 줄(chat-error 의 error.kind, G18). 〈값1〉은 회사 이름.
@@ -517,6 +596,19 @@ const ko = {
     } as Record<string, (a: unknown) => string>,
     /** 회사가 다시 쓸 수 있는 때를 주었을 때 위 줄 뒤에 붙는다. */
     retryAt: (a: unknown) => `${a}에 다시 쓸 수 있습니다.`,
+    /** 2026-11-18 새로 씀(그의 확인 전): 다시 쓸 수 있는 때가 한 시간 안일 때, API 키가 받아들여지지 않았을 때(actions checkApiKey). */
+    retryIn: (a: unknown) => `${a}분 뒤에 다시 쓸 수 있습니다.`,
+    authKeyFailed: (a: unknown) => `${a} API 키가 받아들여지지 않았습니다. 설정의 AI 연결에서 키를 확인해 주세요.`,
+    /** 2026-11-18 새로 씀(그의 확인 전): 회사가 스스로 다시 시도하는 중(chat-provider-retrying)일 때 답 아래 한 줄. */
+    retrying: {
+      rateLimited: (a: unknown) => `${a}에 요청이 많아 다시 시도하는 중입니다`,
+      serviceUnavailable: (a: unknown) => `${a} 쪽이 잠깐 안 돼 다시 시도하는 중입니다`,
+      connectionClosed: (a: unknown) => `${a}와의 연결이 끊겨 다시 시도하는 중입니다`,
+      other: (a: unknown) => `${a}${josa(a, '이', '가')} 다시 시도하는 중입니다`,
+    } as Record<string, (a: unknown) => string>,
+    retryingAttempt: (n: number) => `(${n}번째)`,
+    retryingWait: (n: number) => `${n}초 뒤`,
+    retryingAi: 'AI',
     /** 그 줄의 단추(지금 할 수 있는 일). */
     failureAction: {
       retry: '다시 보내기',
@@ -528,7 +620,7 @@ const ko = {
     authFailed: (a: unknown) => `${a} 연결이 끊어졌습니다. 설정의 AI 연결에서 다시 연결해 주세요.`,
     text11: '이름을 바꾸지 못했습니다',
     text12: '이 환경에서는 폴더 선택을 사용할 수 없습니다',
-    text13: '다시 켜지 못했습니다',
+    text13: '다시 시작하지 못했습니다',
     text14: (a: unknown) => `새 ${a} 만들기`,
     text15: (a: unknown) => `${a} 화면으로 가기`,
     text16: '설정 열기',
@@ -538,10 +630,10 @@ const ko = {
     text20: (a: unknown) => `${a}${josa(a, '을', '를')} 삭제하지 못했습니다`,
     text21: (a: unknown) => `${a}${josa(a, '을', '를')} 바꾸지 못했습니다`,
     text22: '채팅방이 길어져 앞의 내용을 줄여서 이어 갑니다.',
-    title1: '다시 켤까요?',
-    text23: '저장하지 않은 수정 내용이 있거나 AI가 답하는 중입니다. 지금 다시 켜면 그 내용이 사라집니다.',
-    text24: '그만두기',
-    text25: '다시 켜기',
+    title1: '다시 시작할까요?',
+    text23: '저장하지 않은 수정 내용이 있거나 AI가 답하는 중입니다. 지금 다시 시작하면 그 내용이 사라집니다.',
+    text24: '취소',
+    text25: '다시 시작',
   },
   // ---- approvals.ts ----
   approvals: {
@@ -550,11 +642,11 @@ const ko = {
     // 2026-11-17 본부 결정으로 고침(뒤쪽 대조 9): 코덱스가 주는 "이번 세션 동안 허락"을 전할 뿐 몸소가 저장하지 않는다. "항상"이 아니다.
     text2: '이 채팅방에서 계속 허락',
     text3: '거절',
-    text4: '그만두기',
+    text4: '취소',
     text5: '이번만 허락했습니다',
-    text6: '이 채팅방에서 계속 허락했습니다. 앱을 다시 켜거나 AI를 바꾸면 다시 묻습니다',
+    text6: '이 채팅방에서 계속 허락했습니다. 앱을 다시 시작하거나 AI를 바꾸면 다시 묻습니다',
     text7: '거절했습니다',
-    text8: '그만두었습니다',
+    text8: '취소했습니다',
     /** 답하기 전에 뒤쪽이 물음을 닫았을 때(agent-approval-closed: 5분 지남이나 대화 멈춤, 뒤쪽 값으로는 둘을 가르지 못함). 2026-11-17 새로 씀, 그의 확인 전. */
     closed: '답하기 전에 요청이 닫혔습니다',
     /** 5분 동안 답하지 않아 닫혔을 때(reason timeout). 2026-11-17 새로 씀, 그의 확인 전. */
@@ -577,7 +669,11 @@ const ko = {
     text2: (a: unknown) => `${a}${josa(a, '이', '가')} 이 문서를 수정하려고 합니다`,
     text3: (a: unknown) => `${a}${josa(a, '이', '가')} 이 파일을 수정하려고 합니다`,
     text4: (a: unknown) => `${a}${josa(a, '이', '가')} 허락을 구합니다`,
-    aria1: '허락을 구하는 물음',
+    aria1: '승인 요청',
+    /** 코덱스가 보호 장치(샌드박스) 밖에서 명령을 다시 실행하려고 할 때(2026-11-18 실제 앱 점검). 새로 씀, 그의 확인 전. */
+    outsideSandbox: (a: unknown) => `${a}${josa(a, '이', '가')} 보호 장치 밖에서 명령을 다시 실행하려고 합니다`,
+    outsideSandboxWarn: '보호 장치 밖에서는 몸소 폴더 밖의 파일도 바꿀 수 있습니다. 명령을 확인한 뒤에만 허락해 주세요.',
+    showCommand: '명령 보기',
     /**
      * 2026-11-16 새로 쓴 글(그가 아직 정하지 않음): 파일을 어떻게 바꾸려는지(change)에 따른 머리 글.
      * edit 는 위 text2/text3 을 그대로 쓴다. 종류를 모르면(null) "바꾸려고"로 짐작하지 않고 적는다.
@@ -635,7 +731,7 @@ const ko = {
         'eu-south-1': '유럽(밀라노)', 'eu-south-2': '유럽(스페인)', 'eu-north-1': '유럽(스톡홀름)',
         'me-south-1': '중동(바레인)', 'me-central-1': '중동(UAE)', 'il-central-1': '이스라엘(텔아비브)',
       } as Record<string, string>,
-      visibility: '보이는 사람',
+      visibility: '공개 범위',
       visibilityText: { private: '나만 볼 수 있습니다.' } as Record<string, string>,
       cost: '비용',
       costText: { possible: '쓰는 양에 따라 그 회사에서 돈이 나갈 수 있습니다.' } as Record<string, string>,
@@ -647,15 +743,15 @@ const ko = {
     title: (a: unknown) => `${a} 연결에 필요한 키를 넣어 주세요`,
     note: '넣은 키는 AI에게 보내지 않고 이 컴퓨터의 몸소가 보관합니다.',
     save: '저장',
-    cancel: '그만두기',
+    cancel: '취소',
     saved: '키를 저장했습니다',
-    cancelled: '키 넣기를 그만두었습니다',
+    cancelled: '키 입력을 취소했습니다',
     /** 키를 넣기 전에 뒤쪽이 요청을 닫았을 때(agent-setup-secret-closed: 5분 지남이나 대화 멈춤). 2026-11-17 새로 씀, 그의 확인 전. */
     closed: '키를 넣기 전에 요청이 닫혔습니다',
     /** 5분 동안 키를 넣지 않아 닫혔을 때(reason timeout). 2026-11-17 새로 씀, 그의 확인 전. */
     closedTimeout: '키를 넣지 않아 요청이 닫혔습니다. 다시 하려면 AI에게 다시 말해 주세요',
     /** 2026-11-16 새로 씀(그의 확인 전): 그만두기(agent_setup_secret_cancel)가 실패했을 때. */
-    cancelFailed: '그만두지 못했습니다',
+    cancelFailed: '취소하지 못했습니다',
     failed: '키를 저장하지 못했습니다',
     /**
      * 칸 이름: 선생님이 그 회사 화면에서 키를 복사해 오므로 그 회사 화면에 적힌 이름 그대로(2026-11-16 본부). 뒤쪽에 보내는 이름(id)은 계약 그대로다.
@@ -694,7 +790,7 @@ const ko = {
     previousKept: (path: string | null) => (path ? `예전 폴더는 삭제하지 않고 그대로 두었습니다: ${path}` : '예전 폴더는 삭제하지 않고 그대로 두었습니다.'),
     text2: (a: unknown, b: unknown) => `${a}와 ${b}가 이 폴더에 들어 있습니다.`,
     text3: '폴더 열기',
-    text4: '위치 바꾸기',
+    text4: '위치 변경',
     aria1: '폴더 옮기는 중',
     text5: '버전',
     text6: '업데이트',
@@ -702,12 +798,11 @@ const ko = {
     copyright: 'Copyright © 2026 MOW and BigBlue',
     license: (name: string) => `몸소는 ${name} 라이선스를 따릅니다.`,
     licenseLink: '라이선스 전문 보기',
-    otherMarks: '앱에 나오는 다른 회사의 이름과 로고는 각 회사의 것입니다.',
     text7: '최신 버전입니다.',
     text8: '새 버전 ',
     text9: '이 있습니다.',
     aria2: '업데이트 받는 중',
-    text10: '다 받았습니다. 다시 켜면 업데이트가 끝납니다.',
+    text10: '다 받았습니다. 다시 시작하면 업데이트가 끝납니다.',
     text11: '업데이트 확인',
   },
   // ---- components/AssistantPanel.tsx ----
@@ -746,20 +841,24 @@ const ko = {
     label1: (a: unknown) => `새 ${a}`,
     title1: (a: unknown, b: unknown) => `“${a}” ${b}${josa(b, '을', '를')} 삭제할까요?`,
     text2: (a: unknown) => `안의 채팅방은 지워지지 않고 ${a} 밖으로 나옵니다.`,
-    text3: '그만두기',
+    text3: '취소',
     text4: (a: unknown) => `${a} 삭제`,
     aria2: (a: unknown) => `${a} 이름`,
     label2: (a: unknown, b: unknown) => `${a} ${b} 메뉴`,
     text5: '이름 바꾸기',
     text6: '위로 옮기기',
     text7: '아래로 옮기기',
-    aria3: (a: unknown) => `${a}, 답을 기다림`,
+    aria3: (a: unknown) => `${a}, 답변 대기 중`,
     label3: (a: unknown) => `${a} 메뉴`,
     text8: (a: unknown) => `${a}에 넣기`,
-    text9: (a: unknown) => `${a}에서 빼기`,
+    text9: (a: unknown) => `${a}에서 제거`,
   },
   // ---- components/Composer.tsx ----
   composer: {
+    /** 사진과 동영상의 "다시 만들기"로 붙인 생성물 칩(2026-11-18). 새로 씀, 그의 확인 전. */
+    regenerateImage: '다시 만들 사진',
+    regenerateVideo: '다시 만들 동영상',
+    regenerateRemove: '다시 만들기 빼기',
     /** 2026-11-17 모델 목록을 읽는 동안·읽지 못했을 때(본부 결정, 그가 보고 고친다). */
     modelsLoading: '모델 목록 불러오는 중',
     modelsFailed: '모델 목록을 읽지 못했습니다',
@@ -775,7 +874,7 @@ const ko = {
       keys_busy: '누르고 있는 키를 뗀 뒤 다시 눌러 주세요.',
       input_rejected: '음성 입력을 시작할 수 없습니다.',
     } as Record<string, string>,
-    aria2: '몸소 AI에게 보낼 말',
+    aria2: '메시지 입력',
     aria3: '응답 중단',
     aria4: '보내기',
     tip1: 'AI 선택',
@@ -810,10 +909,10 @@ const ko = {
     total: (n: number) => `용어 ${n}개`,
     found: (n: number) => `찾은 용어 ${n}개`,
     empty: '찾는 용어가 없습니다.',
-    otherCategory: '그 밖',
-    mine: '내가 더함',
+    otherCategory: '기타',
+    mine: '내가 추가함',
     spellings: '다른 표기',
-    edited: '내가 고침',
+    edited: '내가 수정함',
     // 2026-11-16 쓰기(더하기·수정·끄기, 사람 이름). 새로 씀, 그의 확인 전.
     termsTab: '용어',
     peopleTab: '사람 이름',
@@ -822,14 +921,14 @@ const ko = {
     fieldSpelling: '표기',
     fieldMeaning: '뜻',
     save: '저장',
-    cancel: '그만두기',
+    cancel: '취소',
     edit: '수정',
     remove: '삭제',
     saveMeaning: '뜻 저장',
-    addSpellingHint: '다른 표기 더하기',
-    addSpelling: '더하기',
+    addSpellingHint: '다른 표기 추가',
+    addSpelling: '추가',
     removeSpelling: (a: unknown) => `${a} 삭제`,
-    useTerm: '이 용어 쓰기',
+    useTerm: '이 용어 사용',
     off: '꺼짐',
     saved: '저장했습니다',
     saveFailed: '저장하지 못했습니다',
@@ -841,16 +940,16 @@ const ko = {
     peopleEmpty: '적어 둔 사람 이름이 없습니다.',
     peopleInvalid: '사람 이름 파일을 읽지 못했습니다. 파일은 그대로 두었습니다.',
     fieldName: '이름',
-    fieldAliases: '다르게 부르는 이름(쉼표로 나눔)',
-    aliases: '다르게 부르는 이름',
+    fieldAliases: '별칭(쉼표로 구분)',
+    aliases: '별칭',
     unconfirmed: '확인 안 됨',
-    confirm: '확인됨으로 바꾸기',
+    confirm: '확인됨으로 표시',
     removePersonTitle: (a: unknown) => `“${a}” 이름을 삭제할까요?`,
     /** 2026-11-17 본부 결정으로 고침(뒤쪽 대조 desktop-promise-audit 7): 앱에 되돌리는 단추가 없다는 뜻. 작업 내역의 글과 같은 말. */
     removePersonText: '삭제한 이름은 몸소에서는 되돌릴 수 없습니다.',
     // 2026-11-17 용어 삭제와 새 용어의 갈래. 새로 씀, 그의 확인 전.
-    fieldCategory: '갈래',
-    categoryNone: '고르지 않음',
+    fieldCategory: '분류',
+    categoryNone: '선택 안 함',
     deleteTerm: '용어 삭제',
     removeTermTitle: (a: unknown) => `“${a}” 용어를 삭제할까요?`,
     /** 2026-11-17 본부 결정으로 고침(뒤쪽 대조 desktop-promise-audit 7): 앱에 되돌리는 단추가 없다는 뜻. 작업 내역의 글과 같은 말. */
@@ -861,8 +960,8 @@ const ko = {
   selectAgain: '선택한 지 오래되어 진행하지 못했습니다. 파일을 다시 선택해 주세요',
   // ---- components/ChatImportSettings.tsx: 다른 AI 에서 내보낸 대화 가져오기. 2026-11-16 새로 씀(그가 보고 고친다, 낱말 목록에 올림). ----
   chatImport: {
-    title: '다른 AI의 대화 가져오기',
-    intro: 'ChatGPT, 클로드, 제미나이에서 내보낸 파일을 선택하면, 그 대화가 왼쪽 목록에 채팅방으로 생깁니다.',
+    title: '다른 AI의 채팅방 가져오기',
+    intro: 'ChatGPT, 클로드, 제미나이에서 내보낸 파일을 선택하면 왼쪽 목록에 채팅방으로 생깁니다.',
     name: { chatgpt: 'ChatGPT', claude: '클로드', gemini: '제미나이' } as Record<string, string>,
     hint: {
       chatgpt: 'ChatGPT 설정의 데이터 내보내기로 받은 파일(zip)을 선택합니다.',
@@ -871,28 +970,31 @@ const ko = {
       gemini: '구글 데이터 내보내기로 받은 제미나이 파일(zip 또는 JSON)을 선택합니다.',
     } as Record<string, string>,
     pick: '파일 선택',
-    fileKind: '내보낸 대화 파일',
+    fileKind: '내보낸 채팅방 파일',
     working: '가져오는 중',
-    done: (n: number) => `대화 ${n}개를 가져왔습니다.`,
+    done: (n: number) => `채팅방 ${n}개를 가져왔습니다.`,
     duplicate: (n: number) => `${n}개는 이미 있어 건너뛰었습니다.`,
-    updated: (n: number) => `${n}개는 새로 이어진 말을 더했습니다.`,
-    failed: '대화를 가져오지 못했습니다',
+    updated: (n: number) => `${n}개는 새로 이어진 메시지를 추가했습니다.`,
+    failed: '채팅방을 가져오지 못했습니다',
     // 2026-11-16 미리 세기·진행·그만두기. 새로 씀, 그의 확인 전.
-    counting: '파일 안의 대화를 세는 중',
-    preview: (n: number) => `대화 ${n}개가 들어 있습니다.`,
+    counting: '파일 안의 채팅방을 세는 중',
+    preview: (n: number) => `채팅방 ${n}개가 들어 있습니다.`,
     previewAlready: (n: number) => `${n}개는 이미 가져온 적이 있어 새로 이어진 말만 더합니다.`,
     previewUnreadable: (n: number) => `${n}개는 읽을 수 없어 건너뜁니다.`,
-    previewRange: (a: string, b: string) => `${a}부터 ${b}까지의 대화입니다.`,
-    previewDay: (a: string) => `${a}의 대화입니다.`,
-    previewEmpty: '이 파일에는 가져올 대화가 없습니다.',
+    previewRange: (a: string, b: string) => `${a}부터 ${b}까지의 기록입니다.`,
+    previewDay: (a: string) => `${a}의 기록입니다.`,
+    previewEmpty: '이 파일에는 가져올 채팅방이 없습니다.',
+    /** 제미나이: 뒤쪽 groupingNotice·guidance 가 있을 때(2026-11-18). 뒤쪽 글 대신 이 글. 새로 씀, 그의 확인 전. */
+    geminiGrouped: '제미나이 기록은 채팅방 구분이 없어, 같은 날 30분 안에 이어진 기록을 한 채팅방으로 묶었습니다.',
+    geminiJsonGuide: '구글 테이크아웃에서 \'내 활동\'을 JSON 형식으로 골라 내보낸 파일을 선택해 주세요.',
     start: '가져오기',
-    cancel: '그만두기',
+    cancel: '취소',
     progress: (done: number, total: number) => `가져오는 중 ${done}/${total}`,
-    cancelling: '그만두는 중',
-    cancelled: '가져오기를 그만두었습니다. 이번에 가져온 대화는 남기지 않았습니다.',
+    cancelling: '취소하는 중',
+    cancelled: '가져오기를 취소했습니다. 이번에 가져온 채팅방은 남기지 않았습니다.',
     reason: {
-      invalid_format: '이 파일에서 대화를 찾지 못했습니다. 내보내기로 받은 파일인지 확인해 주세요.',
-      unsupported_format: '이 파일에서 대화를 찾지 못했습니다. 내보내기로 받은 파일인지 확인해 주세요.',
+      invalid_format: '이 파일에서 채팅방을 찾지 못했습니다. 내보내기로 받은 파일인지 확인해 주세요.',
+      unsupported_format: '이 파일에서 채팅방을 찾지 못했습니다. 내보내기로 받은 파일인지 확인해 주세요.',
       archive_limit: '파일이 너무 커서 가져오지 못했습니다.',
       file_error: '파일을 열지 못했습니다.',
       // 2026-11-17 제미나이. 새로 씀, 그의 확인 전.
@@ -911,7 +1013,7 @@ const ko = {
     nameTitle: '사용자 이름을 정해 주세요',
     nameText: '영어로 적습니다. 영문자, 숫자, -, _, . 를 쓸 수 있습니다.',
     /** 이름 칸 아래: 이 이름이 어디에 쓰이는지(2026-11-17 새로 씀, 그의 확인 전). 적는 동안 momso-적은이름 이 보인다. */
-    nameUse: (a: unknown) => `이 이름으로 내 GitHub 저장소와 오브젝트 스토리지 버킷이 만들어집니다(${a}).`,
+    nameUse: (a: unknown) => `이 이름으로 내 백업 공간이 만들어집니다(${a}).`,
     nameUseSample: 'momso-이름',
     nameLabel: '사용자 이름',
     nameChars: '영문자, 숫자, -, _, . 만 쓸 수 있습니다.',
@@ -920,6 +1022,9 @@ const ko = {
     next: '다음',
     back: '이전',
     aiTitle: 'AI를 하나 이상 연결해 주세요',
+    /** 이미 하나 이상 연결됐을 때의 제목과 안내(2026-11-18). 새로 씀, 그의 확인 전. */
+    aiTitleReady: 'AI가 연결되었습니다',
+    aiTextReady: '다른 AI도 연결하거나 바로 시작할 수 있습니다.',
     aiText: (a: unknown, b: unknown, c: unknown) => `${a}, ${b}, ${c} 가운데 하나 이상 연결해야 몸소를 시작할 수 있습니다.`,
     checking: 'AI 연결 상태를 확인하고 있습니다',
     checkFailed: 'AI 연결 상태를 확인하지 못했습니다.',
@@ -928,17 +1033,33 @@ const ko = {
   },
   // ---- components/MediaView.tsx ----
   mediaView: {
-    aria1: '미디어',
+    /** 화면 이름(2026-11-18 그가 정함: "미디어 라 적지 말고 '사진과 동영상'이라고 적어"). 오른쪽 패널의 탭 이름도 이것. */
+    aria1: '사진과 동영상',
     aria2: '동영상',
     aria3: '사진',
     aria4: '크게 보기',
-    aria5: '앞 것',
-    aria6: '다음 것',
+    aria5: '이전',
+    aria6: '다음',
     aria7: '닫기',
     /** 2026-11-17 읽는 동안·없을 때·읽지 못했을 때(본부 결정, 그가 보고 고친다). */
-    loading: '미디어 불러오는 중',
-    empty: '미디어가 없습니다',
-    failed: '미디어를 읽지 못했습니다',
+    /** 2026-11-18 사진과 동영상 화면(AI 생성 도구들의 꼴): 거르기·찾기·버전·프롬프트. 새로 씀, 그의 확인 전("프롬프트", "버전"은 그의 말). */
+    all: '전체',
+    kindLabel: '보기',
+    searchPlaceholder: '프롬프트로 찾기',
+    clearSearch: '찾는 말 지우기',
+    noMatch: '찾는 사진과 동영상이 없습니다',
+    versions: (n: number) => `버전 ${n}개`,
+    version: (n: number) => `버전 ${n}`,
+    versionHow: { regenerated: '같은 프롬프트로 다시 만듦', edited: '고침' } as Record<string, string>,
+    copyPrompt: '프롬프트 복사',
+    /** "다시 만들기"(2026-11-18 그의 결정: 원래 채팅방으로). 원래 채팅방이 없을 때 단추 풍선. 새로 씀, 그의 확인 전. */
+    regenerate: '다시 만들기',
+    regenerateNoChat: '만든 채팅방이 없어 다시 만들 수 없습니다',
+    copied: '프롬프트를 복사했습니다',
+    copyFailed: '프롬프트를 복사하지 못했습니다',
+    loading: '사진과 동영상 불러오는 중',
+    empty: '사진과 동영상이 없습니다',
+    failed: '사진과 동영상을 읽지 못했습니다',
   },
   // ---- components/MessageRail.tsx ----
   messageRail: {
@@ -952,17 +1073,17 @@ const ko = {
     text3: (a: unknown) => `새 ${a}`,
     text4: (a: unknown) => `최근 ${a}`,
     aria1: '닫기',
-    aria2: '찾을 종류',
+    aria2: '검색 범위',
     /** 2026-11-16 바꿈(원자료 찾기를 더함, 그의 확인 전). 예전 글은 "채팅방, 문서, 할 일 찾기". */
     hint2: (a: unknown, b: unknown, c: unknown) => `${a}, ${b}, ${c}, 할 일 찾기`,
-    aria3: '찾은 것',
+    aria3: '검색 결과',
     aria4: '키 안내',
     label1: '선택',
     label2: '열기',
     label3: '종류 바꾸기',
     /** 2026-11-17 찾는 동안·찾은 것이 없을 때·검색이 실패했을 때(본부 결정, 그가 보고 고친다). */
     searching: '검색하는 중',
-    empty: '찾은 것이 없습니다',
+    empty: '검색 결과가 없습니다',
     failed: '검색하지 못했습니다',
   },
   // ---- components/SettingsView.tsx ----
@@ -1008,7 +1129,7 @@ const ko = {
     text8: (a: unknown, b: unknown) => `${a} ${b}% 남음`,
     text9: '불러오는 중',
     text10: (a: unknown) => `${a}에 확인`,
-    tip1: '띠의 고리가 보이는 갈래',
+    tip1: '사용량 고리에 보이는 한도',
     text11: (a: unknown) => `${a}% 남음`,
     text12: (a: unknown) => `${a}에 다시 참`,
   },
@@ -1129,15 +1250,25 @@ const ko = {
   // ---- components/WindowTitlebar.tsx ----
   windowTitlebar: {
     aria1: '창 제목 표시줄',
-    label1: '목록 보이기',
+    label1: '목록 표시',
     label2: '목록 숨기기',
     tip1: '최소화',
-    tip2: '이전 크기로',
+    tip2: '이전 크기로 복원',
     tip3: '최대화',
     tip4: '닫기',
   },
   // ---- components/ZetPanel.tsx ----
   zetPanel: {
+    /** 오른쪽 패널 위의 두 단추(문서·브라우저)와 문서에서 목록으로 돌아가는 줄. 2026-11-18 새로 씀, 그의 확인 전. */
+    browser: '브라우저',
+    backToList: '목록',
+    /** 문서 화면의 폴더(2026-11-18). 새로 씀, 그의 확인 전. */
+    folders: '폴더',
+    folderPath: '지금 폴더',
+    folderEmpty: '이 폴더에 문서가 없습니다',
+    folderCount: (n: number) => `문서 ${n}개`,
+    folderExpand: (a: unknown) => `${a} 펼치기`,
+    folderCollapse: (a: unknown) => `${a} 접기`,
     text1: '요약',
     text2: '보정된 전사',
     text3: '노트',
@@ -1153,7 +1284,7 @@ const ko = {
     text13: '이 문서를 이어받은 문서',
     text14: '이 문서를 가리키는 문서',
     text15: '이 문서를 대신하는 문서',
-    text16: '사람이 직접',
+    text16: '직접 작성',
     text17: '문서 목록을 읽지 못했습니다',
     text18: '주소를 열지 못했습니다',
     aria1: '문서 패널 너비',
@@ -1165,7 +1296,7 @@ const ko = {
     title1: '저장하지 않은 내용이 있습니다',
     text19: (a: unknown) => `"${a}" 글에서 수정한 내용을 아직 저장하지 않았습니다.`,
     text20: '계속 수정',
-    text21: '버리기',
+    text21: '저장 안 함',
     text22: '저장',
     text23: '저장했습니다',
     text24: '이전 버전으로 되돌렸습니다',
@@ -1188,7 +1319,7 @@ const ko = {
     text38: (a: unknown) => `저장하지 못했습니다. ${a}`,
     text39: '문서 불러오는 중',
     aria6: '제목',
-    text40: '그만두기',
+    text40: '취소',
     title2: '이 문서가 그사이 바뀌었습니다',
     text41: '수정하는 동안 이 문서가 다른 곳에서 바뀌었습니다. 바뀐 문서를 불러오면 내가 수정한 내용이 사라지고, 내 글로 덮어쓰면 그사이 바뀐 내용이 사라집니다.',
     text42: '바뀐 문서 불러오기',
@@ -1201,7 +1332,7 @@ const ko = {
     text47: '연결된 문서 불러오는 중',
     text48: '이전 버전 불러오는 중',
     text49: '저장한 버전이 아직 없습니다',
-    text50: (a: unknown) => `그때 제목: ${a}`,
+    text50: (a: unknown) => `당시 제목: ${a}`,
     text51: (a: unknown) => `다른 문서 ${a}개와 함께 저장`,
     text52: '종류',
     text53: '상태',
@@ -1226,9 +1357,9 @@ const ko = {
     text72: (a: unknown) => `${a} 불러오는 중`,
     text73: '누가',
     text74: '모델',
-    text75: '한 때',
-    text76: '읽은 것',
-    text77: '쓴 것',
+    text75: '시간',
+    text76: '읽은 파일',
+    text77: '수정한 파일',
   },
   // ---- runtime.ts ----
   runtime: {
@@ -1257,6 +1388,7 @@ const en: DeepPartial<Words> = {
   group: 'Group',
   search: 'Search',
   provider: { codex: 'Codex', claude: 'Claude', gemini: 'Gemini' },
+  mediaView: { aria1: 'Media' },
   tip: { home: 'Chat', documents: 'Documents', media: 'Media', settings: 'Settings', back: 'Go back', forward: 'Go forward' },
 }
 

@@ -66,9 +66,10 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
       const counts = await importChatExportWithProgress(requestId, path, source, (processed) => {
         setStep((current) => (current?.kind === 'importing' && current.requestId === requestId ? { ...current, processed } : current))
       })
-      const parts = [words.done(counts.imported)]
+      const parts = counts.needsJson ? [words.geminiJsonGuide] : [words.done(counts.imported)]
       if (counts.duplicate > 0) parts.push(words.duplicate(counts.duplicate))
       if (counts.updated > 0) parts.push(words.updated(counts.updated))
+      if (counts.grouped && !counts.needsJson && counts.imported > 0) parts.push(words.geminiGrouped)
       setStep({ kind: 'result', source, text: parts.join(' '), failed: false })
       onChanged()
     } catch (error) {
@@ -83,6 +84,7 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
   }
 
   function previewLines(preview: ChatImportPreview) {
+    if (preview.needsJson) return [words.geminiJsonGuide]
     if (preview.conversations === 0) return [words.previewEmpty]
     const lines = [words.preview(preview.conversations)]
     if (preview.alreadyImported > 0) lines.push(words.previewAlready(preview.alreadyImported))
@@ -90,6 +92,7 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
     const from = day(preview.oldest)
     const to = day(preview.newest)
     if (from && to) lines.push(from === to ? words.previewDay(from) : words.previewRange(from, to))
+    if (preview.grouped) lines.push(words.geminiGrouped)
     return lines
   }
 

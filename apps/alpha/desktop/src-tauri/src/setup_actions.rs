@@ -263,7 +263,7 @@ pub(crate) async fn dispatch(
         let provider = match input.get("provider").and_then(Value::as_str) {
             Some("chatgpt") => "chatgpt",
             Some("claude") => "claude",
-            Some("gemini") => return json!({"status":"unsupported_format"}),
+            Some("gemini") => "gemini",
             _ => return json!({"status":"unavailable"}),
         };
         let db = app.state::<crate::AppState>().paths.database_path.clone();
@@ -278,17 +278,22 @@ pub(crate) async fn dispatch(
             .await;
         return tauri::async_runtime::spawn_blocking(move || {
             if cancel.is_cancelled() { return json!({"status":"cancelled"}); }
-            let Some(file) = app.dialog().file().add_filter("대화 내보내기", &["json", "zip"]).blocking_pick_file().and_then(|v| v.into_path().ok()) else { return json!({"status":"cancelled"}); };
+            let Some(file) = app.dialog().file().add_filter("대화 내보내기", &["json", "zip", "html", "htm"]).blocking_pick_file().and_then(|v| v.into_path().ok()) else { return json!({"status":"cancelled"}); };
             if cancel.is_cancelled() { return json!({"status":"cancelled"}); }
             let preview = match crate::chat_export_import::preview(&db, &file, provider) { Ok(v) => v, Err(_) => return json!({"status":"failure"}) };
-            let message = format!("대화 {}개, 이미 가져온 대화 {}개, 읽을 수 없는 대화 {}개입니다. 가져올까요?", preview.conversations, preview.already_imported, preview.unreadable);
+            if let Some(guidance) = preview.guidance {
+                app.dialog().message(guidance).blocking_show();
+                return json!({"status":"needs_json", "guidance":guidance});
+            }
+            let notice = if provider == "gemini" { crate::chat_export_import::GEMINI_GROUPING_NOTICE } else { "" };
+            let message = format!("대화 {}개, 이미 가져온 대화 {}개, 읽을 수 없는 대화 {}개입니다. {} 가져올까요?", preview.conversations, preview.already_imported, preview.unreadable, notice);
             if !app.dialog().message(message).buttons(MessageDialogButtons::OkCancel).blocking_show() || cancel.is_cancelled() { return json!({"status":"cancelled"}); }
             let request_id = uuid::Uuid::new_v4().to_string();
             let result = crate::chat_export_import::import_with_id(&db, &file, provider, &request_id, &|processed| {
                 if cancel.is_cancelled() { crate::chat_export_import::cancel(&request_id); }
                 let _ = app.emit("chat-import-progress", json!({"requestId":request_id,"processed":processed,"chatId":chat_id}));
             });
-            match result { Ok(v) => { crate::report_chat_archive(&app, None, crate::chat_archive_store::write_all(&lease, &paths)); json!({"status":"success","imported":v.imported,"duplicate":v.duplicate,"skipped":v.skipped}) }, Err(e) if e == "cancelled" => json!({"status":"cancelled"}), Err(_) => json!({"status":"failure"}) }
+            match result { Ok(v) => { crate::report_chat_archive(&app, None, crate::chat_archive_store::write_all(&lease, &paths)); json!({"status":"success","imported":v.imported,"duplicate":v.duplicate,"skipped":v.skipped,"groupingNotice":v.grouping_notice}) }, Err(e) if e == "cancelled" => json!({"status":"cancelled"}), Err(_) => json!({"status":"failure"}) }
         }).await.unwrap_or_else(|_| json!({"status":"unavailable"}));
     }
     if let Some((service, account, region)) = storage_account(&input) {
@@ -360,14 +365,14 @@ async fn connect_r2_oauth(
     let username = crate::archive_remote::username_get_db(&db)
         .map_err(|_| "unavailable")?
         .ok_or("username_missing")?;
-    let account = crate::r2_oauth::login_account(cancel.clone()).await?;
+    let account = crate::r2_oauth::login_account(app.clone(), cancel.clone()).await?;
     let plan =
         crate::setup_approval::SetupPlan::new("cloudflare", &username, &account, Some("auto"))?;
     let broker = app.state::<crate::AppState>().approvals.clone();
     let permit = plan
         .authorize(&broker, &app, chat_id, ai_provider, cancel.clone())
         .await?;
-    crate::r2_oauth::connect_approved(app.state(), chat_id, permit, cancel).await
+    crate::r2_oauth::connect_approved(app.clone(), app.state(), chat_id, permit, cancel).await
 }
 
 pub(crate) fn storage_account(input: &Value) -> Option<(&'static str, &str, &str)> {

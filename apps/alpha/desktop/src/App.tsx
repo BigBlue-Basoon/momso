@@ -6,9 +6,9 @@ import { useAppUpdate } from './components/AppUpdate'
 import { QuestionDialog } from './components/ZetPanel'
 import { restartApp } from './app-update'
 import { isMissingCommand as isMissingMediaCommand } from './ai-models'
-import { EMPTY_CHAT_ITEMS, attachFileToChat, chatItemCount, getChatItems, listenChatItems, type ChatItems } from './chat-items'
+import { EMPTY_CHAT_ITEMS, attachFileToChat, chatItemCount, getChatItems, listenChatItems, readMessageAttachments, type AttachedFile, type ChatItems } from './chat-items'
 import { listSkills, type SkillEntry } from './skills'
-import { listMedia } from './media'
+import { listMedia, mediaChat, mediaSrc, type MediaItem } from './media'
 import { AssistantPanel, type ChatViewMessage } from './components/AssistantPanel'
 import type { ApprovalItem } from './components/ApprovalCard'
 import { listenApprovals, respondApproval, type ApprovalChoice } from './approvals'
@@ -65,6 +65,7 @@ import {
   type ChatContext,
   type ChatDocument,
   type ChatEntry,
+  type ChatRetrying,
 } from './chats'
 import {
   PROVIDER_NAME,
@@ -87,6 +88,8 @@ import {
   saveChatModels,
   savePreferences,
 } from './preferences'
+import { listenPanelAgent, requestPanelBrowser, usePanelBrowserHold, usePanelBrowserShown } from './panel-browser'
+import type { SourceChange } from './source-assets'
 
 const INITIAL_SESSION: RuntimeSession = {
   mode: 'starting',
@@ -110,6 +113,20 @@ const retryDay = new Intl.DateTimeFormat('ko-KR', { month: 'long', day: 'numeric
  * 회사가 준 "다시 쓸 수 있는 때"를 화면 글로. 숫자면 초(10^12 보다 크면 밀리초)로 읽고, 글이면 날짜로 읽는다.
  * 지금보다 앞서거나 40일보다 먼 값은 단위를 잘못 읽었을 수 있어 보이지 않는다(클로드는 단위가 확인되지 않음, G18).
  */
+/** 다시 쓸 수 있는 때가 한 시간 안이면 남은 분(반올림, 적어도 1), 아니면 null. */
+function retryMinutes(value: number | string | null) {
+  if (value === null || value === undefined || value === '') return null
+  const ms = typeof value === 'number' ? (value > 1e12 ? value : value * 1000) : Date.parse(value)
+  if (!Number.isFinite(ms)) return null
+  const left = ms - Date.now()
+  return left > 0 && left <= 3_600_000 ? Math.max(1, Math.round(left / 60_000)) : null
+}
+function withoutKey<T>(record: Record<string, T>, key: string) {
+  const next = { ...record }
+  delete next[key]
+  return next
+}
+
 function retryTimeText(value: number | string | null) {
   if (value === null || value === undefined || value === '') return null
   const ms = typeof value === 'number' ? (value > 1e12 ? value : value * 1000) : Date.parse(value)
@@ -174,6 +191,12 @@ function App() {
   const [chat, setChat] = useState<ChatDocument | null>(null)
   // 보냈지만 아직 대화에 붙지 않은 말(화면에 먼저 보여 준다).
   const [pendingMessage, setPendingMessage] = useState<ChatViewMessage | null>(null)
+  // 첨부(2026-11-18): 채팅방마다 보내기 전까지 붙인 것. 보내면 그 말(chat_send 의 userMessageId)에 붙여 말풍선에 보인다.
+  // 뒤쪽이 chat_read 에 말의 첨부를 돌려주면 그 값을 쓴다(앱을 다시 켜도 보이게). 그 전에는 이 앱을 켠 동안만 보인다.
+  const [pendingAttachments, setPendingAttachments] = useState<Record<string, AttachedFile[]>>({})
+  const pendingAttachmentsRef = useRef(pendingAttachments)
+  pendingAttachmentsRef.current = pendingAttachments
+  const [sentAttachments, setSentAttachments] = useState<Record<string, AttachedFile[]>>({})
   // 채팅방 고정·보관 명령이 있는지(앱을 열 때 알아본다).
   const [chatKeep, setChatKeep] = useState(false)
   // 보관 명령이 있는지 아직 모르면(읽는 중) 설정의 "보관된 채팅방" 칸을 숨기지 않는다(늦게 나타나지 않게, 2026-11-17).
@@ -190,6 +213,8 @@ function App() {
   // 마지막으로 보낸 곳(chat-error 의 fast_unavailable 이 어느 모델의 것인지 알려고).
   const lastSendRef = useRef<{ chatId: string; provider: AiProvider; model: string | null } | null>(null)
   // 답이 오지 않은 채팅방마다 그 까닭(G18 chat-error 의 error)과 보냈던 글. 그 채팅방에서 다시 보내면 지운다.
+  // 회사가 다시 시도하는 중인 채팅방(chat-provider-retrying). 답이 다시 오거나 끝나면 지운다.
+  const [retrying, setRetrying] = useState<Record<string, ChatRetrying>>({})
   const [chatFailures, setChatFailures] = useState<Record<string, { kind: string; retryAt: number | string | null; actions: string[]; provider: AiProvider; text: string; userMessageId: string | null }>>({})
   // userMessageId: 보내기가 시작되면 chat_send 가 주는 내 말의 id(다시 보내기에 쓴다).
   const lastSentTextRef = useRef<{ chatId: string; text: string; userMessageId?: string | null } | null>(null)
@@ -221,6 +246,8 @@ function App() {
   const replacePlace = useRef(false)
   // 대화마다 적다 만 말. 다른 대화로 갔다 와도 남아 있다.
   const drafts = useRef(new Map<string, string>())
+  // "다시 만들기"(2026-11-18 그의 결정: 원래 채팅방으로): 채팅방마다 다시 만들 생성물 하나. 입력칸 위에 칩으로 보이고, 보낼 때 regenerateOf 로 함께 넘긴다.
+  const [regenerate, setRegenerate] = useState<Record<string, { assetId: string; kind: MediaItem['kind']; thumb: string | null }>>({})
   // 지금 보낼 수 있는 곳(chat_send 에 물어 안다). 알기 전에는 Codex·Claude.
   const [probedProviders, setSendableProviders] = useState<AiProvider[]>(FALLBACK_PROVIDERS)
   // AI 연결 상태(provider_auth_status). 저장만 됐거나 틀렸거나 확인하지 못한 API 키는 연결로 치지 않는다(2026-11-17 계약 "AI 연결 확인").
@@ -250,7 +277,7 @@ function App() {
 
   const [toast, setToast] = useState<string | null>(null)
   // 알림 줄의 단추 하나(원자료 삭제의 되돌리기처럼). 알림이 사라지면 함께 사라진다.
-  const [toastAction, setToastAction] = useState<{ label: string; run: () => void } | null>(null)
+  const [toastAction, setToastAction] = useState<Array<{ label: string; run: () => void }> | null>(null)
   const [zetPanelOpen, setZetPanelOpen] = useState(false)
   // 스킬. null = 스킬 명령이 없음(입력 칸의 / 목록과 설정의 "스킬" 쪽을 그리지 않는다).
   const [skills, setSkills] = useState<SkillEntry[] | null>(null)
@@ -334,10 +361,14 @@ function App() {
   }, [desktopRuntime])
   selectedChatRef.current = selectedChatId
 
-  function showToast(message: string, action?: { label: string; run: () => void }) {
+  // sticky: 누르거나 거둘 때까지 남는 알림 줄(AI 가 패널을 열어 달라고 할 때, 2026-11-18).
+  function showToast(message: string, action?: { label: string; run: () => void } | Array<{ label: string; run: () => void }>, sticky = false) {
     setToast(message)
-    setToastAction(action ?? null)
+    const actions = action ? (Array.isArray(action) ? action : [action]) : []
+    setToastAction(actions.length > 0 ? actions : null)
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
+    toastTimer.current = null
+    if (sticky) return
     // 단추가 있으면 누를 틈을 더 둔다.
     toastTimer.current = window.setTimeout(() => { setToast(null); setToastAction(null) }, action ? 8000 : 2600)
   }
@@ -536,6 +567,17 @@ function App() {
     }
   }
 
+  // 사진과 동영상의 "다시 만들기": 원래 채팅방으로 가서 입력칸에 프롬프트를 채우고 생성물을 칩으로 붙인다. 바로 보내지 않는다.
+  function startRegenerate(item: MediaItem) {
+    const origin = mediaChat(item)
+    if (!origin) return
+    const picture = item.kind === 'video' ? item.posterPath : item.kind === 'image' ? item.path : null
+    setRegenerate((current) => ({ ...current, [origin.id]: { assetId: item.id, kind: item.kind, thumb: mediaSrc(picture) } }))
+    drafts.current.set(origin.id, item.prompt ?? '')
+    if (origin.id === selectedChatId) { setScreen('home'); setPrompt(item.prompt ?? ''); return }
+    showPlace(`chat:${origin.id}`)
+  }
+
   function startNewChat() {
     if (restoreBlocks()) return
     showPlace('new')
@@ -591,16 +633,23 @@ function App() {
       }
       // 폴더를 놓으면 뒤쪽이 그 경로만 source_folder_not_allowed 로 거절한다(2026-11-17). 폴더는 건너뛰고 파일은 계속 붙인다.
       const names: string[] = []
+      const attached: AttachedFile[] = []
       let folders = 0
       for (const path of paths) {
         try {
-          names.push(await attachFileToChat(chatId, path))
+          const file = await attachFileToChat(chatId, path)
+          attached.push(file)
+          names.push(file.name)
         } catch (error) {
           if (!String(error instanceof Error ? error.message : error).includes('source_folder_not_allowed')) throw error
           folders += 1
         }
       }
       if (names.length > 0) refreshChatItems(chatId, true)
+      if (attached.length > 0) {
+        const target = chatId
+        setPendingAttachments((current) => ({ ...current, [target]: [...(current[target] ?? []).filter((old) => !attached.some((file) => file.assetId === old.assetId)), ...attached] }))
+      }
       // 붙인 것과 폴더를 한 줄에 함께(둘 다 알 수 있게).
       const done = names.length === 0 ? null : names.length === 1 ? W.attach.done(names[0]) : W.attach.doneMany(names.length)
       showToast([done, folders > 0 ? W.attach.folderNotAllowed : null].filter(Boolean).join('. '))
@@ -755,9 +804,17 @@ function App() {
     void listenChatEvents({
       onStream: ({ chatId, delta }) => {
         if (generatingRef.current?.chatId === chatId) setStreamText((current) => current + delta)
+        // 답이 다시 오기 시작하면 "다시 시도하는 중" 줄을 거둔다.
+        setRetrying((current) => (current[chatId] ? withoutKey(current, chatId) : current))
+      },
+      // 회사가 스스로 다시 시도하는 중: 답을 쓰는 동안 그 채팅방 끝에 조용한 한 줄(2026-11-18 셋째 줄 계약).
+      onRetrying: (event) => {
+        if (generatingRef.current?.chatId !== event.chatId) return
+        setRetrying((current) => ({ ...current, [event.chatId]: event }))
       },
       // 고속 모드 여부와 넘기지 못한 말의 수는 이 이벤트 전에 답에 저장된다. 다시 읽은 말(chat_read)로 보인다.
       onDone: ({ chatId }) => {
+        setRetrying((current) => (current[chatId] ? withoutKey(current, chatId) : current))
         finishGenerating(chatId)
         refreshChatItems(chatId, true)
       },
@@ -778,6 +835,7 @@ function App() {
         refreshContext(chatId)
       },
       onError: ({ chatId, reason, message, status, error, userMessageId }) => {
+        setRetrying((current) => (current[chatId] ? withoutKey(current, chatId) : current))
         if (generatingRef.current?.chatId !== chatId) return
         if (status === 'fast_unavailable') {
           // 보낸 뒤 고속 모드를 쓸 수 없다고 왔다(보낸 말은 채팅방에 남고, 같은 글을 다시 보내면 백엔드가 그 말을 다시 쓴다).
@@ -1008,6 +1066,8 @@ function App() {
     if ((!text && !skill) || generatingChatId || !sendReady) return
     const target = chosen
 
+    // 다시 만들 생성물(칩)은 입력칸에서 보낸 말에만 붙인다.
+    const regenerateOf = !again && selectedChatId ? regenerate[selectedChatId]?.assetId ?? null : null
     if (!again) {
       setPrompt('')
       setChosenSkill(null)
@@ -1015,7 +1075,8 @@ function App() {
     // 답을 받지 못한 마지막 말과 같은 글을 다시 보내면 백엔드가 그 말을 다시 쓸 수 있다(고속 모드 실패 뒤). 그때는 같은 말을 한 번 더 그리지 않는다.
     const last = chat && chat.id === selectedChatId ? chat.messages[chat.messages.length - 1] : undefined
     const resending = Boolean(retryMessageId) || (last?.role === 'user' && last.text === text)
-    setPendingMessage(resending ? null : { id: `pending-${Date.now()}`, role: 'user', text, skill: skill?.title ?? null, createdAt: new Date().toISOString() })
+    const attachedNow = (selectedChatId && pendingAttachmentsRef.current[selectedChatId]) || []
+    setPendingMessage(resending ? null : { id: `pending-${Date.now()}`, role: 'user', text, skill: skill?.title ?? null, createdAt: new Date().toISOString(), attachments: attachedNow })
     const giveBack = (error: unknown, fallback: string) => {
       setPendingMessage(null)
       setPrompt(text)
@@ -1063,9 +1124,16 @@ function App() {
       const targetModel = models?.find((list) => list.provider === target.provider)?.models.find((model) => model.id === target.model)
       const refused = Boolean(fastRefused[`${target.provider}:${target.model ?? ''}`])
       lastSendRef.current = { chatId: targetId, provider: target.provider, model: target.model }
-      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null, retryMessageId ?? null)
+      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null, retryMessageId ?? null, regenerateOf)
       if (result?.status === 'started' && lastSentTextRef.current?.chatId === targetId) {
         lastSentTextRef.current = { ...lastSentTextRef.current, userMessageId: result.userMessageId ?? null }
+      }
+      // 보내기가 시작되면 뒤쪽이 붙인 것을 이 말에 묶는다. 화면도 그 말에 옮겨 두고 모아 둔 것을 비운다.
+      if (result?.status === 'started') {
+        if (regenerateOf) setRegenerate((current) => withoutKey(current, targetId))
+        const sent = pendingAttachmentsRef.current[targetId] ?? []
+        if (sent.length > 0 && result.userMessageId) setSentAttachments((current) => ({ ...current, [result.userMessageId as string]: sent }))
+        if (sent.length > 0) setPendingAttachments((current) => { const next = { ...current }; delete next[targetId]; return next })
       }
       if (result?.status === 'retry_unavailable') {
         // 그 말은 다시 보낼 수 없다(이미 답을 받았거나 예전 실패). 아무것도 보내지 않았다. 글을 입력창에 넣어 새로 보낼 수 있게 한다.
@@ -1175,6 +1243,15 @@ function App() {
   // 창에 파일을 끌어 놓으면 클립과 같게 지금 채팅방에 첨부한다(채팅방 화면일 때만).
   const attachDropRef = useRef<(paths: string[]) => void>(() => {})
   attachDropRef.current = (paths) => { if (screen === 'home' && !settingsOpen) void attachFiles(paths) }
+  // 패널에서 다 받은 파일의 "채팅방에 첨부"(2026-11-18). 지금 보는 채팅방에 붙인다(없으면 새로 만든다).
+  useEffect(() => {
+    const onAttach = (event: Event) => {
+      const paths = (event as CustomEvent<{ paths?: string[] }>).detail?.paths
+      if (Array.isArray(paths) && paths.length > 0) attachDropRef.current(paths)
+    }
+    window.addEventListener('momso:attach-paths', onAttach)
+    return () => window.removeEventListener('momso:attach-paths', onAttach)
+  }, [])
   useEffect(() => {
     if (!desktopRuntime) return
     let stop: (() => void) | undefined
@@ -1202,11 +1279,91 @@ function App() {
     return () => { disposed = true; stop?.() }
   }, [refreshChatItems])
 
+  // 원자료를 삭제·되돌리기·완전히 삭제하면(어느 화면에서든, source-assets.ts 가 알림) 지금 채팅방의 첨부 목록을 바로 다시 읽고,
+  // 말풍선의 첨부 표시(지운 것은 줄 그음)도 고친다. 뒤쪽이 chat_read 에 말의 첨부를 주면 그 값도 다시 읽는다(2026-11-18).
+  useEffect(() => {
+    const onChange = (event: Event) => {
+      const change = (event as CustomEvent<SourceChange>).detail
+      if (!change?.assetId) return
+      const mark = (list: AttachedFile[]) => list.map((file) => (file.assetId === change.assetId ? { ...file, deleted: change.deleted } : file))
+      setSentAttachments((current) => Object.fromEntries(Object.entries(current).map(([id, list]) => [id, mark(list)])))
+      setPendingAttachments((current) => Object.fromEntries(Object.entries(current).map(([id, list]) => [id, mark(list)])))
+      const chatId = selectedChatRef.current
+      if (!chatId) return
+      refreshChatItems(chatId, true)
+      void readChat(chatId).then((document) => {
+        if (selectedChatRef.current === chatId) setChat((current) => (current && current.id === chatId ? { ...current, messages: document.messages } : current))
+      }).catch(() => {})
+    }
+    window.addEventListener('momso:source-changed', onChange)
+    return () => window.removeEventListener('momso:source-changed', onChange)
+  }, [refreshChatItems])
+
   useEffect(() => {
     if (zetPanelOpen && selectedChatId && freshInPanel[selectedChatId]) setFreshInPanel((current) => ({ ...current, [selectedChatId]: false }))
   }, [zetPanelOpen, selectedChatId, freshInPanel])
 
   const toggleZetPanel = () => setZetPanelOpen((current) => !current)
+  // 몸소 안의 웹 링크(momso:open-web)는 오른쪽 패널의 브라우저 탭에서 연다. 홈에서 패널이 닫혀 있으면 연다(탭은 패널이 연다).
+  const screenRef = useRef(screen)
+  screenRef.current = screen
+  useEffect(() => {
+    const onOpen = () => { if (screenRef.current === 'home') setZetPanelOpen(true) }
+    window.addEventListener('momso:open-web', onOpen)
+    return () => window.removeEventListener('momso:open-web', onOpen)
+  }, [])
+  // AI 가 패널을 쓰려는데 패널이 없을 때(panel-agent-open-request, 2026-11-18 계약): 홈이면 패널을 열고 브라우저 탭을 연다.
+  // 뒤쪽은 20초 기다린다. 설정·미디어 화면을 보고 있으면 화면을 바꾸지 않는다(그때는 뒤쪽이 기다리다 끝난다).
+  useEffect(() => {
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenPanelAgent({
+      onOpenRequest: () => {
+        // 설정·미디어를 보는 중이면 화면을 빼앗지 않고 알림 줄로 묻는다(아래 agentOpenPending). 2026-11-18 본부가 정한 임시 동작(그가 바꿀 수 있음).
+        if (screenRef.current !== 'home' && screenRef.current !== 'documents') { setAgentOpenPending(true); return }
+        if (screenRef.current === 'home') setZetPanelOpen(true)
+        requestPanelBrowser(null)
+      },
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [])
+  // AI 가 패널을 열어 달라는데 설정·미디어를 보는 중: "AI가 브라우저를 쓰려고 합니다 [패널 열기]"를 남긴다. 누르면 홈으로 가서 패널을 연다.
+  // 선생님이 스스로 홈으로 돌아와도 연다. AI 의 답이 끝나면(뒤쪽 기다림도 끝남) 거둔다.
+  const [agentOpenPending, setAgentOpenPending] = useState(false)
+  const clearAgentToast = useCallback(() => {
+    setToast((current) => (current === W.panelBrowser.agentWants ? null : current))
+    setToastAction((current) => (current?.some((item) => item.label === W.panelBrowser.agentOpenPanel) ? null : current))
+  }, [])
+  useEffect(() => {
+    if (!agentOpenPending) return
+    if (screen === 'home' || screen === 'documents') {
+      setAgentOpenPending(false)
+      clearAgentToast()
+      if (screen === 'home') setZetPanelOpen(true)
+      requestPanelBrowser(null)
+      return
+    }
+    showToast(W.panelBrowser.agentWants, {
+      label: W.panelBrowser.agentOpenPanel,
+      run: () => { showPlace(chatPlace) },
+    }, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentOpenPending, screen])
+  // 답하던 것이 끝났을 때만(있던 것 → 없음) 거둔다. 처음부터 답하는 중이 아니었으면 누를 때까지 남긴다.
+  const wasGenerating = useRef<string | null>(null)
+  useEffect(() => {
+    const ended = wasGenerating.current !== null && generatingChatId === null
+    wasGenerating.current = generatingChatId
+    if (!ended || !agentOpenPending) return
+    setAgentOpenPending(false)
+    clearAgentToast()
+  }, [generatingChatId, agentOpenPending, clearAgentToast])
+  // 알림 줄은 창 오른쪽 아래라 패널 웹뷰(따로 뜨는 층) 밑에 깔린다. 브라우저 탭이 보이는 동안만 대화 칸 오른쪽 아래로 옮긴다(꼴은 그대로).
+  // 문서 화면은 패널이 화면 가득이라 옮길 자리가 없어, 알림 줄이 떠 있는 동안만 웹뷰를 숨긴다.
+  const webShown = usePanelBrowserShown()
+  const toastOverWeb = webShown && panelShown && Boolean(toast || session.error)
+  usePanelBrowserHold(toastOverWeb && screen === 'documents')
+  const toastStyle: CSSProperties | undefined = toastOverWeb && screen === 'home' ? { right: zetPanelFrame.width + 14 } : undefined
   const zetPanelToggle = desktopRuntime && !zetPanelOpen && screen === 'home'
     ? <ZetPanelToggle open={false} onToggle={toggleZetPanel} fresh={Boolean(selectedChatId && freshInPanel[selectedChatId])} />
     : null
@@ -1274,9 +1431,14 @@ function App() {
     const failure = selectedChatId ? chatFailures[selectedChatId] : undefined
     if (!failure) return null
     const name = PROVIDER_NAME[failure.provider]
-    const base = failure.kind === 'authentication' ? W.app.authFailed(name) : W.app.failure[failure.kind]?.(name) ?? W.app.text7
-    const when = retryTimeText(failure.retryAt)
-    const text = when && (failure.kind === 'usageLimit' || failure.kind === 'rateLimited') ? `${base} ${W.app.retryAt(when)}` : base
+    // 로그인이 풀린 것과 API 키가 받아들여지지 않은 것(actions 에 checkApiKey, 2026-11-18 계약)을 가른다.
+    const base = failure.kind === 'authentication'
+      ? (failure.actions.includes('checkApiKey') ? W.app.authKeyFailed(name) : W.app.authFailed(name))
+      : W.app.failure[failure.kind]?.(name) ?? W.app.text7
+    // 다시 쓸 수 있는 때: 한 시간 안이면 "N분 뒤", 그보다 멀면 시각.
+    const minutes = retryMinutes(failure.retryAt)
+    const when = minutes !== null ? W.app.retryIn(minutes) : retryTimeText(failure.retryAt) ? W.app.retryAt(retryTimeText(failure.retryAt)) : null
+    const text = when && (failure.kind === 'usageLimit' || failure.kind === 'rateLimited') ? `${base} ${when}` : base
     const actions: Array<{ id: string; label: string; run: () => void }> = []
     const has = (...ids: string[]) => ids.some((id) => failure.actions.includes(id))
     // 다시 보내기는 그 말의 id 를 알 때만(같은 말을 새로 남기지 않는다).
@@ -1286,6 +1448,17 @@ function App() {
     if (has('shorten')) actions.push({ id: 'shorten', label: W.app.failureAction.shorten, run: () => startNewChat() })
     if (has('switchProvider')) actions.push({ id: 'switchProvider', label: W.app.failureAction.switchProvider, run: () => window.dispatchEvent(new CustomEvent('momso:open-picker', { detail: 'company' })) })
     return { text, actions }
+  })()
+
+  // 다시 시도하는 중 한 줄: "제미나이에 요청이 많아 다시 시도하는 중입니다(2번째)" · 기다리는 초를 알면 덧붙인다.
+  const retryingText = (() => {
+    const now = selectedChatId ? retrying[selectedChatId] : undefined
+    if (!now) return null
+    const name = PROVIDER_NAME[(now.provider ?? '') as AiProvider] ?? now.provider ?? W.app.retryingAi
+    const base = (W.app.retrying[now.kind ?? ''] ?? W.app.retrying.other)(name)
+    const count = now.attempt ? W.app.retryingAttempt(now.attempt) : ''
+    const wait = now.retryAfterSeconds ? ` · ${W.app.retryingWait(Math.ceil(now.retryAfterSeconds))}` : ''
+    return `${base}${count}${wait}`
   })()
 
   const shownChat = chat && chat.id === selectedChatId ? chat : null
@@ -1307,6 +1480,7 @@ function App() {
       notHandedOver: typeof message.notHandedOver === 'number' && message.notHandedOver > 0 ? message.notHandedOver : 0,
       skill: message.skill ? skills?.find((item) => item.name === message.skill)?.title ?? message.skill : null,
       createdAt: message.createdAt,
+      attachments: message.role === 'user' ? readMessageAttachments(message.attachments) ?? sentAttachments[message.id] ?? undefined : undefined,
     })),
     ...(pendingMessage ? [pendingMessage] : []),
   ]
@@ -1366,7 +1540,7 @@ function App() {
         />
 
         {screen === 'documents' ? null : screen === 'media' ? (
-          <MediaView onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }} onNotice={showToast} />
+          <MediaView onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }} onNotice={showToast} onRegenerate={startRegenerate} />
         ) : settingsOpen ? (
           <SettingsView
             key={settingsStart}
@@ -1424,6 +1598,7 @@ function App() {
             />
             <AssistantPanel
               failure={failureView}
+              retrying={retryingText}
               headerActions={zetPanelToggle}
               title={shownChat?.title ?? ''}
               canRename={Boolean(shownChat)}
@@ -1477,6 +1652,8 @@ function App() {
                   permission={permission}
                   onPermissionChange={(mode) => void changePermission(mode)}
                   onVoiceProblem={showToast}
+                  regenerate={selectedChatId ? regenerate[selectedChatId] ?? null : null}
+                  onRemoveRegenerate={() => { if (selectedChatId) setRegenerate((current) => withoutKey(current, selectedChatId)) }}
                   context={selectedChatId ? chatContext : null}
                 />
               )}
@@ -1489,6 +1666,7 @@ function App() {
           open={panelShown}
           variant={screen === 'documents' ? 'page' : 'side'}
           width={zetPanelFrame.width}
+          minWidth={zetPanelFrame.minWidth}
           maxWidth={zetPanelFrame.maxWidth}
           onWidthChange={zetPanelFrame.changeWidth}
           onResizingChange={zetPanelFrame.setResizing}
@@ -1530,12 +1708,12 @@ function App() {
       )}
 
       {(toast || session.error) && (
-        <div className="workbench-toast" role="status">
+        <div className="workbench-toast" role="status" style={toastStyle}>
           {/* 앱 시작(runtime_info)이 실패하면 뒤쪽 글을 그대로 보이지 않는다: 한글 글이면 그대로, 영어·코드 값이면 일반 글과 다시 시도(2026-11-17). */}
           {toast ?? archiveErrorMessage(session.error, W.app.runtimeFailed)}
-          {toast && toastAction && (
-            <button className="secondary-button workbench-toast-action" type="button" onClick={() => { const run = toastAction.run; setToast(null); setToastAction(null); run() }}>{toastAction.label}</button>
-          )}
+          {toast && toastAction && toastAction.map((item) => (
+            <button key={item.label} className="secondary-button workbench-toast-action" type="button" onClick={() => { const run = item.run; setToast(null); setToastAction(null); run() }}>{item.label}</button>
+          ))}
           {!toast && session.error && (
             <button className="secondary-button workbench-toast-action" type="button" onClick={() => void refreshRuntime()}>{W.firstRun.retry}</button>
           )}

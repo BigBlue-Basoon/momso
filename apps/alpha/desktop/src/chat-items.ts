@@ -56,7 +56,10 @@ export async function getChatItems(chatId: string) {
  * 첨부한 것은 오른쪽 패널의 "이 채팅방에서 다룬 것"에 보인다(chat-items-updated). 미디어는 미디어 칸, 그 밖(글 파일 등)은 첨부파일 칸.
  * T42 부터 뒤쪽은 첨부한 파일을 다음 chat_send 의 말과 함께 묶어, 코덱스·클로드에 몸소 폴더 안 원자료 경로를 넘겨 읽게 한다(제미나이는 아직 아님).
  */
-export async function attachFileToChat(chatId: string, path: string) {
+/** 내 말풍선에 보일 첨부 하나(2026-11-18). assetId 는 원자료 번호. */
+export type AttachedFile = { assetId: string; name: string; mediaType: string | null; deleted?: boolean }
+
+export async function attachFileToChat(chatId: string, path: string): Promise<AttachedFile> {
   if (!isDesktopRuntime()) throw new Error('attach needs the desktop runtime')
   const fileName = fileNameFromPath(path)
   const proposal: SourceAssetImportProposal = {
@@ -68,7 +71,20 @@ export async function attachFileToChat(chatId: string, path: string) {
   const plan = await planSourceAssetImport(proposal)
   const asset = await applySourceAssetImport({ ...proposal, assetKind: plan.assetKind }, plan.planDigest, true)
   await invoke<string>('chat_attach_asset', { chatId, assetId: asset.id })
-  return fileName
+  return { assetId: asset.id, name: fileName, mediaType: proposal.mediaType ?? null }
+}
+
+/**
+ * chat_read 의 내 말에 붙은 첨부(뒤쪽에 요청한 꼴, 2026-11-18): messages[].attachments = [{ assetId, name, mediaType, deleted }].
+ * 뒤쪽은 보낼 때 첨부를 그 말에 묶어 둔다(chat_attachments.message_id). 아직 chat_read 가 돌려주지 않으면 null.
+ */
+export function readMessageAttachments(value: unknown): AttachedFile[] | null {
+  if (!Array.isArray(value)) return null
+  return value.flatMap((item) => {
+    const entry = item as Partial<AttachedFile> | null
+    if (!entry || typeof entry.assetId !== 'string' || typeof entry.name !== 'string') return []
+    return [{ assetId: entry.assetId, name: entry.name, mediaType: typeof entry.mediaType === 'string' ? entry.mediaType : null, deleted: entry.deleted === true }]
+  })
 }
 
 export async function listenChatItems(onChange: (chatId: string) => void) {

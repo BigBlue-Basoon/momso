@@ -19,8 +19,8 @@ type Draft = { name: string; title: string; description: string; body: string }
 const EMPTY: Draft = { name: '', title: '', description: '', body: '' }
 
 /**
- * 설정의 "스킬" 쪽. 목록(이름, 설명, 처음부터 있던 것 / 내가 만든 것, 켜고 끄기) → 누르면 고치기, "새 스킬", 없애기.
- * 처음부터 있던 스킬은 없앨 수 없고 끌 수만 있다. 저장은 문서처럼 그사이 바뀌었으면 묻는다.
+ * 설정의 "스킬" 쪽. 목록(이름, 설명, 기본 제공 / 내가 만든 것, 켜고 끄기) → 누르면 고치기, "새 스킬", 없애기.
+ * 기본 제공 스킬은 없앨 수 없고 끌 수만 있다. 저장은 문서처럼 그사이 바뀌었으면 묻는다.
  */
 export function SkillsSettings({ skills, onChanged }: { skills: SkillEntry[]; onChanged: () => void }) {
   const [editing, setEditing] = useState<{ name: string | null } | null>(null)

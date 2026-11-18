@@ -1,5 +1,6 @@
 import { Fragment, type ReactNode, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { useAvoidPanelBrowser } from '../panel-browser'
 import './ShortcutTip.css'
 
 // 올린 뒤 풍선이 뜨기까지(스쳐 지나갈 때 깜빡이지 않게).
@@ -29,6 +30,8 @@ export function ShortcutTip({
   const [open, setOpen] = useState(false)
   const [leaving, setLeaving] = useState(false)
   const [place, setPlace] = useState<{ left: number; top: number } | null>(null)
+  // 풍선이 패널 웹뷰와 겹치면 떠 있는 동안 웹뷰를 숨긴다(웹뷰는 HTML 위에 그려진다).
+  useAvoidPanelBrowser(tip, open && place !== null)
 
   const show = () => {
     if (timer.current) window.clearTimeout(timer.current)

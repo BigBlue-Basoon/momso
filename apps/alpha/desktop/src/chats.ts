@@ -45,6 +45,8 @@ export type ChatMessage = {
   actualEffort?: string | null
   /** 답이 끝난 까닭(chat_read). 옛 말은 null. completed 가 아니면 끊긴 답이라 한 줄 알린다. */
   finishReason?: 'completed' | 'length_limit' | 'turn_limit' | 'cancelled' | 'error' | 'refusal' | null
+  /** 내 말에 붙여 보낸 첨부(뒤쪽에 요청한 꼴. chat-items.ts readMessageAttachments 로 읽는다). */
+  attachments?: unknown
 }
 
 export type ChatDocument = {
@@ -85,6 +87,10 @@ export type ChatImportCounts = {
   updated: number
   addedMessages: number
   conflicts: number
+  /** 제미나이: 30분 규칙으로 채팅방을 나눴다는 표시(뒤쪽 글은 쓰지 않고 있다·없다만 본다). */
+  grouped?: boolean
+  /** 제미나이: HTML 을 골라 JSON 이 필요하다는 안내. */
+  needsJson?: boolean
 }
 
 /**
@@ -94,12 +100,12 @@ export type ChatImportCounts = {
  *   chat_import_export_cancel({ requestId }) → 대화 경계에서 멈추고 그 요청 전체를 되돌린다. 그러면 가져오기는 'cancelled' 오류로 끝난다.
  *   alreadyImported 는 같은 회사·대화 번호가 있는 수(새 말이 이어졌으면 더한다).
  */
-export type ChatImportPreview = { conversations: number; alreadyImported: number; unreadable: number; oldest: string | null; newest: string | null }
+export type ChatImportPreview = { conversations: number; alreadyImported: number; unreadable: number; oldest: string | null; newest: string | null; grouped?: boolean; needsJson?: boolean }
 export async function previewChatExport(path: string, provider: ChatImportSource) {
   requireChats()
-  const value = await invoke<Partial<ChatImportPreview> | null>('chat_import_export_preview', { path, provider })
+  const value = await invoke<(Partial<ChatImportPreview> & { groupingNotice?: unknown; guidance?: unknown }) | null>('chat_import_export_preview', { path, provider })
   const n = (v: unknown) => (typeof v === 'number' ? v : 0)
-  return { conversations: n(value?.conversations), alreadyImported: n(value?.alreadyImported), unreadable: n(value?.unreadable), oldest: value?.oldest ?? null, newest: value?.newest ?? null } as ChatImportPreview
+  return { conversations: n(value?.conversations), alreadyImported: n(value?.alreadyImported), unreadable: n(value?.unreadable), oldest: value?.oldest ?? null, newest: value?.newest ?? null, grouped: typeof value?.groupingNotice === 'string', needsJson: typeof value?.guidance === 'string' } as ChatImportPreview
 }
 export async function importChatExportWithProgress(requestId: string, path: string, provider: ChatImportSource, onProgress: (processed: number) => void) {
   requireChats()
@@ -107,11 +113,12 @@ export async function importChatExportWithProgress(requestId: string, path: stri
     if (event.payload?.requestId === requestId) onProgress(event.payload.processed)
   })
   try {
-    const value = await invoke<Partial<ChatImportCounts> | null>('chat_import_export_progress', { requestId, path, provider })
+    const value = await invoke<(Partial<ChatImportCounts> & { groupingNotice?: unknown; guidance?: unknown }) | null>('chat_import_export_progress', { requestId, path, provider })
     const n = (key: keyof ChatImportCounts) => (typeof value?.[key] === 'number' ? value[key] as number : 0)
     return {
       imported: n('imported'), duplicate: n('duplicate'), skipped: n('skipped'), omittedNonTextMessages: n('omittedNonTextMessages'),
       omittedAttachments: n('omittedAttachments'), updated: n('updated'), addedMessages: n('addedMessages'), conflicts: n('conflicts'),
+      grouped: typeof value?.groupingNotice === 'string', needsJson: typeof value?.guidance === 'string',
     } as ChatImportCounts
   } finally {
     stop()
@@ -271,9 +278,12 @@ export async function listenChatListUpdated(handler: () => void) {
  */
 export type SendResult = { status: 'started' | 'unavailable' | 'not_connected' | 'skill_unavailable' | 'fast_unavailable' | 'retry_unavailable' | string; userMessageId?: string | null }
 
-export async function sendChatMessage(chatId: string, text: string, provider: AiProvider, model: string | null, effort: string | null, fast: boolean | null = null, skill: string | null = null, retryMessageId: string | null = null) {
+/**
+ * regenerateOf(2026-11-18 화면이 가정한 꼴, 셋째 줄에 부탁함): "다시 만들기"로 붙인 생성물의 원자료 id. 뒤쪽이 아직 받지 않으면 무시된다.
+ */
+export async function sendChatMessage(chatId: string, text: string, provider: AiProvider, model: string | null, effort: string | null, fast: boolean | null = null, skill: string | null = null, retryMessageId: string | null = null, regenerateOf: string | null = null) {
   requireChats()
-  return invoke<SendResult>('chat_send', { chatId, text, provider, model, effort, ...(fast === null ? {} : { fast }), ...(skill === null ? {} : { skill }), ...(retryMessageId === null ? {} : { retryMessageId }) })
+  return invoke<SendResult>('chat_send', { chatId, text, provider, model, effort, ...(fast === null ? {} : { fast }), ...(skill === null ? {} : { skill }), ...(retryMessageId === null ? {} : { retryMessageId }), ...(regenerateOf === null ? {} : { regenerateOf }) })
 }
 
 /**
@@ -336,7 +346,14 @@ export type ChatEventHandlers = {
   onCompacted?: (event: { chatId: string }) => void
   /** 첫 답 뒤에 클로드가 내용을 보고 채팅방에 짧은 이름을 지어 붙임(chat-renamed { chatId, title }). */
   onRenamed?: (event: { chatId: string; title: string }) => void
+  /**
+   * 회사가 스스로 다시 시도하는 중(2026-11-18 셋째 줄 계약 desktop-chat-failure-contract.md, 지금은 제미나이만):
+   * chat-provider-retrying { chatId, provider, attempt, kind: rateLimited | serviceUnavailable | connectionClosed, retryAfterSeconds }.
+   * 끝내 실패하면 chat-error 가 따로 온다.
+   */
+  onRetrying?: (event: ChatRetrying) => void
 }
+export type ChatRetrying = { chatId: string; provider: string | null; attempt: number | null; kind: string | null; retryAfterSeconds: number | null }
 
 export async function listenChatEvents(handlers: ChatEventHandlers) {
   if (!isDesktopRuntime()) return () => {}
@@ -346,6 +363,17 @@ export async function listenChatEvents(handlers: ChatEventHandlers) {
     listen<ChatErrorEvent>('chat-error', (event) => handlers.onError(event.payload)),
     listen<{ chatId: string; context?: ChatContext | null }>('chat-context-updated', (event) => handlers.onContext?.(event.payload)),
     listen<{ chatId: string }>('chat-compacted', (event) => handlers.onCompacted?.(event.payload)),
+    listen<{ chatId?: unknown; provider?: unknown; attempt?: unknown; kind?: unknown; retryAfterSeconds?: unknown }>('chat-provider-retrying', (event) => {
+      const p = event.payload ?? {}
+      if (typeof p.chatId !== 'string') return
+      handlers.onRetrying?.({
+        chatId: p.chatId,
+        provider: typeof p.provider === 'string' ? p.provider : null,
+        attempt: typeof p.attempt === 'number' && p.attempt > 0 ? p.attempt : null,
+        kind: typeof p.kind === 'string' ? p.kind : null,
+        retryAfterSeconds: typeof p.retryAfterSeconds === 'number' && p.retryAfterSeconds > 0 ? p.retryAfterSeconds : null,
+      })
+    }),
     listen<{ chatId: string; title?: string | null }>('chat-renamed', (event) => {
       const title = (event.payload?.title ?? '').trim()
       if (event.payload?.chatId && title) handlers.onRenamed?.({ chatId: event.payload.chatId, title })

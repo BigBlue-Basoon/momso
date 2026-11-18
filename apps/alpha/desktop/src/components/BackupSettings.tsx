@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Database, GitBranch, Info, LoaderCircle } from 'lucide-react'
 import {
   errorState,
@@ -15,6 +15,9 @@ import {
   remotePull,
   remotePush,
   remoteStatus,
+  autoBackupGet,
+  autoBackupSet,
+  type AutoBackupStatus,
   storeBackup,
   storeConnect,
   storeDisconnect,
@@ -45,13 +48,15 @@ function size(bytes: number | null) {
   return `${(bytes / 1024 ** 3).toFixed(1)}GB`
 }
 const message = (state: string | null) => (state && B.reason[state]) || B.failed
+// GitHub 칸의 까닭: 글을 정해 둔 것은 그 글, 정해 두지 않은 값은 그 값을 붙여 보인다("하지 못했습니다"만 남지 않게, 2026-11-18).
+const githubMessage = (state: string | null) => (state && B.reason[state]) || (state ? B.unknownReason(state) : B.failed)
 // GitHub 의 까닭 한 줄. 예전에는 이력이 막힌 까닭이 사용자 정보("나에 대해")면 따로 적었지만, 2026-11-16 그가 사용자 정보도 올린다고 정해
 // 뒤쪽은 historyReason 을 늘 비워 준다(archive_remote.rs). 그래서 그 갈래와 글을 지웠다.
 // 풀지 못한 것이 남았으면(diverged) "멈췄다"가 아니라 몇 개가 남았는지. 경로 목록을 계산하지 못했으면(null) 수 없이(2026-11-17).
 const remoteMessage = (status: RemoteStatus) => (
   status.reason === 'diverged' && Array.isArray(status.conflictPaths) && status.conflictPaths.length > 0
     ? B.conflictsLeft(status.conflictPaths.length)
-    : message(status.reason)
+    : githubMessage(status.reason)
 )
 
 /** 양쪽에서 고친 같은 문서라 이 PC 의 것을 이전 버전으로 남긴 문서. 제목을 읽지 못한 것은 "이름 없는 문서". 서로 다른 파일이 저절로 합쳐진 것(autoMerged)은 알리지 않는다. */
@@ -107,8 +112,9 @@ function GithubBackup() {
   const username = usernameState.name
   // 읽는 데 2초쯤 걸린다(2026-11-17 실제 앱). 그동안 "불러오는 중", 명령은 있는데 읽지 못했으면 그 줄과 다시 시도(명령이 없는 옛 뒤쪽은 글 없이 막기만).
   const [statusFailed, setStatusFailed] = useState(false)
+  const [statusError, setStatusError] = useState<string | null>(null)
   const refresh = useCallback(() => {
-    remoteStatus().then((value) => { setStatus(value); setStatusFailed(false) }).catch((error) => { setStatus(null); setStatusFailed(!isMissingCommand(error)) })
+    remoteStatus().then((value) => { setStatus(value); setStatusFailed(false); setStatusError(null) }).catch((error) => { setStatus(null); setStatusFailed(!isMissingCommand(error)); setStatusError(errorState(error)) })
   }, [])
   useEffect(() => { refresh() }, [refresh])
   // 채팅방 사본 쓰기 실패(chat-archive-changed unavailable): 까닭 줄과 같은 자리·같은 꼴의 한 줄. 까닭을 모르면(앱을 다시 켬) 남은 쓰기 수로.
@@ -138,6 +144,43 @@ function GithubBackup() {
   // 같은 이름의 파일이 있어 멈췄으면 그 파일들(뒤쪽 진행 값 또는 받기 결과의 conflictPaths).
   const receiveConflict = firstReceive.conflictPaths.length > 0 ? firstReceive.conflictPaths
     : status?.reason === 'first_receive_conflict' && Array.isArray(status.conflictPaths) ? status.conflictPaths : []
+  // 자동 백업(2026-11-18): 연결된 동안만 켜고 끄기 한 줄과 형편 한 줄. 명령이 없는 뒤쪽이면 줄을 그리지 않는다.
+  // 이벤트가 없어 연결된 동안 15초마다 다시 묻는다(2분 묶음·1~30분 다시 시도를 따라가기에 넉넉하다).
+  const [auto, setAuto] = useState<AutoBackupStatus | null>(null)
+  const [autoWorking, setAutoWorking] = useState(false)
+  const readAuto = useCallback(() => {
+    autoBackupGet().then(setAuto).catch((error) => { if (isMissingCommand(error)) setAuto(null) })
+  }, [])
+  const isConnected = status?.state === 'connected'
+  // 곧 올리거나 올리는 중이면 3초마다, 그 밖에는 15초마다 묻는다.
+  const autoBusy = auto?.state === 'running' || auto?.state === 'pending'
+  useEffect(() => {
+    if (!isConnected) return
+    readAuto()
+    const timer = window.setInterval(readAuto, autoBusy ? 3000 : 15000)
+    return () => window.clearInterval(timer)
+  }, [isConnected, autoBusy, readAuto])
+  // 자동 업로드가 끝나면(running → 다른 상태) "업로드할 것" 숫자와 마지막으로 올린 때를 곧바로 다시 읽는다(2026-11-18 뒤쪽 93e3974).
+  const lastAutoState = useRef<string | null>(null)
+  useEffect(() => {
+    const state = auto?.state ?? null
+    if (lastAutoState.current === 'running' && state !== 'running') refresh()
+    lastAutoState.current = state
+  }, [auto?.state, refresh])
+  async function toggleAuto() {
+    if (!auto) return
+    setAutoWorking(true)
+    try { setAuto(await autoBackupSet(!auto.enabled)) } catch (error) { setNote(githubMessage(errorState(error))) }
+    setAutoWorking(false)
+  }
+  const autoLine = !auto || !auto.enabled ? null
+    : auto.state === 'running' ? B.autoRunning
+      : auto.state === 'pending' ? B.autoPending
+        : auto.state === 'retry_pending'
+          ? (auto.retryInSeconds !== null && auto.retryInSeconds >= 60 ? B.autoRetry(Math.ceil(auto.retryInSeconds / 60)) : B.autoRetrySoon)
+          : null
+  // 다시 시도를 기다리는 동안 그 까닭(앞서 만든 GitHub 까닭 글과 같은 길) 한 줄을 그 아래에.
+  const autoReason = auto?.enabled && auto.state === 'retry_pending' && auto.reason ? githubMessage(auto.reason) : null
   // 저장소 만들기(archive_remote_create)는 username 이 있을 때만 누를 수 있다. 명령이 없으면 눌리지 않는다(누른 뒤 알게 되면 막는다).
   const [createAvailable, setCreateAvailable] = useState(true)
   const newRepoName = username ? `momso-${username}` : null
@@ -157,8 +200,9 @@ function GithubBackup() {
     setWorking(false)
     refresh()
   }
-  // unavailable(예: 이 PC에 Git이 없음 git_missing)이면 입력과 단추는 눌리지 않게 하고 그 까닭 한 줄만 보인다.
-  const supported = Boolean(status) && status?.state !== 'unavailable'
+  // 2026-11-18: 상태를 읽지 못했거나 unavailable 이어도 연결 단추를 끄지 않는다(까닭 줄과 다시 시도를 보이고, 고친 뒤 다시 연결할 수 있게).
+  // Git 이 없을 때(git_missing)만 막고 그 자리에 Git 설치 줄을 둔다. 읽는 중(undefined)에도 막는다.
+  const supported = status !== undefined && status?.reason !== 'git_missing'
   const connected = status?.state === 'connected'
   // Git 이 없어서 막혔으면(git_missing) 그 까닭 줄 대신 그 자리에서 바로 설치할 수 있는 줄을 둔다(GitInstallRow).
   const gitMissing = status?.reason === 'git_missing'
@@ -175,8 +219,9 @@ function GithubBackup() {
       setStatus(next)
       const preserved = await preservedMessage(next)
       setNote([next.reason ? remoteMessage(next) : preserved ? null : B.done, preserved].filter(Boolean).join('. ') || B.done)
-    } catch (error) { setNote(message(errorState(error))) }
+    } catch (error) { setNote(githubMessage(errorState(error))) }
     setWorking(false)
+    readAuto()
   }
 
   return (
@@ -195,6 +240,25 @@ function GithubBackup() {
             {status?.signedInAs && <div><dt>{B.account}</dt><dd>{status.signedInAs}</dd></div>}
             {when(status?.lastPushedAt ?? null) && <div><dt>{B.lastPushed}</dt><dd>{when(status?.lastPushedAt ?? null)}</dd></div>}
           </dl>
+          {/* 자동 백업: 켜고 끄기(스킬 목록과 같은 단추)와 지금 형편 한 줄. 조용한 때(idle)는 형편 줄이 없다. */}
+          {auto && (
+            <div className="backup-row backup-auto">
+              <span className="backup-auto-text">
+                <span>{B.autoBackup}</span>
+                {autoLine && <span className="backup-auto-state" role={auto.state === 'retry_pending' ? 'alert' : 'status'}>{autoLine}</span>}
+                {autoReason && <span className="backup-auto-state">{autoReason}</span>}
+              </span>
+              <button
+                className={auto.enabled ? 'skills-switch is-on' : 'skills-switch'}
+                type="button"
+                role="switch"
+                aria-checked={auto.enabled}
+                aria-label={B.autoBackup}
+                disabled={autoWorking}
+                onClick={() => void toggleAuto()}
+              />
+            </div>
+          )}
           <div className="backup-actions">
             {(status?.ahead ?? 0) > 0 && <span className="backup-count">{B.ahead(status?.ahead)}</span>}
             {(status?.behind ?? 0) > 0 && <span className="backup-count">{B.behind(status?.behind)}</span>}
@@ -241,12 +305,21 @@ function GithubBackup() {
       {status === undefined && <p className="backup-note" role="status">{B.githubLoading}</p>}
       {statusFailed && (
         <p className="backup-note" role="alert">
-          {B.githubFailed}
+          {/* 받은 오류 값이 있으면 그 까닭을(글을 정해 둔 것은 그 글, 아니면 값을 붙여). 2026-11-18. */}
+          {statusError ? githubMessage(statusError) : B.githubFailed}
           <button className="secondary-button backup-inline-retry" type="button" onClick={() => { setStatus(undefined); setStatusFailed(false); refresh() }}>{W.firstRun.retry}</button>
         </p>
       )}
       {gitMissing && <GitInstallRow onInstalled={refresh} />}
-      {(note ?? standing) && <p className="backup-note" role="status">{note ?? standing}</p>}
+      {(note ?? standing) && (
+        <p className="backup-note" role={status?.state === 'unavailable' ? 'alert' : 'status'}>
+          {note ?? standing}
+          {/* 상태가 unavailable 이면(로그인 안 됨·연결 도구 없음 등) 그 까닭 줄에 다시 시도(고친 뒤 다시 읽는다). */}
+          {!note && status?.state === 'unavailable' && (
+            <button className="secondary-button backup-inline-retry" type="button" disabled={working} onClick={() => { setStatus(undefined); refresh() }}>{W.firstRun.retry}</button>
+          )}
+        </p>
+      )}
       {copyLine && <p className="backup-note" role="status">{copyLine}</p>}
       {(redacting || syncRedaction || pushRedaction) && <p className="backup-note" role="status">{B.redactionWait}</p>}
       {(keyLeft || status?.expiredKeyWarning === true) && <p className="backup-note" role="alert">{B.keyLeftWarning}</p>}

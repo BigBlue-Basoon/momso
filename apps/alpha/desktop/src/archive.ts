@@ -16,6 +16,11 @@ export type ZetListEntry = {
   status: ZetStatus
   createdAt: string
   updatedAt: string
+  /**
+   * 몸소 폴더 안의 폴더 경로(2026-11-18 화면이 바라는 꼴, 뒤쪽은 아직 주지 않음 — 지금 문서는 모두 zettels/ 에 평평하게 있다).
+   * '/' 로 나눈 이름들(예: "수업 기록/2026-11"), 맨 위면 '' 또는 null. 문서 화면이 폴더 꼴로 묶는다.
+   */
+  folder?: string | null
 }
 
 // 글 머리의 시각 키는 목록과 달리 created_at, updated_at 이다.
@@ -150,13 +155,21 @@ function requireArchive() {
   if (!isArchiveAvailable()) throw new Error('archive commands need the desktop runtime')
 }
 
+// 개발 앱에서만 문서·폴더 몇 개를 더한다(dev-samples/doc-samples.ts, 읽기·고치기는 메모리에서만). 설치판 빌드에는 들어가지 않는다.
+const devDocs = import.meta.env.DEV ? import('./dev-samples/doc-samples') : null
+const devDoc = async (id: string) => (devDocs && id.startsWith('dev-doc-') ? devDocs : null)
+
 export async function listZets() {
   requireArchive()
-  return invoke<ZetListEntry[]>('zet_list', { kind: null, status: null })
+  const list = await invoke<ZetListEntry[]>('zet_list', { kind: null, status: null })
+  if (!devDocs) return list
+  return [...list, ...(await devDocs).devSampleEntries()]
 }
 
 export async function readZet(id: string) {
   requireArchive()
+  const sample = await devDoc(id)
+  if (sample) return (await sample).devSampleDocument(id)
   return invoke<ZetDocument>('zet_read', { id })
 }
 
@@ -170,6 +183,8 @@ export async function saveZet(
   expectedHash: string,
 ) {
   requireArchive()
+  const sample = await devDoc(id)
+  if (sample) { (await sample).saveDevSample(id, changes); return }
   await invoke<null>('zet_save', { id, changes, expectedHash })
 }
 
@@ -179,11 +194,15 @@ export function isChangedMeanwhileError(error: unknown) {
 
 export async function readZetLinked(id: string) {
   requireArchive()
+  const sample = await devDoc(id)
+  if (sample) return (await sample).devSampleLinked
   return invoke<ZetLinked>('zet_linked', { id })
 }
 
 export async function readZetHistory(id: string) {
   requireArchive()
+  const sample = await devDoc(id)
+  if (sample) return (await sample).devSampleHistory
   return invoke<ZetHistoryEntry[]>('zet_history', { id })
 }
 

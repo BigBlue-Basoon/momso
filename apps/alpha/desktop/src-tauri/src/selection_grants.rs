@@ -65,6 +65,12 @@ fn path_key(path: &Path) -> String {
 }
 
 impl Selections {
+    pub(crate) fn record_webview_event(&self, label: &str, event: &tauri::WebviewEvent) {
+        if let ("main", tauri::WebviewEvent::DragDrop(event)) = (label, event) {
+            self.record_drop(event);
+        }
+    }
+
     pub(crate) fn record_window_event(&self, event: &tauri::WindowEvent) {
         if let tauri::WindowEvent::DragDrop(event) = event {
             self.record_drop(event);
@@ -335,6 +341,29 @@ mod tests {
             position: tauri::PhysicalPosition::new(0.0, 0.0),
         });
         selections.record_window_event(&event);
+        assert!(selections
+            .check(file.to_str().unwrap(), Purpose::Source, true)
+            .is_ok());
+    }
+
+    #[test]
+    fn child_panel_drop_does_not_grant_but_main_window_drop_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("drop.txt");
+        std::fs::write(&file, "fixture").unwrap();
+        let selections = Selections::default();
+        let drop = tauri::DragDropEvent::Drop {
+            paths: vec![file.clone()],
+            position: tauri::PhysicalPosition::new(5.0, 5.0),
+        };
+        selections.record_webview_event(
+            "panel-browser",
+            &tauri::WebviewEvent::DragDrop(drop.clone()),
+        );
+        assert!(selections
+            .check(file.to_str().unwrap(), Purpose::Source, false)
+            .is_err());
+        selections.record_window_event(&tauri::WindowEvent::DragDrop(drop));
         assert!(selections
             .check(file.to_str().unwrap(), Purpose::Source, true)
             .is_ok());

@@ -42,7 +42,23 @@ pub(crate) const BUNDLED_SKILLS: &[(&str, &str)] = &[
 ];
 
 pub(crate) fn install_bundled(root: &Path, resources: &Path) -> Result<(), &'static str> {
-    install(root, resources, BUNDLED_SKILLS)
+    let result = install(root, resources, BUNDLED_SKILLS);
+    if result == Err("save_failed") && existing_bundled_skills_are_readable(root) {
+        // A failed skill transaction has already rolled back its files and
+        // index; retain the usable previous skills and retry on next startup.
+        log::warn!("Bundled skill update deferred after a storage failure");
+        return Ok(());
+    }
+    result
+}
+
+fn existing_bundled_skills_are_readable(root: &Path) -> bool {
+    BUNDLED_SKILLS.iter().all(|(name, _)| {
+        skill_path(root, "skills", name)
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|content| parse(name, &content).is_ok())
+    })
 }
 
 fn install(root: &Path, resources: &Path, bundled: &[(&str, &str)]) -> Result<(), &'static str> {
@@ -490,6 +506,75 @@ mod tests {
             std::fs::read(dir.path().join("skill-builtin-state.json")).unwrap(),
             state
         );
+    }
+
+    #[test]
+    fn startup_defers_failed_builtin_save_only_with_existing_readable_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        crate::archive::profile_set(&root, dir.path(), "Fixture".into(), "".into(), "".into())
+            .unwrap();
+        let (name, current) = BUNDLED_SKILLS[0];
+        let old = format!("{current}\nold fixture\n");
+        let paths: Vec<String> = ["skills", ".agents/skills", ".claude/skills"]
+            .iter()
+            .map(|folder| format!("{folder}/{name}/SKILL.md"))
+            .collect();
+        for path in &paths {
+            std::fs::write(root.join(path), &old).unwrap();
+        }
+        let hash = crate::archive_zet::content_hash(&old);
+        let state_path = dir.path().join("skill-builtin-state.json");
+        let mut state: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        state.insert(name.to_owned(), hash.clone());
+        std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let provider_state = dir.path().join("skill-state").join(format!("{name}.json"));
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&provider_state).unwrap()).unwrap();
+        state["hash"] = hash.into();
+        std::fs::write(provider_state, serde_json::to_vec(&state).unwrap()).unwrap();
+        let tool = crate::archive::storage_tool(dir.path()).unwrap().0;
+        let mut args = vec!["add", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        crate::archive::run_storage_tool(&tool, &root, &args).unwrap();
+        let mut args = vec![
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--only",
+            "-m",
+            "fixture",
+            "--",
+        ];
+        args.extend(paths.iter().map(String::as_str));
+        crate::archive::run_storage_tool(&tool, &root, &args).unwrap();
+        let head = crate::archive::run_storage_tool(&tool, &root, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(
+            root.join(".git/hooks/pre-commit"),
+            "#!/bin/sh\nprintf x > .git/d20-hook-ran\nexit 1\n",
+        )
+        .unwrap();
+
+        assert_eq!(install_bundled(&root, dir.path()), Ok(()));
+        assert!(root.join(".git/d20-hook-ran").is_file());
+        for path in &paths {
+            assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), old);
+        }
+        assert_eq!(
+            crate::archive::run_storage_tool(&tool, &root, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+        std::fs::remove_file(
+            root.join("skills")
+                .join(BUNDLED_SKILLS[1].0)
+                .join("SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(install_bundled(&root, dir.path()), Err("save_failed"));
     }
     #[test]
     fn archive_upgrades_only_unchanged_legacy_rules_with_a_profile() {

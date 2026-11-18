@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
         OnceLock,
@@ -31,7 +31,7 @@ fn usable(path: &Path) -> bool {
     if !path.is_file() {
         return false;
     }
-    let mut command = Command::new(path);
+    let mut command = crate::process::hidden_command(path);
     command
         .arg("--version")
         .stdin(Stdio::null())

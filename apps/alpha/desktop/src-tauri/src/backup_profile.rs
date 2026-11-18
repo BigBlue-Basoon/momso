@@ -34,25 +34,9 @@ pub(crate) struct BackupProfile {
     pub(crate) workspace_id: String,
     pub(crate) github_repository: Option<String>,
     pub(crate) r2_bucket: Option<String>,
-    pub(crate) neon_organization_id: Option<String>,
-    pub(crate) neon_project_id: Option<String>,
-    pub(crate) neon_branch_id: Option<String>,
-    pub(crate) neon_database_name: Option<String>,
-    pub(crate) neon_role_name: Option<String>,
     pub(crate) last_completed_snapshot_id: Option<String>,
     pub(crate) last_completed_content_sha256: Option<String>,
     pub(crate) recovery_key_confirmed_at: Option<String>,
-}
-
-impl BackupProfile {
-    pub(crate) fn is_configured(&self) -> bool {
-        self.github_repository.is_some()
-            && self.r2_bucket.is_some()
-            && self.neon_project_id.is_some()
-            && self.neon_branch_id.is_some()
-            && self.neon_database_name.is_some()
-            && self.neon_role_name.is_some()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -74,14 +58,9 @@ fn read_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<BackupProfile> {
         workspace_id: row.get(0)?,
         github_repository: row.get(1)?,
         r2_bucket: row.get(2)?,
-        neon_organization_id: row.get(3)?,
-        neon_project_id: row.get(4)?,
-        neon_branch_id: row.get(5)?,
-        neon_database_name: row.get(6)?,
-        neon_role_name: row.get(7)?,
-        last_completed_snapshot_id: row.get(8)?,
-        last_completed_content_sha256: row.get(9)?,
-        recovery_key_confirmed_at: row.get(10)?,
+        last_completed_snapshot_id: row.get(3)?,
+        last_completed_content_sha256: row.get(4)?,
+        recovery_key_confirmed_at: row.get(5)?,
     })
 }
 
@@ -90,8 +69,6 @@ pub(crate) fn ensure(database_path: &Path) -> Result<BackupProfile, BackupProfil
     let existing = connection
         .query_row(
             "SELECT workspace_id, github_repository, r2_bucket,
-                    neon_organization_id, neon_project_id, neon_branch_id,
-                    neon_database_name, neon_role_name,
                     last_completed_snapshot_id, last_completed_content_sha256,
                     recovery_key_confirmed_at
              FROM momso_backup_profiles
@@ -119,11 +96,6 @@ pub(crate) fn ensure(database_path: &Path) -> Result<BackupProfile, BackupProfil
         workspace_id,
         github_repository: None,
         r2_bucket: None,
-        neon_organization_id: None,
-        neon_project_id: None,
-        neon_branch_id: None,
-        neon_database_name: None,
-        neon_role_name: None,
         last_completed_snapshot_id: None,
         last_completed_content_sha256: None,
         recovery_key_confirmed_at: None,

@@ -7,8 +7,10 @@ import {
   useRef,
   useState,
 } from 'react'
+import { useAvoidPanelBrowser } from '../panel-browser'
 import { createPortal } from 'react-dom'
-import { Check, ChevronDown, CircleAlert, Gauge, Hand, Mic, Paperclip, Send, ShieldCheck, Square, Wand2, X, Zap, type LucideIcon } from 'lucide-react'
+import { observeSize } from '../resize-later'
+import { Check, ChevronDown, CircleAlert, Gauge, Hand, Mic, Paperclip, RefreshCw, Send, ShieldCheck, Square, Wand2, X, Zap, type LucideIcon } from 'lucide-react'
 import { skillUnavailableText, type SkillEntry } from '../skills'
 import {
   PROVIDER_NAME,
@@ -86,6 +88,9 @@ type ComposerProps = {
   context: ChatContext | null
   /** 마이크(Windows 받아쓰기)를 열지 못했을 때 짧게 알릴 곳. */
   onVoiceProblem?: (message: string) => void
+  /** 사진과 동영상에서 "다시 만들기"로 붙인 생성물(입력칸 윗줄의 칩, 스킬 조각과 같은 꼴). 2026-11-18. */
+  regenerate?: { kind: 'image' | 'video' | 'audio'; thumb: string | null } | null
+  onRemoveRegenerate?: () => void
 }
 
 /**
@@ -119,6 +124,8 @@ export function Composer({
   onPermissionChange,
   context,
   onVoiceProblem,
+  regenerate = null,
+  onRemoveRegenerate,
 }: ComposerProps) {
   const textarea = useRef<HTMLTextAreaElement>(null)
   // 마이크: 받아쓰기 명령이 있고 unsupported 가 아니면 누를 수 있다. 명령이 없거나 unsupported 면 단추만 눌리지 않는다.
@@ -182,9 +189,7 @@ export function Composer({
   useEffect(() => {
     const element = textarea.current
     if (!element) return
-    const observer = new ResizeObserver(() => setNarrow(element.clientWidth < PLACEHOLDER_MIN_WIDTH))
-    observer.observe(element)
-    return () => observer.disconnect()
+    return observeSize(element, () => setNarrow(element.clientWidth < PLACEHOLDER_MIN_WIDTH))
   }, [])
 
   // 적은 만큼 자란다.
@@ -268,6 +273,15 @@ export function Composer({
           아랫줄 왼쪽: 첨부, 권한 단계. 오른쪽: 회사, 모델, 추론 수준, 고속 모드, 채팅방이 찬 정도(고리), 마이크, 보내기. */}
       <div className="prompt-composer composer-boxed">
         <div className="composer-input-row">
+          {regenerate && (
+            <span className="composer-skill composer-regenerate">
+              {regenerate.thumb ? <img src={regenerate.thumb} alt="" draggable={false} /> : <RefreshCw size={13} aria-hidden />}
+              <span className="composer-skill-title">{regenerate.kind === 'video' ? W.composer.regenerateVideo : W.composer.regenerateImage}</span>
+              <button type="button" aria-label={W.composer.regenerateRemove} onClick={() => { onRemoveRegenerate?.(); textarea.current?.focus() }}>
+                <X size={12} aria-hidden />
+              </button>
+            </span>
+          )}
           {skill && (
             <span className="composer-skill" title={skill.description || undefined}>
               <Wand2 size={13} aria-hidden />
@@ -445,6 +459,8 @@ function Popover({
   children: ReactNode
   role?: 'menu' | 'dialog'
 }) {
+  // 좁은 창에서 메뉴가 패널 웹뷰까지 닿으면 열린 동안 웹뷰를 숨긴다.
+  useAvoidPanelBrowser(popover.panel as RefObject<HTMLElement | null>, popover.open)
   if (!popover.open) return null
   return createPortal(
     <div

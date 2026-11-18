@@ -10,10 +10,7 @@ use std::{
     time::Duration,
 };
 use tauri::Emitter;
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Command,
-};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -461,7 +458,7 @@ async fn monitor(app: &tauri::AppHandle) {
     let Some(executable) = process::resolve_interactive_tool("codex") else {
         return;
     };
-    let mut command = Command::new(executable);
+    let mut command = crate::process::hidden_async_command(executable);
     command
         .arg("app-server")
         .env_remove("OPENAI_API_KEY")

@@ -3,6 +3,141 @@ use serde_json::{json, Value};
 use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime};
 use tauri::webview::InvokeRequest;
 
+#[cfg(windows)]
+#[test]
+fn approved_and_manual_documents_reappear_in_mcp_and_recent_list() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let database_path = root.join("momso.db");
+    let backups_path = root.join("backups");
+    std::fs::create_dir_all(&backups_path).unwrap();
+    storage::initialize(&database_path, &backups_path, "test").unwrap();
+    let archive =
+        archive_location::ArchiveLocation::load(database_path.clone(), root, vec![]).unwrap();
+    let archive_root = root.join("momso");
+    archive::initialize(&archive_root, root).unwrap();
+    let paths = RuntimePaths {
+        data_root: root.to_path_buf(),
+        database_path: database_path.clone(),
+        objects_path: archive_root.join("objects"),
+        exports_path: root.join("exports"),
+        backups_path,
+        logs_path: root.join("logs"),
+        archive,
+        archive_lease: None,
+    };
+    let broker = approval::ApprovalBroker::default();
+    let app = mock_builder()
+        .manage(AppState {
+            paths,
+            approvals: broker.clone(),
+            setup_secrets: Default::default(),
+            usage_monitor: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage_cache: Arc::new(usage_status::UsageCache::default()),
+            chat_active: Default::default(),
+            browser: Default::default(),
+            selections: Default::default(),
+        })
+        .invoke_handler(tauri::generate_handler![zet_create, zet_list])
+        .build(mock_context(noop_assets()))
+        .unwrap();
+    let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+        .build()
+        .unwrap();
+    let manual = invoke(
+        &window,
+        "zet_create",
+        json!({"input":{"title":"Manual fixture","summary":"note","kind":"note","body":"manual text","assets":[],"edges":[]}}),
+    );
+    let manual_id = manual.as_str().unwrap();
+    let ai_id = "zet_20990101_120000";
+    let responder = broker.clone();
+    let request = approval::ApprovalRequest {
+        request_id: "fixture-approval".into(),
+        chat_id: Some("fixture-chat".into()),
+        provider: "codex".into(),
+        kind: "fileChange".into(),
+        description: String::new(),
+        command: None,
+        sandbox_escalation: None,
+        change: Some(approval::ChangeKind::Create),
+        targets: vec![approval::ApprovalTarget {
+            path: format!("zettels/{ai_id}.md"),
+            change: Some(approval::ChangeKind::Create),
+        }],
+        reason: None,
+        options: vec![
+            approval::ApprovalChoice::AllowOnce,
+            approval::ApprovalChoice::Deny,
+        ],
+        setup: None,
+    };
+    let approved = tauri::async_runtime::block_on(broker.request_with(
+        request,
+        tokio_util::sync::CancellationToken::new(),
+        move |card| {
+            let id = card.request_id.clone();
+            tauri::async_runtime::spawn(async move {
+                responder
+                    .respond(&id, approval::ApprovalChoice::AllowOnce)
+                    .await
+                    .unwrap();
+            });
+            true
+        },
+        |_| {},
+    ))
+    .unwrap();
+    assert_eq!(approved, approval::ApprovalChoice::AllowOnce);
+    std::fs::write(archive_root.join("zettels").join(format!("{ai_id}.md")), format!("---\nid: {ai_id}\ntitle: Approved fixture\nsummary: note\nkind: note\nstatus: draft\ncreated_at: '2099-01-01T12:00:00+09:00'\nupdated_at: '2099-01-01T12:00:00+09:00'\nassets: []\nedges: []\n---\napproved unique text\n")).unwrap();
+    let manual_path = archive_root.join("zettels").join(format!("{manual_id}.md"));
+    let ai_path = archive_root.join("zettels").join(format!("{ai_id}.md"));
+    let original_manual = std::fs::read(&manual_path).unwrap();
+    let original_ai = std::fs::read(&ai_path).unwrap();
+    let count: i64 = storage::open_writable_connection(&database_path)
+        .unwrap()
+        .query_row("SELECT count(*) FROM archive_zets", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "AI file is not yet indexed");
+    let partial = momso_document_read::dispatch(
+        &archive_root,
+        &database_path,
+        "momso_document_search",
+        &json!({"query":"approved unique"}),
+    );
+    assert_eq!(partial["documents"][0]["id"], ai_id);
+    storage::open_writable_connection(&database_path)
+        .unwrap()
+        .execute("DELETE FROM archive_zets", [])
+        .unwrap();
+    let all = momso_document_read::dispatch(
+        &archive_root,
+        &database_path,
+        "momso_document_list",
+        &json!({}),
+    );
+    assert_eq!(all["status"], "ok");
+    assert_eq!(all["documents"].as_array().unwrap().len(), 2);
+    assert_eq!(all["documents"][0]["id"], ai_id);
+    assert!(all["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|doc| doc["id"] == manual_id));
+    let search = momso_document_read::dispatch(
+        &archive_root,
+        &database_path,
+        "momso_document_search",
+        &json!({"query":"approved unique"}),
+    );
+    assert_eq!(search["documents"][0]["id"], ai_id);
+    let recent = invoke(&window, "zet_list", json!({}));
+    assert_eq!(recent.as_array().unwrap().len(), 2);
+    assert_eq!(recent[0]["id"], ai_id);
+    assert_eq!(std::fs::read(manual_path).unwrap(), original_manual);
+    assert_eq!(std::fs::read(ai_path).unwrap(), original_ai);
+}
+
 pub(crate) fn invoke(window: &tauri::WebviewWindow<MockRuntime>, cmd: &str, body: Value) -> Value {
     get_ipc_response(
         window,
@@ -19,6 +154,118 @@ pub(crate) fn invoke(window: &tauri::WebviewWindow<MockRuntime>, cmd: &str, body
     .unwrap_or_else(|error| panic!("{cmd}: {error}"))
     .deserialize()
     .unwrap()
+}
+
+#[test]
+fn backup_overview_never_launches_neon_or_a_browser() {
+    if std::env::var_os("MOMSO_TEST_OVERVIEW_CHILD").is_some() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let database_path = root.join("momso.db");
+        let backups_path = root.join("backups");
+        std::fs::create_dir_all(&backups_path).unwrap();
+        storage::initialize(&database_path, &backups_path, "test").unwrap();
+        let database_for_test = database_path.clone();
+        let archive =
+            archive_location::ArchiveLocation::load(database_path.clone(), root, vec![]).unwrap();
+        let objects_path = root.join("momso/objects");
+        std::fs::create_dir_all(&objects_path).unwrap();
+        let paths = RuntimePaths {
+            data_root: root.to_path_buf(),
+            database_path,
+            objects_path,
+            exports_path: root.join("exports"),
+            backups_path,
+            logs_path: root.join("logs"),
+            archive,
+            archive_lease: None,
+        };
+        let app = mock_builder()
+            .manage(AppState {
+                paths,
+                approvals: Default::default(),
+                setup_secrets: Default::default(),
+                usage_monitor: Default::default(),
+                usage_cache: Default::default(),
+                chat_active: Default::default(),
+                browser: Default::default(),
+                selections: Default::default(),
+            })
+            .invoke_handler(tauri::generate_handler![
+                user_owned_backup_overview,
+                ai_models,
+                object_store::object_store_status
+            ])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let value = invoke(&window, "user_owned_backup_overview", json!({}));
+        assert_eq!(value["recoveryKeyStored"], false);
+        assert_eq!(value["recoveryKeyConfirmed"], false);
+        assert_eq!(value["syncState"], "unavailable");
+        assert!(value.get("neonOrganizations").is_none());
+        assert!(value["profile"].get("neonProjectId").is_none());
+        let connection = storage::open_writable_connection(&database_for_test).unwrap();
+        connection.execute("UPDATE momso_backup_profiles SET neon_project_id='legacy-project', neon_branch_id='legacy-branch', neon_database_name='legacy-db', neon_role_name='legacy-role'", []).unwrap();
+        drop(connection);
+        let second = invoke(&window, "user_owned_backup_overview", json!({}));
+        assert!(second["profile"].get("neonProjectId").is_none());
+        let connection = storage::open_writable_connection(&database_for_test).unwrap();
+        let legacy: String = connection
+            .query_row(
+                "SELECT neon_project_id FROM momso_backup_profiles",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, "legacy-project");
+        assert!(invoke(&window, "ai_models", json!({})).is_array());
+        assert_eq!(
+            invoke(&window, "object_store_status", json!({}))["state"],
+            "not_connected"
+        );
+        tauri::async_runtime::block_on(async {
+            for provider in ["codex", "claude", "gemini"] {
+                let _ = provider_auth::read_status(provider).await;
+            }
+            let _ = usage_status::fetch_codex().await;
+            let _ = usage_status::fetch_claude(root).await;
+        });
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("browser-opened");
+    std::fs::write(
+        temp.path().join("neon.cmd"),
+        "@echo off\r\necho opened > \"%MOMSO_TEST_BROWSER_MARKER%\"\r\n",
+    )
+    .unwrap();
+    for tool in [
+        "gh", "wrangler", "codex", "claude", "agy", "aws", "gcloud", "ncloud",
+    ] {
+        std::fs::write(temp.path().join(format!("{tool}.cmd")), "@echo off\r\nif /i \"%1\"==\"login\" echo opened > \"%MOMSO_TEST_BROWSER_MARKER%\"\r\nif /i \"%2\"==\"login\" echo opened > \"%MOMSO_TEST_BROWSER_MARKER%\"\r\nexit /b 1\r\n").unwrap();
+    }
+    let path = std::env::join_paths([
+        temp.path().to_path_buf(),
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"),
+    ])
+    .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "command_entry_tests::backup_overview_never_launches_neon_or_a_browser",
+            "--test-threads=1",
+        ])
+        .env("MOMSO_TEST_OVERVIEW_CHILD", "1")
+        .env("MOMSO_TEST_FAKE_CREDENTIAL_STORE", "1")
+        .env("MOMSO_TEST_BROWSER_MARKER", &marker)
+        .env("PATH", path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!marker.exists());
 }
 
 #[test]
@@ -132,7 +379,7 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
     let (remote, stopped, fail_delete) = (objects.clone(), stop.clone(), fail.clone());
     let server = std::thread::spawn(move || {
         let base = format!(
-            "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects",
+            "/client/v4/accounts/{}/r2/buckets/momso-basoon/objects",
             "a".repeat(32)
         );
         while !stopped.load(Ordering::Relaxed) {
@@ -231,7 +478,7 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
             provider: "cloudflare".into(),
             endpoint: format!("http://{address}"),
             region: "wrangleroauth".into(),
-            bucket: "momso-fixture".into(),
+            bucket: "momso-basoon".into(),
             credential_id: uuid::Uuid::new_v4().to_string(),
             last_backup_at: None,
             write_safety: Some(object_store::WriteSafety::CheckThenWrite),
@@ -267,6 +514,7 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
             chat_create,
             chat_attach_asset,
             object_store_transfer::object_store_backup,
+            object_store_state::app_state_backup,
             source_delete::source_asset_delete_preview,
             source_delete::source_asset_trash,
             source_delete::source_asset_purge,
@@ -310,6 +558,10 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
     assert!(attachment.is_string());
     let backup = invoke(&window, "object_store_backup", json!({}));
     assert_eq!(backup["completedCount"], 2);
+    assert_eq!(
+        invoke(&window, "app_state_backup", json!({}))["state"],
+        "complete"
+    );
     let mut target_keys = Vec::new();
     let mut other_keys = Vec::new();
     for (key, value) in objects
@@ -320,6 +572,9 @@ fn oauth_r2_commands_import_backup_purge_and_retry() {
     {
         let decoded = object_store_transfer::decrypt_bytes(value, &identity, 1024 * 1024).unwrap();
         let manifest: object_store_transfer::Manifest = serde_json::from_slice(&decoded).unwrap();
+        if manifest.kind == "app_state" {
+            continue;
+        }
         let dest = if manifest.sha256 == imported[0]["contentSha256"].as_str().unwrap() {
             &mut target_keys
         } else {
@@ -792,6 +1047,32 @@ fn fresh_chat_commands_use_tauri_entry_points() {
     let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
         .build()
         .unwrap();
+    let remote_panel = tauri::WebviewWindowBuilder::new(&app, "panel-browser", Default::default())
+        .build()
+        .unwrap();
+    for (cmd, body) in [
+        ("chat_list", json!({})),
+        ("chat_group_list", json!({})),
+        ("momso_username_set", json!({"username": "fixture"})),
+    ] {
+        let response = get_ipc_response(
+            &remote_panel,
+            InvokeRequest {
+                cmd: cmd.into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "https://example.test/".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.into(),
+            },
+        );
+        assert!(response.is_err(), "remote panel reached {cmd}");
+    }
+    assert_eq!(
+        archive_remote::username_get_db(&app.state::<AppState>().paths.database_path).unwrap(),
+        None
+    );
     assert_eq!(invoke(&window, "chat_list", json!({})), json!([]));
     assert_eq!(invoke(&window, "chat_archived_list", json!({})), json!([]));
     assert_eq!(invoke(&window, "chat_group_list", json!({})), json!([]));
