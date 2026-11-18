@@ -331,6 +331,20 @@ fn attribute(
     }
 }
 
+fn verified_created_assets(result: &Attribution) -> BTreeSet<String> {
+    result
+        .actions
+        .iter()
+        .filter(|(id, action)| {
+            *action == "created"
+                && crate::archive_zet::valid_asset_id(id)
+                && result.evidence.get(*id).is_some_and(|v| v == "tool")
+                && !result.unknown_actor.contains(*id)
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn record(
     root: &Path,
@@ -349,7 +363,21 @@ pub(crate) fn record(
     Ok(true)
 }
 
+#[cfg(test)]
 pub(crate) fn record_tracked(
+    root: &Path,
+    database: &Path,
+    input: crate::archive_receipt::ReceiptCreate,
+    before: &Snapshot,
+    after: &Snapshot,
+    tool_writes: &BTreeSet<String>,
+    tracking: Tracking,
+) -> Result<bool, String> {
+    record_tracked_with_created(root, database, input, before, after, tool_writes, tracking)
+        .map(|value| value.0)
+}
+
+pub(crate) fn record_tracked_with_created(
     root: &Path,
     database: &Path,
     mut input: crate::archive_receipt::ReceiptCreate,
@@ -357,7 +385,7 @@ pub(crate) fn record_tracked(
     after: &Snapshot,
     tool_writes: &BTreeSet<String>,
     tracking: Tracking,
-) -> Result<bool, String> {
+) -> Result<(bool, BTreeSet<String>), String> {
     let activity = tracking.finish();
     let mut actions = changes(before, after);
     actions.retain(|id, _| !id.starts_with("object-path:"));
@@ -369,9 +397,9 @@ pub(crate) fn record_tracked(
         activity.app_write_unknown,
     );
     if result.actions.is_empty() && input.read.is_empty() {
-        return Ok(false);
+        return Ok((false, BTreeSet::new()));
     }
-    let created: Vec<_> = result
+    let created_documents: Vec<_> = result
         .actions
         .iter()
         .filter_map(|(id, action)| {
@@ -381,6 +409,11 @@ pub(crate) fn record_tracked(
             .then_some(id.clone())
         })
         .collect();
+    let created_assets = if activity.overlapping_chat {
+        BTreeSet::new()
+    } else {
+        verified_created_assets(&result)
+    };
     input.wrote = result.actions.keys().cloned().collect();
     let receipt = crate::archive_receipt::create_with_evidence(
         root,
@@ -390,8 +423,8 @@ pub(crate) fn record_tracked(
         result.evidence,
         result.unknown_actor,
     )?;
-    save_ai_created_documents(root, database, after, &created, &receipt)?;
-    Ok(true)
+    save_ai_created_documents(root, database, after, &created_documents, &receipt)?;
+    Ok((true, created_assets))
 }
 
 fn save_ai_created_documents(
@@ -590,6 +623,25 @@ mod tests {
             fs::read_to_string(root.join(format!("zettels/{id}.md"))).unwrap(),
             "human text"
         );
+    }
+
+    #[test]
+    fn generated_candidates_exclude_person_and_unreported_writes() {
+        let a = format!("sha256:{}", "a".repeat(64));
+        let b = format!("sha256:{}", "b".repeat(64));
+        let c = format!("sha256:{}", "c".repeat(64));
+        let actions = [(&a, "created"), (&b, "created"), (&c, "created")]
+            .into_iter()
+            .map(|(id, action)| (id.clone(), action.to_owned()))
+            .collect();
+        let evidence = attribute(
+            actions,
+            &BTreeSet::from([a.clone(), b.clone()]),
+            &BTreeSet::from([b]),
+            false,
+            false,
+        );
+        assert_eq!(verified_created_assets(&evidence), BTreeSet::from([a]));
     }
     #[test]
     fn deleted_file_tool_reference_and_uncertain_actor_are_distinguished() {

@@ -372,6 +372,21 @@ mod tests {
         }
     }
     #[test]
+    fn bundled_skills_do_not_direct_shell_commands() {
+        for &(name, source) in BUNDLED_SKILLS {
+            // GitHub login is owned by the separate authentication work.
+            if name == "github-connect" {
+                continue;
+            }
+            for command in ["`gh auth", "`wrangler", "`powershell", "`ls", "`cat"] {
+                assert!(
+                    !source.to_lowercase().contains(command),
+                    "{name}: {command}"
+                );
+            }
+        }
+    }
+    #[test]
     fn setup_skills_are_installed_for_all_three_providers() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("archive");

@@ -6,6 +6,9 @@ authors = ["MOW", "BigBlue"]
 license = "PolyForm-Shield-1.0.0"
 edition = "2021"
 
+[features]
+g61-test-probe = []
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]

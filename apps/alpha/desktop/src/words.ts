@@ -483,6 +483,8 @@ const ko = {
     agentUsing: 'AI가 이 패널을 쓰고 있습니다',
     /** 설정·미디어를 보는 중에 AI 가 패널을 열어 달라고 할 때 알림 줄(누를 때까지 남음). 2026-11-18 본부 임시안, 그의 확인 전. */
     agentWants: 'AI가 브라우저를 쓰려고 합니다',
+    /** 설정 화면 등에서 로그인(R2 등)이 오른쪽 패널을 열어 달라고 할 때(2026-11-18). 새로 씀, 그의 확인 전. */
+    loginWants: '로그인 페이지를 오른쪽 패널에 엽니다',
     agentOpenPanel: '패널 열기',
     /** AI 가 연 빈 패널의 탭 이름(브라우저의 빈 탭과 같은 말). */
     newTab: '새 탭',
@@ -499,6 +501,13 @@ const ko = {
     agentLoginOutside: '구글 로그인은 몸소 브라우저 창에서 해 주세요. 끝나면 AI에게 돌려주세요',
     agentOpenOutside: '열기',
     agentLoginNotYet: '아직 로그인이 끝나지 않았습니다',
+    /** [AI에게 돌려주기] 뒤 이어 하기가 안 될 때(2026-11-18 여섯째 줄 G68 panel_agent_resume 오류). 새로 씀, 그의 확인 전. */
+    resumeFailed: {
+      in_progress: '이미 AI에게 이어서 하라고 보냈습니다',
+      login_wait_ended: '로그인 기다림이 끝났습니다. AI에게 다시 부탁해 주세요.',
+      resume_unavailable: 'AI가 이어서 하지 못했습니다. AI에게 다시 부탁해 주세요.',
+      external_login_unavailable: '구글 로그인은 몸소 브라우저 창에서 마친 뒤 AI에게 다시 부탁해 주세요.',
+    } as Record<string, string>,
   },
   // ---- 작업 내역 지우기(2026-11-17 본부 결정, 오른쪽 패널 작업 내역 탭 머리의 ⋯ 메뉴). 새로 씀, 그의 확인 전. ----
   receiptDelete: {
@@ -617,6 +626,8 @@ const ko = {
       switchProvider: '다른 AI로 바꾸기',
       shorten: '새 채팅방',
     } as Record<string, string>,
+    /** 화면 한 부분이 그리다 죽었을 때 그 자리(오류 경계, 2026-11-18). 새로 씀, 그의 확인 전. */
+    partFailed: '이 부분을 표시하지 못했습니다',
     authFailed: (a: unknown) => `${a} 연결이 끊어졌습니다. 설정의 AI 연결에서 다시 연결해 주세요.`,
     text11: '이름을 바꾸지 못했습니다',
     text12: '이 환경에서는 폴더 선택을 사용할 수 없습니다',
@@ -854,6 +865,29 @@ const ko = {
     text9: (a: unknown) => `${a}에서 제거`,
   },
   // ---- components/Composer.tsx ----
+  /** GitHub 로그인 정보가 안전하지 않은 곳에 남았을 때(2026-11-18 넷째 줄 D33·D34 provider-login-insecure-storage). 새로 씀, 그의 확인 전. */
+  loginStorage: {
+    removed: 'GitHub 로그인 정보가 안전하지 않은 곳에 남아 있어 지웠습니다. GitHub을 다시 연결해 주세요.',
+    cleanup_failed: 'GitHub 로그인 정보가 안전하지 않은 곳에 남아 있는데 지우지 못했습니다. 몸소를 다시 켠 뒤 GitHub을 다시 연결해 주세요.',
+    verification_required: 'GitHub 로그인 정보가 안전하게 저장됐는지 확인하지 못했습니다. 다음에 다시 확인합니다.',
+    open: '연결과 백업 열기',
+  } as Record<string, string>,
+  /** 로그인 코드 카드(2026-11-18, 장치 코드 로그인·클로드 기본 브라우저 안내). 새로 씀, 그의 확인 전. */
+  deviceLogin: {
+    names: { github: 'GitHub', codex: '코덱스', claude: '클로드', gemini: '제미나이' } as Record<string, string>,
+    title: (a: unknown) => `${a} 로그인`,
+    text: '로그인 페이지에 아래 코드를 입력해 주세요.',
+    codeLabel: '로그인 코드',
+    copy: '복사',
+    copied: '코드를 복사했습니다',
+    copyFailed: '코드를 복사하지 못했습니다',
+    left: (a: unknown) => `${a} 남음`,
+    expired: '코드 시간이 지났습니다. 다시 로그인해 주세요.',
+    openPage: '로그인 페이지 열기',
+    cancel: '취소',
+    browserText: (a: unknown) => `기본 브라우저에서 ${a} 로그인 창이 열립니다. 로그인을 마치면 몸소로 돌아와 주세요.`,
+    ok: '확인',
+  },
   composer: {
     /** 사진과 동영상의 "다시 만들기"로 붙인 생성물 칩(2026-11-18). 새로 씀, 그의 확인 전. */
     regenerateImage: '다시 만들 사진',
@@ -1052,6 +1086,20 @@ const ko = {
     version: (n: number) => `버전 ${n}`,
     versionHow: { regenerated: '같은 프롬프트로 다시 만듦', edited: '고침' } as Record<string, string>,
     copyPrompt: '프롬프트 복사',
+    /** 도구가 알리지 않아 자동 등록된 생성물(프롬프트가 빈 값, 2026-11-18 뒤쪽 f42672f). 새로 씀, 그의 확인 전. */
+    noPrompt: '프롬프트 기록이 없습니다',
+    /** 다시 만들기로 새 판이 기록됐을 때(chat-media-regeneration recorded). 새로 씀, 그의 확인 전. */
+    regenerated: '새 버전을 사진과 동영상에 넣었습니다',
+    /** 내려받기(media_save_as, 2026-11-18 뒤쪽 C52). 새로 씀, 그의 확인 전. */
+    saveAs: '내려받기',
+    saved: '파일을 저장했습니다',
+    saveFailed: {
+      destination_exists: '같은 이름의 파일이 있어 저장하지 않았습니다. 다른 이름을 골라 주세요.',
+      invalid_destination: '이 자리에는 저장할 수 없습니다. 다른 폴더를 골라 주세요.',
+      asset_not_found: '원래 파일을 찾지 못했습니다',
+      asset_changed: '원래 파일이 바뀌어 저장하지 않았습니다',
+      other: '파일을 저장하지 못했습니다',
+    } as Record<string, string>,
     /** "다시 만들기"(2026-11-18 그의 결정: 원래 채팅방으로). 원래 채팅방이 없을 때 단추 풍선. 새로 씀, 그의 확인 전. */
     regenerate: '다시 만들기',
     regenerateNoChat: '만든 채팅방이 없어 다시 만들 수 없습니다',
@@ -1269,6 +1317,18 @@ const ko = {
     folderCount: (n: number) => `문서 ${n}개`,
     folderExpand: (a: unknown) => `${a} 펼치기`,
     folderCollapse: (a: unknown) => `${a} 접기`,
+    /** 폴더 만들기·이름 바꾸기·옮기기(2026-11-18 뒤쪽 1568490). 새로 씀, 그의 확인 전. */
+    newFolder: '새 폴더',
+    newFolderName: '새 폴더',
+    rename: '이름 바꾸기',
+    renameLabel: (a: unknown) => `${a} 새 이름`,
+    moveTo: '다른 폴더로 옮기기',
+    moveTitle: '어느 폴더로 옮길까요?',
+    moveText: (a: unknown) => `“${a}”${josa(a, '을', '를')} 옮길 폴더를 고르세요.`,
+    moved: (a: unknown, b: unknown) => `“${a}”${josa(a, '을', '를')} ${b}${josa(b, '으로', '로')} 옮겼습니다`,
+    itemMenu: (a: unknown) => `${a} 메뉴`,
+    folderBadName: '폴더 이름에는 / 나 \ 를 쓸 수 없고, 앞뒤에 빈칸을 둘 수 없습니다',
+    folderFailed: '폴더를 바꾸지 못했습니다',
     text1: '요약',
     text2: '보정된 전사',
     text3: '노트',

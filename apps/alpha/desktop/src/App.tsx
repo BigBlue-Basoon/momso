@@ -88,7 +88,11 @@ import {
   saveChatModels,
   savePreferences,
 } from './preferences'
-import { listenPanelAgent, requestPanelBrowser, usePanelBrowserHold, usePanelBrowserShown } from './panel-browser'
+import { listenPanelAgent, openHumanBrowser, requestPanelBrowser, usePanelBrowserHold, usePanelBrowserShown } from './panel-browser'
+import { acknowledgeBrowserLogin, cancelLogin, listenDeviceLogin, listenLoginStorage, type DeviceLogin } from './device-login'
+import { DeviceLoginCard } from './components/DeviceLoginCard'
+import { ErrorBoundary } from './components/ErrorBoundary'
+import { listenProviderAuth } from './provider-auth'
 import type { SourceChange } from './source-assets'
 
 const INITIAL_SESSION: RuntimeSession = {
@@ -215,9 +219,9 @@ function App() {
   // 답이 오지 않은 채팅방마다 그 까닭(G18 chat-error 의 error)과 보냈던 글. 그 채팅방에서 다시 보내면 지운다.
   // 회사가 다시 시도하는 중인 채팅방(chat-provider-retrying). 답이 다시 오거나 끝나면 지운다.
   const [retrying, setRetrying] = useState<Record<string, ChatRetrying>>({})
-  const [chatFailures, setChatFailures] = useState<Record<string, { kind: string; retryAt: number | string | null; actions: string[]; provider: AiProvider; text: string; userMessageId: string | null }>>({})
+  const [chatFailures, setChatFailures] = useState<Record<string, { kind: string; retryAt: number | string | null; actions: string[]; provider: AiProvider; text: string; userMessageId: string | null; regenerateOf?: string | null }>>({})
   // userMessageId: 보내기가 시작되면 chat_send 가 주는 내 말의 id(다시 보내기에 쓴다).
-  const lastSentTextRef = useRef<{ chatId: string; text: string; userMessageId?: string | null } | null>(null)
+  const lastSentTextRef = useRef<{ chatId: string; text: string; userMessageId?: string | null; regenerateOf?: string | null } | null>(null)
   // 설정을 열 때 처음 보일 쪽(알림 줄의 "AI 연결 열기"면 'ai').
   const [settingsStart, setSettingsStart] = useState<SettingsSection>('profile')
   const [models, setModels] = useState<ProviderModels[] | null>(null)
@@ -252,7 +256,8 @@ function App() {
   const [probedProviders, setSendableProviders] = useState<AiProvider[]>(FALLBACK_PROVIDERS)
   // AI 연결 상태(provider_auth_status). 저장만 됐거나 틀렸거나 확인하지 못한 API 키는 연결로 치지 않는다(2026-11-17 계약 "AI 연결 확인").
   // 입력창의 회사 고르기·기본 회사와 왼쪽 띠 사용량이 같은 조건(isConnected)을 쓴다. 상태를 읽지 못하면 chat_send 에 물은 것만 쓴다.
-  const providerAuth = useProviderAuth()
+  // 첫 실행 판정(checkFirstRun)이 끝난 뒤에 묻는다(같은 상태를 두 번 묻지 않게, G71).
+  const providerAuth = useProviderAuth(firstRun === null)
   const sendableProviders = useMemo(() => {
     const list = providerAuth.list
     if (!Array.isArray(list)) return probedProviders
@@ -573,8 +578,10 @@ function App() {
     if (!origin) return
     const picture = item.kind === 'video' ? item.posterPath : item.kind === 'image' ? item.path : null
     setRegenerate((current) => ({ ...current, [origin.id]: { assetId: item.id, kind: item.kind, thumb: mediaSrc(picture) } }))
-    drafts.current.set(origin.id, item.prompt ?? '')
-    if (origin.id === selectedChatId) { setScreen('home'); setPrompt(item.prompt ?? ''); return }
+    // 프롬프트가 없으면(자동 등록) 입력칸은 비워 둔다. 칩(regenerateOf)으로 뒤쪽이 원래 요청과 파일을 AI 에게 넘긴다(계약 C52).
+    const draft = item.prompt?.trim() ?? ''
+    drafts.current.set(origin.id, draft)
+    if (origin.id === selectedChatId) { setScreen('home'); setPrompt(draft); return }
     showPlace(`chat:${origin.id}`)
   }
 
@@ -807,6 +814,18 @@ function App() {
         // 답이 다시 오기 시작하면 "다시 시도하는 중" 줄을 거둔다.
         setRetrying((current) => (current[chatId] ? withoutKey(current, chatId) : current))
       },
+      // "다시 만들기" 결과(chat-media-regeneration): 사진과 동영상 화면과 그 채팅방(말풍선·이 채팅방에서 다룬 것)을 다시 읽는다.
+      // 새 판을 기록했으면 한 줄로 알린다. 찾지 못함·안 됨은 조용히(생성물이 없다는 확정이 아니라서).
+      onMediaRegeneration: ({ chatId, status }) => {
+        window.dispatchEvent(new CustomEvent('momso:media-changed'))
+        refreshChatItems(chatId, true)
+        if (selectedChatRef.current === chatId) {
+          void readChat(chatId).then((document) => {
+            if (selectedChatRef.current === chatId) setChat((current) => (current && current.id === chatId ? { ...current, messages: document.messages } : current))
+          }).catch(() => {})
+        }
+        if (status === 'recorded') showToast(W.mediaView.regenerated)
+      },
       // 회사가 스스로 다시 시도하는 중: 답을 쓰는 동안 그 채팅방 끝에 조용한 한 줄(2026-11-18 셋째 줄 계약).
       onRetrying: (event) => {
         if (generatingRef.current?.chatId !== event.chatId) return
@@ -860,6 +879,7 @@ function App() {
             provider: (sent?.chatId === chatId ? sent.provider : null) ?? 'codex',
             text: sentText,
             userMessageId: userMessageId ?? (lastSentTextRef.current?.chatId === chatId ? lastSentTextRef.current.userMessageId ?? null : null),
+            regenerateOf: lastSentTextRef.current?.chatId === chatId ? lastSentTextRef.current.regenerateOf ?? null : null,
           },
         }))
         // 오다가 끊긴 답은 뒤쪽이 저장해 두므로(messageId) finishGenerating 이 채팅방을 다시 읽어 그때까지 온 글을 보인다.
@@ -1066,8 +1086,10 @@ function App() {
     if ((!text && !skill) || generatingChatId || !sendReady) return
     const target = chosen
 
-    // 다시 만들 생성물(칩)은 입력칸에서 보낸 말에만 붙인다.
-    const regenerateOf = !again && selectedChatId ? regenerate[selectedChatId]?.assetId ?? null : null
+    // 다시 만들 생성물(칩)은 입력칸에서 보낸 말에 붙인다. 실패한 말을 다시 보낼 때는 그때 붙였던 것을 다시 넘긴다(계약 C52).
+    const regenerateOf = !again
+      ? (selectedChatId ? regenerate[selectedChatId]?.assetId ?? null : null)
+      : (selectedChatId && chatFailures[selectedChatId]?.regenerateOf) || null
     if (!again) {
       setPrompt('')
       setChosenSkill(null)
@@ -1101,7 +1123,7 @@ function App() {
       return
     }
     const targetId = chatId
-    lastSentTextRef.current = { chatId: targetId, text }
+    lastSentTextRef.current = { chatId: targetId, text, regenerateOf }
     // 브라우저에서 직접 한 뒤 채팅으로 알린 것이므로 "직접 해 주세요" 줄을 거둔다.
     setBrowserHuman((current) => {
       if (!current[targetId]) return current
@@ -1318,20 +1340,91 @@ function App() {
     let stop: (() => void) | undefined
     let disposed = false
     void listenPanelAgent({
-      onOpenRequest: () => {
+      // 로그인 뒤 이어 하기 턴(G68): 그 채팅방을 답을 쓰는 중으로 두고(답 조각·끝이 그대로 이어짐), 새 말풍선을 보이려 다시 읽는다.
+      onResumeStarted: ({ chatId, userMessageId, text, provider }) => {
+        if (!generatingRef.current) {
+          generatingRef.current = { chatId }
+          setGeneratingChatId(chatId)
+          setStreamText('')
+          if (provider === 'codex' || provider === 'claude' || provider === 'gemini') lastSendRef.current = { chatId, provider, model: null }
+          lastSentTextRef.current = { chatId, text: text ?? '', userMessageId }
+        }
+        if (selectedChatRef.current === chatId) {
+          void readChat(chatId).then((document) => {
+            if (selectedChatRef.current === chatId) setChat((current) => (current && current.id === chatId ? { ...current, messages: document.messages } : current))
+          }).catch(() => {})
+        }
+      },
+      onOpenRequest: (requestChatId) => {
+        // 로그인 코드 카드가 떠 있으면(장치 코드 로그인) 그 카드의 [로그인 페이지 열기]가 이 요청을 받는다(알림 줄을 따로 띄우지 않는다).
+        if (deviceLoginRef.current?.kind === 'device' && screenRef.current !== 'home' && screenRef.current !== 'documents') { setDevicePanelPending(true); return }
         // 설정·미디어를 보는 중이면 화면을 빼앗지 않고 알림 줄로 묻는다(아래 agentOpenPending). 2026-11-18 본부가 정한 임시 동작(그가 바꿀 수 있음).
-        if (screenRef.current !== 'home' && screenRef.current !== 'documents') { setAgentOpenPending(true); return }
+        // 채팅방 번호가 없으면 로그인(R2 등, 2026-11-18 뒤쪽 9e54c07 open_oauth_panel)이 패널을 여는 것이라 알림 줄을 로그인 말로.
+        if (screenRef.current !== 'home' && screenRef.current !== 'documents') { setAgentOpenPending(requestChatId ? 'ai' : 'login'); return }
         if (screenRef.current === 'home') setZetPanelOpen(true)
         requestPanelBrowser(null)
       },
     }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
   }, [])
+  // 로그인 코드(2026-11-18 넷째 줄 계약): 장치 코드 로그인이면 코드 카드, 클로드는 기본 브라우저 안내. 닫힘이 오면 거둔다.
+  const [deviceLogin, setDeviceLogin] = useState<DeviceLogin | null>(null)
+  const deviceLoginRef = useRef<DeviceLogin | null>(null)
+  deviceLoginRef.current = deviceLogin
+  // 설정 화면 등에서 뒤쪽이 패널을 열어 달라고 했는데 아직 열지 않음(카드의 [로그인 페이지 열기]가 받는다).
+  const [devicePanelPending, setDevicePanelPending] = useState(false)
+  useEffect(() => {
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenDeviceLogin({
+      onShow: (login) => { setDevicePanelPending(false); setDeviceLogin(login) },
+      onClose: (provider) => {
+        setDeviceLogin((current) => (current && current.provider === provider ? null : current))
+        setDevicePanelPending(false)
+      },
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [])
+  // GitHub 로그인 정보가 안전하지 않은 곳에 남았을 때: 조용한 알림 줄. 다시 연결해야 하면 [연결과 백업 열기].
+  useEffect(() => {
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenLoginStorage((provider, action) => {
+      const text = provider === 'github' ? W.loginStorage[action] : undefined
+      if (!text) return
+      showToast(text, action === 'verification_required' ? undefined : { label: W.loginStorage.open, run: () => openSettingsAt('backup') })
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  // 클로드 안내 카드는 로그인 형편이 바뀌면(끝남·취소·시간 넘음) 거둔다.
+  useEffect(() => {
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenProviderAuth((provider, state) => {
+      if (state === 'inProgress') return
+      setDeviceLogin((current) => (current && current.kind === 'browser' && current.provider === provider ? null : current))
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [])
+  function openDevicePage(login: DeviceLogin) {
+    if (devicePanelPending) {
+      // 홈으로 가서 오른쪽 패널을 열면 뒤쪽이 그 자리에 로그인 페이지를 연다.
+      setDevicePanelPending(false)
+      showPlace(chatPlace)
+      setZetPanelOpen(true)
+      requestPanelBrowser(null)
+      return
+    }
+    // 뒤쪽이 이미 기다리기를 끝냈으면(패널을 못 열었음) 몸소 브라우저 창으로 연다.
+    if (login.kind === 'device') void openHumanBrowser(login.url).catch(() => showToast(W.panelBrowser.humanFailed))
+  }
+
   // AI 가 패널을 열어 달라는데 설정·미디어를 보는 중: "AI가 브라우저를 쓰려고 합니다 [패널 열기]"를 남긴다. 누르면 홈으로 가서 패널을 연다.
   // 선생님이 스스로 홈으로 돌아와도 연다. AI 의 답이 끝나면(뒤쪽 기다림도 끝남) 거둔다.
-  const [agentOpenPending, setAgentOpenPending] = useState(false)
+  const [agentOpenPending, setAgentOpenPending] = useState<false | 'ai' | 'login'>(false)
   const clearAgentToast = useCallback(() => {
-    setToast((current) => (current === W.panelBrowser.agentWants ? null : current))
+    setToast((current) => (current === W.panelBrowser.agentWants || current === W.panelBrowser.loginWants ? null : current))
     setToastAction((current) => (current?.some((item) => item.label === W.panelBrowser.agentOpenPanel) ? null : current))
   }, [])
   useEffect(() => {
@@ -1343,10 +1436,14 @@ function App() {
       requestPanelBrowser(null)
       return
     }
-    showToast(W.panelBrowser.agentWants, {
+    showToast(agentOpenPending === 'login' ? W.panelBrowser.loginWants : W.panelBrowser.agentWants, {
       label: W.panelBrowser.agentOpenPanel,
       run: () => { showPlace(chatPlace) },
     }, true)
+    // 로그인은 답을 쓰는 중이 아니라서, 뒤쪽이 기다리는 20초가 지나면 거둔다(그 뒤에는 뒤쪽이 몸소 브라우저 창으로 연다).
+    if (agentOpenPending !== 'login') return
+    const timer = window.setTimeout(() => { setAgentOpenPending(false); clearAgentToast() }, 20_000)
+    return () => window.clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agentOpenPending, screen])
   // 답하던 것이 끝났을 때만(있던 것 → 없음) 거둔다. 처음부터 답하는 중이 아니었으면 누를 때까지 남긴다.
@@ -1540,8 +1637,11 @@ function App() {
         />
 
         {screen === 'documents' ? null : screen === 'media' ? (
-          <MediaView onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }} onNotice={showToast} onRegenerate={startRegenerate} />
+          <ErrorBoundary name="MediaView" className="screen-error-main">
+            <MediaView onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }} onNotice={showToast} onRegenerate={startRegenerate} />
+          </ErrorBoundary>
         ) : settingsOpen ? (
+          <ErrorBoundary name="SettingsView" className="screen-error-main">
           <SettingsView
             key={settingsStart}
             initialSection={settingsStart}
@@ -1556,6 +1656,7 @@ function App() {
             archivedChats={chatKeep || (desktopRuntime && !chatKeepKnown)}
             onChatsChanged={() => void refreshChats()}
           />
+          </ErrorBoundary>
         ) : (
           <>
             <ChatSidebar
@@ -1662,6 +1763,7 @@ function App() {
         )}
       </div>
       {desktopRuntime && (
+        <ErrorBoundary name="ZetPanel" className={screen === 'documents' ? 'screen-error-main' : panelShown ? 'screen-error-panel' : 'screen-error-hidden'}>
         <ZetPanel
           open={panelShown}
           variant={screen === 'documents' ? 'page' : 'side'}
@@ -1680,6 +1782,7 @@ function App() {
           onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }}
           onOpenMedia={() => showPlace('media')}
         />
+        </ErrorBoundary>
       )}
       </div>
 
@@ -1707,6 +1810,16 @@ function App() {
         />
       )}
 
+      {deviceLogin && (
+        <DeviceLoginCard
+          login={deviceLogin}
+          style={webShown && panelShown && screen === 'home' ? { right: zetPanelFrame.width + 14 } : undefined}
+          onCopy={(code) => { void navigator.clipboard.writeText(code).then(() => showToast(W.deviceLogin.copied)).catch(() => showToast(W.deviceLogin.copyFailed)) }}
+          onOpenPage={devicePanelPending || !(webShown && panelShown) ? () => openDevicePage(deviceLogin) : undefined}
+          onCancel={() => { const provider = deviceLogin.provider; setDeviceLogin(null); setDevicePanelPending(false); void cancelLogin(provider).catch(() => {}) }}
+          onDismiss={() => { const provider = deviceLogin.provider; setDeviceLogin(null); void acknowledgeBrowserLogin(provider).catch(() => {}) }}
+        />
+      )}
       {(toast || session.error) && (
         <div className="workbench-toast" role="status" style={toastStyle}>
           {/* 앱 시작(runtime_info)이 실패하면 뒤쪽 글을 그대로 보이지 않는다: 한글 글이면 그대로, 영어·코드 값이면 일반 글과 다시 시도(2026-11-17). */}

@@ -6,7 +6,7 @@ use std::{
 };
 use thiserror::Error;
 
-const LATEST_SCHEMA_VERSION: u32 = 93;
+const LATEST_SCHEMA_VERSION: u32 = 96;
 const MAX_AUTOMATED_BACKUPS: usize = 5;
 
 struct Migration {
@@ -195,6 +195,21 @@ const MIGRATIONS: &[Migration] = &[
         version: 93,
         description: "preserve masked chat fields",
         sql: include_str!("../migrations/0093_chat_redaction_preserved.sql"),
+    },
+    Migration {
+        version: 94,
+        description: "store media generation provenance",
+        sql: include_str!("../migrations/0094_media_generation.sql"),
+    },
+    Migration {
+        version: 95,
+        description: "distinguish regenerated and edited media versions",
+        sql: include_str!("../migrations/0095_media_version_how.sql"),
+    },
+    Migration {
+        version: 96,
+        description: "recover generated output turns",
+        sql: include_str!("../migrations/0096_generated_output_turns.sql"),
     },
 ];
 

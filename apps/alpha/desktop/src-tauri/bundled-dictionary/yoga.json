@@ -1,5 +1,5 @@
 {
-  "bundleVersion": 3,
+  "bundleVersion": 6,
   "reviewStatus": "사람 검수 전",
   "terms": [
     {
@@ -7886,7 +7886,8 @@
       "koreanNames": [],
       "meaning": "절제와 관련한 수련 원칙.",
       "sources": [
-        "https://marpple.shop/kr/yogaletter/products/21080199"
+        "https://marpple.shop/kr/yogaletter/products/21080199",
+        "https://ayora.me/courses/1/lectures/4"
       ],
       "variants": [
         {
@@ -7901,16 +7902,28 @@
           "unverifiedSources": [
             "https://articles.sivananda.org/hatha-yoga/thoughts-on-hatha-yoga/"
           ]
+        },
+        {
+          "text": "브라흐마차리야",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://ayora.me/courses/1/lectures/4"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "category": "철학·수련",
       "verifiedSources": [
-        "https://marpple.shop/kr/yogaletter/products/21080199"
+        "https://marpple.shop/kr/yogaletter/products/21080199",
+        "https://ayora.me/courses/1/lectures/4"
       ],
       "unverifiedSources": [
         "https://articles.sivananda.org/hatha-yoga/thoughts-on-hatha-yoga/"
       ],
-      "sourceAssessment": "한 곳 확인"
+      "sourceAssessment": "두 곳 이상 확인"
     },
     {
       "id": "yoga-112",
@@ -8332,7 +8345,8 @@
       "meaning": "요가 전통에서 말하는 에너지 중심.",
       "sources": [
         "https://kriyayoga.co.kr/21",
-        "https://vasistas.tistory.com/295"
+        "https://vasistas.tistory.com/295",
+        "https://alfl6843.tistory.com/318"
       ],
       "variants": [
         {
@@ -8346,12 +8360,24 @@
           "requiresConfirmation": false,
           "label": "실제로 본 표기",
           "unverifiedSources": []
+        },
+        {
+          "text": "챠크라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://alfl6843.tistory.com/318"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "category": "철학·수련",
       "verifiedSources": [
         "https://kriyayoga.co.kr/21",
-        "https://vasistas.tistory.com/295"
+        "https://vasistas.tistory.com/295",
+        "https://alfl6843.tistory.com/318"
       ],
       "unverifiedSources": [
         "https://vasistas.tistory.com/"
@@ -9066,7 +9092,8 @@
       "koreanNames": [],
       "meaning": "호흡 수련",
       "sources": [
-        "https://www.koreayoga.net/page/sub5_4"
+        "https://www.koreayoga.net/page/sub5_4",
+        "https://www.yes24.com/product/goods/125576822"
       ],
       "variants": [
         {
@@ -9081,16 +9108,28 @@
           "unverifiedSources": [
             "https://www.tummee.com/ko/yoga-poses/pranayama"
           ]
+        },
+        {
+          "text": "수리야 베다나",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.yes24.com/product/goods/125576822"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "category": "호흡·정화",
       "verifiedSources": [
-        "https://www.koreayoga.net/page/sub5_4"
+        "https://www.koreayoga.net/page/sub5_4",
+        "https://www.yes24.com/product/goods/125576822"
       ],
       "unverifiedSources": [
         "https://www.tummee.com/ko/yoga-poses/pranayama"
       ],
-      "sourceAssessment": "한 곳 확인"
+      "sourceAssessment": "두 곳 이상 확인"
     },
     {
       "id": "yoga-d10",
@@ -9531,11 +9570,13 @@
       "koreanNames": [],
       "meaning": "정렬과 도구 활용을 강조하는 요가 유파.",
       "sources": [
-        "https://www.easyyoga.co.kr/yogaprogram/"
+        "https://www.easyyoga.co.kr/yogaprogram/",
+        "https://iyengaryogamin.com/2221-2/"
       ],
       "category": "유파·수업",
       "verifiedSources": [
-        "https://www.easyyoga.co.kr/yogaprogram/"
+        "https://www.easyyoga.co.kr/yogaprogram/",
+        "https://iyengaryogamin.com/2221-2/"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9549,9 +9590,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "아엥가요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://iyengaryogamin.com/2221-2/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Iyengar Yoga",
       "language": "english_or_proper_name"
     },
@@ -9565,12 +9617,14 @@
       "meaning": "자세에 머무르며 수련하는 수업 이름.",
       "sources": [
         "https://www.yogaatelier.kr/classes",
-        "https://yogafield.co.kr/product/Yinteacher_training"
+        "https://yogafield.co.kr/product/Yinteacher_training",
+        "https://m.blog.naver.com/yogavid/221934172193"
       ],
       "category": "유파·수업",
       "verifiedSources": [
         "https://www.yogaatelier.kr/classes",
-        "https://yogafield.co.kr/product/Yinteacher_training"
+        "https://yogafield.co.kr/product/Yinteacher_training",
+        "https://m.blog.naver.com/yogavid/221934172193"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9584,6 +9638,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": true
+        },
+        {
+          "text": "음요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://m.blog.naver.com/yogavid/221934172193"
+          ],
+          "requiresConfirmation": true,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "ambiguityReason": "문맥에 따라 다른 말이나 수업 이름일 수 있어 확인이 필요함",
@@ -9648,12 +9713,14 @@
       "meaning": "아쉬탕가의 개별 수련 수업 방식.",
       "sources": [
         "https://drishtiyoga.co.kr/?page_id=215",
-        "https://www.easyyoga.co.kr/yogaprogram/"
+        "https://www.easyyoga.co.kr/yogaprogram/",
+        "https://tristhanayoga.co.kr/"
       ],
       "category": "유파·수업",
       "verifiedSources": [
         "https://drishtiyoga.co.kr/?page_id=215",
-        "https://www.easyyoga.co.kr/yogaprogram/"
+        "https://www.easyyoga.co.kr/yogaprogram/",
+        "https://tristhanayoga.co.kr/"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9667,6 +9734,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "마이소르 클래스",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://tristhanayoga.co.kr/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -9682,11 +9760,13 @@
       "koreanNames": [],
       "meaning": "안내에 따라 함께 하는 아쉬탕가 수업.",
       "sources": [
-        "https://drishtiyoga.co.kr/?page_id=215"
+        "https://drishtiyoga.co.kr/?page_id=215",
+        "https://www.healyoga.co.kr/default/05/01.php?com_board_basic=read_form&com_board_id=13&com_board_idx=149&com_board_page=49&com_board_search_code=&com_board_search_value1=&com_board_search_value2="
       ],
       "category": "유파·수업",
       "verifiedSources": [
-        "https://drishtiyoga.co.kr/?page_id=215"
+        "https://drishtiyoga.co.kr/?page_id=215",
+        "https://www.healyoga.co.kr/default/05/01.php?com_board_basic=read_form&com_board_id=13&com_board_idx=149&com_board_page=49&com_board_search_code=&com_board_search_value1=&com_board_search_value2="
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9700,9 +9780,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "레드 클래스",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.healyoga.co.kr/default/05/01.php?com_board_basic=read_form&com_board_id=13&com_board_idx=149&com_board_page=49&com_board_search_code=&com_board_search_value1=&com_board_search_value2="
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Ashtanga Led",
       "language": "english_or_proper_name"
     },
@@ -9715,11 +9806,13 @@
       "koreanNames": [],
       "meaning": "변형과 단계적 동작을 활용하는 수련 이름.",
       "sources": [
-        "https://drishtiyoga.co.kr/?page_id=215"
+        "https://drishtiyoga.co.kr/?page_id=215",
+        "https://drishtiyoga.co.kr/?page_id=18"
       ],
       "category": "유파·수업",
       "verifiedSources": [
-        "https://drishtiyoga.co.kr/?page_id=215"
+        "https://drishtiyoga.co.kr/?page_id=215",
+        "https://drishtiyoga.co.kr/?page_id=18"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9733,9 +9826,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "빈야사 크라마",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://drishtiyoga.co.kr/?page_id=18"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Vinyasa Krama",
       "language": "english_or_proper_name"
     },
@@ -9883,12 +9987,14 @@
       "meaning": "아쉬탕가의 두 번째 시리즈.",
       "sources": [
         "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://goseulkim.tistory.com/entry/%EC%95%84%EC%89%AC%ED%83%95%EA%B0%80-%EC%9A%94%EA%B0%80%EC%99%80-%EB%A7%88%EC%9D%B4%EC%86%94-%EC%88%98%EB%A0%A8"
       ],
       "category": "시리즈",
       "verifiedSources": [
         "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://goseulkim.tistory.com/entry/%EC%95%84%EC%89%AC%ED%83%95%EA%B0%80-%EC%9A%94%EA%B0%80%EC%99%80-%EB%A7%88%EC%9D%B4%EC%86%94-%EC%88%98%EB%A0%A8"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9902,6 +10008,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "인티미디엇 시리즈",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://goseulkim.tistory.com/entry/%EC%95%84%EC%89%AC%ED%83%95%EA%B0%80-%EC%9A%94%EA%B0%80%EC%99%80-%EB%A7%88%EC%9D%B4%EC%86%94-%EC%88%98%EB%A0%A8"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10101,12 +10218,14 @@
       "meaning": "아쉬탕가 수업에서 세는 3번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10120,6 +10239,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "뜨리니",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://saram123.tistory.com/69"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10228,12 +10358,14 @@
       "meaning": "아쉬탕가 수업에서 세는 6번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10247,6 +10379,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "삳",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://saram123.tistory.com/69"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10262,12 +10405,14 @@
       "meaning": "아쉬탕가 수업에서 세는 7번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10281,6 +10426,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "삽따",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://saram123.tistory.com/69"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10296,12 +10452,14 @@
       "meaning": "아쉬탕가 수업에서 세는 8번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10315,6 +10473,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "아슈따",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://saram123.tistory.com/69"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10330,12 +10499,14 @@
       "meaning": "아쉬탕가 수업에서 세는 9번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://saram123.tistory.com/69"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10349,6 +10520,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "나와",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://saram123.tistory.com/69"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10432,12 +10614,14 @@
       "meaning": "아쉬탕가 수업에서 세는 12번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10451,6 +10635,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "드와다샤",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://jnanayoga.tistory.com/138"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10466,12 +10661,14 @@
       "meaning": "아쉬탕가 수업에서 세는 13번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10485,6 +10682,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "트라요다샤",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://jnanayoga.tistory.com/138"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10500,12 +10708,14 @@
       "meaning": "아쉬탕가 수업에서 세는 14번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10519,6 +10729,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "차투르다샤",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://jnanayoga.tistory.com/138"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10534,12 +10755,14 @@
       "meaning": "아쉬탕가 수업에서 세는 15번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10553,6 +10776,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "판차다샤",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://jnanayoga.tistory.com/138"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10602,12 +10836,14 @@
       "meaning": "아쉬탕가 수업에서 세는 17번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://jnanayoga.tistory.com/138"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10621,6 +10857,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "삽타다샤",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://jnanayoga.tistory.com/138"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10636,12 +10883,14 @@
       "meaning": "요가 전통에서 쓰는 정화 수련의 이름.",
       "sources": [
         "https://ksip.jams.or.kr/po/volisse/sjPubsArtiPopView.kci?artiId=SJ0000000369&indexNo=3&sereId=SER000000001&soceId=INS000001578&submCnt=1",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://blog.naver.com/yogahari/223573436089"
       ],
       "category": "호흡·정화",
       "verifiedSources": [
         "https://ksip.jams.or.kr/po/volisse/sjPubsArtiPopView.kci?artiId=SJ0000000369&indexNo=3&sereId=SER000000001&soceId=INS000001578&submCnt=1",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://blog.naver.com/yogahari/223573436089"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10655,6 +10904,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "다우띠",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://blog.naver.com/yogahari/223573436089"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10670,12 +10930,14 @@
       "meaning": "요가 전통에서 쓰는 정화 수련의 이름.",
       "sources": [
         "https://ksip.jams.or.kr/po/volisse/sjPubsArtiPopView.kci?artiId=SJ0000000369&indexNo=3&sereId=SER000000001&soceId=INS000001578&submCnt=1",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://blog.naver.com/yogahari/223573436089"
       ],
       "category": "호흡·정화",
       "verifiedSources": [
         "https://ksip.jams.or.kr/po/volisse/sjPubsArtiPopView.kci?artiId=SJ0000000369&indexNo=3&sereId=SER000000001&soceId=INS000001578&submCnt=1",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://blog.naver.com/yogahari/223573436089"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10689,6 +10951,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "바스띠",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://blog.naver.com/yogahari/223573436089"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10704,12 +10977,14 @@
       "meaning": "요가 전통에서 쓰는 정화 수련의 이름.",
       "sources": [
         "https://ksip.jams.or.kr/po/volisse/sjPubsArtiPopView.kci?artiId=SJ0000000369&indexNo=3&sereId=SER000000001&soceId=INS000001578&submCnt=1",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://blog.naver.com/yogahari/223573436089"
       ],
       "category": "호흡·정화",
       "verifiedSources": [
         "https://ksip.jams.or.kr/po/volisse/sjPubsArtiPopView.kci?artiId=SJ0000000369&indexNo=3&sereId=SER000000001&soceId=INS000001578&submCnt=1",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://blog.naver.com/yogahari/223573436089"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10723,6 +10998,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "네띠",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://blog.naver.com/yogahari/223573436089"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10738,12 +11024,14 @@
       "meaning": "요가 전통에서 쓰는 정화 수련의 이름.",
       "sources": [
         "https://ksip.jams.or.kr/po/volisse/sjPubsArtiPopView.kci?artiId=SJ0000000369&indexNo=3&sereId=SER000000001&soceId=INS000001578&submCnt=1",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "http://www.kinara.net/sub_04_01.php?gsp_pg=view&gsp_md=gb&gsp_gb_id=43&gsp_uid=8&gsp_chgval=undefined"
       ],
       "category": "호흡·정화",
       "verifiedSources": [
         "https://ksip.jams.or.kr/po/volisse/sjPubsArtiPopView.kci?artiId=SJ0000000369&indexNo=3&sereId=SER000000001&soceId=INS000001578&submCnt=1",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "http://www.kinara.net/sub_04_01.php?gsp_pg=view&gsp_md=gb&gsp_gb_id=43&gsp_uid=8&gsp_chgval=undefined"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10757,6 +11045,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "뜨라따까",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "http://www.kinara.net/sub_04_01.php?gsp_pg=view&gsp_md=gb&gsp_gb_id=43&gsp_uid=8&gsp_chgval=undefined"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10803,11 +11102,13 @@
       "koreanNames": [],
       "meaning": "여섯 가지 정화 수련을 묶어 부르는 말.",
       "sources": [
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://alfl6843.tistory.com/319"
       ],
       "category": "호흡·정화",
       "verifiedSources": [
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://alfl6843.tistory.com/319"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10821,9 +11122,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "샤뜨 까르마",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://alfl6843.tistory.com/319"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "language": "sanskrit_transliteration"
     },
     {
@@ -10856,6 +11168,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "물라다라 차크라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://kriyayoga.co.kr/21"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10891,6 +11214,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "스와디스타나 차크라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://kriyayoga.co.kr/21"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10926,6 +11260,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "마니푸라 차크라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://kriyayoga.co.kr/21"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10961,6 +11306,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "아나하타 차크라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://kriyayoga.co.kr/21"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10996,6 +11352,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "비슈다 차크라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://kriyayoga.co.kr/21"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11077,6 +11444,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "사하스라라 차크라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://kriyayoga.co.kr/21"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11092,12 +11470,14 @@
       "meaning": "요가 전통에서 말하는 나디의 이름.",
       "sources": [
         "https://www.kci.go.kr/kciportal/landing/article.kci?arti_id=ART002835916",
-        "https://dhara.day/mom4/"
+        "https://dhara.day/mom4/",
+        "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
       ],
       "category": "나디·구나",
       "verifiedSources": [
         "https://www.kci.go.kr/kciportal/landing/article.kci?arti_id=ART002835916",
-        "https://dhara.day/mom4/"
+        "https://dhara.day/mom4/",
+        "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11111,6 +11491,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": true
+        },
+        {
+          "text": "이다나디",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
+          ],
+          "requiresConfirmation": true,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "ambiguityReason": "문맥에 따라 다른 말이나 수업 이름일 수 있어 확인이 필요함",
@@ -11127,12 +11518,14 @@
       "meaning": "요가 전통에서 말하는 나디의 이름.",
       "sources": [
         "https://www.kci.go.kr/kciportal/landing/article.kci?arti_id=ART002835916",
-        "https://dhara.day/mom4/"
+        "https://dhara.day/mom4/",
+        "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
       ],
       "category": "나디·구나",
       "verifiedSources": [
         "https://www.kci.go.kr/kciportal/landing/article.kci?arti_id=ART002835916",
-        "https://dhara.day/mom4/"
+        "https://dhara.day/mom4/",
+        "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11146,6 +11539,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "핑갈라 나디",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11161,12 +11565,14 @@
       "meaning": "요가 전통에서 말하는 나디의 이름.",
       "sources": [
         "https://www.kci.go.kr/kciportal/landing/article.kci?arti_id=ART002835916",
-        "https://dhara.day/mom4/"
+        "https://dhara.day/mom4/",
+        "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
       ],
       "category": "나디·구나",
       "verifiedSources": [
         "https://www.kci.go.kr/kciportal/landing/article.kci?arti_id=ART002835916",
-        "https://dhara.day/mom4/"
+        "https://dhara.day/mom4/",
+        "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11180,6 +11586,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "수슘나 나디",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://k-google.tistory.com/entry/%EB%82%98%EB%94%94%EC%9D%98-%EC%A2%85%EB%A5%98"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11226,11 +11643,13 @@
       "koreanNames": [],
       "meaning": "요가 철학에서 쓰는 구나 관련 용어.",
       "sources": [
-        "https://vykorea.cafe24.com/myf/session/session-D1-14-ED1.html"
+        "https://vykorea.cafe24.com/myf/session/session-D1-14-ED1.html",
+        "https://ko.wikipedia.org/wiki/%EC%82%AC%ED%8A%B8%EB%B0%94"
       ],
       "category": "나디·구나",
       "verifiedSources": [
-        "https://vykorea.cafe24.com/myf/session/session-D1-14-ED1.html"
+        "https://vykorea.cafe24.com/myf/session/session-D1-14-ED1.html",
+        "https://ko.wikipedia.org/wiki/%EC%82%AC%ED%8A%B8%EB%B0%94"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11244,9 +11663,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "사트바",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://ko.wikipedia.org/wiki/%EC%82%AC%ED%8A%B8%EB%B0%94"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "language": "sanskrit_transliteration"
     },
     {
@@ -11323,12 +11753,14 @@
       "meaning": "요가 동작을 돕는 도구.",
       "sources": [
         "https://boiledyoga.com/RENTAL",
-        "https://www.yogaatelier.kr/classes"
+        "https://www.yogaatelier.kr/classes",
+        "https://h2friendly.tistory.com/84"
       ],
       "category": "도구",
       "verifiedSources": [
         "https://boiledyoga.com/RENTAL",
-        "https://www.yogaatelier.kr/classes"
+        "https://www.yogaatelier.kr/classes",
+        "https://h2friendly.tistory.com/84"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11342,6 +11774,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "요가 블럭",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://h2friendly.tistory.com/84"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11358,12 +11801,14 @@
       "meaning": "요가 동작을 돕는 끈.",
       "sources": [
         "https://boiledyoga.com/RENTAL",
-        "https://www.yogaatelier.kr/classes"
+        "https://www.yogaatelier.kr/classes",
+        "https://price.enuri.com/catalog/15571791"
       ],
       "category": "도구",
       "verifiedSources": [
         "https://boiledyoga.com/RENTAL",
-        "https://www.yogaatelier.kr/classes"
+        "https://www.yogaatelier.kr/classes",
+        "https://price.enuri.com/catalog/15571791"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11377,6 +11822,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "요가 벨트",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://price.enuri.com/catalog/15571791"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11427,11 +11883,13 @@
       "koreanNames": [],
       "meaning": "수련할 때 바닥에 까는 도구.",
       "sources": [
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://manduka.co.kr/category/%EC%9A%94%EA%B0%80%EB%A7%A4%ED%8A%B8/179"
       ],
       "category": "도구",
       "verifiedSources": [
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://manduka.co.kr/category/%EC%9A%94%EA%B0%80%EB%A7%A4%ED%8A%B8/179"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11445,9 +11903,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "요가 매트",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://manduka.co.kr/category/%EC%9A%94%EA%B0%80%EB%A7%A4%ED%8A%B8/179"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Yoga Mat",
       "language": "english_or_proper_name"
     },
@@ -11460,11 +11929,13 @@
       "koreanNames": [],
       "meaning": "둥근 고리 형태의 수련 도구.",
       "sources": [
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://m.blog.naver.com/lime0915/221467283222"
       ],
       "category": "도구",
       "verifiedSources": [
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://m.blog.naver.com/lime0915/221467283222"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11478,9 +11949,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "요가휠",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://m.blog.naver.com/lime0915/221467283222"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Yoga Wheel",
       "language": "english_or_proper_name"
     },
@@ -11526,11 +12008,13 @@
       "koreanNames": [],
       "meaning": "눈 위에 올리는 수련 도구.",
       "sources": [
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://blog.naver.com/dammashanti_yoga/223438958577"
       ],
       "category": "도구",
       "verifiedSources": [
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://blog.naver.com/dammashanti_yoga/223438958577"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11544,9 +12028,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "눈베개",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://blog.naver.com/dammashanti_yoga/223438958577"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Eye Pillow",
       "language": "english_or_proper_name"
     },
@@ -11560,12 +12055,14 @@
       "meaning": "소리를 내어 명상 등에 쓰는 도구.",
       "sources": [
         "https://boiledyoga.com/RENTAL",
-        "https://www.easyyoga.co.kr/yogaprogram/"
+        "https://www.easyyoga.co.kr/yogaprogram/",
+        "https://note.com/elr_awareness/n/n6750ca8d5599?hl=ko"
       ],
       "category": "도구",
       "verifiedSources": [
         "https://boiledyoga.com/RENTAL",
-        "https://www.easyyoga.co.kr/yogaprogram/"
+        "https://www.easyyoga.co.kr/yogaprogram/",
+        "https://note.com/elr_awareness/n/n6750ca8d5599?hl=ko"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11579,6 +12076,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "싱잉 볼",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://note.com/elr_awareness/n/n6750ca8d5599?hl=ko"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11594,11 +12102,13 @@
       "koreanNames": [],
       "meaning": "원통형 수련 보조 도구.",
       "sources": [
-        "https://www.yogaatelier.kr/classes"
+        "https://www.yogaatelier.kr/classes",
+        "https://www.lululemon.co.kr/ko-kr/p/%EB%8D%94%EB%B8%94-%EB%A1%A4%EB%9F%AC/prod8900773.html"
       ],
       "category": "도구",
       "verifiedSources": [
-        "https://www.yogaatelier.kr/classes"
+        "https://www.yogaatelier.kr/classes",
+        "https://www.lululemon.co.kr/ko-kr/p/%EB%8D%94%EB%B8%94-%EB%A1%A4%EB%9F%AC/prod8900773.html"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11612,9 +12122,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "폼 롤러",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.lululemon.co.kr/ko-kr/p/%EB%8D%94%EB%B8%94-%EB%A1%A4%EB%9F%AC/prod8900773.html"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Foam Roller",
       "language": "english_or_proper_name"
     },
@@ -11663,12 +12184,14 @@
       "meaning": "수련이나 인사에서 쓰이는 말.",
       "sources": [
         "https://pf.kakao.com/_JxfpsC/posts",
-        "https://sites.google.com/view/hathatraining/202003_CancleInform/2020Hatha"
+        "https://sites.google.com/view/hathatraining/202003_CancleInform/2020Hatha",
+        "https://blog.naver.com/leeashuram/100192619844?viewType=pc"
       ],
       "category": "만트라·수업 말",
       "verifiedSources": [
         "https://pf.kakao.com/_JxfpsC/posts",
-        "https://sites.google.com/view/hathatraining/202003_CancleInform/2020Hatha"
+        "https://sites.google.com/view/hathatraining/202003_CancleInform/2020Hatha",
+        "https://blog.naver.com/leeashuram/100192619844?viewType=pc"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11682,6 +12205,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "샨띠",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://blog.naver.com/leeashuram/100192619844?viewType=pc"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -12660,11 +13194,13 @@
       "koreanNames": [],
       "meaning": "태양 경배의 A 순서.",
       "sources": [
-        "https://www.yes24.com/product/goods/100057770"
+        "https://www.yes24.com/product/goods/100057770",
+        "https://comfortstones.tistory.com/5"
       ],
       "category": "시리즈",
       "verifiedSources": [
-        "https://www.yes24.com/product/goods/100057770"
+        "https://www.yes24.com/product/goods/100057770",
+        "https://comfortstones.tistory.com/5"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -12678,9 +13214,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "수리야 나마스카라 A",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://comfortstones.tistory.com/5"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "language": "sanskrit_transliteration"
     },
     {
@@ -12692,11 +13239,13 @@
       "koreanNames": [],
       "meaning": "태양 경배의 B 순서.",
       "sources": [
-        "https://www.yes24.com/product/goods/100057770"
+        "https://www.yes24.com/product/goods/100057770",
+        "https://comfortstones.tistory.com/5"
       ],
       "category": "시리즈",
       "verifiedSources": [
-        "https://www.yes24.com/product/goods/100057770"
+        "https://www.yes24.com/product/goods/100057770",
+        "https://comfortstones.tistory.com/5"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -12710,9 +13259,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "수리야 나마스카라 B",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://comfortstones.tistory.com/5"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "language": "sanskrit_transliteration"
     },
     {
@@ -12726,12 +13286,14 @@
       "meaning": "요가 전통에서 사용하는 수행 분야의 이름.",
       "sources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://brunch.co.kr/@onlyoga/9"
       ],
       "category": "유파·수업",
       "verifiedSources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://brunch.co.kr/@onlyoga/9"
       ],
       "unverifiedSources": [],
       "sourceAssessment": "두 곳 이상 확인",
@@ -12747,6 +13309,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "라자요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://brunch.co.kr/@onlyoga/9"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ]
     },
@@ -12761,12 +13334,14 @@
       "meaning": "요가 전통에서 사용하는 수행 분야의 이름.",
       "sources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://brunch.co.kr/@onlyoga/9"
       ],
       "category": "유파·수업",
       "verifiedSources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://brunch.co.kr/@onlyoga/9"
       ],
       "unverifiedSources": [],
       "sourceAssessment": "두 곳 이상 확인",
@@ -12782,6 +13357,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "박티요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://brunch.co.kr/@onlyoga/9"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ]
     },
@@ -12796,12 +13382,14 @@
       "meaning": "요가 전통에서 사용하는 수행 분야의 이름.",
       "sources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://brunch.co.kr/@onlyoga/9"
       ],
       "category": "유파·수업",
       "verifiedSources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://brunch.co.kr/@onlyoga/9"
       ],
       "unverifiedSources": [],
       "sourceAssessment": "두 곳 이상 확인",
@@ -12817,6 +13405,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "카르마요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://brunch.co.kr/@onlyoga/9"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ]
     },
@@ -12831,12 +13430,14 @@
       "meaning": "요가 전통에서 사용하는 수행 분야의 이름.",
       "sources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://brunch.co.kr/@onlyoga/9"
       ],
       "category": "유파·수업",
       "verifiedSources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf"
+        "https://www.yogatherapy.jp/HP_WHO/kankoku_eigo_who_kijunkisai.pdf",
+        "https://brunch.co.kr/@onlyoga/9"
       ],
       "unverifiedSources": [],
       "sourceAssessment": "두 곳 이상 확인",
@@ -12852,6 +13453,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "즈나나요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://brunch.co.kr/@onlyoga/9"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ]
     },
@@ -12866,12 +13478,14 @@
       "meaning": "요가 전통에서 사용하는 수행 분야의 이름.",
       "sources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://oak.chosun.ac.kr/bitstream/2020.oak/15885/2/%EC%9A%94%EA%B0%80%20%EC%A7%80%EB%8F%84%EC%9E%90%20%EB%A6%AC%EB%8D%94%EC%8B%AD%20%EC%9C%A0%ED%98%95%EC%9D%B4%20%EC%84%B1%EC%9D%B8%20%EC%97%AC%EC%84%B1%20%EC%88%98%EB%A0%A8%EC%83%9D%EC%9D%98%20%EC%88%98%EB%A0%A8%20%EB%AA%B0%EC%9E%85%EB%8F%84%EC%99%80%20%EC%88%98%EB%A0%A8%20%EB%A7%8C%EC%A1%B1%EB%8F%84%EC%97%90%20%EB%AF%B8%EC%B9%98%EB%8A%94%20%EC%98%81%ED%96%A5.pdf"
+        "https://oak.chosun.ac.kr/bitstream/2020.oak/15885/2/%EC%9A%94%EA%B0%80%20%EC%A7%80%EB%8F%84%EC%9E%90%20%EB%A6%AC%EB%8D%94%EC%8B%AD%20%EC%9C%A0%ED%98%95%EC%9D%B4%20%EC%84%B1%EC%9D%B8%20%EC%97%AC%EC%84%B1%20%EC%88%98%EB%A0%A8%EC%83%9D%EC%9D%98%20%EC%88%98%EB%A0%A8%20%EB%AA%B0%EC%9E%85%EB%8F%84%EC%99%80%20%EC%88%98%EB%A0%A8%20%EB%A7%8C%EC%A1%B1%EB%8F%84%EC%97%90%20%EB%AF%B8%EC%B9%98%EB%8A%94%20%EC%98%81%ED%96%A5.pdf",
+        "https://blog.naver.com/kwyoga5125/220998284986?viewType=pc"
       ],
       "category": "유파·수업",
       "verifiedSources": [
         "https://wonbuddhism.wku.ac.kr/?p=3769",
-        "https://oak.chosun.ac.kr/bitstream/2020.oak/15885/2/%EC%9A%94%EA%B0%80%20%EC%A7%80%EB%8F%84%EC%9E%90%20%EB%A6%AC%EB%8D%94%EC%8B%AD%20%EC%9C%A0%ED%98%95%EC%9D%B4%20%EC%84%B1%EC%9D%B8%20%EC%97%AC%EC%84%B1%20%EC%88%98%EB%A0%A8%EC%83%9D%EC%9D%98%20%EC%88%98%EB%A0%A8%20%EB%AA%B0%EC%9E%85%EB%8F%84%EC%99%80%20%EC%88%98%EB%A0%A8%20%EB%A7%8C%EC%A1%B1%EB%8F%84%EC%97%90%20%EB%AF%B8%EC%B9%98%EB%8A%94%20%EC%98%81%ED%96%A5.pdf"
+        "https://oak.chosun.ac.kr/bitstream/2020.oak/15885/2/%EC%9A%94%EA%B0%80%20%EC%A7%80%EB%8F%84%EC%9E%90%20%EB%A6%AC%EB%8D%94%EC%8B%AD%20%EC%9C%A0%ED%98%95%EC%9D%B4%20%EC%84%B1%EC%9D%B8%20%EC%97%AC%EC%84%B1%20%EC%88%98%EB%A0%A8%EC%83%9D%EC%9D%98%20%EC%88%98%EB%A0%A8%20%EB%AA%B0%EC%9E%85%EB%8F%84%EC%99%80%20%EC%88%98%EB%A0%A8%20%EB%A7%8C%EC%A1%B1%EB%8F%84%EC%97%90%20%EB%AF%B8%EC%B9%98%EB%8A%94%20%EC%98%81%ED%96%A5.pdf",
+        "https://blog.naver.com/kwyoga5125/220998284986?viewType=pc"
       ],
       "unverifiedSources": [],
       "sourceAssessment": "두 곳 이상 확인",
@@ -12887,6 +13501,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "만트라요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://blog.naver.com/kwyoga5125/220998284986?viewType=pc"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ]
     },
@@ -12933,12 +13558,14 @@
       "meaning": "요가 명상에서 쓰는 수련 이름.",
       "sources": [
         "https://www.yes24.com/product/goods/149215599",
-        "https://kriyayoga.co.kr/40"
+        "https://kriyayoga.co.kr/40",
+        "https://www.youtube.com/watch?v=w4cykXjf6xM"
       ],
       "category": "철학·수련",
       "verifiedSources": [
         "https://www.yes24.com/product/goods/149215599",
-        "https://kriyayoga.co.kr/40"
+        "https://kriyayoga.co.kr/40",
+        "https://www.youtube.com/watch?v=w4cykXjf6xM"
       ],
       "unverifiedSources": [],
       "sourceAssessment": "두 곳 이상 확인",
@@ -12954,6 +13581,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "아자빠자빠",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.youtube.com/watch?v=w4cykXjf6xM"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ]
     },
@@ -13000,12 +13638,14 @@
       "meaning": "요가 문헌과 수업에 나오는 무드라 이름.",
       "sources": [
         "https://journal.kci.go.kr/crbs/archive/articlePdf?artiId=ART002031008",
-        "https://yoga-bits.com/ko/mudras/"
+        "https://yoga-bits.com/ko/mudras/",
+        "https://journal.kci.go.kr/crbs/archive/articlePdf?artiId=ART002031008"
       ],
       "category": "반다·무드라",
       "verifiedSources": [
         "https://journal.kci.go.kr/crbs/archive/articlePdf?artiId=ART002031008",
-        "https://yoga-bits.com/ko/mudras/"
+        "https://yoga-bits.com/ko/mudras/",
+        "https://journal.kci.go.kr/crbs/archive/articlePdf?artiId=ART002031008"
       ],
       "unverifiedSources": [],
       "sourceAssessment": "두 곳 이상 확인",
@@ -13020,6 +13660,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": true
+        },
+        {
+          "text": "요니무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://journal.kci.go.kr/crbs/archive/articlePdf?artiId=ART002031008"
+          ],
+          "requiresConfirmation": true,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "ambiguityReason": "요가 문헌과 수업에서 같은 이름이 서로 다른 수련을 뜻할 수 있어 확인이 필요함"
@@ -13058,6 +13709,628 @@
           "requiresConfirmation": false
         }
       ]
+    },
+    {
+      "id": "yoga-c58-murcha",
+      "sanskrit": "Murcha",
+      "korean": [
+        "무르차",
+        "무르챠"
+      ],
+      "koreanNames": [],
+      "meaning": "숨을 다스리는 요가 호흡법.",
+      "sources": [
+        "https://yoga-bits.com/ko/breaths/",
+        "https://m.yes24.com/goods/detail/3248151"
+      ],
+      "variants": [
+        {
+          "text": "무르차",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yoga-bits.com/ko/breaths/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "무르챠",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://m.yes24.com/goods/detail/3248151"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "호흡·정화",
+      "verifiedSources": [
+        "https://yoga-bits.com/ko/breaths/",
+        "https://m.yes24.com/goods/detail/3248151"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c58-plavini",
+      "sanskrit": "Plavini",
+      "korean": [
+        "플라비니",
+        "플라비니 호흡법"
+      ],
+      "koreanNames": [],
+      "meaning": "전통 요가의 호흡법.",
+      "sources": [
+        "https://www.koreayoga.net/page/sub5_4",
+        "https://yoga-bits.com/ko/breaths/"
+      ],
+      "variants": [
+        {
+          "text": "플라비니",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.koreayoga.net/page/sub5_4"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "플라비니 호흡법",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yoga-bits.com/ko/breaths/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "호흡·정화",
+      "verifiedSources": [
+        "https://www.koreayoga.net/page/sub5_4",
+        "https://yoga-bits.com/ko/breaths/"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c58-chandra-bhedana",
+      "sanskrit": "Chandra Bhedana",
+      "korean": [
+        "찬드라 베다나",
+        "찬드라 나디 베다나"
+      ],
+      "koreanNames": [],
+      "meaning": "달의 통로와 관련한 한쪽 콧구멍 호흡법.",
+      "sources": [
+        "https://www.yes24.com/product/goods/125576822",
+        "https://www.anantadrishtiyoga.com/ko/advanced-pranayama-course?course=30-day"
+      ],
+      "variants": [
+        {
+          "text": "찬드라 베다나",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.yes24.com/product/goods/125576822"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "찬드라 나디 베다나",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.anantadrishtiyoga.com/ko/advanced-pranayama-course?course=30-day"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "호흡·정화",
+      "verifiedSources": [
+        "https://www.yes24.com/product/goods/125576822",
+        "https://www.anantadrishtiyoga.com/ko/advanced-pranayama-course?course=30-day"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c58-dirgha",
+      "sanskrit": "Dirgha Pranayama",
+      "korean": [
+        "디르가 프라나야마",
+        "삼부 호흡"
+      ],
+      "koreanNames": [],
+      "meaning": "호흡을 세 부분으로 나누어 의식하는 호흡법.",
+      "sources": [
+        "https://www.yes24.com/product/goods/125576822",
+        "https://www.tummee.com/ko/yoga-poses/dirga-pranayama"
+      ],
+      "variants": [
+        {
+          "text": "디르가 프라나야마",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.yes24.com/product/goods/125576822"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "삼부 호흡",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.tummee.com/ko/yoga-poses/dirga-pranayama"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "호흡·정화",
+      "verifiedSources": [
+        "https://www.yes24.com/product/goods/125576822",
+        "https://www.tummee.com/ko/yoga-poses/dirga-pranayama"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c59-anjali",
+      "sanskrit": "Anjali Mudra",
+      "korean": [
+        "안잘리 무드라",
+        "안잘리무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "합장으로 표현하는 손동작.",
+      "sources": [
+        "https://www.tummee.com/ko/yoga-poses/wide-squat-pose",
+        "https://yogaeun.tistory.com/526"
+      ],
+      "variants": [
+        {
+          "text": "안잘리 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.tummee.com/ko/yoga-poses/wide-squat-pose"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "안잘리무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yogaeun.tistory.com/526"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://www.tummee.com/ko/yoga-poses/wide-squat-pose",
+        "https://yogaeun.tistory.com/526"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c59-vishnu",
+      "sanskrit": "Vishnu Mudra",
+      "korean": [
+        "비슈누 무드라",
+        "비쉬누 무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "교대 호흡 등에 사용하는 손동작.",
+      "sources": [
+        "https://www.siddhiyoga.com/ko/yoga/practice/mudra/vishnu-mudra",
+        "https://lifeonmat.tistory.com/12"
+      ],
+      "variants": [
+        {
+          "text": "비슈누 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.siddhiyoga.com/ko/yoga/practice/mudra/vishnu-mudra"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "비쉬누 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://lifeonmat.tistory.com/12"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://www.siddhiyoga.com/ko/yoga/practice/mudra/vishnu-mudra",
+        "https://lifeonmat.tistory.com/12"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c59-ashwini",
+      "sanskrit": "Ashwini Mudra",
+      "korean": [
+        "아시위니 무드라",
+        "아쉬위니 무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "골반저 수축과 이완을 사용하는 무드라.",
+      "sources": [
+        "https://kriyayoga.co.kr/91",
+        "https://dhsrmstory.tistory.com/280"
+      ],
+      "variants": [
+        {
+          "text": "아시위니 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://kriyayoga.co.kr/91"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "아쉬위니 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://dhsrmstory.tistory.com/280"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://kriyayoga.co.kr/91",
+        "https://dhsrmstory.tistory.com/280"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c59-dhyana-mudra",
+      "sanskrit": "Dhyana Mudra",
+      "korean": [
+        "디야나 무드라",
+        "디야나무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "명상할 때 쓰는 손동작.",
+      "sources": [
+        "https://www.yes24.com/product/goods/125576822",
+        "https://gimssine.com/products/9791198675606?_fid=1d056c3b1&_pos=2596&_ss=c"
+      ],
+      "variants": [
+        {
+          "text": "디야나 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.yes24.com/product/goods/125576822"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "디야나무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://gimssine.com/products/9791198675606?_fid=1d056c3b1&_pos=2596&_ss=c"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://www.yes24.com/product/goods/125576822",
+        "https://gimssine.com/products/9791198675606?_fid=1d056c3b1&_pos=2596&_ss=c"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c59-pushan",
+      "sanskrit": "Pushan Mudra",
+      "korean": [
+        "푸샨 무드라",
+        "푸샨무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "양손의 손가락을 서로 다르게 모으는 무드라.",
+      "sources": [
+        "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+      ],
+      "variants": [
+        {
+          "text": "푸샨 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "푸샨무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "한 곳 확인"
+    },
+    {
+      "id": "yoga-c59-prana-mudra",
+      "sanskrit": "Prana Mudra",
+      "korean": [
+        "프라나 무드라",
+        "프라나무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "엄지와 약지·새끼손가락 끝을 모으는 무드라.",
+      "sources": [
+        "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+      ],
+      "variants": [
+        {
+          "text": "프라나 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "프라나무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "한 곳 확인"
+    },
+    {
+      "id": "yoga-c59-vayu-mudra",
+      "sanskrit": "Vayu Mudra",
+      "korean": [
+        "바유 무드라",
+        "바유무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "검지를 접어 엄지로 누르는 무드라.",
+      "sources": [
+        "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+      ],
+      "variants": [
+        {
+          "text": "바유 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "바유무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "한 곳 확인"
+    },
+    {
+      "id": "yoga-c59-garuda-mudra",
+      "sanskrit": "Garuda Mudra",
+      "korean": [
+        "가루다 무드라",
+        "가루다무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "손을 겹치고 엄지를 교차하는 무드라.",
+      "sources": [
+        "https://yoga-bits.com/ko/mudras/",
+        "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+      ],
+      "variants": [
+        {
+          "text": "가루다 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yoga-bits.com/ko/mudras/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "가루다무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://yoga-bits.com/ko/mudras/",
+        "https://yeonjaehada.tistory.com/entry/%EB%AC%B4%EB%93%9C%EB%9D%BC-%EC%86%90%EC%9C%BC%EB%A1%9C-%ED%95%98%EB%8A%94-%EC%88%98%EB%A0%A8%EC%9D%98-%EC%9D%98%EB%AF%B8%EC%99%80-%EC%97%AC%EB%9F%AC-%EA%B0%80%EC%A7%80-%EB%AC%B4%EB%93%9C%EB%9D%BC"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c59-hands-on",
+      "sanskrit": "",
+      "korean": [
+        "핸즈온",
+        "핸즈 온"
+      ],
+      "koreanNames": [],
+      "meaning": "지도자가 손으로 수련자의 움직임이나 자세를 돕는 지도 방식.",
+      "sources": [
+        "https://rebornyoga.co.kr/notice/?bmode=view&idx=164200195",
+        "https://brunch.co.kr/brunchbook/greenery"
+      ],
+      "variants": [
+        {
+          "text": "핸즈온",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://rebornyoga.co.kr/notice/?bmode=view&idx=164200195"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "핸즈 온",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://brunch.co.kr/brunchbook/greenery"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "철학·수련",
+      "verifiedSources": [
+        "https://rebornyoga.co.kr/notice/?bmode=view&idx=164200195",
+        "https://brunch.co.kr/brunchbook/greenery"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "두 곳 이상 확인"
+    },
+    {
+      "id": "yoga-c59-adi",
+      "sanskrit": "Adi Mudra",
+      "korean": [
+        "아디 무드라",
+        "아디무드라"
+      ],
+      "koreanNames": [],
+      "meaning": "손가락을 엄지 위로 감싸 쥐는 무드라.",
+      "sources": [
+        "https://www.tummee.com/ko/yoga-poses/adi-mudra"
+      ],
+      "variants": [
+        {
+          "text": "아디 무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.tummee.com/ko/yoga-poses/adi-mudra"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        },
+        {
+          "text": "아디무드라",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.tummee.com/ko/yoga-poses/adi-mudra"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
+        }
+      ],
+      "category": "반다·무드라",
+      "verifiedSources": [
+        "https://www.tummee.com/ko/yoga-poses/adi-mudra"
+      ],
+      "unverifiedSources": [],
+      "sourceAssessment": "한 곳 확인"
     }
   ],
   "fragments": [

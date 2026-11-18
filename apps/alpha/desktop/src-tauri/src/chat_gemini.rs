@@ -522,6 +522,7 @@ pub(crate) async fn run<F: FnMut(&str, Value) + Send>(
     key: String,
     approvals: Option<ApprovalChannel>,
     cancel: CancellationToken,
+    output_dir: Option<&Path>,
     emit: &mut F,
 ) -> Result<(), String> {
     let blocks = attachment_blocks(archive, attachments)?;
@@ -532,6 +533,9 @@ pub(crate) async fn run<F: FnMut(&str, Value) + Send>(
         .join("gemini-acp");
     std::fs::create_dir_all(&config_dir).map_err(|_| "AI 저장소를 열지 못했습니다")?;
     let mut cmd = crate::process::hidden_async_command(exe);
+    if let Some(path) = output_dir {
+        crate::chat_output::add_dir(&mut cmd, path);
+    }
     cmd.args(["--settings", GEMINI_SETTINGS, "acp", "--gemini-dir"])
         .arg(config_dir)
         .arg("--log-file")

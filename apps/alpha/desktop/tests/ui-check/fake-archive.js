@@ -204,6 +204,7 @@
         status: head.status,
         createdAt: head.created_at,
         updatedAt: head.updated_at,
+        folder: (window.__zetFolderOf || {})[head.id] ?? '',
       }))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
@@ -727,6 +728,15 @@
   // 팝업(가짜): window.__panelPopup('opened'|'closed', host, openerHost, title)
   window.__panelPopup = (state, host, openerHost, title) => emit('panel-browser-popup', { state, host, openerHost: openerHost ?? null, title: title ?? null, reason: state === 'closed' ? 'user' : null })
   window.__panelAgentOpen = (chatId) => emit('panel-agent-open-request', { chatId })
+  // 로그인 코드(가짜, 2026-11-18 넷째 줄 계약): 장치 코드 · 닫힘 · 클로드 기본 브라우저 안내.
+  window.__deviceLogin = (provider = 'codex', seconds = 900) => emit('provider-login-device', { provider, url: provider === 'github' ? 'https://github.com/login/device' : 'https://auth.openai.com/codex/device', code: provider === 'github' ? 'A1B2-C3D4' : 'KQ7M-2XWP', expiresInSeconds: seconds })
+  window.__deviceLoginClosed = (provider = 'codex') => emit('provider-login-device-closed', { provider })
+  window.__claudeLogin = (provider = 'claude') => emit('provider-login-browser', { provider, mode: 'default_browser' })
+  window.__browserLoginClosed = (provider = 'claude') => emit('provider-login-browser-closed', { provider })
+  window.__mediaRegenerated = (chatId, status = 'recorded') => emit('chat-media-regeneration', { chatId, userMessageId: 'm', status })
+  window.__chatItemsUpdated = (chatId) => emit('chat-items-updated', { chatId })
+  window.__loginStorage = (action = 'removed') => emit('provider-login-insecure-storage', { provider: 'github', action })
+  window.__resumeStarted = (chatId) => emit('panel-agent-resume-started', { chatId, userMessageId: 'resume-1', text: '로그인을 마쳤습니다. 이어서 해 주세요.', provider: 'claude', skill: null, originalMessageId: null })
   // 회사가 다시 시도하는 중(가짜, 2026-11-18 계약): 지금 답을 쓰는 채팅방마다 chat-provider-retrying.
   window.__chatRetrying = (kind = 'serviceUnavailable', attempt = 1, seconds = null) => Object.keys(running).forEach((chatId) => emit('chat-provider-retrying', { chatId, provider: 'gemini', attempt, kind, retryAfterSeconds: seconds }))
   window.__panelAgent = (chatId, state, reason, chatTitle, loginUrl) => {
@@ -1570,6 +1580,26 @@
       case 'zet_list':
         if (scenario === 'fail') throw '글 목록을 읽지 못했습니다'
         return scenario === 'empty' ? [] : listEntries()
+      // 문서 폴더(가짜, 2026-11-18 뒤쪽 1568490 꼴): 폴더 목록·만들기·문서 옮기기·이름 바꾸기.
+      case 'zet_folders': {
+        const all = new Set(window.__zetFolders || [])
+        Object.values(window.__zetFolderOf || {}).forEach((path) => { const parts = path.split('/').filter(Boolean); for (let i = 1; i <= parts.length; i += 1) all.add(parts.slice(0, i).join('/')) })
+        return [...all]
+      }
+      case 'zet_create_folder': {
+        if (!args.folder || args.folder.split('/').some((part) => !part || part.trim() !== part)) throw 'invalid_folder'
+        const parts = args.folder.split('/'); window.__zetFolders = window.__zetFolders || []
+        for (let i = 1; i <= parts.length; i += 1) { const path = parts.slice(0, i).join('/'); if (!window.__zetFolders.includes(path)) window.__zetFolders.push(path) }
+        return null
+      }
+      case 'provider_login_browser_ack': window.__ackCalls = (window.__ackCalls || []).concat([args.provider]); return 'acknowledged'
+      case 'zet_set_folder': window.__zetFolderOf = { ...(window.__zetFolderOf || {}), [args.id]: args.folder }; return null
+      case 'zet_rename_folder': {
+        const swap = (path) => (path === args.from ? args.to : path.startsWith(args.from + '/') ? args.to + path.slice(args.from.length) : path)
+        window.__zetFolders = (window.__zetFolders || []).map(swap)
+        window.__zetFolderOf = Object.fromEntries(Object.entries(window.__zetFolderOf || {}).map(([id, path]) => [id, swap(path)]))
+        return null
+      }
       case 'zet_read': {
         const zet = zets[args.id]
         if (!zet) throw '글을 읽지 못했습니다'

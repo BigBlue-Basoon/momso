@@ -22,7 +22,8 @@ $turn = [Console]::ReadLine() | ConvertFrom-Json
 if ($turn.params.PSObject.Properties.Name -contains 'effort') { exit 25 }
 if ($turn.params.input[0].text.Contains('C15_PRIVATE_DICTIONARY_MARKER')) { exit 25 }
 if (-not $turn.params.input[0].text.Contains('history-marker') -or -not $turn.params.input[0].text.Contains('attachment-marker.txt')) { exit 21 }
-if (-not $turn.params.input[0].text.StartsWith('$sample ')) { exit 22 }
+if (-not $turn.params.input[0].text.Contains('momso_skill_read') -or -not $turn.params.input[0].text.Contains('sample')) { exit 22 }
+if ($env:SCENE -eq 'complete') { & $env:MOMSO_COMPARE_EXE --exact chat_conformance::document_bridge_helper --nocapture | Out-Null; if ($LASTEXITCODE -ne 0) { exit 27 } }
 '{"method":"thread/tokenUsage/updated","params":{"threadId":"fixture-thread","tokenUsage":{"last":{"totalTokens":12},"modelContextWindow":1000}}}'
 '{"method":"item/agentMessage/delta","params":{"delta":"hello"}}'
 if ($env:SCENE -eq 'stop') { [Threading.Thread]::Sleep(30000); exit 0 }
@@ -60,6 +61,7 @@ $turn = [Console]::ReadLine() | ConvertFrom-Json
 if ($turn.message.content.Contains('C15_PRIVATE_DICTIONARY_MARKER')) { exit 25 }
 if (-not $turn.message.content.Contains('history-marker') -or -not $turn.message.content.Contains('attachment-marker.txt')) { exit 21 }
 if (-not $turn.message.content.StartsWith('/sample ')) { exit 22 }
+if ($env:SCENE -eq 'complete') { & $env:MOMSO_COMPARE_EXE --exact chat_conformance::document_bridge_helper --nocapture | Out-Null; if ($LASTEXITCODE -ne 0) { exit 27 } }
 '{"type":"system","subtype":"init","session_id":"fixture-session"}'
 '{"type":"assistant","message":{"model":"fixture-model","content":[]}}'
 '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}}'
@@ -112,6 +114,8 @@ while ($line = [Console]::ReadLine()) {
       if ($v.params.prompt[0].text.Contains('C15_PRIVATE_DICTIONARY_MARKER')) { exit 25 }
       if (-not $v.params.prompt[0].text.Contains('history-marker') -or -not $v.params.prompt[0].text.Contains('attachment-marker.txt')) { exit 21 }
       if (-not $v.params.prompt[0].text.StartsWith('/sample ')) { exit 22 }
+      if (-not (($v.params.prompt | ConvertTo-Json -Depth 10 -Compress).Contains('fake file'))) { exit 28 }
+      if ($env:SCENE -eq 'complete') { & $env:MOMSO_COMPARE_EXE --exact chat_conformance::document_bridge_helper --nocapture | Out-Null; if ($LASTEXITCODE -ne 0) { exit 27 } }
       '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}'
       if ($env:SCENE -eq 'stop') {
         $null = [Console]::ReadLine()
@@ -162,7 +166,7 @@ fn command(path: &Path, scene: &str) -> Command {
 }
 
 #[tokio::test]
-async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
+async fn three_providers_compare_document_attachment_approval_stop_and_authentication() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.sqlite");
     storage::initialize(&db, &dir.path().join("backups"), "test").unwrap();
@@ -172,6 +176,19 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
     std::fs::create_dir_all(dir.path().join("zettels")).unwrap();
     std::fs::create_dir_all(dir.path().join("receipts")).unwrap();
     std::fs::create_dir_all(dir.path().join("dictionary")).unwrap();
+    let document = crate::archive_zet::create(
+        dir.path(),
+        &db,
+        crate::archive_zet::ZetCreate {
+            title: "Fixture document".into(),
+            summary: "Fixture summary".into(),
+            kind: "note".into(),
+            body: "fixture document body".into(),
+            assets: vec![],
+            edges: vec![],
+        },
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("dictionary/yoga.json"),
         "C15_PRIVATE_DICTIONARY_MARKER",
@@ -262,6 +279,30 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
             fake.current_dir(dir.path())
                 .env("ZET_EDIT", &edit_id)
                 .env("ZET_CREATE", &create_id);
+            let root = dir.path().to_path_buf();
+            let bridge_db = db.clone();
+            let handler: crate::setup_bridge::Handler = Arc::new(move |input| {
+                let root = root.clone();
+                let db = bridge_db.clone();
+                Box::pin(async move {
+                    crate::momso_document_read::dispatch(
+                        &root,
+                        &db,
+                        input["method"].as_str().unwrap_or(""),
+                        &input["arguments"],
+                    )
+                })
+            });
+            let _bridge =
+                crate::setup_bridge::start(&id, CancellationToken::new(), handler).unwrap();
+            let read_marker = dir.path().join(format!("read-{id}"));
+            fake.env("MOMSO_COMPARE_EXE", std::env::current_exe().unwrap())
+                .env(
+                    "MOMSO_COMPARE_PIPE",
+                    crate::setup_bridge::name(&id).unwrap(),
+                )
+                .env("MOMSO_COMPARE_DOC", &document)
+                .env("MOMSO_COMPARE_MARKER", &read_marker);
             let requests = Arc::new(Mutex::new(Vec::new()));
             let observed = requests.clone();
             let channel: ApprovalChannel = Box::new(move |request, _| {
@@ -312,6 +353,7 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
                             token,
                             None,
                             None,
+                            None,
                             &mut emit,
                         )
                         .await
@@ -342,7 +384,7 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
                             dir.path(),
                             &id,
                             &prompt,
-                            Vec::new(),
+                            chat_gemini::attachment_blocks(dir.path(), &attachments).unwrap(),
                             None,
                             None,
                             "default",
@@ -457,6 +499,12 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
                 continue;
             }
             result.unwrap();
+            if scene == "complete" {
+                assert_eq!(
+                    std::fs::read_to_string(&read_marker).unwrap(),
+                    "fixture document body"
+                );
+            }
             let after = crate::chat_file_changes::capture(dir.path()).unwrap();
             let receipt = crate::archive_receipt::ReceiptCreate {
                 tool: provider.into(),
@@ -564,4 +612,30 @@ async fn same_fake_scene_compares_stream_completion_stop_and_approvals() {
     assert_eq!(outcomes[1][2].0, "command");
     assert_eq!(outcomes[1][2].1, "delete");
     assert_eq!(outcomes[2][2].1, "delete");
+}
+
+#[test]
+fn document_bridge_helper() {
+    use std::io::{BufRead, BufReader, Write};
+    let Ok(pipe) = std::env::var("MOMSO_COMPARE_PIPE") else {
+        return;
+    };
+    let id = std::env::var("MOMSO_COMPARE_DOC").unwrap();
+    let marker = std::env::var("MOMSO_COMPARE_MARKER").unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pipe)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({"method":"momso_document_read","arguments":{"id":id}})
+    )
+    .unwrap();
+    let mut response = String::new();
+    BufReader::new(file).read_line(&mut response).unwrap();
+    let value: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(value["status"], "ok");
+    std::fs::write(marker, value["document"]["body"].as_str().unwrap()).unwrap();
 }

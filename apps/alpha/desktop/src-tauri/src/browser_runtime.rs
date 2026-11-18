@@ -47,6 +47,7 @@ struct Entry {
     session: Arc<Mutex<Option<Session>>>,
     panel_lease: Option<Arc<crate::panel_ownership::PanelLease>>,
     waiting_for_human: AtomicBool,
+    external_login: AtomicBool,
 }
 impl Entry {
     fn denied(&self) -> Value {
@@ -180,9 +181,22 @@ async fn request_scope(
 #[derive(Default)]
 pub(crate) struct BrowserManager {
     entries: AsyncMutex<HashMap<String, Arc<Entry>>>,
+    turns: Mutex<HashMap<String, ResumeTurn>>,
+    pub(crate) resume_lock: AsyncMutex<()>,
     pub(crate) panel_ownership: crate::panel_ownership::PanelOwnership,
     app: std::sync::OnceLock<tauri::AppHandle>,
     panel_identities: Mutex<HashMap<String, PanelIdentity>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResumeTurn {
+    pub provider: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub skill: Option<String>,
+    pub fast: Option<bool>,
+    pub auth_method: Option<String>,
+    pub original_message_id: String,
 }
 
 async fn wait_for_panel(
@@ -364,6 +378,37 @@ async fn call<T: Send + 'static>(
 }
 
 impl BrowserManager {
+    pub(crate) async fn wait_for_login_turn_end(
+        &self,
+        active: &crate::chat_codex::Active,
+        chat_id: &str,
+    ) -> Result<(), &'static str> {
+        while active.lock().await.contains_key(chat_id) {
+            if !self.waiting_for_login(chat_id).await {
+                return Err("login_wait_ended");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+    pub(crate) fn remember_turn(&self, chat_id: &str, turn: ResumeTurn) {
+        if let Ok(mut turns) = self.turns.lock() {
+            turns.entry(chat_id.to_owned()).or_insert(turn);
+        }
+    }
+    pub(crate) fn remembered_turn(&self, chat_id: &str) -> Option<ResumeTurn> {
+        self.turns.lock().ok()?.get(chat_id).cloned()
+    }
+    pub(crate) async fn waiting_for_login(&self, chat_id: &str) -> bool {
+        self.entries.lock().await.get(chat_id).is_some_and(|entry| {
+            entry.panel_lease.is_some() && entry.waiting_for_human.load(Ordering::Acquire)
+        })
+    }
+    pub(crate) async fn restore_login_wait(&self, chat_id: &str) {
+        if let Some(entry) = self.entries.lock().await.get(chat_id) {
+            entry.waiting_for_human.store(true, Ordering::Release);
+        }
+    }
     pub(crate) async fn resume_after_login(
         &self,
         chat_id: &str,
@@ -374,10 +419,16 @@ impl BrowserManager {
         if entry.panel_lease.is_none() || !entry.waiting_for_human.load(Ordering::Acquire) {
             return Ok(false);
         }
+        if entry.external_login.load(Ordering::Acquire) {
+            return Err("external_login_unavailable");
+        }
         let _serial = entry.serial.lock().await;
         call(&entry, |session| session.adopt_after_human_login())
             .await
-            .map_err(|_| "human_required")?;
+            .map_err(|error| match error {
+                DriverError::HumanRequired(_) | DriverError::Blocked(_) => "login_incomplete",
+                _ => "unavailable",
+            })?;
         self.panel_ready(&entry, chat_id, notify);
         Ok(true)
     }
@@ -400,7 +451,10 @@ impl BrowserManager {
     pub(crate) fn bind_app(&self, app: tauri::AppHandle) {
         let _ = self.app.set(app);
     }
-    pub(crate) async fn close_panel_turn(&self, chat_id: &str, notify: &Notify) {
+    pub(crate) async fn close_panel_turn(&self, chat_id: &str, keep_login: bool, notify: &Notify) {
+        if keep_login && self.waiting_for_login(chat_id).await {
+            return;
+        }
         let is_panel = self
             .entries
             .lock()
@@ -409,6 +463,8 @@ impl BrowserManager {
             .is_some_and(|entry| entry.panel_lease.is_some());
         if is_panel {
             self.close(chat_id, notify).await;
+        } else if let Ok(mut turns) = self.turns.lock() {
+            turns.remove(chat_id);
         }
     }
     pub(crate) async fn is_open(&self, chat_id: &str) -> bool {
@@ -438,6 +494,9 @@ impl BrowserManager {
         active
     }
     pub(crate) async fn close(&self, chat_id: &str, notify: &Notify) {
+        if let Ok(mut turns) = self.turns.lock() {
+            turns.remove(chat_id);
+        }
         let entry = self.entries.lock().await.remove(chat_id);
         if let Some(entry) = entry {
             let _serial = entry.serial.lock().await;
@@ -693,6 +752,7 @@ impl BrowserManager {
                 session: Arc::new(Mutex::new(Some(session))),
                 panel_lease,
                 waiting_for_human: AtomicBool::new(false),
+                external_login: AtomicBool::new(false),
             });
             let mut entries = self.entries.lock().await;
             if cancel.is_cancelled() {
@@ -726,6 +786,10 @@ impl BrowserManager {
             Arc::new(move |name: &str, mut payload: Value| {
                 if name == "browser-human-required" {
                     entry.waiting_for_human.store(true, Ordering::Release);
+                    entry.external_login.store(
+                        payload.get("reason").and_then(Value::as_str) == Some("external_login"),
+                        Ordering::Release,
+                    );
                     let reason = match payload.get("reason").and_then(Value::as_str) {
                         Some("external_login") => "google_login_external",
                         Some("login" | "password") => "login_page",
@@ -1095,6 +1159,99 @@ mod scope_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
+    async fn returning_while_turn_finishes_waits_and_rejects_duplicate() {
+        let manager = Arc::new(BrowserManager::default());
+        let lease = Arc::new(manager.panel_ownership.claim("chat").unwrap());
+        let entry = Arc::new(Entry {
+            policy: Policy::test_loopback("http://127.0.0.1:1234".into()),
+            skill: "fixture-skill".into(),
+            action: "fixture".into(),
+            grant: Mutex::new(None),
+            extra_origins: Mutex::new(BTreeSet::new()),
+            blocked_origin: Mutex::new(None),
+            serial: AsyncMutex::new(()),
+            session: Arc::new(Mutex::new(Some(Session::fake_for_host_approval(&[])))),
+            panel_lease: Some(lease),
+            waiting_for_human: AtomicBool::new(true),
+            external_login: AtomicBool::new(false),
+        });
+        manager.entries.lock().await.insert("chat".into(), entry);
+        let active = crate::chat_codex::Active::default();
+        active
+            .lock()
+            .await
+            .insert("chat".into(), CancellationToken::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task_manager = manager.clone();
+        let task_active = active.clone();
+        let task_calls = calls.clone();
+        let pending = tokio::spawn(async move {
+            let _guard = task_manager.resume_lock.try_lock().unwrap();
+            ready_tx.send(()).unwrap();
+            task_manager
+                .wait_for_login_turn_end(&task_active, "chat")
+                .await
+                .unwrap();
+            task_calls.fetch_add(1, Ordering::SeqCst);
+        });
+        ready_rx.await.unwrap();
+        assert!(manager.resume_lock.try_lock().is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let notify: Notify = Arc::new(|_, _| {});
+        manager.close_panel_turn("chat", true, &notify).await;
+        active.lock().await.remove("chat");
+        pending.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(manager.waiting_for_login("chat").await);
+    }
+
+    #[tokio::test]
+    async fn finished_login_turn_preserves_scope_and_original_request() {
+        let manager = BrowserManager::default();
+        let lease = Arc::new(manager.panel_ownership.claim("chat").unwrap());
+        let entry = Arc::new(Entry {
+            policy: Policy::test_loopback("http://127.0.0.1:1234".into()),
+            skill: "fixture-skill".into(),
+            action: "fixture".into(),
+            grant: Mutex::new(None),
+            extra_origins: Mutex::new(BTreeSet::new()),
+            blocked_origin: Mutex::new(None),
+            serial: AsyncMutex::new(()),
+            session: Arc::new(Mutex::new(Some(Session::fake_for_host_approval(&[])))),
+            panel_lease: Some(lease),
+            waiting_for_human: AtomicBool::new(true),
+            external_login: AtomicBool::new(false),
+        });
+        manager.entries.lock().await.insert("chat".into(), entry);
+        manager.remember_turn(
+            "chat",
+            ResumeTurn {
+                provider: "codex".into(),
+                model: None,
+                effort: None,
+                skill: Some("fixture-skill".into()),
+                fast: None,
+                auth_method: None,
+                original_message_id: "message-1".into(),
+            },
+        );
+        let notify: Notify = Arc::new(|_, _| {});
+        manager.close_panel_turn("chat", true, &notify).await;
+        assert!(manager.waiting_for_login("chat").await);
+        let turn = manager.remembered_turn("chat").unwrap();
+        assert_eq!(turn.skill.as_deref(), Some("fixture-skill"));
+        assert_eq!(turn.original_message_id, "message-1");
+        assert_eq!(
+            manager.resume_after_login("chat", &notify).await,
+            Err("unavailable")
+        );
+        assert!(manager.waiting_for_login("chat").await);
+        manager.close_panel_turn("chat", false, &notify).await;
+        assert!(manager.remembered_turn("chat").is_none());
+    }
+
+    #[tokio::test]
     async fn panel_open_wait_ends_with_turn_cancellation() {
         let ownership = crate::panel_ownership::PanelOwnership::default();
         let lease = ownership.claim("fixture").unwrap();
@@ -1155,6 +1312,7 @@ mod scope_tests {
             session: Arc::new(Mutex::new(Some(Session::fake_for_host_approval(&[])))),
             panel_lease: None,
             waiting_for_human: AtomicBool::new(false),
+            external_login: AtomicBool::new(false),
         });
         let manager = BrowserManager::default();
         manager
@@ -1425,6 +1583,7 @@ mod tests {
                     session: Arc::new(Mutex::new(Some(session))),
                     panel_lease: None,
                     waiting_for_human: AtomicBool::new(false),
+                    external_login: AtomicBool::new(false),
                 });
                 manager.entries.lock().await.insert("chat".into(), entry);
                 let broker = ApprovalBroker::default();

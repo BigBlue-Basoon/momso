@@ -408,7 +408,9 @@ struct GhReply {
 }
 
 fn run_gh(args: &[&str]) -> Result<GhReply, ()> {
-    let output = hidden(&mut crate::process::hidden_command("gh"))
+    let mut command = crate::process::hidden_command("gh");
+    crate::gh_owned::apply(&mut command).map_err(|_| ())?;
+    let output = hidden(&mut command)
         .env("GH_HOST", "github.com")
         .args(args)
         .stdin(Stdio::null())
@@ -758,6 +760,7 @@ fn hidden(command: &mut Command) -> &mut Command {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteStatus {
     state: &'static str,
+    gh_config_source: Option<&'static str>,
     chat_backup: &'static str,
     reason: Option<&'static str>,
     history_reason: Option<&'static str>,
@@ -789,6 +792,7 @@ impl RemoteStatus {
     fn new(state: &'static str, reason: Option<&'static str>) -> Self {
         Self {
             state,
+            gh_config_source: crate::gh_owned::source(),
             chat_backup: "included",
             reason,
             history_reason: None,
@@ -878,7 +882,15 @@ fn git_path(_resources: &Path) -> Option<PathBuf> {
     crate::git_tool::resolve().map(|(path, _)| path)
 }
 fn git_output(tool: &Path, root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    hidden(&mut crate::process::hidden_command(tool))
+    let mut command = crate::process::hidden_command(tool);
+    let verified = crate::gh_owned::apply(&mut command).is_ok();
+    if !verified {
+        if let Some(dir) = crate::gh_owned::directory() {
+            command.env("GH_CONFIG_DIR", dir);
+        }
+        command.env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");
+    }
+    hidden(&mut command)
         .current_dir(root)
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -902,7 +914,11 @@ fn git_output(tool: &Path, root: &Path, args: &[&str]) -> std::io::Result<std::p
             "-c",
             "credential.helper=",
             "-c",
-            "credential.https://github.com.helper=!gh auth git-credential",
+            if verified {
+                "credential.https://github.com.helper=!gh auth git-credential"
+            } else {
+                "credential.https://github.com.helper="
+            },
             "-c",
             "http.followRedirects=false",
             "-c",
@@ -1220,7 +1236,9 @@ fn merge_people(base: &str, local: &str, remote: &str) -> Result<(Vec<u8>, bool)
     Ok((bytes, conflicts))
 }
 fn gh_output(args: &[&str]) -> std::io::Result<std::process::Output> {
-    hidden(&mut crate::process::hidden_command("gh"))
+    let mut command = crate::process::hidden_command("gh");
+    crate::gh_owned::apply(&mut command)?;
+    hidden(&mut command)
         .env("GH_HOST", "github.com")
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
@@ -1844,6 +1862,7 @@ fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static
             || matches!(
                 p,
                 "zettels"
+                    | "zettels/.folders.json"
                     | "receipts"
                     | ".gitignore"
                     | "AGENTS.md"
@@ -2560,12 +2579,25 @@ fn default_file_unchanged(path: &Path, name: &str) -> bool {
     let Ok(contents) = fs::read_to_string(path) else {
         return false;
     };
-    let expected = if name == ".gitignore" {
-        "objects/\n"
-    } else {
-        include_str!("archive_rules.md")
-    };
-    contents.replace("\r\n", "\n") == expected.replace("\r\n", "\n")
+    let normalized = contents.replace("\r\n", "\n");
+    if name == ".gitignore" {
+        return normalized == "objects/\n" || normalized == "objects/\n.momso/outputs/\n";
+    }
+    let expected = include_str!("archive_rules.md");
+    normalized == expected.replace("\r\n", "\n")
+}
+
+#[cfg(test)]
+#[test]
+fn first_receive_accepts_both_default_ignore_versions() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join(".gitignore");
+    for contents in ["objects/\n", "objects/\n.momso/outputs/\n"] {
+        std::fs::write(&path, contents).unwrap();
+        assert!(default_file_unchanged(&path, ".gitignore"));
+    }
+    std::fs::write(&path, "objects/\ncustom/\n").unwrap();
+    assert!(!default_file_unchanged(&path, ".gitignore"));
 }
 
 // First receive moves only exact bundled files aside and preserves them; any
@@ -4120,6 +4152,9 @@ pub(crate) async fn archive_remote_status(
     app: tauri::AppHandle,
     state: State<'_, crate::AppState>,
 ) -> Result<RemoteStatus, String> {
+    if let Err(reason) = crate::provider_auth::refresh_gh_owned(&app).await {
+        return Ok(RemoteStatus::new("unavailable", Some(reason)));
+    }
     Ok(status_impl(app, state).await)
 }
 #[tauri::command]
@@ -4816,6 +4851,27 @@ mod tests {
             );
             assert_eq!(status["state"], "saved");
         }
+    }
+    #[test]
+    fn safe_history_accepts_folder_registry() {
+        let f = Fixture::new();
+        fs::write(f.root.join("zettels/.folders.json"), "[\"Classes\"]\n").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "zettels/.folders.json"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "folders",
+            ],
+        )
+        .unwrap();
+        assert!(super::safe_history(&f.tool, &f.root, "HEAD").is_ok());
     }
     impl Fixture {
         fn new() -> Self {

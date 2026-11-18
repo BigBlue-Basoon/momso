@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { AudioLines, ChevronLeft, ChevronRight, Copy, Layers, MessageSquare, Play, RefreshCw, X } from 'lucide-react'
-import { mediaChat, mediaSrc, type MediaItem } from '../media'
+import { AudioLines, ChevronLeft, ChevronRight, Copy, Download, Layers, MessageSquare, Play, RefreshCw, X } from 'lucide-react'
+import { listMediaVersions, mediaChat, mediaSrc, saveMediaAs, type MediaItem } from '../media'
 import { PROVIDER_NAME } from '../ai-models'
 import { W } from '../words'
 import { SourceDeleteDialog, type SourceNotice } from './SourceDelete'
@@ -184,9 +184,10 @@ function MediaTile({ creation, width, onOpen }: { creation: Creation; width: num
   const item = creation.cover
   const chat = mediaChat(item)
   const when = timeFormat.format(new Date(whenOf(item)))
-  const label = item.title ?? item.prompt ?? mediaLabel(item)
+  const label = item.title ?? (item.prompt?.trim() || null) ?? mediaLabel(item)
   const picture = item.kind === 'video' ? item.posterPath : item.kind === 'image' ? item.path : null
-  const count = creation.versions.length
+  // 목록에는 최신 판 하나와 판 수(versionCount)만 올 수 있다(뒤쪽 C52).
+  const count = Math.max(creation.versions.length, item.versionCount ?? 1)
   return (
     <button className={`media-tile is-${item.kind}`} type="button" style={{ width }} onClick={onOpen} aria-label={count > 1 ? `${label}, ${W.mediaView.versions(count)}` : label}>
       {picture ? (
@@ -237,11 +238,25 @@ function MediaDetail({ creations, index, onIndex, onClose, onOpenChat, onDelete,
 }) {
   // 화면 가득 덮으므로 열려 있는 동안 패널 브라우저를 숨긴다.
   usePanelBrowserHold()
-  const creation = creations[index]
+  const base = creations[index]
+  // 목록에 판이 하나만 왔는데 판 수가 더 많으면(뒤쪽 C52) 판 전체를 media_versions 로 읽는다.
+  const [loaded, setLoaded] = useState<{ key: string; versions: MediaItem[] } | null>(null)
+  useEffect(() => {
+    const cover = base.cover
+    if (base.versions.length > 1 || (cover.versionCount ?? 1) <= 1 || !cover.lineageId) return
+    let alive = true
+    listMediaVersions(cover)
+      .then((versions) => { if (alive && versions.length > 1) setLoaded({ key: base.key, versions }) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [base])
+  const creation = loaded && loaded.key === base.key ? { ...base, versions: loaded.versions } : base
   // 처음에는 마지막 버전. 다른 생성물로 넘어가면 그 생성물의 마지막 버전으로.
   const [versionIndex, setVersionIndex] = useState(creation.versions.length - 1)
-  useEffect(() => { setVersionIndex(creations[index].versions.length - 1) }, [creations, index])
+  useEffect(() => { setVersionIndex(creation.versions.length - 1) }, [creation.key, creation.versions.length])
   const item = creation.versions[Math.min(versionIndex, creation.versions.length - 1)]
+  // 빈 칸·빈칸만 있는 프롬프트는 없는 것으로 본다.
+  const prompt = item.prompt?.trim() || null
   const chat = mediaChat(item)
   const go = useCallback((step: number) => onIndex((index + step + creations.length) % creations.length), [index, creations.length, onIndex])
 
@@ -256,9 +271,19 @@ function MediaDetail({ creations, index, onIndex, onClose, onOpenChat, onDelete,
     return () => window.removeEventListener('keydown', onKey, true)
   }, [go, onClose, paused])
 
+  // 내려받기(media_save_as): Windows 저장 창에서 사람이 고른 자리에 새 파일로. 취소하면 아무 알림도 없다.
+  const [saving, setSaving] = useState(false)
+  function saveAs() {
+    setSaving(true)
+    saveMediaAs(item.id)
+      .then((status) => { if (status === 'saved') onNotice?.(W.mediaView.saved) })
+      .catch((error) => onNotice?.(W.mediaView.saveFailed[String(error)] ?? W.mediaView.saveFailed.other))
+      .finally(() => setSaving(false))
+  }
+
   function copyPrompt() {
-    if (!item.prompt) return
-    void navigator.clipboard.writeText(item.prompt)
+    if (!prompt) return
+    void navigator.clipboard.writeText(prompt)
       .then(() => onNotice?.(W.mediaView.copied))
       .catch(() => onNotice?.(W.mediaView.copyFailed))
   }
@@ -275,19 +300,20 @@ function MediaDetail({ creations, index, onIndex, onClose, onOpenChat, onDelete,
               <audio key={item.id} src={mediaSrc(item.path) ?? undefined} controls />
             </div>
           ) : (
-            <img key={item.id} src={mediaSrc(item.path) ?? undefined} alt={item.title ?? item.prompt ?? ''} />
+            <img key={item.id} src={mediaSrc(item.path) ?? undefined} alt={item.title ?? prompt ?? ''} />
           )}
         </figure>
         <aside className="media-side">
           {item.title && <h2 className="media-side-title">{item.title}</h2>}
-          {item.prompt && (
+          {/* 도구가 알리지 않아 자동 등록된 생성물은 프롬프트가 비어 온다(뒤쪽 f42672f): 빈 칸 대신 한 줄, 복사 단추는 두지 않는다. */}
+          {prompt ? (
             <div className="media-prompt">
-              <p>{item.prompt}</p>
+              <p>{prompt}</p>
               <button className="media-side-button" type="button" onClick={copyPrompt}>
                 <Copy size={13} aria-hidden />{W.mediaView.copyPrompt}
               </button>
             </div>
-          )}
+          ) : (item.by?.kind === 'ai' || item.lineageId) ? <p className="media-prompt-missing">{W.mediaView.noPrompt}</p> : null}
           <p className="media-side-meta">
             <MediaBy item={item} onDark={false} />
             <time dateTime={whenOf(item)}>{timeFormat.format(new Date(whenOf(item)))}</time>
@@ -306,9 +332,10 @@ function MediaDetail({ creations, index, onIndex, onClose, onOpenChat, onDelete,
                     aria-pressed={version.id === item.id}
                     aria-label={how ? `${name}, ${how}` : name}
                     title={how ? `${name} · ${how}` : name}
+                    disabled={!version.path}
                     onClick={() => setVersionIndex(at)}
                   >
-                    {picture ? <img src={mediaSrc(picture) ?? undefined} alt="" draggable={false} /> : <AudioLines size={16} aria-hidden />}
+                    {picture ? <img src={mediaSrc(picture) ?? undefined} alt="" draggable={false} /> : version.kind === 'audio' ? <AudioLines size={16} aria-hidden /> : <span className="media-version-missing" aria-hidden>—</span>}
                     <span>{version.version ?? at + 1}</span>
                   </button>
                 )
@@ -321,6 +348,11 @@ function MediaDetail({ creations, index, onIndex, onClose, onOpenChat, onDelete,
             {onRegenerate && (
               <button className="media-side-button is-primary" type="button" disabled={!chat} title={chat ? undefined : W.mediaView.regenerateNoChat} onClick={() => onRegenerate(item)}>
                 <RefreshCw size={13} aria-hidden />{W.mediaView.regenerate}
+              </button>
+            )}
+            {deletable(item) && item.path && item.kind !== 'audio' && (
+              <button className="media-side-button" type="button" disabled={saving} onClick={saveAs}>
+                <Download size={13} aria-hidden />{W.mediaView.saveAs}
               </button>
             )}
             {chat && onOpenChat && (

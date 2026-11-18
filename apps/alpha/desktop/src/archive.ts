@@ -17,8 +17,8 @@ export type ZetListEntry = {
   createdAt: string
   updatedAt: string
   /**
-   * 몸소 폴더 안의 폴더 경로(2026-11-18 화면이 바라는 꼴, 뒤쪽은 아직 주지 않음 — 지금 문서는 모두 zettels/ 에 평평하게 있다).
-   * '/' 로 나눈 이름들(예: "수업 기록/2026-11"), 맨 위면 '' 또는 null. 문서 화면이 폴더 꼴로 묶는다.
+   * 문서의 폴더(2026-11-18 뒤쪽 1568490, 문서 머리의 folder 값). '/' 로 나눈 이름들(예: "수업 기록/2026-11"), 맨 위면 ''.
+   * 파일은 그대로 zettels/ 에 있고 폴더는 머리 값과 폴더 목록 파일로만 있다. 문서 화면이 폴더 꼴로 묶는다.
    */
   folder?: string | null
 }
@@ -155,15 +155,46 @@ function requireArchive() {
   if (!isArchiveAvailable()) throw new Error('archive commands need the desktop runtime')
 }
 
-// 개발 앱에서만 문서·폴더 몇 개를 더한다(dev-samples/doc-samples.ts, 읽기·고치기는 메모리에서만). 설치판 빌드에는 들어가지 않는다.
+// 개발 앱에서만, 실제 문서가 하나도 없을 때 문서·폴더 몇 개를 보인다(dev-samples/doc-samples.ts, 읽기·고치기·옮기기는 메모리에서만).
+// 실제 문서가 있으면 섞지 않는다(2026-11-18). 설치판 빌드에는 들어가지 않는다.
 const devDocs = import.meta.env.DEV ? import('./dev-samples/doc-samples') : null
 const devDoc = async (id: string) => (devDocs && id.startsWith('dev-doc-') ? devDocs : null)
+let showingDevDocs = false
 
 export async function listZets() {
   requireArchive()
   const list = await invoke<ZetListEntry[]>('zet_list', { kind: null, status: null })
-  if (!devDocs) return list
-  return [...list, ...(await devDocs).devSampleEntries()]
+  showingDevDocs = Boolean(devDocs) && list.length === 0
+  if (!devDocs || !showingDevDocs) return list
+  return (await devDocs).devSampleEntries()
+}
+
+/**
+ * 폴더(2026-11-18 뒤쪽 1568490): zet_folders() → 모든 폴더 경로(빈 폴더와 위 폴더 포함). zet_create_folder({ folder }) 는 전체 경로,
+ * zet_set_folder({ id, folder }) 는 문서를 옮김(맨 위 ''), zet_rename_folder({ from, to }) 는 이름 바꾸기·옮기기(아래 폴더와 문서도 함께).
+ * 오류: invalid_folder(빈 이름 칸, 앞뒤 빈칸, . .., \), not_found, invalid_document, unavailable, 그리고 보관함 쓰기가 막혔을 때의 값.
+ */
+export async function listZetFolders() {
+  requireArchive()
+  const real = await invoke<string[]>('zet_folders').catch((error) => { if (showingDevDocs) return [] as string[]; throw error })
+  if (!devDocs || !showingDevDocs) return real
+  return [...new Set([...real, ...(await devDocs).devSampleFolders()])]
+}
+export async function createZetFolder(folder: string) {
+  requireArchive()
+  if (devDocs && showingDevDocs) { (await devDocs).createDevFolder(folder); return }
+  await invoke('zet_create_folder', { folder })
+}
+export async function setZetFolder(id: string, folder: string) {
+  requireArchive()
+  const sample = await devDoc(id)
+  if (sample) { (await sample).setDevFolder(id, folder); return }
+  await invoke('zet_set_folder', { id, folder })
+}
+export async function renameZetFolder(from: string, to: string) {
+  requireArchive()
+  if (devDocs && showingDevDocs) { (await devDocs).renameDevFolder(from, to); return }
+  await invoke('zet_rename_folder', { from, to })
 }
 
 export async function readZet(id: string) {

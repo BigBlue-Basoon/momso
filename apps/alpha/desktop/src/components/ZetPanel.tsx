@@ -13,7 +13,7 @@ import {
 } from 'react'
 import { createPortal } from 'react-dom'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { ArrowLeft, Check, ChevronRight, FileText, Folder, Globe, PanelRight, Pencil, RefreshCw, Search, Undo2 } from 'lucide-react'
+import { ArrowLeft, Check, ChevronRight, FileText, Folder, FolderPlus, Globe, PanelRight, Pencil, RefreshCw, Search, Undo2 } from 'lucide-react'
 import { PanelBrowserView } from './PanelBrowser'
 import { usePanelBrowserHold } from '../panel-browser'
 import { observeSize } from '../resize-later'
@@ -26,6 +26,10 @@ import {
   isChangedMeanwhileError,
   isUnsavedError,
   listZets,
+  listZetFolders,
+  createZetFolder,
+  setZetFolder,
+  renameZetFolder,
   deleteReceipt,
   readReceipt,
   readZet,
@@ -45,7 +49,7 @@ import {
   type ZetListEntry,
   type ZetStatus,
 } from '../archive'
-import { readAttachmentText } from '../chat-items'
+import { listenChatItems, readAttachmentText } from '../chat-items'
 import { ZetMarkdown } from './ZetMarkdown'
 import './ZetPanel.css'
 import { W } from '../words'
@@ -383,6 +387,20 @@ export function ZetPanel({
   const [leaveWorking, setLeaveWorking] = useState(false)
 
   const [list, reloadList] = useLoadable(listZets, W.zetPanel.text17, openCount > 0, [openCount])
+  // AI 가 채팅에서 문서를 만들거나 고치면(뒤쪽 chat-items-updated, B79: 기존 폴더에 만들기) 목록과 폴더를 곧바로 다시 읽는다. 연달아 오면 한 번만.
+  const reloadRef = useRef(reloadList)
+  reloadRef.current = reloadList
+  useEffect(() => {
+    if (!open) return
+    let timer = 0
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenChatItems(() => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => reloadRef.current(), 300)
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; window.clearTimeout(timer); stop?.() }
+  }, [open])
 
   const entries = list.state === 'ready' ? list.value : null
   const entriesById = useMemo(
@@ -961,24 +979,26 @@ function PaneMessage({ text, onRetry }: { text: string; onRetry?: () => void }) 
 
 type FolderNode = { name: string; path: string; children: FolderNode[]; docs: ZetListEntry[]; total: number }
 
-/** 문서들의 folder 값으로 폴더 나무를 만든다. 폴더 값이 없으면 맨 위. 폴더는 이름 차례, 문서는 새로 고친 것부터. */
-function folderTree(entries: ZetListEntry[]): FolderNode {
+const parentOf = (path: string) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '')
+const nameOf = (path: string) => path.slice(path.lastIndexOf('/') + 1)
+const joinPath = (parent: string, name: string) => (parent ? `${parent}/${name}` : name)
+
+/** 문서들의 folder 값과 폴더 목록(빈 폴더 포함)으로 폴더 나무를 만든다. 폴더는 이름 차례, 문서는 새로 고친 것부터. */
+function folderTree(entries: ZetListEntry[], folders: string[]): FolderNode {
   const root: FolderNode = { name: '', path: '', children: [], docs: [], total: 0 }
   const byPath = new Map<string, FolderNode>([['', root]])
   const nodeFor = (path: string): FolderNode => {
     const found = byPath.get(path)
     if (found) return found
-    const cut = path.lastIndexOf('/')
-    const parent = nodeFor(cut < 0 ? '' : path.slice(0, cut))
-    const node: FolderNode = { name: cut < 0 ? path : path.slice(cut + 1), path, children: [], docs: [], total: 0 }
+    const parent = nodeFor(parentOf(path))
+    const node: FolderNode = { name: nameOf(path), path, children: [], docs: [], total: 0 }
     parent.children.push(node)
     byPath.set(path, node)
     return node
   }
-  for (const entry of entries) {
-    const path = (entry.folder ?? '').split('/').map((part) => part.trim()).filter(Boolean).join('/')
-    nodeFor(path).docs.push(entry)
-  }
+  const clean = (value: string | null | undefined) => (value ?? '').split('/').map((part) => part.trim()).filter(Boolean).join('/')
+  for (const folder of folders) if (clean(folder)) nodeFor(clean(folder))
+  for (const entry of entries) nodeFor(clean(entry.folder)).docs.push(entry)
   const finish = (node: FolderNode): number => {
     node.children.sort((a, b) => a.name.localeCompare(b.name, 'ko-KR', { numeric: true }))
     node.docs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
@@ -999,9 +1019,23 @@ function findFolder(root: FolderNode, path: string): FolderNode | null {
   return node ?? null
 }
 
+function allFolders(node: FolderNode, out: FolderNode[] = []): FolderNode[] {
+  for (const child of node.children) { out.push(child); allFolders(child, out) }
+  return out
+}
+
+/** 폴더 이름으로 쓸 수 있는지(뒤쪽 validate_folder 와 같은 규칙: 빈 이름, 앞뒤 빈칸, '/', '\\', '.', '..' 은 안 됨). */
+function validFolderName(name: string) {
+  return name.length > 0 && name.trim() === name && !/[\\/]/.test(name) && name !== '.' && name !== '..' && !/[\u0000-\u001f]/.test(name)
+}
+
+type Moving = { kind: 'doc'; id: string; label: string; from: string } | { kind: 'folder'; path: string; label: string }
+
 /**
  * 문서 화면(2026-11-18, 그의 말 "구글드라이브? 그런 트리구조처럼"): 왼쪽에 접고 펴는 폴더 나무, 오른쪽에 지금 폴더의 경로 줄과
  * 그 안의 폴더·문서 목록(Windows 탐색기·Finder·Drive 의 흔한 꼴). 찾기는 모든 폴더에서 하고, 결과마다 폴더를 적는다.
+ * 폴더는 실제 값(뒤쪽 1568490): 빈 폴더도 보인다. [새 폴더](만들고 바로 이름 고치기), 줄의 … 메뉴로 이름 바꾸기·다른 폴더로 옮기기,
+ * 문서·폴더를 끌어 다른 폴더(나무나 목록의 폴더 줄)에 놓으면 옮긴다(파일 앱처럼).
  * 창이 좁으면 나무를 숨기고 경로 줄로만 오간다. 폴더가 하나도 없으면 나무 없이 목록만.
  */
 function ZetFolderView({
@@ -1017,11 +1051,26 @@ function ZetFolderView({
   onOpen: (id: string) => void
   onReload: () => void
 }) {
+  const notice = useContext(PanelNoticeContext)
   const [query, setQuery] = useState('')
-  // 펼친 폴더. 처음에는 맨 위 폴더들과 지금 폴더까지.
+  // 펼친 폴더. 지금 폴더까지는 저절로 펼친다.
   const [openFolders, setOpenFolders] = useState<ReadonlySet<string>>(new Set())
   const entries = list.state === 'ready' ? list.value : null
-  const root = useMemo(() => folderTree(entries ?? []), [entries])
+  // 폴더 목록(빈 폴더 포함). 문서 목록이 바뀌거나 폴더를 바꾸면 다시 읽는다.
+  const [folders, setFolders] = useState<string[]>([])
+  const [foldersSeq, setFoldersSeq] = useState(0)
+  useEffect(() => {
+    if (!entries) return
+    let alive = true
+    listZetFolders().then((value) => { if (alive) setFolders(value) }).catch(() => {})
+    return () => { alive = false }
+  }, [entries, foldersSeq])
+  const root = useMemo(() => folderTree(entries ?? [], folders), [entries, folders])
+  const [renaming, setRenaming] = useState<string | null>(null)
+  const [renameText, setRenameText] = useState('')
+  const [moving, setMoving] = useState<Moving | null>(null)
+  const [working, setWorking] = useState(false)
+
   useEffect(() => {
     if (!folder) return
     setOpenFolders((current) => {
@@ -1032,9 +1081,66 @@ function ZetFolderView({
     })
   }, [folder])
 
+  const refresh = () => { onReload(); setFoldersSeq((value) => value + 1) }
+  const fail = (error: unknown) => notice?.(String(error).includes('invalid_folder') ? W.zetPanel.folderBadName : W.zetPanel.folderFailed)
+
+  // ---- 끌어 놓기(포인터로. 웹뷰의 HTML 끌기는 앱의 파일 끌어 놓기와 겹칠 수 있어 쓰지 않는다) ----
+  const drag = useRef<{ item: Moving; x: number; y: number; active: boolean } | null>(null)
+  const dragEnded = useRef(false)
+  const [ghost, setGhost] = useState<{ x: number; y: number; label: string } | null>(null)
+  const [dropTarget, setDropTarget] = useState<string | null>(null)
+  const canDrop = (item: Moving, target: string) => item.kind === 'doc'
+    ? item.from !== target
+    : target !== item.path && !target.startsWith(`${item.path}/`) && parentOf(item.path) !== target
+  const moveTo = useRef<(item: Moving, target: string) => void>(() => {})
+  moveTo.current = (item, target) => {
+    setWorking(true)
+    const run = item.kind === 'doc' ? setZetFolder(item.id, target) : renameZetFolder(item.path, joinPath(target, nameOf(item.path)))
+    run.then(() => {
+      if (item.kind === 'folder' && (folder === item.path || folder.startsWith(`${item.path}/`))) onFolder(joinPath(target, nameOf(item.path)) + folder.slice(item.path.length))
+      notice?.(W.zetPanel.moved(item.label, target ? nameOf(target) : W.document))
+      refresh()
+    }).catch(fail).finally(() => { setWorking(false); setMoving(null) })
+  }
+  useEffect(() => {
+    const move = (event: PointerEvent) => {
+      const now = drag.current
+      if (!now) return
+      if (!now.active && Math.hypot(event.clientX - now.x, event.clientY - now.y) < 6) return
+      now.active = true
+      setGhost({ x: event.clientX, y: event.clientY, label: now.item.label })
+      const target = (document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null)?.closest<HTMLElement>('[data-drop-folder]')?.dataset.dropFolder
+      setDropTarget(target !== undefined && canDrop(now.item, target) ? target : null)
+    }
+    const up = () => {
+      const now = drag.current
+      drag.current = null
+      if (!now?.active) return
+      dragEnded.current = true
+      setGhost(null)
+      setDropTarget((target) => {
+        if (target !== null) moveTo.current(now.item, target)
+        return null
+      })
+    }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
+    return () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); window.removeEventListener('pointercancel', up) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  const startDrag = (item: Moving) => (event: ReactPointerEvent) => {
+    if (event.button !== 0 || renaming) return
+    drag.current = { item, x: event.clientX, y: event.clientY, active: false }
+  }
+  // 끌기를 마친 바로 그 누름은 여는 동작으로 치지 않는다.
+  const unlessDragged = (run: () => void) => () => {
+    if (dragEnded.current) { dragEnded.current = false; return }
+    run()
+  }
+
   if (list.state === 'error') return <PaneMessage text={list.message} onRetry={onReload} />
   if (list.state !== 'ready') return <PaneMessage text={W.zetPanel.text26} />
-  if (list.value.length === 0) return <PaneMessage text={W.zetPanel.text27} />
 
   const current = findFolder(root, folder) ?? root
   const hasFolders = root.children.length > 0
@@ -1052,17 +1158,45 @@ function ZetFolderView({
     return next
   })
 
+  function newFolder() {
+    const taken = new Set(current.children.map((child) => child.name))
+    let name = W.zetPanel.newFolderName
+    for (let n = 2; taken.has(name); n += 1) name = `${W.zetPanel.newFolderName} ${n}`
+    const path = joinPath(current.path, name)
+    setWorking(true)
+    createZetFolder(path)
+      .then(() => { setFoldersSeq((value) => value + 1); setQuery(''); setRenaming(path); setRenameText(name) })
+      .catch(fail)
+      .finally(() => setWorking(false))
+  }
+  function commitRename(path: string) {
+    const name = renameText.trim()
+    setRenaming(null)
+    if (!name || name === nameOf(path)) return
+    if (!validFolderName(name)) { notice?.(W.zetPanel.folderBadName); return }
+    const to = joinPath(parentOf(path), name)
+    setWorking(true)
+    renameZetFolder(path, to)
+      .then(() => {
+        if (folder === path || folder.startsWith(`${path}/`)) onFolder(to + folder.slice(path.length))
+        refresh()
+      })
+      .catch(fail)
+      .finally(() => setWorking(false))
+  }
+
   const renderTree = (nodes: FolderNode[], depth: number): ReactNode => nodes.map((node) => {
     const expanded = openFolders.has(node.path)
+    const classes = ['zet-tree-row', node.path === current.path ? 'is-current' : '', dropTarget === node.path ? 'is-drop' : ''].filter(Boolean).join(' ')
     return (
       <li key={node.path} role="treeitem" aria-expanded={node.children.length > 0 ? expanded : undefined} aria-selected={node.path === current.path}>
-        <div className={node.path === current.path ? 'zet-tree-row is-current' : 'zet-tree-row'} style={{ paddingLeft: 6 + depth * 14 }}>
+        <div className={classes} style={{ paddingLeft: 6 + depth * 14 }} data-drop-folder={node.path}>
           {node.children.length > 0 ? (
             <button className="zet-tree-twist" type="button" aria-label={expanded ? W.zetPanel.folderCollapse(node.name) : W.zetPanel.folderExpand(node.name)} onClick={() => toggle(node.path)}>
               <ChevronRight size={13} strokeWidth={1.75} aria-hidden className={expanded ? 'is-open' : undefined} />
             </button>
           ) : <span className="zet-tree-twist" aria-hidden />}
-          <button className="zet-tree-name" type="button" onClick={() => { setQuery(''); onFolder(node.path) }}>
+          <button className="zet-tree-name" type="button" onPointerDown={startDrag({ kind: 'folder', path: node.path, label: node.name })} onClick={unlessDragged(() => { setQuery(''); onFolder(node.path) })}>
             <Folder size={14} strokeWidth={1.75} aria-hidden />
             <span>{node.name}</span>
           </button>
@@ -1073,8 +1207,13 @@ function ZetFolderView({
   })
 
   const docRow = (entry: ZetListEntry, showFolder: boolean) => (
-    <li key={entry.id}>
-      <button className="zet-row" type="button" onClick={() => onOpen(entry.id)}>
+    <li key={entry.id} className="zet-folder-item">
+      <button
+        className="zet-row"
+        type="button"
+        onPointerDown={startDrag({ kind: 'doc', id: entry.id, label: entry.title, from: (entry.folder ?? '') })}
+        onClick={unlessDragged(() => onOpen(entry.id))}
+      >
         <strong>{entry.title}</strong>
         <span className="zet-row-summary">{entry.summary}</span>
         <span className="zet-row-meta">
@@ -1084,16 +1223,21 @@ function ZetFolderView({
           <time dateTime={entry.updatedAt}>{formatDay(entry.updatedAt)}</time>
         </span>
       </button>
+      <RowMenu label={W.zetPanel.itemMenu(entry.title)}>
+        {(close) => <MenuItem close={close} onSelect={() => setMoving({ kind: 'doc', id: entry.id, label: entry.title, from: entry.folder ?? '' })}>{W.zetPanel.moveTo}</MenuItem>}
+      </RowMenu>
     </li>
   )
 
+  const targets: Array<{ path: string; name: string; depth: number }> = [{ path: '', name: W.document, depth: 0 }, ...allFolders(root).map((node) => ({ path: node.path, name: node.name, depth: node.path.split('/').length }))]
+
   return (
-    <div className={hasFolders ? 'zet-folders' : 'zet-folders is-flat'}>
+    <div className={hasFolders ? 'zet-folders' : 'zet-folders is-flat'} aria-busy={working}>
       {hasFolders && (
         <nav className="zet-tree" aria-label={W.zetPanel.folders}>
           <ul role="tree">
             <li role="treeitem" aria-selected={current.path === ''}>
-              <div className={current.path === '' ? 'zet-tree-row is-current' : 'zet-tree-row'} style={{ paddingLeft: 6 }}>
+              <div className={['zet-tree-row', current.path === '' ? 'is-current' : '', dropTarget === '' ? 'is-drop' : ''].filter(Boolean).join(' ')} style={{ paddingLeft: 6 }} data-drop-folder="">
                 <span className="zet-tree-twist" aria-hidden />
                 <button className="zet-tree-name" type="button" onClick={() => { setQuery(''); onFolder('') }}>
                   <FileText size={14} strokeWidth={1.75} aria-hidden />
@@ -1107,45 +1251,116 @@ function ZetFolderView({
       )}
       <div className="zet-list zet-folder-main">
         <div className="zet-folder-bar">
-          {found === null && hasFolders ? (
+          {found === null ? (
             <nav className="zet-crumbs" aria-label={W.zetPanel.folderPath}>
-              <button type="button" className={crumbs.length === 0 ? 'is-current' : undefined} aria-current={crumbs.length === 0 ? 'page' : undefined} onClick={() => onFolder('')}>{W.document}</button>
+              <button type="button" className={[crumbs.length === 0 ? 'is-current' : '', dropTarget === '' && crumbs.length > 0 ? 'is-drop' : ''].filter(Boolean).join(' ') || undefined} aria-current={crumbs.length === 0 ? 'page' : undefined} data-drop-folder="" onClick={() => onFolder('')}>{W.document}</button>
               {crumbs.map((part, index) => {
                 const path = crumbs.slice(0, index + 1).join('/')
                 const last = index === crumbs.length - 1
                 return (
                   <span key={path} className="zet-crumb">
                     <ChevronRight size={13} strokeWidth={1.75} aria-hidden />
-                    <button type="button" className={last ? 'is-current' : undefined} aria-current={last ? 'page' : undefined} onClick={() => onFolder(path)}>{part}</button>
+                    <button type="button" className={last ? 'is-current' : dropTarget === path ? 'is-drop' : undefined} aria-current={last ? 'page' : undefined} data-drop-folder={last ? undefined : path} onClick={() => onFolder(path)}>{part}</button>
                   </span>
                 )
               })}
             </nav>
           ) : <span />}
-          <label className="zet-search">
-            <Search size={15} aria-hidden />
-            <span className="sr-only">{W.zetPanel.text28}</span>
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={W.zetPanel.text28} type="search" />
-          </label>
+          <div className="zet-folder-tools">
+            {found === null && (
+              <button className="secondary-button" type="button" disabled={working} onClick={newFolder}>
+                <FolderPlus size={14} strokeWidth={1.75} aria-hidden />{W.zetPanel.newFolder}
+              </button>
+            )}
+            <label className="zet-search">
+              <Search size={15} aria-hidden />
+              <span className="sr-only">{W.zetPanel.text28}</span>
+              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={W.zetPanel.text28} type="search" />
+            </label>
+          </div>
         </div>
         {found !== null ? (
           found.length === 0 ? <PaneMessage text={W.zetPanel.text29} /> : <ul className="zet-rows">{found.map((entry) => docRow(entry, true))}</ul>
+        ) : list.value.length === 0 && root.children.length === 0 ? (
+          <PaneMessage text={W.zetPanel.text27} />
         ) : current.children.length === 0 && current.docs.length === 0 ? (
           <PaneMessage text={W.zetPanel.folderEmpty} />
         ) : (
           <ul className="zet-rows">
             {current.children.map((child) => (
-              <li key={child.path}>
-                <button className="zet-row zet-folder-row" type="button" onClick={() => onFolder(child.path)}>
-                  <span className="zet-folder-name"><Folder size={15} strokeWidth={1.75} aria-hidden /><strong>{child.name}</strong></span>
-                  <span className="zet-row-meta"><span>{W.zetPanel.folderCount(child.total)}</span></span>
-                </button>
+              <li key={child.path} className="zet-folder-item">
+                {renaming === child.path ? (
+                  <div className="zet-row zet-folder-row is-renaming">
+                    <span className="zet-folder-name">
+                      <Folder size={15} strokeWidth={1.75} aria-hidden />
+                      <input
+                        autoFocus
+                        value={renameText}
+                        aria-label={W.zetPanel.renameLabel(child.name)}
+                        onFocus={(event) => event.currentTarget.select()}
+                        onChange={(event) => setRenameText(event.target.value)}
+                        onBlur={() => commitRename(child.path)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur() }
+                          if (event.key === 'Escape') { event.preventDefault(); setRenameText(child.name); setRenaming(null) }
+                        }}
+                      />
+                    </span>
+                  </div>
+                ) : (
+                  <button
+                    className={dropTarget === child.path ? 'zet-row zet-folder-row is-drop' : 'zet-row zet-folder-row'}
+                    type="button"
+                    data-drop-folder={child.path}
+                    onPointerDown={startDrag({ kind: 'folder', path: child.path, label: child.name })}
+                    onClick={unlessDragged(() => onFolder(child.path))}
+                    onKeyDown={(event) => { if (event.key === 'F2') { event.preventDefault(); setRenaming(child.path); setRenameText(child.name) } }}
+                  >
+                    <span className="zet-folder-name"><Folder size={15} strokeWidth={1.75} aria-hidden /><strong>{child.name}</strong></span>
+                    <span className="zet-row-meta"><span>{W.zetPanel.folderCount(child.total)}</span></span>
+                  </button>
+                )}
+                {renaming !== child.path && (
+                  <RowMenu label={W.zetPanel.itemMenu(child.name)}>
+                    {(close) => (
+                      <>
+                        <MenuItem close={close} onSelect={() => { setRenaming(child.path); setRenameText(child.name) }}>{W.zetPanel.rename}</MenuItem>
+                        <MenuItem close={close} onSelect={() => setMoving({ kind: 'folder', path: child.path, label: child.name })}>{W.zetPanel.moveTo}</MenuItem>
+                      </>
+                    )}
+                  </RowMenu>
+                )}
               </li>
             ))}
             {current.docs.map((entry) => docRow(entry, false))}
           </ul>
         )}
       </div>
+      {ghost && createPortal(<div className="zet-drag-ghost" style={{ left: ghost.x + 12, top: ghost.y + 10 }}>{ghost.label}</div>, document.body)}
+      {moving && (
+        <QuestionDialog
+          title={W.zetPanel.moveTitle}
+          text={W.zetPanel.moveText(moving.label)}
+          working={working}
+          onDismiss={() => setMoving(null)}
+          detail={(
+            <ul className="zet-move-targets">
+              {targets.map((target) => {
+                const allowed = canDrop(moving, target.path)
+                return (
+                  <li key={target.path || '/'}>
+                    <button type="button" disabled={!allowed || working} style={{ paddingLeft: 8 + target.depth * 14 }} onClick={() => moveTo.current(moving, target.path)}>
+                      {target.path ? <Folder size={14} strokeWidth={1.75} aria-hidden /> : <FileText size={14} strokeWidth={1.75} aria-hidden />}
+                      <span>{target.name}</span>
+                    </button>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+          actions={[{ label: W.zetPanel.text20, onSelect: () => setMoving(null), autoFocus: true }]}
+        />
+      )}
     </div>
   )
 }

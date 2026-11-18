@@ -27,6 +27,19 @@ pub(crate) struct MediaItem {
     pub(crate) how: Option<&'static str>,
     pub(crate) at: Option<String>,
     pub(crate) chats: Vec<crate::chat_items::ChatLink>,
+    asset_id: String,
+    prompt: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    generated_at: Option<String>,
+    message_id: Option<String>,
+    version_group_id: Option<String>,
+    version: Option<i64>,
+    parent_asset_id: Option<String>,
+    lineage_id: Option<String>,
+    version_of: Option<String>,
+    version_how: Option<String>,
+    version_count: usize,
 }
 
 fn classify(bytes: &[u8]) -> Option<(&'static str, Option<(u32, u32)>)> {
@@ -339,6 +352,7 @@ pub(crate) fn collect(
         items.push((
             timestamp,
             MediaItem {
+                asset_id: id.clone(),
                 id,
                 kind: detected,
                 title: info.map(|x| x.0),
@@ -354,6 +368,18 @@ pub(crate) fn collect(
                 how: None,
                 at: None,
                 chats: Vec::new(),
+                prompt: None,
+                provider: None,
+                model: None,
+                generated_at: None,
+                message_id: None,
+                version_group_id: None,
+                version: None,
+                parent_asset_id: None,
+                lineage_id: None,
+                version_of: None,
+                version_how: None,
+                version_count: 1,
             },
         ));
     }
@@ -365,11 +391,137 @@ pub(crate) fn collect(
         .collect())
 }
 
+pub(crate) fn gallery(
+    worker_root: &Path,
+    database: &Path,
+    kind: Option<&str>,
+    chat_id: Option<&str>,
+    before: Option<&str>,
+    limit: usize,
+) -> Result<Vec<MediaItem>, String> {
+    let mut items = collect(
+        &worker_root.join("objects"),
+        database,
+        kind,
+        None,
+        usize::MAX,
+    )?;
+    crate::chat_items::enrich_media(worker_root, database, &mut items)?;
+    let generations = crate::media_generation::all(database)?;
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "unavailable")?;
+    let mut query = connection
+        .prepare("SELECT id, title FROM chats")
+        .map_err(|_| "unavailable")?;
+    let chat_titles: std::collections::HashMap<String, String> = query
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|_| "unavailable")?
+        .collect::<Result<_, _>>()
+        .map_err(|_| "unavailable")?;
+    let available: std::collections::HashSet<_> =
+        items.iter().map(|item| item.id.as_str()).collect();
+    let mut counts = std::collections::HashMap::new();
+    let mut latest = std::collections::HashMap::new();
+    for generation in generations
+        .iter()
+        .filter(|g| available.contains(g.asset_id.as_str()))
+    {
+        *counts
+            .entry(generation.version_group_id.clone())
+            .or_insert(0_usize) += 1;
+        let current = latest
+            .entry(generation.version_group_id.clone())
+            .or_insert(0_i64);
+        *current = (*current).max(generation.version);
+    }
+    let by_asset: std::collections::HashMap<_, _> = generations
+        .iter()
+        .map(|g| (g.asset_id.as_str(), g))
+        .collect();
+    let by_version: std::collections::HashMap<_, _> = generations
+        .iter()
+        .map(|g| {
+            (
+                (g.version_group_id.as_str(), g.version),
+                g.asset_id.as_str(),
+            )
+        })
+        .collect();
+    items.retain_mut(|item| {
+        if let Some(g) = by_asset.get(item.id.as_str()) {
+            if latest.get(&g.version_group_id) != Some(&g.version) {
+                return false;
+            }
+            item.prompt = Some(g.prompt.clone());
+            item.provider = Some(g.provider.clone());
+            item.model = g.model.clone();
+            item.generated_at = g.created_at.clone();
+            if let Some(title) = chat_titles.get(&g.chat_id) {
+                item.chat_id = Some(g.chat_id.clone());
+                item.chats.retain(|link| link.id != g.chat_id);
+                item.chats.insert(
+                    0,
+                    crate::chat_items::ChatLink {
+                        id: g.chat_id.clone(),
+                        title: Some(title.clone()),
+                    },
+                );
+            } else {
+                item.chat_id = None;
+                item.chats.clear();
+            }
+            item.message_id = g.message_id.clone();
+            item.version_group_id = Some(g.version_group_id.clone());
+            item.version = Some(g.version);
+            item.parent_asset_id = g.parent_asset_id.clone();
+            item.lineage_id = Some(g.version_group_id.clone());
+            if g.version > 1 {
+                item.version_of = g.parent_asset_id.clone().or_else(|| {
+                    by_version
+                        .get(&(g.version_group_id.as_str(), g.version - 1))
+                        .map(|id| (*id).to_owned())
+                });
+                item.version_how = Some(g.version_how.clone().unwrap_or_else(|| {
+                    if g.parent_asset_id.is_some() {
+                        "edited".into()
+                    } else {
+                        "regenerated".into()
+                    }
+                }));
+            }
+            item.version_count = counts[&g.version_group_id];
+        }
+        chat_id.is_none_or(|chat| {
+            item.chat_id.as_deref() == Some(chat) || item.chats.iter().any(|link| link.id == chat)
+        })
+    });
+    if let Some(cursor) = before {
+        let (time, id) = cursor
+            .split_once('|')
+            .map_or((cursor, None), |(t, i)| (t, Some(i)));
+        let time = DateTime::parse_from_rfc3339(time)
+            .map_err(|_| "invalid_before")?
+            .with_timezone(&Utc);
+        items.retain(|item| {
+            DateTime::parse_from_rfc3339(&item.created_at)
+                .ok()
+                .is_some_and(|created| {
+                    created.with_timezone(&Utc) < time
+                        || (created.with_timezone(&Utc) == time
+                            && id.is_some_and(|id| item.id.as_str() < id))
+                })
+        });
+    }
+    items.truncate(limit.clamp(1, 100));
+    Ok(items)
+}
+
 #[tauri::command]
 pub(crate) async fn media_list(
     app: tauri::AppHandle,
     state: State<'_, crate::AppState>,
     kind: Option<String>,
+    chat_id: Option<String>,
     before: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<MediaItem>, String> {
@@ -378,15 +530,14 @@ pub(crate) async fn media_list(
     let _lease = root;
     let database = state.paths.database_path.clone();
     let items = tauri::async_runtime::spawn_blocking(move || {
-        let mut items = collect(
-            &worker_root.join("objects"),
+        gallery(
+            &worker_root,
             &database,
             kind.as_deref(),
+            chat_id.as_deref(),
             before.as_deref(),
-            limit.unwrap_or(40).clamp(1, 100),
-        )?;
-        crate::chat_items::enrich_media(&worker_root, &database, &mut items)?;
-        Ok::<_, String>(items)
+            limit.unwrap_or(40),
+        )
     })
     .await
     .map_err(|_| "unavailable".to_string())??;

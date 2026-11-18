@@ -160,6 +160,40 @@ pub(crate) fn dictionary_request(
     }
 }
 
+pub(crate) fn document_request(
+    chat_id: &str,
+    provider: &str,
+    title: &str,
+    id: Option<&str>,
+) -> ApprovalRequest {
+    let change = if id.is_some() {
+        ChangeKind::Edit
+    } else {
+        ChangeKind::Create
+    };
+    ApprovalRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        chat_id: Some(chat_id.to_owned()),
+        provider: provider.to_owned(),
+        kind: "file_change".into(),
+        description: title.to_owned(),
+        command: None,
+        sandbox_escalation: None,
+        change: Some(change),
+        targets: vec![ApprovalTarget {
+            path: id.map_or_else(|| "zettels/".to_owned(), |id| format!("zettels/{id}.md")),
+            change: Some(change),
+        }],
+        reason: None,
+        options: vec![
+            ApprovalChoice::AllowOnce,
+            ApprovalChoice::Deny,
+            ApprovalChoice::Cancel,
+        ],
+        setup: None,
+    }
+}
+
 pub(crate) fn dictionary_delete_request(
     chat_id: &str,
     provider: &str,

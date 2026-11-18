@@ -371,6 +371,17 @@ pub(crate) async fn run_json_rpc_tool(
 ) -> Result<serde_json::Value, ProcessError> {
     let executable =
         resolve_interactive_tool(name).ok_or_else(|| ProcessError::MissingTool(name.into()))?;
+    run_json_rpc_resolved(&executable, args, cwd, environment, request, timeout).await
+}
+
+pub(crate) async fn run_json_rpc_resolved(
+    executable: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    environment: &HashMap<String, String>,
+    request: JsonRpcRequest<'_>,
+    timeout: Duration,
+) -> Result<serde_json::Value, ProcessError> {
     let is_script = executable
         .extension()
         .and_then(|value| value.to_str())

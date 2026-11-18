@@ -6,7 +6,7 @@ const SERVICE: &str = "app.momso.desktop";
 static ENTRY_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static SECRET_CHANGE_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(test)]
+#[cfg(any(test, all(debug_assertions, feature = "g61-test-probe")))]
 fn fake_store() -> Option<&'static Mutex<std::collections::HashMap<String, String>>> {
     use std::sync::OnceLock;
     static STORE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
@@ -69,7 +69,7 @@ fn entry(name: &str) -> Result<keyring::Entry, CredentialError> {
 }
 
 pub(crate) fn has_secret(name: &str) -> Result<bool, CredentialError> {
-    #[cfg(test)]
+    #[cfg(any(test, all(debug_assertions, feature = "g61-test-probe")))]
     if let Some(store) = fake_store() {
         return Ok(store
             .lock()
@@ -84,7 +84,7 @@ pub(crate) fn has_secret(name: &str) -> Result<bool, CredentialError> {
 }
 
 pub(crate) fn get_secret(name: &str) -> Result<Option<String>, CredentialError> {
-    #[cfg(test)]
+    #[cfg(any(test, all(debug_assertions, feature = "g61-test-probe")))]
     if let Some(store) = fake_store() {
         return Ok(store
             .lock()
@@ -116,7 +116,7 @@ pub(crate) fn set_secret(name: &str, secret: &str) -> Result<(), CredentialError
 }
 
 pub(crate) fn put_secret_unlocked(name: &str, secret: &str) -> Result<(), CredentialError> {
-    #[cfg(test)]
+    #[cfg(any(test, all(debug_assertions, feature = "g61-test-probe")))]
     if let Some(store) = fake_store() {
         store
             .lock()
@@ -140,7 +140,7 @@ pub(crate) fn delete_secret(name: &str) -> Result<(), CredentialError> {
 }
 
 pub(crate) fn remove_secret_unlocked(name: &str) -> Result<(), CredentialError> {
-    #[cfg(test)]
+    #[cfg(any(test, all(debug_assertions, feature = "g61-test-probe")))]
     if let Some(store) = fake_store() {
         store
             .lock()

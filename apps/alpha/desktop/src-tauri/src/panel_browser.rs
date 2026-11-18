@@ -15,6 +15,188 @@ pub(crate) fn navigation_gate() -> &'static crate::panel_navigation::PanelNaviga
 const POPUP_PREFIX: &str = "panel-popup-";
 const CACHE_LIMIT: u64 = 500 * 1024 * 1024;
 
+struct OAuthPanelState {
+    id: uuid::Uuid,
+    state: String,
+    external: tokio::sync::mpsc::UnboundedSender<()>,
+    revoked: tokio_util::sync::CancellationToken,
+}
+
+fn oauth_panel_state() -> &'static std::sync::Mutex<Option<OAuthPanelState>> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<Option<OAuthPanelState>>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+struct OAuthPanelGuard(uuid::Uuid);
+impl Drop for OAuthPanelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = oauth_panel_state().lock() {
+            if state.as_ref().is_some_and(|active| active.id == self.0) {
+                *state = None;
+            }
+        }
+    }
+}
+
+fn oauth_callback_allowed(url: &reqwest::Url) -> bool {
+    if url.scheme() != "http"
+        || url.host_str() != Some("localhost")
+        || url.port() != Some(8976)
+        || url.path() != "/oauth/callback"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let pairs: Vec<_> = url.query_pairs().collect();
+    let states: Vec<_> = pairs.iter().filter(|(key, _)| key == "state").collect();
+    let codes: Vec<_> = pairs.iter().filter(|(key, _)| key == "code").collect();
+    let errors: Vec<_> = pairs.iter().filter(|(key, _)| key == "error").collect();
+    let result = (codes.len() == 1 && !codes[0].1.is_empty() && errors.is_empty())
+        || (errors.len() == 1 && !errors[0].1.is_empty() && codes.is_empty());
+    states.len() == 1
+        && result
+        && oauth_panel_state().lock().is_ok_and(|active| {
+            active.as_ref().is_some_and(|active| {
+                !active.state.is_empty()
+                    && !active.revoked.is_cancelled()
+                    && states[0].1 == active.state
+            })
+        })
+}
+
+fn oauth_external_login() -> bool {
+    oauth_panel_state().lock().is_ok_and(|active| {
+        active.as_ref().is_some_and(|active| {
+            !active.revoked.is_cancelled() && active.external.send(()).is_ok()
+        })
+    })
+}
+
+pub(crate) struct OAuthPanel {
+    _guard: OAuthPanelGuard,
+    _lease: crate::panel_ownership::PanelLease,
+    fallback: tokio::task::JoinHandle<()>,
+}
+impl Drop for OAuthPanel {
+    fn drop(&mut self) {
+        self.fallback.abort();
+    }
+}
+
+pub(crate) async fn open_oauth_panel(
+    app: tauri::AppHandle,
+    chat_id: &str,
+    url: reqwest::Url,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<OAuthPanel, &'static str> {
+    let token = url
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or("invalid_url")?;
+    open_login_panel(app, chat_id, url, cancel, token).await
+}
+
+pub(crate) async fn open_device_login_panel(
+    app: tauri::AppHandle,
+    url: reqwest::Url,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<OAuthPanel, &'static str> {
+    if !valid_device_login_url(&url) {
+        return Err("invalid_url");
+    }
+    open_login_panel(app, "", url, cancel, String::new()).await
+}
+
+fn valid_device_login_url(url: &reqwest::Url) -> bool {
+    let allowed = matches!(
+        (url.host_str(), url.path()),
+        (Some("auth.openai.com"), "/codex/device") | (Some("github.com"), "/login/device")
+    );
+    url.scheme() == "https"
+        && allowed
+        && url.port().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+async fn open_login_panel(
+    app: tauri::AppHandle,
+    chat_id: &str,
+    url: reqwest::Url,
+    cancel: tokio_util::sync::CancellationToken,
+    token: String,
+) -> Result<OAuthPanel, &'static str> {
+    let state = app.state::<crate::AppState>();
+    let lease = state
+        .browser
+        .panel_ownership
+        .claim(&format!("oauth-{}", uuid::Uuid::new_v4()))?;
+    let revoked = lease.cancellation();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let id = uuid::Uuid::new_v4();
+    {
+        let mut active = oauth_panel_state().lock().map_err(|_| "unavailable")?;
+        if active.is_some() {
+            return Err("panel_busy");
+        }
+        *active = Some(OAuthPanelState {
+            id,
+            state: token,
+            external: sender,
+            revoked: revoked.clone(),
+        });
+    }
+    let guard = OAuthPanelGuard(id);
+    app.emit_to(
+        "main",
+        "panel-agent-open-request",
+        serde_json::json!({"chatId": chat_id}),
+    )
+    .map_err(|_| "unavailable")?;
+    let panel = async {
+        loop {
+            if app.get_webview(LABEL).is_some() {
+                break Ok::<(), &'static str>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    tokio::select! {
+        _ = cancel.cancelled() => return Err("cancelled"),
+        _ = revoked.cancelled() => return Err("cancelled"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(20), panel) => result.map_err(|_| "panel_unavailable")??,
+    }
+    if !navigation_gate().permits_navigation(url.as_str()) {
+        return Err("panel_busy");
+    }
+    panel_browser_navigate(app.clone(), url.to_string())
+        .await
+        .map_err(|_| "panel_unavailable")?;
+    let fallback = tokio::spawn(async move {
+        tokio::select! {
+            value = receiver.recv() => if value.is_some() {
+                if panel_browser_open_human(app, url.to_string()).await.is_ok() {
+                    revoked.cancelled().await;
+                    cancel.cancel();
+                } else { cancel.cancel(); }
+            },
+            _ = revoked.cancelled() => cancel.cancel(),
+        }
+    });
+    Ok(OAuthPanel {
+        _guard: guard,
+        _lease: lease,
+        fallback,
+    })
+}
+
 #[cfg(windows)]
 struct PopupInfo {
     host: Option<String>,
@@ -163,6 +345,9 @@ fn google_notice(app: &tauri::AppHandle, url: &reqwest::Url, site: Option<String
     if !is_google_login(url) {
         return false;
     }
+    if oauth_external_login() {
+        return true;
+    }
     let _ = app.emit_to(
         "main",
         "panel-browser-google-login",
@@ -235,7 +420,7 @@ pub(crate) async fn panel_browser_open(
     if google_notice(&app, &url, None) {
         return Err("google_login_required".into());
     }
-    open_panel(app, url, x, y, width, height).await
+    open_panel(app, url, x, y, width, height, true).await
 }
 
 /// Open an empty panel for an already-approved agent session; no site loads yet.
@@ -248,7 +433,12 @@ pub(crate) async fn panel_browser_open_agent(
     height: f64,
 ) -> Result<(), String> {
     let url = reqwest::Url::parse("about:blank").map_err(|_| "unavailable")?;
-    open_panel(app, url, x, y, width, height).await
+    open_panel(app, url, x, y, width, height, false).await
+}
+
+#[cfg(any(windows, test))]
+fn human_panel_may_focus(main: usize, foreground: usize, root: usize) -> bool {
+    main != 0 && foreground != 0 && (main == foreground || main == root)
 }
 
 async fn open_panel(
@@ -258,6 +448,7 @@ async fn open_panel(
     y: f64,
     width: f64,
     height: f64,
+    human_requested: bool,
 ) -> Result<(), String> {
     if ![x, y, width, height].iter().all(|v| v.is_finite()) || width <= 0.0 || height <= 0.0 {
         return Err("invalid_bounds".into());
@@ -282,8 +473,9 @@ async fn open_panel(
         .add_child(
             WebviewBuilder::new(LABEL, WebviewUrl::External(url))
                 .data_directory(profile)
+                // Creating an agent panel must not activate a background window.
                 .focused(false)
-                .on_navigation(move |url| navigation_gate().permits_navigation(url.as_str()) && allowed_address(url.as_str()).is_ok() && !google_notice(&nav_app, url, nav_site.lock().ok().and_then(|v| v.clone())))
+                .on_navigation(move |url| navigation_gate().permits_navigation(url.as_str()) && (allowed_address(url.as_str()).is_ok() || oauth_callback_allowed(url)) && !google_notice(&nav_app, url, nav_site.lock().ok().and_then(|v| v.clone())))
                 .on_new_window(move |url, features| {
                     if deny_agent_popup(&url) || allowed_address(url.as_str()).is_err() || google_notice(&popup_app, &url, popup_site.lock().ok().and_then(|v| v.clone())) {
                         return NewWindowResponse::Deny;
@@ -377,6 +569,7 @@ async fn open_panel(
                 })
                 .on_page_load(move |webview, payload| {
                     let url = payload.url();
+                    if url.scheme() == "http" && url.host_str() == Some("localhost") && url.port() == Some(8976) && url.path() == "/oauth/callback" { return; }
                     if let Ok(mut site) = loaded_site.lock() { *site = Some(url.to_string()); }
                     let _ = webview.app_handle().emit_to("main", "panel-browser-page", serde_json::json!({
                         "url": url.as_str(), "host": url.host_str(), "secure": url.scheme() == "https",
@@ -389,6 +582,25 @@ async fn open_panel(
         )
         .map_err(|_| "unavailable".to_owned())?;
     crate::app_lifecycle::observe_webview(&panel_view);
+    #[cfg(windows)]
+    if human_requested {
+        if let Ok(hwnd) = window.hwnd() {
+            let main = hwnd.0 as usize;
+            let _ = panel_view.with_webview(move |platform| {
+                use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
+                use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetForegroundWindow, GA_ROOT};
+                let foreground = unsafe { GetForegroundWindow() };
+                let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+                if human_panel_may_focus(main, foreground as usize, root as usize) {
+                    let _ = unsafe { platform.controller().MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC) };
+                }
+            });
+        }
+    }
+    #[cfg(not(windows))]
+    if human_requested && window.is_focused().unwrap_or(false) {
+        let _ = panel_view.set_focus();
+    }
     Ok(())
 }
 
@@ -684,6 +896,14 @@ pub(crate) async fn panel_browser_action(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn human_panel_focus_requires_own_foreground_window() {
+        assert!(super::human_panel_may_focus(10, 10, 10));
+        assert!(super::human_panel_may_focus(10, 11, 10));
+        assert!(!super::human_panel_may_focus(10, 20, 20));
+        assert!(!super::human_panel_may_focus(10, 0, 0));
+        assert!(!super::human_panel_may_focus(0, 10, 10));
+    }
     #[cfg(windows)]
     #[test]
     #[ignore = "requires WebView2 and an interactive Windows desktop"]
@@ -767,6 +987,80 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn device_login_only_accepts_fixed_provider_addresses() {
+        for valid in [
+            "https://auth.openai.com/codex/device",
+            "https://github.com/login/device",
+        ] {
+            assert!(super::valid_device_login_url(
+                &reqwest::Url::parse(valid).unwrap()
+            ));
+        }
+        for invalid in [
+            "http://github.com/login/device",
+            "https://github.com.evil.test/login/device",
+            "https://github.com/login/device?code=secret",
+            "https://auth.openai.com/codex/device#fragment",
+        ] {
+            assert!(!super::valid_device_login_url(
+                &reqwest::Url::parse(invalid).unwrap()
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn oauth_panel_allows_only_its_callback_and_requests_external_login() {
+        use super::*;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let id = uuid::Uuid::new_v4();
+        let revoked = tokio_util::sync::CancellationToken::new();
+        *oauth_panel_state().lock().unwrap() = Some(OAuthPanelState {
+            id,
+            state: "fixture-state".into(),
+            external: sender,
+            revoked: revoked.clone(),
+        });
+        let guard = OAuthPanelGuard(id);
+        let good = reqwest::Url::parse(
+            "http://localhost:8976/oauth/callback?code=fixture&state=fixture-state",
+        )
+        .unwrap();
+        assert!(oauth_callback_allowed(&good));
+        assert!(oauth_callback_allowed(
+            &reqwest::Url::parse(
+                "http://localhost:8976/oauth/callback?error=access_denied&state=fixture-state"
+            )
+            .unwrap()
+        ));
+        for value in [
+            "http://localhost:8976/oauth/callback?code=x&state=wrong",
+            "http://localhost:8977/oauth/callback?code=x&state=fixture-state",
+            "http://127.0.0.1:8976/oauth/callback?code=x&state=fixture-state",
+            "http://localhost:8976/oauth/callback?code=x&state=fixture-state&state=wrong",
+            "http://localhost:8976/other?code=x&state=fixture-state",
+        ] {
+            assert!(!oauth_callback_allowed(
+                &reqwest::Url::parse(value).unwrap()
+            ));
+        }
+        assert!(oauth_external_login());
+        assert_eq!(receiver.recv().await, Some(()));
+        oauth_panel_state()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .state
+            .clear();
+        assert!(!oauth_callback_allowed(
+            &reqwest::Url::parse("http://localhost:8976/oauth/callback?code=x&state=").unwrap()
+        ));
+        revoked.cancel();
+        assert!(!oauth_callback_allowed(&good));
+        assert!(!oauth_external_login());
+        drop(guard);
+        assert!(!oauth_callback_allowed(&good));
+    }
     #[test]
     fn cache_limit_counts_only_disk_cache() {
         let temp = tempfile::tempdir().unwrap();

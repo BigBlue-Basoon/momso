@@ -552,7 +552,8 @@ pub(crate) async fn run<F: FnMut(&str, Value) + Send>(
     emit: F,
 ) -> Result<(), String> {
     run_with_skill(
-        db, archive, id, text, model, effort, mode, fast, None, None, None, approvals, cancel, emit,
+        db, archive, id, text, model, effort, mode, fast, None, None, None, approvals, cancel,
+        None, emit,
     )
     .await
 }
@@ -571,18 +572,22 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
     api_key: Option<&str>,
     approvals: Option<ApprovalChannel>,
     cancel: CancellationToken,
+    output_dir: Option<&Path>,
     mut emit: F,
 ) -> Result<(), String> {
     let exe = executable().ok_or("Claude를 찾지 못했습니다")?;
     let session = previous(db, id)?;
     let mut command = crate::process::hidden_async_command(&exe);
     command.args(arguments(model, effort, mode, session.as_deref(), fast));
+    if let Some(path) = output_dir {
+        crate::chat_output::add_dir(&mut command, path);
+    }
     let mcp = crate::momso_mcp::claude_config(&crate::momso_mcp::executable()?, id);
     command.args([
         "--mcp-config",
         &mcp.to_string(),
         "--allowedTools",
-        "mcp__momso_internal_runtime_v1__momso_version,mcp__momso_internal_runtime_v1__momso_github_connect,mcp__momso_internal_runtime_v1__momso_object_store_r2_connect,mcp__momso_internal_runtime_v1__momso_object_store_gcp_connect,mcp__momso_internal_runtime_v1__momso_object_store_aws_connect",
+        "mcp__momso_internal_runtime_v1__momso_version,mcp__momso_internal_runtime_v1__media_register_generated,mcp__momso_internal_runtime_v1__momso_github_connect,mcp__momso_internal_runtime_v1__momso_object_store_r2_connect,mcp__momso_internal_runtime_v1__momso_object_store_gcp_connect,mcp__momso_internal_runtime_v1__momso_object_store_aws_connect",
     ]);
     let result = run_command_ref(
         command,
@@ -609,12 +614,15 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
             emit("momso-internal-handoff-fallback", Value::Null);
             let mut command = crate::process::hidden_async_command(exe);
             command.args(arguments(model, effort, mode, None, fast));
+            if let Some(path) = output_dir {
+                crate::chat_output::add_dir(&mut command, path);
+            }
             let mcp = crate::momso_mcp::claude_config(&crate::momso_mcp::executable()?, id);
             command.args([
                 "--mcp-config",
                 &mcp.to_string(),
                 "--allowedTools",
-                "mcp__momso_internal_runtime_v1__momso_version,mcp__momso_internal_runtime_v1__momso_github_connect,mcp__momso_internal_runtime_v1__momso_object_store_r2_connect,mcp__momso_internal_runtime_v1__momso_object_store_gcp_connect,mcp__momso_internal_runtime_v1__momso_object_store_aws_connect",
+                "mcp__momso_internal_runtime_v1__momso_version,mcp__momso_internal_runtime_v1__media_register_generated,mcp__momso_internal_runtime_v1__momso_github_connect,mcp__momso_internal_runtime_v1__momso_object_store_r2_connect,mcp__momso_internal_runtime_v1__momso_object_store_gcp_connect,mcp__momso_internal_runtime_v1__momso_object_store_aws_connect",
             ]);
             return run_command_ref(
                 command, db, archive, id, fallback, model, effort, fast, skill, None, &approvals,

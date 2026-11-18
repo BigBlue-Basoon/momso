@@ -93,7 +93,12 @@ export type PanelAgentControl = {
 }
 // browser-human-required { chatId, reason }(login | password | one_time_code | captcha | verification | external_login): 몸소 브라우저가 사람에게 넘길 때.
 // 패널 AI 의 채팅방이면 패널 위 로그인 줄로도 보인다(뒤쪽은 보통 panel-agent-control-changed login 도 함께 보내지만, 그것이 없을 때를 위해).
-export async function listenPanelAgent(handlers: { onOpenRequest?: (chatId: string | null) => void; onControl?: (control: PanelAgentControl) => void; onHumanRequired?: (chatId: string, reason: string, loginUrl: string | null) => void }) {
+export async function listenPanelAgent(handlers: { onOpenRequest?: (chatId: string | null) => void; onControl?: (control: PanelAgentControl) => void; onHumanRequired?: (chatId: string, reason: string, loginUrl: string | null) => void
+  /**
+   * 로그인 뒤 [AI에게 돌려주기]로 몸소가 그 채팅방에 "로그인을 마쳤습니다. 이어서 해 주세요."를 보내 새 턴이 시작됨
+   * (2026-11-18 여섯째 줄 G68): panel-agent-resume-started { chatId, userMessageId, text, provider, skill, originalMessageId }.
+   */
+  onResumeStarted?: (event: { chatId: string; userMessageId: string | null; text: string | null; provider: string | null }) => void }) {
   if (!isDesktopRuntime()) return () => {}
   const stops = await Promise.all([
     listen<{ chatId?: unknown }>('panel-agent-open-request', (event) => handlers.onOpenRequest?.(typeof event.payload?.chatId === 'string' ? event.payload.chatId : null)),
@@ -103,6 +108,12 @@ export async function listenPanelAgent(handlers: { onOpenRequest?: (chatId: stri
       if (typeof p.chatId === 'string' && typeof p.state === 'string') {
         handlers.onControl?.({ chatId: p.chatId, state: p.state, reason: text(p.reason), provider: text(p.provider), chatTitle: text(p.chatTitle), loginUrl: text(p.loginUrl), siteUrl: text(p.siteUrl) })
       }
+    }),
+    listen<{ chatId?: unknown; userMessageId?: unknown; text?: unknown; provider?: unknown }>('panel-agent-resume-started', (event) => {
+      const p = event.payload ?? {}
+      if (typeof p.chatId !== 'string') return
+      const text = (value: unknown) => (typeof value === 'string' && value ? value : null)
+      handlers.onResumeStarted?.({ chatId: p.chatId, userMessageId: text(p.userMessageId), text: text(p.text), provider: text(p.provider) })
     }),
     listen<{ chatId?: unknown; reason?: unknown; loginUrl?: unknown }>('browser-human-required', (event) => {
       const p = event.payload ?? {}

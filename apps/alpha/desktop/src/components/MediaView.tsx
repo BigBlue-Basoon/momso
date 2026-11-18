@@ -34,6 +34,12 @@ export function MediaView({ onOpenChat, onNotice, onRegenerate }: { onOpenChat?:
       })
   }, [])
   useEffect(() => { load() }, [load])
+  // 다시 만들기로 새 판이 생기면(앱이 momso:media-changed 를 보냄) 다시 읽는다.
+  useEffect(() => {
+    const onChange = () => load()
+    window.addEventListener('momso:media-changed', onChange)
+    return () => window.removeEventListener('momso:media-changed', onChange)
+  }, [load])
 
   const shown = useMemo(() => {
     if (!items) return null

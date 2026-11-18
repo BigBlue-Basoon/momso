@@ -28,7 +28,7 @@ fn storage_tool_result(outcome: &Value) -> Value {
     }
 }
 
-fn r2_tool_status(outcome: Result<(), &'static str>) -> &'static str {
+pub(crate) fn r2_tool_status(outcome: Result<(), &'static str>) -> &'static str {
     match outcome {
         Ok(()) => "success",
         Err("login_required") => "login_required",
@@ -365,14 +365,66 @@ async fn connect_r2_oauth(
     let username = crate::archive_remote::username_get_db(&db)
         .map_err(|_| "unavailable")?
         .ok_or("username_missing")?;
-    let account = crate::r2_oauth::login_account(app.clone(), cancel.clone()).await?;
+    let broker = app.state::<crate::AppState>().approvals.clone();
+    let login_app = app.clone();
+    let login_chat = chat_id.to_owned();
+    let approval_app = app.clone();
+    let approval_chat = chat_id.to_owned();
+    let approval_provider = ai_provider.to_owned();
+    let connection_chat = chat_id.to_owned();
+    run_r2_flow(
+        username,
+        cancel,
+        move |cancel| async move {
+            crate::r2_oauth::login_account(login_app, &login_chat, cancel).await
+        },
+        move |plan, cancel| async move {
+            plan.authorize(
+                &broker,
+                &approval_app,
+                &approval_chat,
+                &approval_provider,
+                cancel,
+            )
+            .await
+        },
+        move |permit, cancel| async move {
+            crate::r2_oauth::connect_approved(
+                app.clone(),
+                app.state(),
+                &connection_chat,
+                permit,
+                cancel,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+pub(crate) async fn run_r2_flow<F, Fut, G, Gf, H, Hf>(
+    username: String,
+    cancel: CancellationToken,
+    login: F,
+    authorize: G,
+    connect: H,
+) -> Result<(), &'static str>
+where
+    F: FnOnce(CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = Result<String, &'static str>>,
+    G: FnOnce(crate::setup_approval::SetupPlan, CancellationToken) -> Gf,
+    Gf: std::future::Future<Output = Result<crate::setup_approval::SetupPermit, &'static str>>,
+    H: FnOnce(crate::setup_approval::SetupPermit, CancellationToken) -> Hf,
+    Hf: std::future::Future<Output = Result<(), &'static str>>,
+{
+    if cancel.is_cancelled() {
+        return Err("cancelled");
+    }
+    let account = login(cancel.clone()).await?;
     let plan =
         crate::setup_approval::SetupPlan::new("cloudflare", &username, &account, Some("auto"))?;
-    let broker = app.state::<crate::AppState>().approvals.clone();
-    let permit = plan
-        .authorize(&broker, &app, chat_id, ai_provider, cancel.clone())
-        .await?;
-    crate::r2_oauth::connect_approved(app.clone(), app.state(), chat_id, permit, cancel).await
+    let permit = authorize(plan, cancel.clone()).await?;
+    connect(permit, cancel).await
 }
 
 pub(crate) fn storage_account(input: &Value) -> Option<(&'static str, &str, &str)> {
