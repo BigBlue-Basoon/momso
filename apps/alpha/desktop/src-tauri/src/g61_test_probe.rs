@@ -6,6 +6,29 @@ pub fn run() {
     run_cases(false);
 }
 
+pub fn run_g83() {
+    if std::env::var_os("MOMSO_G83_PROBE").is_none() {
+        eprintln!("G83_PROBE missing isolation flag");
+        return;
+    }
+    struct SafeLogger;
+    impl log::Log for SafeLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            let text = record.args().to_string();
+            if text.starts_with("codex_failure ") {
+                println!("G83_PROBE {text}");
+            }
+        }
+        fn flush(&self) {}
+    }
+    static LOGGER: SafeLogger = SafeLogger;
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+    run_cases(false);
+}
+
 pub fn run_g62() {
     if std::env::var_os("MOMSO_G62_PROBE").is_none() {
         eprintln!("G62_PROBE missing isolation flag");
@@ -92,6 +115,145 @@ fn run_cases(g62: bool) {
                 }
             });
         }
+        if std::env::var_os("MOMSO_G83_PROBE").is_some() {
+            let chat = serde_json::to_value(crate::chat::create(&database).map_err(|_| "chat")?)
+                .map_err(|_| "chat")?["id"]
+                .as_str()
+                .ok_or("chat")?
+                .to_owned();
+            let result = async {
+                let prompt =
+                    "Use $imagegen to create one simple blue circle on a white background.";
+                for step in 1..=2 {
+                    let parent = if step == 1 {
+                        None
+                    } else {
+                        Some(
+                            crate::media_generation::all(&database)
+                                .map_err(|_| "media")?
+                                .into_iter()
+                                .find(|g| g.chat_id == chat && g.version == 1)
+                                .ok_or("first_image_missing")?
+                                .asset_id,
+                        )
+                    };
+                    let sent = crate::chat_send(
+                        app_handle.clone(),
+                        app_handle.state(),
+                        chat.clone(),
+                        prompt.into(),
+                        "codex".into(),
+                        Some("gpt-6.1-terra".into()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        parent.clone(),
+                    )
+                    .await
+                    .map_err(|_| "send")?;
+                    if sent["status"] != "started" {
+                        return Err("not_started");
+                    }
+                    let finished = tokio::time::timeout(Duration::from_secs(360), async {
+                        while let Some((name, payload)) = rx.recv().await {
+                            if payload
+                                .get("chatId")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|id| id != chat)
+                            {
+                                continue;
+                            }
+                            if name == "agent-approval-request" {
+                                if let Some(id) = payload["requestId"].as_str() {
+                                    let _ = app_handle
+                                        .state::<crate::AppState>()
+                                        .approvals
+                                        .respond(id, crate::approval::ApprovalChoice::Deny)
+                                        .await;
+                                }
+                            }
+                            if name == "chat-done" {
+                                return true;
+                            }
+                            if name == "chat-error" {
+                                let kind = match payload["error"]["kind"].as_str() {
+                                    Some("authentication") => "authentication",
+                                    Some("toolMissing") => "tool_missing",
+                                    Some("timeout") => "timeout",
+                                    Some("connectionClosed") => "connection_closed",
+                                    Some("serviceUnavailable") => "service_unavailable",
+                                    Some("usageLimit") => "usage_limit",
+                                    Some("rateLimited") => "rate_limit",
+                                    Some("modelUnavailable") => "model_unavailable",
+                                    Some("contextTooLong") => "context_limit",
+                                    _ => "unknown",
+                                };
+                                println!("G83_PROBE step={step} error_kind={kind}");
+                                return false;
+                            }
+                        }
+                        false
+                    })
+                    .await
+                    .map_err(|_| "timeout")?;
+                    if !finished {
+                        return Err(if step == 1 {
+                            "first_turn_failed"
+                        } else {
+                            "regeneration_failed"
+                        });
+                    }
+                    let items = crate::media_generation::all(&database).map_err(|_| "media")?;
+                    let found = items.iter().any(|g| {
+                        g.chat_id == chat
+                            && g.version == step
+                            && (step == 1 || g.parent_asset_id == parent)
+                    });
+                    if !found {
+                        return Err(if step == 1 {
+                            "first_image_missing"
+                        } else {
+                            "second_image_missing"
+                        });
+                    }
+                    println!("G83_PROBE step={step} result=recorded");
+                }
+                Ok::<(), &'static str>(())
+            }
+            .await;
+            if let Some(token) = app_handle
+                .state::<crate::AppState>()
+                .chat_active
+                .lock()
+                .await
+                .get(&chat)
+            {
+                token.cancel();
+            }
+            if let Ok(Some(thread)) = crate::chat::codex_thread(&database, &chat) {
+                let mut archive = crate::process::hidden_async_command("codex.cmd");
+                archive
+                    .arg("archive")
+                    .arg(&thread)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                let archived = archive.status().await.is_ok_and(|status| status.success());
+                if archived {
+                    println!("G83_PROBE archive=ok");
+                } else {
+                    println!("G83_PROBE archive_failed_thread={thread}");
+                }
+            }
+            match result {
+                Ok(()) => println!("G83_PROBE result=ok"),
+                Err(reason) => println!("G83_PROBE result={reason}"),
+            }
+            return Ok::<(), &'static str>(());
+        }
         let cases = if g62 {
             vec![
                 (
@@ -168,6 +330,7 @@ fn run_cases(g62: bool) {
                 None,
                 None,
                 skill,
+                None,
                 None,
                 None,
                 None,

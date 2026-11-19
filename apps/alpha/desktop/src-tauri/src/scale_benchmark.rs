@@ -173,6 +173,83 @@ fn measure_large_search(db_path: &Path, room_count: usize, short: &str, long: &s
 }
 
 #[test]
+#[ignore = "startup benchmark with 1000 synthetic documents; run explicitly"]
+fn populated_archive_startup_1000_documents() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let database = root.join("momso.db");
+    let archive = root.join("momso");
+    let backups = root.join("backups");
+    crate::storage::initialize(&database, &backups, "fixture").unwrap();
+    let _ = crate::archive_location::ArchiveLocation::load(database.clone(), root, vec![]).unwrap();
+    crate::archive::initialize(&archive, root).unwrap();
+    let first = crate::archive_zet::create(
+        &archive,
+        &database,
+        crate::archive_zet::ZetCreate {
+            title: "fixture".into(),
+            summary: "fixture".into(),
+            kind: "note".into(),
+            body: "synthetic document".into(),
+            assets: vec![],
+            edges: vec![],
+        },
+    )
+    .unwrap();
+    let template = fs::read_to_string(archive.join("zettels").join(format!("{first}.md"))).unwrap();
+    let base = chrono::Local::now().naive_local() - chrono::Duration::seconds(2000);
+    for n in 0..999 {
+        let id = format!(
+            "zet_{}",
+            (base + chrono::Duration::seconds(n)).format("%Y%m%d_%H%M%S")
+        );
+        fs::write(
+            archive.join("zettels").join(format!("{id}.md")),
+            template.replace(&first, &id),
+        )
+        .unwrap();
+    }
+    crate::archive::reindex(&archive, &database).unwrap();
+    let connection = crate::storage::open_writable_connection(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE archive_location_settings SET initialized=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let start = Instant::now();
+    crate::storage::initialize(&database, &backups, "fixture").unwrap();
+    let storage_ms = start.elapsed().as_millis();
+    let location =
+        crate::archive_location::ArchiveLocation::load(database.clone(), root, vec![]).unwrap();
+    assert!(!location.needs_initial_index);
+    let paths = crate::runtime::RuntimePaths {
+        data_root: root.to_path_buf(),
+        database_path: database.clone(),
+        objects_path: archive.join("objects"),
+        exports_path: root.join("exports"),
+        backups_path: backups,
+        logs_path: root.join("logs"),
+        archive: location,
+        archive_lease: None,
+    };
+    let archive_start = Instant::now();
+    crate::prepare_archive_for_start(&paths, root).unwrap();
+    println!(
+        "S1_BASELINE documents=1000 storage_ms={storage_ms} archive_ms={} total_ms={}",
+        archive_start.elapsed().as_millis(),
+        start.elapsed().as_millis()
+    );
+    assert_eq!(
+        crate::archive_zet::list(&database, None, None)
+            .unwrap()
+            .len(),
+        1000
+    );
+}
+
+#[test]
 #[ignore = "large synthetic capacity benchmark; run explicitly with --ignored --nocapture"]
 fn synthetic_year_capacity() {
     let smoke = std::env::var_os("MOMSO_SCALE_SMOKE").is_some();

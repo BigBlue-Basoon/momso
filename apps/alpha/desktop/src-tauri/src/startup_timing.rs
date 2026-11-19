@@ -1,4 +1,4 @@
-//! Opt-in, content-free timings for startup investigation.
+//! Content-free startup timings; other timing traces remain opt-in.
 use std::{sync::OnceLock, time::Instant};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -11,9 +11,7 @@ fn enabled() -> bool {
 }
 
 pub(crate) fn begin() {
-    if enabled() {
-        ORIGIN.get_or_init(Instant::now);
-    }
+    ORIGIN.get_or_init(Instant::now);
 }
 
 pub(crate) struct Timer {
@@ -29,6 +27,14 @@ pub(crate) fn start(stage: &'static str) -> Timer {
         None
     };
     Timer { stage, started }
+}
+
+pub(crate) fn start_startup(stage: &'static str) -> Timer {
+    begin();
+    Timer {
+        stage,
+        started: Some(Instant::now()),
+    }
 }
 
 impl Drop for Timer {
@@ -52,6 +58,12 @@ fn timing_line(stage: &'static str, start_ms: u128, elapsed_ms: u128, end_ms: u1
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_stage_is_timed_without_opt_in() {
+        let timer = super::start_startup("runtime_prepare");
+        assert!(timer.started.is_some());
+    }
+
     #[test]
     fn startup_timing_line_contains_only_stage_and_milliseconds() {
         assert_eq!(

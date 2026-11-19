@@ -301,6 +301,43 @@ fn thread_params(archive: &Path, settings: &CodexSettings, now: &str) -> Value {
     };
     params
 }
+
+fn codex_stage(phase: u8, resuming: bool) -> &'static str {
+    match phase {
+        1 => "initialize",
+        2 if resuming => "thread_resume",
+        2 => "thread_start",
+        3 => "turn_start",
+        _ => "turn_stream",
+    }
+}
+
+fn codex_failure_code(event: &Value) -> &'static str {
+    match event
+        .pointer("/params/turn/error/codexErrorInfo")
+        .and_then(Value::as_str)
+    {
+        Some("usageLimitExceeded") => "usage_limit",
+        Some("sessionBudgetExceeded") => "session_budget",
+        Some("rateLimitExceeded") => "rate_limit",
+        Some("unauthorized") => "unauthorized",
+        Some("modelNotFound") => "model_not_found",
+        Some("serverOverloaded") => "server_overloaded",
+        Some("internalServerError") => "server_error",
+        Some("contextWindowExceeded") => "context_limit",
+        _ => "unknown",
+    }
+}
+
+fn codex_large_response_allowed(phase: u8, response: &Value, image_event: bool) -> bool {
+    image_event
+        || (phase == 2
+            && response.get("id").and_then(Value::as_u64) == Some(2)
+            && response
+                .pointer("/result/thread/id")
+                .and_then(Value::as_str)
+                .is_some())
+}
 async fn terminate(child: &mut Child) {
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -528,14 +565,14 @@ where
             let mut limited = (&mut reader).take(32 * 1024 * 1024 + 1);
             let length = tokio::select! {
                 _ = cancel.cancelled() => return Err("요청을 중단했습니다".to_string()),
-                result = tokio::time::timeout(Duration::from_secs(180), limited.read_until(b'\n', &mut line)) => result.map_err(|_| "AI의 응답 시간이 초과되었습니다".to_string())?.map_err(|_| "AI의 답을 읽지 못했습니다".to_string())?,
+                result = tokio::time::timeout(Duration::from_secs(180), limited.read_until(b'\n', &mut line)) => result.map_err(|_| { log::warn!("codex_failure stage={} kind=read_timeout", codex_stage(phase, resuming)); "AI의 응답 시간이 초과되었습니다".to_string() })?.map_err(|_| { log::warn!("codex_failure stage={} kind=read_error", codex_stage(phase, resuming)); "AI의 답을 읽지 못했습니다".to_string() })?,
             };
-            if length == 0 { return Err("AI 연결이 끊겼습니다".into()); }
-            if length > 32 * 1024 * 1024 || !line.ends_with(b"\n") { return Err("AI의 답을 읽지 못했습니다".into()); }
+            if length == 0 { log::warn!("codex_failure stage={} kind=eof", codex_stage(phase, resuming)); return Err("AI 연결이 끊겼습니다".into()); }
+            if length > 32 * 1024 * 1024 || !line.ends_with(b"\n") { log::warn!("codex_failure stage={} kind=line_limit", codex_stage(phase, resuming)); return Err("AI의 답을 읽지 못했습니다".into()); }
             let Ok(v) = serde_json::from_slice::<Value>(&line) else { continue; };
             let image_event = v.get("method").and_then(Value::as_str) == Some("item/completed")
                 && v.pointer("/params/item/type").and_then(Value::as_str) == Some("imageGeneration");
-            if length > 2 * 1024 * 1024 && !image_event { return Err("AI의 답을 읽지 못했습니다".into()); }
+            if length > 2 * 1024 * 1024 && !codex_large_response_allowed(phase, &v, image_event) { log::warn!("codex_failure stage={} kind=line_limit", codex_stage(phase, resuming)); return Err("AI의 답을 읽지 못했습니다".into()); }
             if let Some(method) = v.get("method").and_then(Value::as_str) {
                 #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
                 if std::env::var_os("MOMSO_G62_PROBE").is_some()
@@ -619,9 +656,10 @@ where
                         if let Some(info) = v.pointer("/params/turn/error/codexErrorInfo").and_then(crate::chat_finish::codex_error) { emit("momso-internal-provider-error", info); }
                         if is_unauthorized(&v) { return Err("__momso_auth_failed".into()); }
                         if is_context_limit(&v) { emit("momso-internal-finish-reason", json!("length_limit")); }
+                        log::warn!("codex_failure stage=turn_stream kind=turn_failed code={}", codex_failure_code(&v));
                         return Err("AI가 응답을 완료하지 못했습니다".into());
                     }
-                    if answer.is_empty() { return Err("AI의 답을 읽지 못했습니다".into()); }
+                    if answer.is_empty() { log::warn!("codex_failure stage=turn_stream kind=empty_answer"); return Err("AI의 답을 읽지 못했습니다".into()); }
                     let message=chat::append_finished(db, chat_id, &answer, "codex".into(), actual_model, actual_effort, chat::FinishReason::Completed)?;
                     let done = json!({"chatId":chat_id,"messageId":message.id,"actualEffort":null,"actualSpecialEffort":null,"fastState":null,"stopReason":null,"finishReason":"completed"});
                     emit("chat-done", done);
@@ -643,6 +681,7 @@ where
                     send(&mut input, json!({"id":2,"method":"thread/start","params":params})).await?;
                     continue;
                 }
+                log::warn!("codex_failure stage={} kind=rpc_error", codex_stage(phase, resuming));
                 return Err("AI 연결을 완료하지 못했습니다".into());
             }
             let result = v.get("result").ok_or("AI의 답을 읽지 못했습니다")?;
@@ -652,13 +691,13 @@ where
                     let mut params=thread_params(archive, settings, &Local::now().to_rfc3339());
                     if let Some(provider) = expected_provider { params["modelProvider"] = json!(provider); }
                     if let Some(m)=model.filter(|x| !x.trim().is_empty()) { params["model"]=json!(m); }
-                    let method=if let Some(id)=previous.as_ref() { params["threadId"]=json!(id); "thread/resume" } else { "thread/start" };
+                    let method=if let Some(id)=previous.as_ref() { params["threadId"]=json!(id); params["excludeTurns"]=json!(true); "thread/resume" } else { "thread/start" };
                     send(&mut input,json!({"id":2,"method":method,"params":params})).await?; phase=2;
                 }
                 2 => {
-                    if !effective_settings_match(result, settings) { return Err("선택한 권한 설정을 적용하지 못했습니다".into()); }
-                    if expected_provider.is_some_and(|provider| result.get("modelProvider").and_then(Value::as_str) != Some(provider)) { return Err("unavailable".into()); }
-                    let id=result.pointer("/thread/id").and_then(Value::as_str).ok_or("채팅방을 열지 못했습니다")?;
+                    if !effective_settings_match(result, settings) { log::warn!("codex_failure stage={} kind=settings_mismatch", codex_stage(phase, resuming)); return Err("선택한 권한 설정을 적용하지 못했습니다".into()); }
+                    if expected_provider.is_some_and(|provider| result.get("modelProvider").and_then(Value::as_str) != Some(provider)) { log::warn!("codex_failure stage={} kind=provider_mismatch", codex_stage(phase, resuming)); return Err("unavailable".into()); }
+                    let id=result.pointer("/thread/id").and_then(Value::as_str).ok_or_else(|| { log::warn!("codex_failure stage={} kind=missing_thread_id", codex_stage(phase, resuming)); "채팅방을 열지 못했습니다" })?;
                     actual_model=result.get("model").and_then(Value::as_str).map(str::to_owned);
                     actual_effort=effort.filter(|e| !e.trim().is_empty()).map(str::to_owned).or_else(|| result.get("reasoningEffort").and_then(Value::as_str).map(str::to_owned));
                     if let Some(model) = &actual_model { emit("momso-internal-observed-model", json!(model)); }
@@ -756,6 +795,97 @@ pub(crate) fn valid_model(model: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_responses_are_limited_to_expected_thread_and_images() {
+        let thread = json!({"id": 2, "result": {"thread": {"id": "test"}}});
+        assert!(codex_large_response_allowed(2, &thread, false));
+        assert!(!codex_large_response_allowed(3, &thread, false));
+        assert!(!codex_large_response_allowed(
+            2,
+            &json!({"id": 3, "result": {"thread": {"id": "test"}}}),
+            false
+        ));
+        assert!(codex_large_response_allowed(4, &json!({}), true));
+        assert_eq!(codex_stage(2, true), "thread_resume");
+        assert_eq!(codex_stage(3, true), "turn_start");
+        assert_eq!(
+            codex_failure_code(
+                &json!({"params":{"turn":{"error":{"codexErrorInfo":"rateLimitExceeded"}}}})
+            ),
+            "rate_limit"
+        );
+        assert_eq!(
+            codex_failure_code(
+                &json!({"params":{"turn":{"error":{"codexErrorInfo":"fixture-secret"}}}})
+            ),
+            "unknown"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fake_codex_resume_accepts_large_history_and_excludes_turns() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("archive");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = d.path().join("db.sqlite");
+        crate::storage::initialize(&db, &d.path().join("backups"), "test").unwrap();
+        let id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let script = d.path().join("fake-codex.ps1");
+        std::fs::write(&script, r#"
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"id":1,"result":{}}')
+$null = [Console]::In.ReadLine()
+$resume = [Console]::In.ReadLine() | ConvertFrom-Json
+if ($resume.method -ne 'thread/resume' -or $resume.params.excludeTurns -ne $true) { exit 9 }
+$response = @{id=2; result=@{thread=@{id='fixture-thread'; turns=@(@{data=('a' * 3700000)})}; approvalPolicy='on-request'; approvalsReviewer='user'; sandbox=@{type='workspaceWrite'}; modelProvider='openai'; model='fixture-model'; reasoningEffort='low'}}
+[Console]::WriteLine(($response | ConvertTo-Json -Compress -Depth 10))
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"id":3,"result":{"turn":{"id":"fixture-turn"}}}')
+[Console]::WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"done"}}')
+[Console]::WriteLine('{"method":"turn/completed","params":{"turn":{"status":"completed"}}}')
+"#).unwrap();
+        let mut command = crate::process::hidden_async_command("powershell.exe");
+        command
+            .args(["-NoProfile", "-File"])
+            .arg(script)
+            .current_dir(d.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        run_command(
+            command,
+            &db,
+            &root,
+            &id,
+            "continue",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::permission_modes::codex_settings("Ask for approval").unwrap(),
+            None,
+            CancellationToken::new(),
+            Some("fixture-thread".into()),
+            Some("openai"),
+            None,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        let detail = serde_json::to_value(chat::read(&db, &id).unwrap()).unwrap();
+        assert!(detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "done"));
+    }
 
     #[cfg(windows)]
     #[tokio::test]
