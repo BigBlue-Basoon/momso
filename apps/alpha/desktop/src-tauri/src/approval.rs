@@ -54,6 +54,8 @@ pub(crate) struct ApprovalRequest {
     pub(crate) change: Option<ChangeKind>,
     pub(crate) targets: Vec<ApprovalTarget>,
     pub(crate) reason: Option<String>,
+    pub(crate) folder: Option<String>,
+    pub(crate) original_file_name: Option<String>,
     pub(crate) options: Vec<ApprovalChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) setup: Option<SetupApproval>,
@@ -83,6 +85,8 @@ pub(crate) fn setup_request(
             ApprovalChoice::Deny,
             ApprovalChoice::Cancel,
         ],
+        folder: None,
+        original_file_name: None,
         setup: Some(setup),
     }
 }
@@ -114,6 +118,8 @@ pub(crate) fn browser_request(
             ApprovalChoice::Deny,
             ApprovalChoice::Cancel,
         ],
+        folder: None,
+        original_file_name: None,
         setup: None,
     }
 }
@@ -163,6 +169,8 @@ pub(crate) fn dictionary_request(
             ApprovalChoice::Deny,
             ApprovalChoice::Cancel,
         ],
+        folder: None,
+        original_file_name: None,
         setup: None,
     }
 }
@@ -172,6 +180,7 @@ pub(crate) fn document_request(
     provider: &str,
     title: &str,
     id: Option<&str>,
+    folder: Option<&str>,
 ) -> ApprovalRequest {
     let change = if id.is_some() {
         ChangeKind::Edit
@@ -197,6 +206,8 @@ pub(crate) fn document_request(
             ApprovalChoice::Deny,
             ApprovalChoice::Cancel,
         ],
+        folder: folder.map(str::to_owned),
+        original_file_name: None,
         setup: None,
     }
 }
@@ -220,6 +231,41 @@ pub(crate) struct ApprovalClosed {
     pub(crate) reason: &'static str,
 }
 impl ApprovalRequest {
+    fn add_original_file_name(&mut self, root: &std::path::Path, database: &std::path::Path) {
+        if self.kind != "file_change" || self.targets.len() != 1 {
+            return;
+        }
+        let path = std::path::Path::new(&self.targets[0].path);
+        let objects = root.join("objects");
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&objects).ok()
+        } else {
+            path.strip_prefix("objects").ok()
+        };
+        let Some(relative) = relative else { return };
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return;
+        }
+        let key = relative.to_string_lossy().replace('\\', "/");
+        if !key.starts_with("sha256/") {
+            return;
+        }
+        let Ok(db) = rusqlite::Connection::open_with_flags(
+            database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            return;
+        };
+        self.original_file_name = db.query_row(
+            "SELECT original_file_name FROM momso_source_assets WHERE storage_relative_path = ?1 LIMIT 1",
+            [&key],
+            |row| row.get::<_, String>(0),
+        ).ok().filter(|name| !name.is_empty());
+    }
+
     pub(crate) fn redact_sensitive(&mut self, known: &[&str]) {
         let clean = |value: &mut String| {
             *value = crate::chat_archive_redact::redact_with_known(value, known).text;
@@ -233,6 +279,12 @@ impl ApprovalRequest {
         }
         if let Some(reason) = &mut self.reason {
             clean(reason);
+        }
+        if let Some(folder) = &mut self.folder {
+            clean(folder);
+        }
+        if let Some(name) = &mut self.original_file_name {
+            clean(name);
         }
         if let Some(setup) = &mut self.setup {
             clean(&mut setup.service);
@@ -338,6 +390,14 @@ impl ApprovalBroker {
         let state = app.try_state::<crate::AppState>().ok_or("unavailable")?;
         let data_root = state.paths.data_root.clone();
         let database = state.paths.database_path.clone();
+        let archive = state.paths.archive.current.read().await.clone();
+        let lookup_database = database.clone();
+        request = tokio::task::spawn_blocking(move || {
+            request.add_original_file_name(&archive, &lookup_database);
+            request
+        })
+        .await
+        .map_err(|_| "unavailable")?;
         let known = tokio::task::spawn_blocking(move || {
             crate::chat_archive_store::known_values(&data_root, &database)
         })
@@ -415,6 +475,43 @@ impl ApprovalBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_approval_includes_destination_folder() {
+        let request = document_request("chat", "codex", "title", None, Some("class/notes"));
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["folder"], "class/notes");
+        let root = document_request("chat", "codex", "title", None, Some(""));
+        assert_eq!(serde_json::to_value(root).unwrap()["folder"], "");
+    }
+
+    #[test]
+    fn approval_original_file_name_comes_only_from_matching_asset() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("test.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE momso_source_assets (storage_relative_path TEXT, original_file_name TEXT)", []).unwrap();
+        conn.execute(
+            "INSERT INTO momso_source_assets VALUES (?1, ?2)",
+            ["sha256/ab/abcdef", "lesson.png"],
+        )
+        .unwrap();
+        let mut request = document_request("chat", "codex", "title", Some("id"), None);
+        request.targets[0].path = "objects/sha256/ab/abcdef".into();
+        request.add_original_file_name(temp.path(), &db);
+        assert_eq!(request.original_file_name.as_deref(), Some("lesson.png"));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["originalFileName"],
+            "lesson.png"
+        );
+        request.redact_sensitive(&["lesson.png"]);
+        assert_ne!(request.original_file_name.as_deref(), Some("lesson.png"));
+        request.original_file_name = None;
+        request.targets[0].path = "objects/sha256/ab/missing".into();
+        request.add_original_file_name(temp.path(), &db);
+        assert!(request.original_file_name.is_none());
+        assert!(serde_json::to_value(&request).unwrap()["originalFileName"].is_null());
+    }
 
     #[test]
     fn browser_scope_displays_bundled_skill_title() {
@@ -668,6 +765,8 @@ mod tests {
             targets: vec![],
             reason: None,
             options: vec![ApprovalChoice::Deny],
+            folder: None,
+            original_file_name: None,
             setup: None,
         };
         assert_eq!(

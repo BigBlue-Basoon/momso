@@ -96,6 +96,11 @@
   font-size: 12px;
 }
 
+/* 제목 줄 안의 폴더 이름(2026-11-19 G82): 목록의 종류 글과 같은 굵기. */
+.approval-subject .approval-target-change {
+  font-weight: 400;
+}
+
 .approval-subject.is-plain {
   font-weight: 400;
   white-space: normal;

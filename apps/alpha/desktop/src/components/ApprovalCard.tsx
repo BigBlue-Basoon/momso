@@ -4,6 +4,7 @@ import { Check } from 'lucide-react'
 import { findZetId, readZet } from '../archive'
 import { PROVIDER_NAME, type AiProvider } from '../ai-models'
 import { CHOICE_DONE, CHOICE_LABEL, approvalChange, isBrowserApproval, orderedChoices, type ApprovalChange, type ApprovalChoice, type ApprovalRequest, type SetupAction } from '../approvals'
+import { approvalFolderName, isSourcePath, targetName } from '../approval-names'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 import './ApprovalCard.css'
 
@@ -40,20 +41,6 @@ function ClosedLine({ subject, reason }: { subject: string | null; reason?: stri
 
 function providerName(provider: string) {
   return PROVIDER_NAME[provider as AiProvider] ?? provider
-}
-
-function fileName(path: string) {
-  return path.split(/[\\/]/).filter(Boolean).pop() ?? path
-}
-
-/** 원자료(objects/sha256/…) 파일인지. 해시 조각은 사람이 읽을 이름이 아니다(2026-11-19 G81 5). */
-function isSourcePath(path: string) {
-  return /(^|[\\/])objects[\\/]sha256[\\/]/i.test(path)
-}
-
-/** 대상 하나의 보이는 이름: 원자료면 "원자료 파일"(물음에 원자료 이름이 오지 않아 짐작하지 않는다), 그 밖은 파일 이름. */
-function targetName(path: string) {
-  return isSourcePath(path) ? W.approvalCard.sourceFile : fileName(path)
 }
 
 /** 몸소 문서 쪽 대상(zettels/ 또는 zettels/<id>.md). 뒤쪽 문서 만들기 물음은 description 에 문서 제목을 준다(approval.rs document_request). */
@@ -263,14 +250,16 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
     ? 'file'
     : !request.description.trim() ? 'none' : request.provider === 'codex' ? 'folder' : 'file'
   const zetTitle = useZetTitle(request, targets.length > 1 ? null : path, change)
-  // 문서 만들기(G81 4): 경로 끝(zettels) 대신 이미 받은 문서 제목. 물음에 폴더 값은 오지 않는다.
+  // 문서 만들기(G81 4): 경로 끝(zettels) 대신 이미 받은 문서 제목. 저장될 폴더는 뒤쪽이 준 folder(G82)로 제목 곁에.
   const docTitle = request.kind === 'file_change' && targets.length <= 1 && isDocumentTarget(path) && !read.path && request.description.trim() && request.description !== path
     ? request.description.trim() : null
   const title = zetTitle ?? docTitle
   const command = read.command ?? request.description
   const subject = request.kind === 'file_change'
-    ? (targets.length > 1 ? targets.map((target) => targetName(target.path)).join(', ') : title ?? targetName(path))
+    ? (targets.length > 1 ? targets.map((target) => targetName(target.path)).join(', ') : title ?? targetName(path, request.originalFileName))
     : request.kind === 'command' ? command : request.description
+  // 저장될 폴더(G82): "" 는 맨 위(문서), null 이면 적지 않는다. 대상이 하나인 파일 변경에만.
+  const folderName = request.kind === 'file_change' && targets.length <= 1 ? approvalFolderName(request) : null
 
   if (request.kind === 'setup_change' && request.setup) return <SetupApprovalCard item={item} setup={request.setup} onAnswer={onAnswer} />
   if (isBrowserApproval(request)) return <BrowserApprovalCard item={item} onAnswer={onAnswer} />
@@ -326,7 +315,12 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
         </ul>
       ) : request.kind === 'file_change' ? (
         <>
-          {subject && <p className="approval-subject" title={isSourcePath(path) ? undefined : path}>{subject}</p>}
+          {subject && (
+            <p className="approval-subject" title={isSourcePath(path) ? undefined : path}>
+              {subject}
+              {folderName && <> <span className="approval-target-change" title={request.folder || undefined}>{folderName}</span></>}
+            </p>
+          )}
           {/* 원자료 파일은 정확한 경로를 펼쳐 보기에(G81 5). */}
           {isSourcePath(path) && (
             <details className="approval-more">

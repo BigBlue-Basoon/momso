@@ -70,6 +70,8 @@ fn approved_and_manual_documents_reappear_in_mcp_and_recent_list() {
             approval::ApprovalChoice::AllowOnce,
             approval::ApprovalChoice::Deny,
         ],
+        folder: None,
+        original_file_name: None,
         setup: None,
     };
     let approved = tauri::async_runtime::block_on(broker.request_with(

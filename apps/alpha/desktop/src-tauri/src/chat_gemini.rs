@@ -466,6 +466,8 @@ fn approval(chat_id: &str, params: &Value) -> ApprovalRequest {
         targets,
         reason: None,
         options: choices,
+        folder: None,
+        original_file_name: None,
         setup: None,
     }
 }

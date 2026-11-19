@@ -57,6 +57,10 @@ export type ApprovalRequest = {
   targets?: ApprovalTarget[] | null
   /** kind 가 'setup_change' 일 때 하려는 일(위 SetupAction). */
   setup?: SetupAction | null
+  /** 문서 만들기에서 문서가 저장될 폴더(2026-11-19 G82). "" 는 맨 위, 모르면 null. */
+  folder?: string | null
+  /** 대상이 하나인 파일 변경에서 그 경로가 원자료와 맞을 때의 원래 파일 이름(G82). 없으면 null. */
+  originalFileName?: string | null
 }
 
 /**
