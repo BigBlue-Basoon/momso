@@ -208,6 +208,37 @@ fn git(tool: &Path, root: &Path, args: &[&str]) -> Result<String, &'static str> 
     })
 }
 
+// These quiet probes use exit 1 for an ordinary negative answer. Other
+// failures remain storage errors rather than being mistaken for a clean state.
+fn git_predicate(tool: &Path, root: &Path, args: &[&str]) -> Result<bool, &'static str> {
+    let status = crate::process::hidden_command(tool)
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| {
+            log::warn!("Skill storage check could not start");
+            "save_failed"
+        })?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => {
+            log::warn!("Skill storage check failed");
+            Err("save_failed")
+        }
+    }
+}
+
+fn has_head(tool: &Path, root: &Path) -> Result<bool, &'static str> {
+    git_predicate(tool, root, &["rev-parse", "--verify", "--quiet", "HEAD"])
+}
+
 fn transact(
     root: &Path,
     resources: &Path,
@@ -362,9 +393,9 @@ pub(crate) fn install_builtins(
     if git(&tool, root, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
         return Err("save_failed");
     }
-    let mut has_history = git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok();
+    let mut has_history = has_head(&tool, root)?;
     let clean_tracked = if has_history
-        && git(
+        && git_predicate(
             &tool,
             root,
             &[
@@ -376,9 +407,7 @@ pub(crate) fn install_builtins(
                 ".agents/skills",
                 ".claude/skills",
             ],
-        )
-        .is_ok()
-    {
+        )? {
         git(
             &tool,
             root,
@@ -416,7 +445,7 @@ pub(crate) fn install_builtins(
                 .iter()
                 .any(|(builtin_name, builtin_text)| *builtin_name == name && *builtin_text == text)
         {
-            has_history = git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok();
+            has_history = has_head(&tool, root)?;
         }
     }
     Ok(())
@@ -517,13 +546,11 @@ fn install_builtin_locked(
             {
                 let mut diff = vec!["diff", "--quiet", "HEAD", "--"];
                 diff.extend(paths.iter().map(String::as_str));
-                if git(&tool, root, &diff).is_ok() {
+                if git_predicate(&tool, root, &diff)? {
                     return Ok(());
                 }
             }
-            Err(_) if git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_err() => {
-                return Ok(())
-            }
+            Err(_) if !has_head(&tool, root)? => return Ok(()),
             _ => {}
         }
     }
@@ -595,7 +622,7 @@ pub(crate) fn save_external_changes(root: &Path, resources: &Path) -> Result<(),
     if git(&tool, root, &status_args)?.is_empty() {
         return Ok(());
     }
-    let deleted = if git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok() {
+    let deleted = if has_head(&tool, root)? {
         git(
             &tool,
             root,
@@ -1004,6 +1031,37 @@ pub(crate) async fn skill_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_builtins_can_be_committed_without_breaking_first_receive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        let tool = crate::archive::storage_tool(dir.path()).unwrap().0;
+        assert_eq!(has_head(&tool, &root), Ok(false));
+        for (name, _) in crate::skills::BUNDLED_SKILLS {
+            assert!(root.join(format!("skills/{name}/SKILL.md")).is_file());
+        }
+        assert!(crate::archive_remote::fresh_archive_with_local_files(
+            &tool, &root, false
+        ));
+        save_external_changes(&root, dir.path()).unwrap();
+        assert_eq!(has_head(&tool, &root), Ok(true));
+        for (name, _) in crate::skills::BUNDLED_SKILLS {
+            for folder in ["skills", ".agents/skills", ".claude/skills"] {
+                let object = format!("HEAD:{folder}/{name}/SKILL.md");
+                assert!(git(&tool, &root, &["cat-file", "-e", &object]).is_ok());
+            }
+        }
+        let path = format!("skills/{}/SKILL.md", crate::skills::BUNDLED_SKILLS[0].0);
+        fs::write(root.join(&path), b"changed fixture").unwrap();
+        assert_eq!(
+            git_predicate(&tool, &root, &["diff", "--quiet", "HEAD", "--", &path]),
+            Ok(false)
+        );
+        assert_eq!(has_head(&tool, dir.path()), Err("save_failed"));
+    }
+
     fn create() -> Operation {
         Operation::Create {
             title: "수업".into(),
