@@ -75,6 +75,8 @@ fn declined_approval(chat_id: &str, method: &str, params: &Value) -> Option<Appr
             .and_then(Value::as_str)
             .map(str::to_owned),
         options: vec![ApprovalChoice::Deny],
+        folder: None,
+        original_file_name: None,
         setup: None,
     })
 }

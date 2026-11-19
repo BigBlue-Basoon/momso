@@ -83,7 +83,13 @@ pub(crate) async fn dispatch(
             return json!({"status":"changed"});
         }
     }
-    let request = crate::approval::document_request(chat, provider, &title, id.as_deref());
+    let request = crate::approval::document_request(
+        chat,
+        provider,
+        &title,
+        id.as_deref(),
+        if id.is_none() { Some(&folder) } else { None },
+    );
     if !ask(request, cancel.clone()).await || cancel.is_cancelled() {
         return json!({"status":"denied"});
     }
@@ -215,6 +221,7 @@ mod tests {
             .contains(&"홍보".to_string()));
         let ask: crate::browser_runtime::Ask = Arc::new(|request, _| {
             assert_eq!(request.kind, "file_change");
+            assert_eq!(request.folder.as_deref(), Some("홍보"));
             Box::pin(async { true })
         });
         let result = dispatch(
