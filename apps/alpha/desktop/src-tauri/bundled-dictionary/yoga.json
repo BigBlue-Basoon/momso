@@ -1,5 +1,5 @@
 {
-  "bundleVersion": 6,
+  "bundleVersion": 7,
   "reviewStatus": "사람 검수 전",
   "terms": [
     {
@@ -9852,11 +9852,13 @@
       "koreanNames": [],
       "meaning": "벽과 로프를 활용하는 수업 이름.",
       "sources": [
-        "https://www.easyyoga.co.kr/yogaprogram/"
+        "https://www.easyyoga.co.kr/yogaprogram/",
+        "https://www.classu.co.kr/class/classDetail/1853"
       ],
       "category": "유파·수업",
       "verifiedSources": [
-        "https://www.easyyoga.co.kr/yogaprogram/"
+        "https://www.easyyoga.co.kr/yogaprogram/",
+        "https://www.classu.co.kr/class/classDetail/1853"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9870,9 +9872,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "월 요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.classu.co.kr/class/classDetail/1853"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Wall Yoga",
       "language": "english_or_proper_name"
     },
@@ -9918,11 +9931,13 @@
       "koreanNames": [],
       "meaning": "인요가와 빈야사를 함께 수련하는 수업 이름.",
       "sources": [
-        "https://www.yogaatelier.kr/classes"
+        "https://www.yogaatelier.kr/classes",
+        "https://v.daum.net/v/20210925122022181"
       ],
       "category": "유파·수업",
       "verifiedSources": [
-        "https://www.yogaatelier.kr/classes"
+        "https://www.yogaatelier.kr/classes",
+        "https://v.daum.net/v/20210925122022181"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9936,9 +9951,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "인양 요가",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://v.daum.net/v/20210925122022181"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Yin Yang Yoga",
       "language": "english_or_proper_name"
     },
@@ -9952,12 +9978,14 @@
       "meaning": "아쉬탕가의 첫 번째 시리즈.",
       "sources": [
         "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://manduka.co.kr/article/%EA%B3%B5%EC%A7%80%EC%82%AC%ED%95%AD/1/114/"
       ],
       "category": "시리즈",
       "verifiedSources": [
         "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://manduka.co.kr/article/%EA%B3%B5%EC%A7%80%EC%82%AC%ED%95%AD/1/114/"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -9971,6 +9999,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "프라이머리시리즈",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://manduka.co.kr/article/%EA%B3%B5%EC%A7%80%EC%82%AC%ED%95%AD/1/114/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10054,6 +10093,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "어드밴스드A",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.ashtangavidya.com/ko/starting-third-series-again/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10070,12 +10120,14 @@
       "meaning": "아쉬탕가의 네 번째 시리즈 이름.",
       "sources": [
         "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://www.ashtangavidya.com/ko/starting-third-series-again/"
       ],
       "category": "시리즈",
       "verifiedSources": [
         "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://www.ashtangavidya.com/ko/starting-third-series-again/"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10089,6 +10141,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "어드밴스드B",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.ashtangavidya.com/ko/starting-third-series-again/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10104,11 +10167,13 @@
       "koreanNames": [],
       "meaning": "수련을 마무리하는 자세 순서.",
       "sources": [
-        "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B"
+        "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B",
+        "https://www.yes24.com/product/goods/118035255"
       ],
       "category": "시리즈",
       "verifiedSources": [
-        "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B"
+        "https://library.kaist.ac.kr/search/ctlgSearch/posesn/view.do?bibctrlno=609700&se=b0&ty=B",
+        "https://www.yes24.com/product/goods/118035255"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10122,9 +10187,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "마무리 시퀀스",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.yes24.com/product/goods/118035255"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Finishing Sequence",
       "language": "english_or_proper_name"
     },
@@ -10138,12 +10214,14 @@
       "meaning": "아쉬탕가 수업에서 세는 1번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://vedabase.io/ko/library/bg/5/5/"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://vedabase.io/ko/library/bg/5/5/"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10157,6 +10235,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "에깜",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://vedabase.io/ko/library/bg/5/5/"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -10580,12 +10669,14 @@
       "meaning": "아쉬탕가 수업에서 세는 11번 구령. 표기는 자료마다 다를 수 있다.",
       "sources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://www.tummee.com/ko/yoga-poses/chakrasana-flow/how-to-do"
       ],
       "category": "빈야사 구령",
       "verifiedSources": [
         "https://www.harley.com/yoga/",
-        "https://fruitgood.tistory.com/224"
+        "https://fruitgood.tistory.com/224",
+        "https://www.tummee.com/ko/yoga-poses/chakrasana-flow/how-to-do"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -10599,6 +10690,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "에카다사",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.tummee.com/ko/yoga-poses/chakrasana-flow/how-to-do"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11720,11 +11822,13 @@
       "koreanNames": [],
       "meaning": "요가 철학에서 쓰는 구나 관련 용어.",
       "sources": [
-        "https://vykorea.cafe24.com/myf/session/session-D1-14-ED1.html"
+        "https://vykorea.cafe24.com/myf/session/session-D1-14-ED1.html",
+        "https://seore.org/raw/%EB%AC%B8%EC%84%9C%3A%EC%9A%94%EA%B0%80"
       ],
       "category": "나디·구나",
       "verifiedSources": [
-        "https://vykorea.cafe24.com/myf/session/session-D1-14-ED1.html"
+        "https://vykorea.cafe24.com/myf/session/session-D1-14-ED1.html",
+        "https://seore.org/raw/%EB%AC%B8%EC%84%9C%3A%EC%9A%94%EA%B0%80"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11738,9 +11842,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "따마스",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://seore.org/raw/%EB%AC%B8%EC%84%9C%3A%EC%9A%94%EA%B0%80"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "language": "sanskrit_transliteration"
     },
     {
@@ -11849,12 +11964,14 @@
       "meaning": "몸을 받치는 길쭉한 쿠션 형태의 도구.",
       "sources": [
         "https://37degrees.co.kr/2524",
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://ncnspace.shop/goods/event_sale.php?sno=158"
       ],
       "category": "도구",
       "verifiedSources": [
         "https://37degrees.co.kr/2524",
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://ncnspace.shop/goods/event_sale.php?sno=158"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11868,6 +11985,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "요가볼스터",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://ncnspace.shop/goods/event_sale.php?sno=158"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "sourceAssessment": "두 곳 이상 확인",
@@ -11975,11 +12103,13 @@
       "koreanNames": [],
       "meaning": "수련 중 몸을 받치거나 덮는 도구.",
       "sources": [
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://minishop.gmarket.co.kr/MMARKM/List?Category=21000000&DisplayType=None&SortType=None"
       ],
       "category": "도구",
       "verifiedSources": [
-        "https://boiledyoga.com/RENTAL"
+        "https://boiledyoga.com/RENTAL",
+        "https://minishop.gmarket.co.kr/MMARKM/List?Category=21000000&DisplayType=None&SortType=None"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -11993,9 +12123,20 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "요가담요",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://minishop.gmarket.co.kr/MMARKM/List?Category=21000000&DisplayType=None&SortType=None"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
-      "sourceAssessment": "한 곳 확인",
+      "sourceAssessment": "두 곳 이상 확인",
       "roman": "Blanket",
       "language": "english_or_proper_name"
     },
@@ -12149,12 +12290,14 @@
       "meaning": "수련이나 만트라에서 쓰이는 소리.",
       "sources": [
         "https://pf.kakao.com/_JxfpsC/posts",
-        "https://sites.google.com/view/hathatraining/202003_CancleInform/2020Hatha"
+        "https://sites.google.com/view/hathatraining/202003_CancleInform/2020Hatha",
+        "https://hohohalmoney1.tistory.com/entry/%EC%A0%84%ED%86%B5%EC%9A%94%EA%B0%80%EC%9D%98-%EC%A2%85%EB%A5%98%EC%97%90%EB%8A%94-%EC%96%B4%EB%96%A4-%EA%B2%83%EB%93%A4%EC%9D%B4-%EC%9E%88%EC%9D%84%EA%B9%8C"
       ],
       "category": "만트라·수업 말",
       "verifiedSources": [
         "https://pf.kakao.com/_JxfpsC/posts",
-        "https://sites.google.com/view/hathatraining/202003_CancleInform/2020Hatha"
+        "https://sites.google.com/view/hathatraining/202003_CancleInform/2020Hatha",
+        "https://hohohalmoney1.tistory.com/entry/%EC%A0%84%ED%86%B5%EC%9A%94%EA%B0%80%EC%9D%98-%EC%A2%85%EB%A5%98%EC%97%90%EB%8A%94-%EC%96%B4%EB%96%A4-%EA%B2%83%EB%93%A4%EC%9D%B4-%EC%9E%88%EC%9D%84%EA%B9%8C"
       ],
       "unverifiedSources": [],
       "variants": [
@@ -12168,6 +12311,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": true
+        },
+        {
+          "text": "오움",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://hohohalmoney1.tistory.com/entry/%EC%A0%84%ED%86%B5%EC%9A%94%EA%B0%80%EC%9D%98-%EC%A2%85%EB%A5%98%EC%97%90%EB%8A%94-%EC%96%B4%EB%96%A4-%EA%B2%83%EB%93%A4%EC%9D%B4-%EC%9E%88%EC%9D%84%EA%B9%8C"
+          ],
+          "requiresConfirmation": true,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ],
       "ambiguityReason": "문맥에 따라 다른 말이나 수업 이름일 수 있어 확인이 필요함",
@@ -13525,14 +13679,16 @@
       "koreanNames": [],
       "meaning": "시선을 코끝에 두는 수련의 이름.",
       "sources": [
-        "https://kriyayoga.co.kr/64"
+        "https://kriyayoga.co.kr/64",
+        "https://www.siddhiyoga.com/ko/yoga/practice/mudra/kaki-mudra"
       ],
       "category": "시리즈",
       "verifiedSources": [
-        "https://kriyayoga.co.kr/64"
+        "https://kriyayoga.co.kr/64",
+        "https://www.siddhiyoga.com/ko/yoga/practice/mudra/kaki-mudra"
       ],
       "unverifiedSources": [],
-      "sourceAssessment": "개인 블로그 하나",
+      "sourceAssessment": "두 곳 이상 확인",
       "variants": [
         {
           "text": "나시카그라 드리쉬티",
@@ -13544,6 +13700,17 @@
           ],
           "unverifiedSources": [],
           "requiresConfirmation": false
+        },
+        {
+          "text": "나사그라 드리스티",
+          "origin": "observed",
+          "recognitionOnly": false,
+          "sources": [
+            "https://www.siddhiyoga.com/ko/yoga/practice/mudra/kaki-mudra"
+          ],
+          "requiresConfirmation": false,
+          "label": "실제로 본 표기",
+          "unverifiedSources": []
         }
       ]
     },

@@ -80,10 +80,27 @@ function readAutoBackup(value: Partial<AutoBackupStatus> | null): AutoBackupStat
     retryInSeconds: typeof value?.retryInSeconds === 'number' ? value.retryInSeconds : null,
   }
 }
+/**
+ * 원자료 자동 업로드(2026-11-18 넷째 줄 D38, desktop-object-store-auto-upload.md): object_store_auto_upload_get() / _set({ enabled }) →
+ * GitHub 자동 백업과 같은 꼴 { enabled, state, consecutiveFailures, reason, retryInSeconds }. state 에 not_connected 가 더 있다.
+ * 바뀐 뒤 120초 묶어 올리고(30초마다 살핌), 실패하면 60초부터 두 배씩 최대 30분 뒤 다시. 기본 켬.
+ */
+export async function storeAutoUploadGet() { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('object_store_auto_upload_get')) }
+export async function storeAutoUploadSet(enabled: boolean) { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('object_store_auto_upload_set', { enabled })) }
 export async function autoBackupGet() { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('archive_auto_backup_get')) }
 export async function autoBackupSet(enabled: boolean) { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('archive_auto_backup_set', { enabled })) }
 export async function remoteConnect(repo: string) { need(); return invoke<RemoteStatus>('archive_remote_connect', { repo }) }
 export async function remotePush() { need(); return invoke<RemoteStatus>('archive_remote_push') }
+/**
+ * 따로 넣은 파일 수(desktop-document-folders.md: archive_additional_files_count() → { count }, 읽을 수 없으면 unavailable).
+ * 문서 목록에 넣지 않는 일반 파일이고 GitHub 에 함께 올라간다. 명령이 없는 뒤쪽이거나 읽지 못하면 null(줄을 그리지 않는다).
+ */
+export async function additionalFilesCount(): Promise<number | null> {
+  need()
+  const value = await invoke<{ count?: unknown } | null>('archive_additional_files_count').catch(() => null)
+  return typeof value?.count === 'number' && Number.isFinite(value.count) ? value.count : null
+}
+
 export async function remotePull() { need(); return invoke<RemoteStatus>('archive_remote_pull') }
 export async function remoteDisconnect() { need(); return invoke<RemoteStatus>('archive_remote_disconnect') }
 /**

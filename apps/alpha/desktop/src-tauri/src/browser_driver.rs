@@ -84,6 +84,10 @@ pub(crate) fn executable() -> Option<PathBuf> {
     crate::browser_choice::resolve(crate::browser_choice::BrowserChoice::Auto).map(|(_, path)| path)
 }
 pub(crate) fn available() -> bool {
+    #[cfg(test)]
+    if std::env::var_os("MOMSO_G70_FAKE_BROWSER").is_some() {
+        return true;
+    }
     cfg!(windows) && executable().is_some()
 }
 
@@ -96,6 +100,8 @@ enum Request {
     Stop,
 }
 pub(crate) struct Session {
+    #[cfg(test)]
+    fake_login_completed: Option<Arc<AtomicBool>>,
     requests: mpsc::Sender<Request>,
     worker: Option<thread::JoinHandle<()>>,
     panel: Option<crate::panel_worker::PanelWorker>,
@@ -526,6 +532,8 @@ pub(crate) fn launch_with_login_choice(
     })();
     match result {
         Ok((requests, join)) => Ok(Session {
+            #[cfg(test)]
+            fake_login_completed: None,
             requests,
             worker: Some(join),
             panel: None,
@@ -573,6 +581,8 @@ impl Session {
         let (webauthn_pending, uninspectable_frame) = panel.security_flags();
         let (requests, _) = mpsc::channel();
         Ok(Self {
+            #[cfg(test)]
+            fake_login_completed: None,
             requests,
             worker: None,
             panel: Some(panel),
@@ -664,6 +674,7 @@ impl Session {
             }
         });
         Self {
+            fake_login_completed: None,
             requests,
             worker: Some(worker),
             panel: None,
@@ -693,6 +704,7 @@ impl Session {
             }
         });
         Self {
+            fake_login_completed: None,
             requests,
             worker: Some(worker),
             panel: None,
@@ -709,6 +721,12 @@ impl Session {
         }
     }
     #[cfg(test)]
+    pub(crate) fn fake_login_panel(completed: Arc<AtomicBool>) -> Self {
+        let mut session = Self::fake_for_host_approval(&[]);
+        session.fake_login_completed = Some(completed);
+        session
+    }
+    #[cfg(test)]
     pub(crate) fn test_allows_origin(&self, value: &str) -> bool {
         self.allowed
             .lock()
@@ -723,8 +741,13 @@ impl Session {
             .is_some_and(|worker| !worker.is_finished())
     }
     pub(crate) fn adopt_after_human_login(&mut self) -> Result<(), DriverError> {
-        if self.panel.is_none() {
-            return Err(DriverError::Unavailable);
+        #[cfg(test)]
+        if let Some(completed) = &self.fake_login_completed {
+            return if completed.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(DriverError::HumanRequired("login"))
+            };
         }
         let frames = self.call("Page.getFrameTree", json!({}))?;
         let url = frames
@@ -740,8 +763,12 @@ impl Session {
         {
             return Err(DriverError::Blocked(candidate));
         }
-        let old_url = self.panel_expected_url.replace(url);
-        let old_armed = std::mem::replace(&mut self.panel_armed, true);
+        let old_url = self.panel_expected_url.clone();
+        let old_armed = self.panel_armed;
+        if self.panel.is_some() {
+            self.panel_expected_url = Some(url);
+            self.panel_armed = true;
+        }
         match self.read().and_then(|page| {
             if has_login_button(&page) {
                 Err(DriverError::HumanRequired("login"))
@@ -1214,6 +1241,7 @@ mod login_guard_tests {
             }
         });
         let mut session = Session {
+            fake_login_completed: None,
             requests: tx,
             worker: Some(worker),
             panel: None,

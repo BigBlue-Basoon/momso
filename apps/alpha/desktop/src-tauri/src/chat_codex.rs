@@ -8,7 +8,7 @@ use chrono::Local;
 use serde_json::{json, Value};
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
 };
 use tokio_util::sync::CancellationToken;
@@ -490,6 +490,17 @@ pub(crate) async fn run_command<F>(
 where
     F: FnMut(&str, Value) + Send,
 {
+    let codex_home = command
+        .as_std()
+        .get_envs()
+        .find(|(key, _)| *key == "CODEX_HOME")
+        .and_then(|(_, value)| value.map(std::path::PathBuf::from))
+        .or_else(|| std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from))
+        .or_else(|| {
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+                .map(|home| std::path::PathBuf::from(home).join(".codex"))
+        });
+    let mut image_snapshot: Option<crate::generated_output::CodexImageSnapshot> = None;
     let mut child = command
         .spawn()
         .map_err(|_| "Codex를 시작하지 못했습니다".to_string())?;
@@ -498,24 +509,31 @@ where
     let result = async {
         let mut input = child.stdin.take().ok_or("AI에 요청을 보내지 못했습니다")?;
         let output = child.stdout.take().ok_or("AI의 답을 읽지 못했습니다")?;
-        let mut lines = BufReader::new(output).lines();
+        let mut reader = BufReader::new(output);
         send(&mut input, json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"momso","title":"momso","version":env!("CARGO_PKG_VERSION")}}})).await?;
         let mut phase = 1_u8;
         let mut answer = String::new();
         let mut actual_model: Option<String> = None;
         let mut actual_effort: Option<String> = None;
         let mut active_thread = previous.clone();
+        let mut active_turn: Option<String> = None;
         let mut resuming = previous.is_some();
         let mut turn_text = text;
         let mut before_compaction: Option<chat_context::Context> = None;
         let mut pending_file_changes = std::collections::HashMap::<String, Value>::new();
         loop {
-            let line = tokio::select! {
+            let mut line = Vec::new();
+            let mut limited = (&mut reader).take(32 * 1024 * 1024 + 1);
+            let length = tokio::select! {
                 _ = cancel.cancelled() => return Err("요청을 중단했습니다".to_string()),
-                line = tokio::time::timeout(Duration::from_secs(180), lines.next_line()) => line.map_err(|_| "AI의 응답 시간이 초과되었습니다".to_string())?.map_err(|_| "AI의 답을 읽지 못했습니다".to_string())?.ok_or("AI 연결이 끊겼습니다")?,
+                result = tokio::time::timeout(Duration::from_secs(180), limited.read_until(b'\n', &mut line)) => result.map_err(|_| "AI의 응답 시간이 초과되었습니다".to_string())?.map_err(|_| "AI의 답을 읽지 못했습니다".to_string())?,
             };
-            if line.len() > 2 * 1024 * 1024 { return Err("AI의 답을 읽지 못했습니다".into()); }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue; };
+            if length == 0 { return Err("AI 연결이 끊겼습니다".into()); }
+            if length > 32 * 1024 * 1024 || !line.ends_with(b"\n") { return Err("AI의 답을 읽지 못했습니다".into()); }
+            let Ok(v) = serde_json::from_slice::<Value>(&line) else { continue; };
+            let image_event = v.get("method").and_then(Value::as_str) == Some("item/completed")
+                && v.pointer("/params/item/type").and_then(Value::as_str) == Some("imageGeneration");
+            if length > 2 * 1024 * 1024 && !image_event { return Err("AI의 답을 읽지 못했습니다".into()); }
             if let Some(method) = v.get("method").and_then(Value::as_str) {
                 #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
                 if std::env::var_os("MOMSO_G62_PROBE").is_some()
@@ -553,6 +571,19 @@ where
                 }
                 if method == "item/started" && active_thread.is_some() && v.pointer("/params/threadId").and_then(Value::as_str) == active_thread.as_deref() {
                     if let Some((id, changes)) = started_file_changes(&v["params"]) { pending_file_changes.insert(id, changes); }
+                }
+                if image_event && active_thread.as_deref().is_some_and(|id| v.pointer("/params/threadId").and_then(Value::as_str) == Some(id))
+                    && active_turn.as_deref().is_some_and(|id| v.pointer("/params/turnId").and_then(Value::as_str) == Some(id))
+                    && v.pointer("/params/item/status").and_then(Value::as_str) == Some("completed") {
+                    if let (Some(output), Some(home), Some(thread), Some(path)) = (output_dir, codex_home.as_ref(), active_thread.as_deref(), v.pointer("/params/item/savedPath").and_then(Value::as_str)) {
+                        let prompt = v.pointer("/params/item/revisedPrompt").and_then(Value::as_str).filter(|s| s.len() <= 65536).unwrap_or("");
+                        if crate::generated_output::import_codex_image(archive, db, output, chat_id, crate::generated_output::CodexImageSource { home, thread, path: Path::new(path), prompt }).is_err() {
+                            log::warn!("Codex image registration failed; original file retained");
+                        } else {
+                            if let Some(snapshot) = image_snapshot.as_mut() { snapshot.mark_reported(Path::new(path)); }
+                            emit("chat-items-updated", json!({"chatId":chat_id}));
+                        }
+                    }
                 }
                 if method == "thread/started" && active_thread.is_none() {
                     active_thread = v.pointer("/params/thread/id").and_then(Value::as_str).map(str::to_owned);
@@ -632,6 +663,9 @@ where
                     if let Some(effort) = &actual_effort { emit("momso-internal-observed-effort", json!(effort)); }
                     chat::set_codex_thread(db, chat_id, id)?;
                     active_thread=Some(id.to_owned());
+                    if let (Some(home), Some(_)) = (codex_home.as_ref(), output_dir) {
+                        image_snapshot = crate::generated_output::CodexImageSnapshot::capture(home.clone(), id).ok();
+                    }
                     let selected=skill.map(|name| format!("선택된 몸소 스킬은 {name}입니다. 셸 대신 momso_skill_read 도구로 이 스킬을 읽고 따르세요.\n\n")).unwrap_or_default();
                     let prompt=format!("{selected}{turn_text}");
                     let sandbox = turn_sandbox(settings.sandbox_type, archive, output_dir);
@@ -641,11 +675,19 @@ where
                     set_turn_service_tier(&mut params, fast);
                     send(&mut input,json!({"id":3,"method":"turn/start","params":params})).await?; phase=3;
                 }
-                _ => { phase=4; }
+                _ => { active_turn=result.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned); phase=4; }
             }
         }
     }.await;
+    let ended = std::time::SystemTime::now();
     terminate(&mut child).await;
+    if let (Some(snapshot), Some(output)) = (image_snapshot, output_dir) {
+        match snapshot.scan(archive, db, output, chat_id, ended) {
+            Ok(count) if count > 0 => emit("chat-items-updated", json!({"chatId":chat_id})),
+            Ok(_) => {}
+            Err(_) => log::warn!("Could not scan Codex image output"),
+        }
+    }
     result
 }
 
@@ -712,6 +754,111 @@ pub(crate) fn valid_model(model: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fake_codex_image_event_registers_and_does_not_truncate_reply() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("archive");
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        let db = d.path().join("db.sqlite");
+        crate::storage::initialize(&db, &d.path().join("backups"), "test").unwrap();
+        let id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let user = chat::append(&db, &id, chat::Role::User, "draw", None, None).unwrap();
+        let output = crate::chat_output::create(&root, &id).unwrap();
+        crate::generated_output::begin(&db, &output, &id, &user.id, "codex", None).unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        let turn = uuid::Uuid::new_v4().to_string();
+        let home = d.path().join("codex");
+        let session = home.join("generated_images").join(&thread);
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("old.jpg"), [0xff, 0xd8, 0xff, 3]).unwrap();
+        let other = home
+            .join("generated_images")
+            .join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("other.jpg"), [0xff, 0xd8, 0xff, 4]).unwrap();
+        let script = d.path().join("fake-codex.ps1");
+        std::fs::write(&script, r#"
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine('{"id":1,"result":{}}')
+$null = [Console]::In.ReadLine()
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine(('{"id":2,"result":{"thread":{"id":"' + $env:FIXTURE_THREAD + '"},"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"},"modelProvider":"openai","model":"fixture-model","reasoningEffort":"low"}}'))
+$null = [Console]::In.ReadLine()
+[Console]::WriteLine(('{"id":3,"result":{"turn":{"id":"' + $env:FIXTURE_TURN + '"}}}'))
+$dir = Join-Path (Join-Path $env:CODEX_HOME 'generated_images') $env:FIXTURE_THREAD
+[IO.Directory]::CreateDirectory($dir) | Out-Null
+$image = Join-Path $dir 'result.jpg'
+[IO.File]::WriteAllBytes($image, [byte[]](255,216,255,1))
+[IO.File]::WriteAllBytes((Join-Path $dir 'unannounced.jpg'), [byte[]](255,216,255,2))
+$item = @{type='imageGeneration'; status='completed'; savedPath=$image; revisedPrompt='fixture prompt'; result=('a' * 3300000)}
+$event = @{method='item/completed'; params=@{threadId=$env:FIXTURE_THREAD; turnId=$env:FIXTURE_TURN; item=$item}}
+[Console]::WriteLine(($event | ConvertTo-Json -Compress -Depth 10))
+[Console]::WriteLine('{"method":"item/agentMessage/delta","params":{"delta":"finished"}}')
+[Console]::WriteLine('{"method":"turn/completed","params":{"turn":{"status":"completed"}}}')
+"#).unwrap();
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-File"])
+            .arg(script)
+            .env("CODEX_HOME", &home)
+            .env("FIXTURE_THREAD", &thread)
+            .env("FIXTURE_TURN", &turn)
+            .current_dir(d.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        run_command(
+            cmd,
+            &db,
+            &root,
+            &id,
+            "draw",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::permission_modes::codex_settings("Ask for approval").unwrap(),
+            None,
+            CancellationToken::new(),
+            None,
+            Some("openai"),
+            Some(&output),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        let generated = crate::media_generation::all(&db).unwrap();
+        assert_eq!(generated.len(), 2);
+        assert_eq!(
+            generated
+                .iter()
+                .filter(|g| g.prompt == "fixture prompt")
+                .count(),
+            1
+        );
+        assert_eq!(generated.iter().filter(|g| g.prompt.is_empty()).count(), 1);
+        assert_eq!(
+            crate::generated_output::scan(
+                &root,
+                &db,
+                &crate::generated_output::pending(&db).unwrap()[0]
+            )
+            .unwrap(),
+            0
+        );
+        let detail = serde_json::to_value(chat::read(&db, &id).unwrap()).unwrap();
+        assert!(detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["text"] == "finished"));
+    }
 
     #[test]
     fn archive_request_targets_the_stored_thread() {

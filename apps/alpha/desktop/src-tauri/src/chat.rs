@@ -122,6 +122,13 @@ pub(crate) struct ChatDetail {
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ChatPage {
+    #[serde(flatten)]
+    detail: ChatDetail,
+    next_cursor: Option<String>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ChatSearchResult {
     #[serde(flatten)]
     chat: ChatSummary,
@@ -474,7 +481,7 @@ pub(crate) fn read(path: &Path, id: &str) -> Result<ChatDetail, String> {
     let mut messages = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
-    let mut attachments = read_attachments(&c, id)?;
+    let mut attachments = read_attachments(&c, id, i64::MIN, i64::MAX)?;
     for message in &mut messages {
         if message.role == Role::User {
             message.attachments = attachments.remove(&message.id).unwrap_or_default();
@@ -490,9 +497,77 @@ pub(crate) fn read(path: &Path, id: &str) -> Result<ChatDetail, String> {
     })
 }
 
+pub(crate) fn read_page(
+    path: &Path,
+    id: &str,
+    before: Option<&str>,
+    limit: usize,
+) -> Result<ChatPage, String> {
+    if !(1..=200).contains(&limit) {
+        return Err("invalid_limit".into());
+    }
+    let mut c = db(path)?;
+    let tx = c
+        .transaction()
+        .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    let h = one(&tx, id)?;
+    let cutoff = match before {
+        Some(cursor) => tx
+            .query_row(
+                "SELECT rowid FROM chat_messages WHERE chat_id=?1 AND id=?2",
+                params![id, cursor],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?
+            .ok_or_else(|| "invalid_cursor".to_owned())?,
+        None => i64::MAX,
+    };
+    let mut q = tx.prepare("SELECT id,role,text,NULLIF(created_at,''),provider,model,effort,skill,fast,not_handed_over,actual_effort,finish_reason,auth_method,fast_state,rowid FROM chat_messages WHERE chat_id=?1 AND rowid<?2 ORDER BY rowid DESC LIMIT ?3").map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    let rows = q
+        .query_map(params![id, cutoff, (limit + 1) as i64], |row| {
+            Ok((row.get::<_, i64>(14)?, message(row)?))
+        })
+        .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    let mut messages = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
+    let has_more = messages.len() > limit;
+    if has_more {
+        messages.pop();
+    }
+    messages.reverse();
+    let next_cursor = has_more.then(|| messages[0].1.id.clone());
+    let lower = messages.first().map_or(0, |item| item.0);
+    let upper = messages.last().map_or(0, |item| item.0);
+    let mut attachments = read_attachments(&tx, id, lower, upper)?;
+    let messages = messages
+        .into_iter()
+        .map(|(_, mut message)| {
+            if message.role == Role::User {
+                message.attachments = attachments.remove(&message.id).unwrap_or_default();
+            }
+            message
+        })
+        .collect();
+    Ok(ChatPage {
+        detail: ChatDetail {
+            id: h.id,
+            title: h.title,
+            created_at: h.created_at,
+            updated_at: h.updated_at,
+            imported_from: h.imported_from,
+            messages,
+        },
+        next_cursor,
+    })
+}
+
 fn read_attachments(
     c: &Connection,
     chat_id: &str,
+    lower: i64,
+    upper: i64,
 ) -> Result<HashMap<String, Vec<ChatReadAttachment>>, String> {
     let has_attachments: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_attachments')", [], |row| row.get(0))
         .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
@@ -502,15 +577,15 @@ fn read_attachments(
     let has_pending: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_archive_pending_attachment')", [], |row| row.get(0))
         .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
     let query = if has_pending {
-        "SELECT a.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id),0 AS source_order,a.rowid AS attachment_order FROM chat_attachments a JOIN momso_source_assets s ON s.id=a.asset_id WHERE a.chat_id=?1 AND a.message_id IS NOT NULL UNION ALL SELECT p.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id),1 AS source_order,p.rowid AS attachment_order FROM chat_archive_pending_attachment p JOIN momso_source_assets s ON s.id=p.asset_id WHERE p.chat_id=?1 AND p.message_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM chat_attachments a WHERE a.receipt_id=p.receipt_id) ORDER BY source_order,attachment_order"
+        "SELECT a.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id),0 AS source_order,a.rowid AS attachment_order FROM chat_attachments a JOIN momso_source_assets s ON s.id=a.asset_id JOIN chat_messages m ON m.id=a.message_id AND m.chat_id=a.chat_id WHERE a.chat_id=?1 AND m.rowid>=?2 AND m.rowid<=?3 UNION ALL SELECT p.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id),1 AS source_order,p.rowid AS attachment_order FROM chat_archive_pending_attachment p JOIN momso_source_assets s ON s.id=p.asset_id JOIN chat_messages m ON m.id=p.message_id AND m.chat_id=p.chat_id WHERE p.chat_id=?1 AND m.rowid>=?2 AND m.rowid<=?3 AND NOT EXISTS(SELECT 1 FROM chat_attachments a WHERE a.receipt_id=p.receipt_id) ORDER BY source_order,attachment_order"
     } else {
-        "SELECT a.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id) FROM chat_attachments a JOIN momso_source_assets s ON s.id=a.asset_id WHERE a.chat_id=?1 AND a.message_id IS NOT NULL ORDER BY a.rowid"
+        "SELECT a.message_id,s.content_sha256,s.original_file_name,s.media_type,s.integrity_state,EXISTS(SELECT 1 FROM source_asset_deletions d WHERE d.asset_id=s.id) FROM chat_attachments a JOIN momso_source_assets s ON s.id=a.asset_id JOIN chat_messages m ON m.id=a.message_id AND m.chat_id=a.chat_id WHERE a.chat_id=?1 AND m.rowid>=?2 AND m.rowid<=?3 ORDER BY a.rowid"
     };
     let mut q = c
         .prepare(query)
         .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?;
     let rows = q
-        .query_map([chat_id], |row| {
+        .query_map(params![chat_id, lower, upper], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1152,6 +1227,12 @@ mod tests {
         );
         assert_eq!(value["messages"][1]["attachments"], serde_json::json!([]));
         assert_eq!(value["messages"][2]["attachments"], serde_json::json!([]));
+        let page = serde_json::to_value(read_page(&path, &id, None, 2).unwrap()).unwrap();
+        let cursor = page["nextCursor"].as_str().unwrap();
+        let earlier =
+            serde_json::to_value(read_page(&path, &id, Some(cursor), 2).unwrap()).unwrap();
+        assert_eq!(earlier["messages"][0], value["messages"][0]);
+        assert!(earlier["nextCursor"].is_null());
         let c = db(&path).unwrap();
         c.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('one','fixture-one','trashed','now','later')", []).unwrap();
         c.execute("INSERT INTO source_asset_deletions(asset_id,operation_id,state,requested_at,retain_until) VALUES('two','fixture-two','purged','now','later')", []).unwrap();
@@ -1165,6 +1246,50 @@ mod tests {
         assert_eq!(attachments[1]["deleted"], true);
         assert_eq!(attachments[1]["name"], "deleted");
         assert!(attachments[1].get("path").is_none());
+    }
+
+    #[test]
+    fn page_cursor_preserves_order_and_new_messages_do_not_duplicate() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("test.db");
+        crate::storage::initialize(&path, &temp.path().join("backups"), "test").unwrap();
+        let id = create(&path).unwrap().id;
+        let empty = read_page(&path, &id, None, 100).unwrap();
+        assert!(empty.detail.messages.is_empty());
+        assert!(empty.next_cursor.is_none());
+        let mut c = db(&path).unwrap();
+        let tx = c.transaction().unwrap();
+        for n in 0..2000 {
+            tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at) VALUES(?1,?2,'user',?3,'fixture')", params![format!("fixture-{n:04}"), id, format!("message {n}")]).unwrap();
+        }
+        tx.commit().unwrap();
+        drop(c);
+        let start = std::time::Instant::now();
+        let full = read(&path, &id).unwrap();
+        let full_ms = start.elapsed().as_millis();
+        let start = std::time::Instant::now();
+        let latest = read_page(&path, &id, None, 100).unwrap();
+        let page_ms = start.elapsed().as_millis();
+        println!("BENCH chat_read_2000_ms={full_ms} chat_read_page_100_ms={page_ms}");
+        assert_eq!(full.messages.len(), 2000);
+        assert_eq!(latest.detail.messages[0].id, "fixture-1900");
+        assert_eq!(latest.detail.messages[99].id, "fixture-1999");
+        let cursor = latest.next_cursor.unwrap();
+        append_for_send(&path, &id, "new message", None).unwrap();
+        let older = read_page(&path, &id, Some(&cursor), 100).unwrap();
+        assert_eq!(older.detail.messages[0].id, "fixture-1800");
+        assert_eq!(older.detail.messages[99].id, "fixture-1899");
+        assert!(read_page(&path, &id, Some("not-in-room"), 100).is_err());
+        assert!(read_page(&path, &id, None, 0).is_err());
+        assert!(read_page(&path, &id, None, 201).is_err());
+        let mut next = Some(cursor);
+        let mut seen = 100;
+        while let Some(current) = next {
+            let page = read_page(&path, &id, Some(&current), 100).unwrap();
+            seen += page.detail.messages.len();
+            next = page.next_cursor;
+        }
+        assert_eq!(seen, 2000);
     }
 
     #[tokio::test]

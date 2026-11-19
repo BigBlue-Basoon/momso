@@ -68,7 +68,6 @@ export function SkillsSettings({ skills, onChanged }: { skills: SkillEntry[]; on
                 {item.description && <span className="skills-row-description">{item.description}</span>}
                 {/* 까닭 줄: 다른 곳에서 수정한 것은 위 표시가 이미 까닭을 말한다. */}
                 {unavailable && item.unavailableReason !== 'skill_conflict' && <span className="skills-row-unavailable">{unavailable}</span>}
-                <span className="skills-row-name">/{item.name}</span>
               </button>
               <button
                 className={item.enabled ? 'skills-switch is-on' : 'skills-switch'}
@@ -165,6 +164,8 @@ function SkillEditor({ name, onBack }: { name: string | null; onBack: () => void
           <span>{W.skills.fieldTitle}</span>
           <input value={draft.title} onChange={(event) => set('title')(event.target.value)} autoFocus={isNew} />
         </label>
+        {/* 호출 이름(영어)은 새로 만들 때만 정한다. 있는 스킬은 보이지 않는다(2026-11-19 G81 3). 본문은 고치는 곳이라 그대로. */}
+        {isNew && (
         <label className="setting-field">
           <span>{W.skills.fieldName}</span>
           <input
@@ -177,6 +178,7 @@ function SkillEditor({ name, onBack }: { name: string | null; onBack: () => void
           />
           <small>{W.skills.fieldNameHelp}</small>
         </label>
+        )}
         <label className="setting-field">
           <span>{W.skills.fieldDescription}</span>
           <input value={draft.description} onChange={(event) => set('description')(event.target.value)} />

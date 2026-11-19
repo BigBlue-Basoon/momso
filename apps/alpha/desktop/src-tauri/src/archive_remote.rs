@@ -25,6 +25,14 @@ pub(crate) fn try_lock_remote_for_auto() -> Result<std::sync::MutexGuard<'static
 }
 
 pub(crate) fn lock_first_receive(db: &Path) -> Result<fs::File, &'static str> {
+    receive_lock(db, false)
+}
+
+pub(crate) fn lock_backup_against_first_receive(db: &Path) -> Result<fs::File, &'static str> {
+    receive_lock(db, true)
+}
+
+fn receive_lock(db: &Path, shared: bool) -> Result<fs::File, &'static str> {
     let lock_path = db
         .parent()
         .ok_or("local_state_unavailable")?
@@ -41,7 +49,11 @@ pub(crate) fn lock_first_receive(db: &Path) -> Result<fs::File, &'static str> {
         .truncate(false)
         .open(lock_path)
         .map_err(|_| "local_state_unavailable")?;
-    file.try_lock().map_err(|_| "busy")?;
+    if shared {
+        file.try_lock_shared().map_err(|_| "busy")?;
+    } else {
+        file.try_lock().map_err(|_| "busy")?;
+    }
     Ok(file)
 }
 
@@ -351,6 +363,7 @@ pub(crate) fn username_get_db(path: &Path) -> Result<Option<String>, ()> {
 pub(crate) async fn momso_username_get(
     state: State<'_, crate::AppState>,
 ) -> Result<UsernameResult, String> {
+    let _timer = crate::startup_timing::start("momso_username_get");
     Ok(match username_get_db(&state.paths.database_path) {
         Ok(username) => UsernameResult {
             state: "ok",
@@ -408,6 +421,7 @@ struct GhReply {
 }
 
 fn run_gh(args: &[&str]) -> Result<GhReply, ()> {
+    let _timer = crate::startup_timing::start("cli_gh");
     let mut command = crate::process::hidden_command("gh");
     crate::gh_owned::apply(&mut command).map_err(|_| ())?;
     let output = hidden(&mut command)
@@ -819,7 +833,14 @@ impl RemoteStatus {
         }
         let state = if matches!(
             error,
-            "remote_ahead" | "diverged" | "unsaved_changes" | "unsafe_history"
+            "remote_ahead"
+                | "diverged"
+                | "unsaved_changes"
+                | "unsafe_history"
+                | "ignored_history"
+                | "ignored_history_published"
+                | "ignored_history_unverified"
+                | "ignored_history_locked"
         ) {
             "connected"
         } else {
@@ -1586,6 +1607,7 @@ pub(crate) fn ensure_document_write_allowed(root: &Path, db: &Path) -> Result<()
 pub(crate) async fn archive_first_receive_status(
     state: State<'_, crate::AppState>,
 ) -> Result<FirstReceiveProgress, String> {
+    let _timer = crate::startup_timing::start("archive_first_receive_status");
     let root = state.paths.archive.current.clone().read_owned().await;
     Ok(current_first_receive_progress(
         &root,
@@ -1873,6 +1895,7 @@ fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static
             || safe_skill_path(p)
             || safe_chat_path(p)
             || crate::yoga_dictionary::is_path(p)
+            || crate::archive::additional_file_path(p)
             || ((p.starts_with("zettels/") || p.starts_with("receipts/"))
                 && p.ends_with(".md")
                 && !p.contains("..")
@@ -2151,7 +2174,7 @@ fn safe_chat_path(path: &str) -> bool {
         .and_then(|name| name.strip_suffix(".json"))
         .is_some_and(crate::archive_receipt::valid_chat_id)
 }
-fn safe_skill_path(path: &str) -> bool {
+pub(crate) fn safe_skill_path(path: &str) -> bool {
     ["skills/", ".agents/skills/", ".claude/skills/"]
         .iter()
         .any(|prefix| {
@@ -3559,6 +3582,7 @@ fn transfer_with_options(
         }
         let mut revision =
             git(tool, root, &["rev-parse", "--verify", "HEAD"]).map_err(|_| "nothing_saved")?;
+        revision = clean_ignored_unpushed_history(tool, root, target, branch, &revision)?;
         safe_history(tool, root, &revision)?;
         if let Some(check) = options.check {
             let remote_ref = format!("refs/heads/{branch}");
@@ -3708,6 +3732,291 @@ fn transfer_with_options(
     }
     Ok(merged)
 }
+
+struct OwnedIndexLock {
+    path: PathBuf,
+    file: Option<fs::File>,
+    owns: bool,
+}
+
+impl Drop for OwnedIndexLock {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if self.owns {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn clean_ignored_unpushed_history(
+    tool: &Path,
+    root: &Path,
+    target: &str,
+    branch: &str,
+    revision: &str,
+) -> Result<String, &'static str> {
+    let remote_ref = format!("refs/heads/{branch}");
+    let reported = remote_git(tool, root, &["ls-remote", "--heads", target, &remote_ref])?;
+    let mut args = vec![
+        "log",
+        "--format=",
+        "--name-only",
+        "--diff-filter=AM",
+        "--no-renames",
+        "-m",
+        "--root",
+        "-z",
+        revision,
+    ];
+    let excluded;
+    let mut base = None;
+    if !reported.is_empty() {
+        let mut fields = reported.split_whitespace();
+        let oid = fields.next().ok_or("remote_unavailable")?;
+        if fields.next() != Some(remote_ref.as_str())
+            || fields.next().is_some()
+            || git(
+                tool,
+                root,
+                &["rev-parse", "--verify", "refs/remotes/momso/observed"],
+            )
+            .as_deref()
+                != Ok(oid)
+        {
+            return Err("remote_unavailable");
+        }
+        excluded = format!("^{oid}");
+        args.push(&excluded);
+        base = Some(oid.to_owned());
+    }
+    let changed = git_output(tool, root, &args).map_err(|_| "git_unavailable")?;
+    if !changed.status.success() {
+        return Err("git_unavailable");
+    }
+    let changed = String::from_utf8(changed.stdout).map_err(|_| "ignored_history")?;
+    let mut paths: Vec<String> = changed
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let ignored =
+        crate::archive::ignored_paths(tool, root, &paths).map_err(|_| "local_state_unavailable")?;
+    if ignored.is_empty() {
+        return Ok(revision.to_owned());
+    }
+    if ignored.iter().any(|p| p.contains('\u{fffd}')) {
+        return Err("ignored_history");
+    }
+    // Another configured destination could already contain these commits.
+    // Do not guess whether that destination has published them.
+    let remotes = git_raw(tool, root, &["remote"]).map_err(|_| "ignored_history")?;
+    for name in remotes.lines() {
+        for args in [
+            &["remote", "get-url", "--all", name][..],
+            &["remote", "get-url", "--push", "--all", name][..],
+        ] {
+            let urls = git_raw(tool, root, args).map_err(|_| "ignored_history")?;
+            if urls.trim().is_empty() || urls.lines().any(|url| url != target) {
+                return Err("ignored_history_unverified");
+            }
+        }
+    }
+    let mut paths: Vec<_> = ignored.into_iter().collect();
+    paths.sort();
+    // A file already in the remote tree cannot be removed without changing
+    // published history or making a separate, user-visible deletion.
+    if let Some(base) = base.as_deref() {
+        for path in &paths {
+            let entry = git_raw(
+                tool,
+                root,
+                &[
+                    "--literal-pathspecs",
+                    "ls-tree",
+                    "-r",
+                    "-z",
+                    base,
+                    "--",
+                    path,
+                ],
+            )
+            .map_err(|_| "ignored_history")?;
+            if !entry.is_empty() {
+                return Err("ignored_history_published");
+            }
+        }
+    }
+    // Refuse to rewrite commits reachable through any other published ref,
+    // including tags. Unknown remote objects are deliberately treated as unsafe.
+    let published = remote_git(tool, root, &["ls-remote", "--refs", target])?;
+    let mut remote_ids = Vec::new();
+    for line in published.lines() {
+        let (oid, _) = line.split_once('\t').ok_or("ignored_history")?;
+        if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("ignored_history");
+        }
+        let commit = git(
+            tool,
+            root,
+            &["rev-parse", "--verify", &format!("{oid}^{{commit}}")],
+        )
+        .map_err(|_| "ignored_history_unverified")?;
+        remote_ids.push(commit);
+    }
+    let mut unpushed_args = vec!["rev-list", "--reverse", "--topo-order", revision];
+    let excluded = base.as_ref().map(|id| format!("^{id}"));
+    if let Some(excluded) = excluded.as_deref() {
+        unpushed_args.push(excluded);
+    }
+    let commits = git_raw(tool, root, &unpushed_args).map_err(|_| "ignored_history")?;
+    let commit_set: std::collections::HashSet<_> = commits.lines().collect();
+    let mut private_args = vec!["rev-list", revision, "--not"];
+    private_args.extend(remote_ids.iter().map(String::as_str));
+    let private = git_raw(tool, root, &private_args).map_err(|_| "ignored_history")?;
+    let private_set: std::collections::HashSet<_> = private.lines().collect();
+    if commit_set.is_empty() || commit_set != private_set {
+        return Err("ignored_history_published");
+    }
+
+    let tmp = tempfile::tempdir().map_err(|_| "local_state_unavailable")?;
+    let index = tmp.path().join("index");
+    let mut rewritten = std::collections::HashMap::<String, String>::new();
+    for commit in commits.lines() {
+        let output = git_output(tool, root, &["cat-file", "commit", commit])
+            .map_err(|_| "ignored_history")?;
+        if !output.status.success() {
+            return Err("ignored_history");
+        }
+        let raw = String::from_utf8(output.stdout).map_err(|_| "ignored_history")?;
+        let (header, message) = raw.split_once("\n\n").ok_or("ignored_history")?;
+        if header.lines().any(|line| {
+            line.starts_with("gpgsig ")
+                || line.starts_with("gpgsig-sha256 ")
+                || line.starts_with("mergetag ")
+        }) {
+            return Err("ignored_history");
+        }
+        git_index(tool, root, &index, &["read-tree", "--reset", commit])
+            .map_err(|_| "ignored_history")?;
+        for path in &paths {
+            git_index(
+                tool,
+                root,
+                &index,
+                &[
+                    "--literal-pathspecs",
+                    "update-index",
+                    "--force-remove",
+                    "--",
+                    path,
+                ],
+            )
+            .map_err(|_| "ignored_history")?;
+        }
+        let tree = git_index(tool, root, &index, &["write-tree"]).map_err(|_| "ignored_history")?;
+        let mut lines = Vec::new();
+        let mut trees = 0;
+        for line in header.split('\n') {
+            if line.starts_with("tree ") {
+                trees += 1;
+                lines.push(format!("tree {}", tree.trim()));
+            } else if let Some(parent) = line.strip_prefix("parent ") {
+                let parent = if let Some(mapped) = rewritten.get(parent) {
+                    mapped.as_str()
+                } else if let Some(base) = base.as_deref() {
+                    if git(tool, root, &["merge-base", "--is-ancestor", parent, base]).is_err() {
+                        return Err("ignored_history");
+                    }
+                    parent
+                } else {
+                    return Err("ignored_history");
+                };
+                lines.push(format!("parent {parent}"));
+            } else {
+                lines.push(line.to_owned());
+            }
+        }
+        if trees != 1 {
+            return Err("ignored_history");
+        }
+        let bytes = format!("{}\n\n{}", lines.join("\n"), message);
+        let oid = git_hash_typed(tool, root, "commit", bytes.as_bytes())
+            .map_err(|_| "ignored_history")?;
+        rewritten.insert(commit.to_owned(), oid);
+    }
+    let candidate = rewritten.get(revision).ok_or("ignored_history")?;
+    safe_history(tool, root, candidate)?;
+    let _app_guard = crate::chat_file_changes::lock_app_write();
+    let _write_guard = crate::archive_zet::WRITE_LOCK.lock().map_err(|_| "busy")?;
+    let _chat_guard = crate::chat_archive_store::lock_store().map_err(|_| "busy")?;
+    // Keep Git's real index locked from the clean check until it is replaced.
+    // This prevents another Git process from staging changes in that interval.
+    let git_dir = root.join(".git");
+    let metadata = fs::symlink_metadata(&git_dir).map_err(|_| "ignored_history")?;
+    if !metadata.is_dir() || crate::archive_location::is_link_or_reparse(&metadata) {
+        return Err("ignored_history");
+    }
+    let index_path = git_dir.join("index");
+    let lock_path = git_dir.join("index.lock");
+    let lock_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|_| "ignored_history_locked")?;
+    let mut index_lock = OwnedIndexLock {
+        path: lock_path,
+        file: Some(lock_file),
+        owns: true,
+    };
+    let dirty = git(
+        tool,
+        root,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ],
+    )
+    .map_err(|_| "ignored_history")?;
+    if !dirty.lines().all(|line| safe_untracked_default(root, line))
+        || git(tool, root, &["rev-parse", "--verify", "HEAD"]).as_deref() != Ok(revision)
+        || git(tool, root, &["symbolic-ref", "-q", "HEAD"]).is_err()
+        || remote_git(tool, root, &["ls-remote", "--refs", target])? != published
+    {
+        return Err("ignored_history");
+    }
+    git_index(tool, root, &index, &["read-tree", "--reset", candidate])
+        .map_err(|_| "ignored_history")?;
+    {
+        use std::io::Write;
+        let data = fs::read(&index).map_err(|_| "ignored_history")?;
+        let file = index_lock.file.as_mut().ok_or("ignored_history")?;
+        file.write_all(&data)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "ignored_history")?;
+    }
+    let backup = format!("refs/momso/ignored-history/{revision}");
+    match git(tool, root, &["rev-parse", "--verify", &backup]) {
+        Ok(existing) if existing == revision => {}
+        Ok(_) => return Err("ignored_history"),
+        Err(_) => {
+            let absent = "0".repeat(revision.len());
+            git(tool, root, &["update-ref", &backup, revision, &absent])
+                .map_err(|_| "ignored_history")?;
+        }
+    }
+    git(tool, root, &["update-ref", "HEAD", candidate, revision]).map_err(|_| "ignored_history")?;
+    drop(index_lock.file.take());
+    if fs::rename(&index_lock.path, &index_path).is_err() {
+        let _ = git(tool, root, &["update-ref", "HEAD", revision, candidate]);
+        return Err("ignored_history");
+    }
+    index_lock.owns = false;
+    Ok(candidate.clone())
+}
 fn apply_relation(result: &mut RemoteStatus, tool: &Path, root: &Path, ahead: u64, behind: u64) {
     result.state = "connected";
     result.ahead = Some(ahead);
@@ -3848,7 +4157,7 @@ pub(crate) async fn run_transfer<R: tauri::Runtime>(
             return RemoteStatus::new("unavailable", Some("auto_backup_disabled"));
         }
         let _automatic_receive_lock = if automatic {
-            match lock_first_receive(&db) {
+            match lock_backup_against_first_receive(&db) {
                 Ok(lock) => Some(lock),
                 Err(reason) => return RemoteStatus::new("unavailable", Some(reason)),
             }
@@ -4376,6 +4685,23 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(super::lock_first_receive(&db).is_ok());
+    }
+    #[test]
+    fn concurrent_backups_share_receive_lock_but_first_receive_is_exclusive() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("momso.db");
+        let first = super::lock_backup_against_first_receive(&db).unwrap();
+        let second = super::lock_backup_against_first_receive(&db).unwrap();
+        assert!(matches!(super::lock_first_receive(&db), Err("busy")));
+        drop(first);
+        assert!(matches!(super::lock_first_receive(&db), Err("busy")));
+        drop(second);
+        let exclusive = super::lock_first_receive(&db).unwrap();
+        assert!(matches!(
+            super::lock_backup_against_first_receive(&db),
+            Err("busy")
+        ));
+        drop(exclusive);
     }
     #[test]
     fn first_receive_progress_matches_chat_restore_fields() {
@@ -6765,8 +7091,8 @@ mod tests {
         let head = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
         assert!(is_known_archive_history(&f.tool, &f.root, &head));
         assert!(!is_known_archive_history(&f.tool, &f.root, &"0".repeat(40)));
-        fs::write(f.root.join("unsafe-file"), "fictional").unwrap();
-        git(&f.tool, &f.root, &["add", "--", "unsafe-file"]).unwrap();
+        fs::write(f.root.join("ordinary-file"), "fictional").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "ordinary-file"]).unwrap();
         git(
             &f.tool,
             &f.root,
@@ -6777,7 +7103,26 @@ mod tests {
                 "user.email=test@example.invalid",
                 "commit",
                 "-m",
-                "unsafe",
+                "ordinary file",
+            ],
+        )
+        .unwrap();
+        let ordinary_head = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        assert!(is_known_archive_history(&f.tool, &f.root, &ordinary_head));
+        fs::create_dir_all(f.root.join("objects")).unwrap();
+        fs::write(f.root.join("objects/original"), "fictional").unwrap();
+        git(&f.tool, &f.root, &["add", "-f", "--", "objects/original"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "unsafe original",
             ],
         )
         .unwrap();
@@ -8163,8 +8508,380 @@ mod tests {
             Err("unsafe_history")
         );
     }
+
     #[test]
-    fn rejects_original_removed_from_latest_commit() {
+    fn ignored_history_rewritten_with_backup_and_redaction() {
+        let f = Fixture::new();
+        f.push();
+        let remote_before = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(f.root.join("later-private.txt"), b"local private fixture").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "later-private.txt"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "before ignore",
+            ],
+        )
+        .unwrap();
+        let key = "fixture-private-value";
+        let id = "chat_20261115_120000";
+        let chat_dir = f.root.join("chats");
+        fs::create_dir_all(&chat_dir).unwrap();
+        let chat_path = chat_dir.join(format!("{id}.json"));
+        let snapshot = |text| {
+            serde_json::json!({"version":1,"room":{"id":id,"title":"fixture"},"messages":[{"id":"m","text":text}],"groups":[],"imports":[],"importMessages":[],"attachments":[],"redactions":0}).to_string()
+        };
+        fs::write(&chat_path, snapshot(key)).unwrap();
+        git(&f.tool, &f.root, &["add", "--", "chats/"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "fixture chat",
+            ],
+        )
+        .unwrap();
+        fs::write(&chat_path, snapshot("[가림]")).unwrap();
+        git(&f.tool, &f.root, &["add", "--", "chats/"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "fixture redaction",
+            ],
+        )
+        .unwrap();
+        fs::write(f.root.join(".gitignore"), "objects/\nlater-private.txt\n").unwrap();
+        git(&f.tool, &f.root, &["add", "--", ".gitignore"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "fixture ignore",
+            ],
+        )
+        .unwrap();
+        let before = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            unpushed_chat_needs_redaction(&f.tool, &f.root, &before, Some(&remote_before), &[key]),
+            Ok(true)
+        );
+        let keys = vec![key.to_owned()];
+        let mut uploaded = None;
+        assert_eq!(
+            transfer_with_redaction_check(
+                &f.tool,
+                &f.root,
+                f.remote(),
+                "main",
+                "push",
+                &mut None,
+                (
+                    Some(RedactionCheck {
+                        known: &keys,
+                        watched: None,
+                        uploaded_key_found: &mut uploaded
+                    }),
+                    None
+                )
+            ),
+            Ok(false)
+        );
+        let after = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(after, before);
+        assert_eq!(
+            git(
+                &f.tool,
+                &f.root,
+                &["rev-parse", &format!("refs/momso/ignored-history/{before}")]
+            )
+            .unwrap(),
+            before
+        );
+        assert!(git(
+            &f.tool,
+            &f.root,
+            &["merge-base", "--is-ancestor", &remote_before, &after]
+        )
+        .is_ok());
+        assert_eq!(
+            git(
+                &f.tool,
+                &f.root,
+                &["--git-dir", f.remote(), "rev-parse", "main"]
+            )
+            .unwrap(),
+            after
+        );
+        let before_log = git(
+            &f.tool,
+            &f.root,
+            &[
+                "log",
+                "--format=%an <%ae>|%aI|%cn <%ce>|%cI|%s",
+                &format!("{remote_before}..{before}"),
+            ],
+        )
+        .unwrap();
+        let after_log = git(
+            &f.tool,
+            &f.root,
+            &[
+                "log",
+                "--format=%an <%ae>|%aI|%cn <%ce>|%cI|%s",
+                &format!("{remote_before}..{after}"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(before_log, after_log);
+        assert_eq!(fs::read_to_string(&chat_path).unwrap(), snapshot("[가림]"));
+        assert_eq!(
+            git_raw(
+                &f.tool,
+                &f.root,
+                &["show", &format!("{before}:zettels/a.md")]
+            )
+            .unwrap(),
+            git_raw(
+                &f.tool,
+                &f.root,
+                &["show", &format!("{after}:zettels/a.md")]
+            )
+            .unwrap()
+        );
+        let remote_paths = git_raw(
+            &f.tool,
+            &f.root,
+            &[
+                "--git-dir",
+                f.remote(),
+                "log",
+                "--format=",
+                "--name-only",
+                "main",
+            ],
+        )
+        .unwrap();
+        assert!(!remote_paths.lines().any(|p| p == "later-private.txt"));
+        assert!(git(
+            &f.tool,
+            &f.root,
+            &[
+                "--git-dir",
+                f.remote(),
+                "cat-file",
+                "-e",
+                "main:later-private.txt"
+            ]
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(f.root.join("later-private.txt")).unwrap(),
+            b"local private fixture"
+        );
+    }
+    #[test]
+    fn ignored_history_published_file_is_never_rewritten() {
+        let f = Fixture::new();
+        fs::write(f.root.join("published.txt"), "published").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "published.txt"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "published",
+            ],
+        )
+        .unwrap();
+        f.push();
+        let published = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(f.root.join("published.txt"), "local edit").unwrap();
+        fs::write(f.root.join(".gitignore"), "objects/\npublished.txt\n").unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &["add", "--", "published.txt", ".gitignore"],
+        )
+        .unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "local",
+            ],
+        )
+        .unwrap();
+        let local = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "push"),
+            Err("ignored_history_published")
+        );
+        assert_eq!(
+            git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap(),
+            local
+        );
+        assert_eq!(
+            git(
+                &f.tool,
+                &f.root,
+                &["--git-dir", f.remote(), "rev-parse", "main"]
+            )
+            .unwrap(),
+            published
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("published.txt")).unwrap(),
+            "local edit"
+        );
+    }
+    #[test]
+    fn ignored_history_commit_published_on_another_branch_is_not_rewritten() {
+        let f = Fixture::new();
+        f.push();
+        fs::write(f.root.join("published-elsewhere.txt"), "preserve").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "published-elsewhere.txt"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "published elsewhere",
+            ],
+        )
+        .unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &["push", f.remote(), "HEAD:refs/heads/other"],
+        )
+        .unwrap();
+        let other = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(
+            f.root.join(".gitignore"),
+            "objects/\npublished-elsewhere.txt\n",
+        )
+        .unwrap();
+        git(&f.tool, &f.root, &["add", "--", ".gitignore"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "ignore",
+            ],
+        )
+        .unwrap();
+        let head = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "push"),
+            Err("ignored_history_published")
+        );
+        assert_eq!(git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(
+            git(
+                &f.tool,
+                &f.root,
+                &["--git-dir", f.remote(), "rev-parse", "other"]
+            )
+            .unwrap(),
+            other
+        );
+    }
+    #[test]
+    fn ignored_history_respects_another_git_index_lock() {
+        let f = Fixture::new();
+        f.push();
+        fs::write(f.root.join("private.txt"), "keep").unwrap();
+        git(&f.tool, &f.root, &["add", "--", "private.txt"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "private",
+            ],
+        )
+        .unwrap();
+        fs::write(f.root.join(".gitignore"), "objects/\nprivate.txt\n").unwrap();
+        git(&f.tool, &f.root, &["add", "--", ".gitignore"]).unwrap();
+        git(
+            &f.tool,
+            &f.root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "ignore",
+            ],
+        )
+        .unwrap();
+        let head = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
+        let lock = f.root.join(".git/index.lock");
+        fs::write(&lock, "another process").unwrap();
+        assert_eq!(
+            transfer(&f.tool, &f.root, f.remote(), "main", "push"),
+            Err("ignored_history_locked")
+        );
+        assert_eq!(git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert_eq!(fs::read_to_string(lock).unwrap(), "another process");
+    }
+    #[test]
+    fn ignored_history_cleans_original_removed_from_latest_commit() {
         let f = Fixture::new();
         fs::create_dir_all(f.root.join("objects")).unwrap();
         fs::write(f.root.join("objects/original"), "initial").unwrap();
@@ -8198,10 +8915,37 @@ mod tests {
             ],
         )
         .unwrap();
+        let original_head = git(&f.tool, &f.root, &["rev-parse", "HEAD"]).unwrap();
         assert_eq!(
             transfer(&f.tool, &f.root, f.remote(), "main", "push"),
-            Err("unsafe_history")
+            Ok(())
         );
+        assert_eq!(
+            git(
+                &f.tool,
+                &f.root,
+                &[
+                    "rev-parse",
+                    &format!("refs/momso/ignored-history/{original_head}")
+                ]
+            )
+            .unwrap(),
+            original_head
+        );
+        let remote_paths = git_raw(
+            &f.tool,
+            &f.root,
+            &[
+                "--git-dir",
+                f.remote(),
+                "log",
+                "--format=",
+                "--name-only",
+                "main",
+            ],
+        )
+        .unwrap();
+        assert!(!remote_paths.lines().any(|p| p == "objects/original"));
     }
     #[test]
     fn rejects_incomplete_history() {

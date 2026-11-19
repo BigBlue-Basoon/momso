@@ -440,6 +440,18 @@ pub(crate) fn known_values(data_root: &Path, database: &Path) -> Result<Vec<Stri
 
 #[cfg(test)]
 pub(crate) fn known_values(data_root: &Path, database: &Path) -> Result<Vec<String>, &'static str> {
+    if std::env::var_os("MOMSO_AUTO_BOTH_CHILD").is_some() {
+        return known_values_with(
+            data_root,
+            database,
+            |name| crate::credentials::get_secret(name).map_err(|_| "credentials_unavailable"),
+            |config| {
+                let keys = crate::object_store::load_keys(config)
+                    .map_err(|_| "credentials_unavailable")?;
+                Ok((keys.access_key_id, keys.secret_access_key))
+            },
+        );
+    }
     known_values_with(data_root, database, |_| Ok(None), |_| Err("unavailable"))
 }
 

@@ -1,8 +1,8 @@
 # Built-in skills
 
-This directory intentionally contains no skill content. When content is approved,
-bundle each skill at compile time and register its name and `SKILL.md` text in
-`src/skills.rs`'s `BUNDLED_SKILLS`. The installer updates only files that still
+The skills in this directory are bundled at compile time by registering each name
+and `SKILL.md` text in `src/skills.rs`'s `BUNDLED_SKILLS`. `marketing-preparation`
+prepares promotional materials for the teacher to publish. The installer updates only files that still
 match the previous bundled version; it preserves files changed by the user.
 
 The installer covers `SKILL.md` only and maintains the provider copies. Saving

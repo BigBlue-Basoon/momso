@@ -58,7 +58,7 @@ import {
   setChatPinned,
   listenChatEvents,
   listChatsPage,
-  readChat,
+  readChatPage,
   readChatContext,
   renameChat,
   sendChatMessage,
@@ -193,6 +193,8 @@ function App() {
   const [groups, setGroups] = useState<ChatGroup[] | null>(null)
   const [selectedChatId, setSelectedChatId] = useState<string | null>(null)
   const [chat, setChat] = useState<ChatDocument | null>(null)
+  const chatRef = useRef<ChatDocument | null>(null)
+  chatRef.current = chat
   // 보냈지만 아직 대화에 붙지 않은 말(화면에 먼저 보여 준다).
   const [pendingMessage, setPendingMessage] = useState<ChatViewMessage | null>(null)
   // 첨부(2026-11-18): 채팅방마다 보내기 전까지 붙인 것. 보내면 그 말(chat_send 의 userMessageId)에 붙여 말풍선에 보인다.
@@ -476,12 +478,48 @@ function App() {
     await Promise.all([refreshGroups(), refreshChats()])
   }, [refreshGroups, refreshChats])
 
+  // 긴 채팅방(2026-11-18 B84): 열 때는 최근 100개만 읽고, 위로 올려 읽으면 이전 페이지를 앞에 붙인다.
+  // 다시 읽기(답이 끝남 등)는 최근 페이지를 읽어, 이미 불러 둔 옛 말 뒤에 이어 붙인다(전부 다시 읽지 않음).
+  const [older, setOlder] = useState<{ chatId: string; cursor: string | null; loading: boolean } | null>(null)
+  const olderStateRef = useRef(older)
+  olderStateRef.current = older
+  const readChatPaged = useCallback(async (id: string, fresh = false): Promise<ChatDocument> => {
+    const { document, nextCursor } = await readChatPage(id)
+    const current = chatRef.current
+    if (!fresh && current && current.id === id && document.messages.length > 0) {
+      const at = current.messages.findIndex((message) => message.id === document.messages[0].id)
+      if (at > 0) return { ...document, messages: [...current.messages.slice(0, at), ...document.messages] }
+    }
+    setOlder({ chatId: id, cursor: nextCursor, loading: false })
+    return document
+  }, [])
+  const loadOlderMessages = useCallback(() => {
+    const state = olderStateRef.current
+    const current = chatRef.current
+    if (!state || !state.cursor || state.loading || !current || current.id !== state.chatId) return
+    setOlder({ ...state, loading: true })
+    readChatPage(state.chatId, state.cursor).then(({ document, nextCursor }) => {
+      const known = new Set((chatRef.current?.messages ?? []).map((message) => message.id))
+      const added = document.messages.filter((message) => !known.has(message.id))
+      // 물음·줄임·사람이 할 일 줄·키 넣기의 자리(그때까지의 말 수)를 앞에 붙은 수만큼 민다.
+      if (added.length > 0) {
+        const shift = (at: number) => (at >= Number.MAX_SAFE_INTEGER ? at : at + added.length)
+        setApprovals((items) => items.map((item) => (item.chatId === state.chatId ? { ...item, at: shift(item.at) } : item)))
+        setCompactions((items) => items.map((item) => (item.chatId === state.chatId ? { ...item, at: shift(item.at) } : item)))
+        setSecretRequests((items) => items.map((item) => (item.request.chatId === state.chatId ? { ...item, at: shift(item.at) } : item)))
+        setBrowserHuman((items) => (items[state.chatId] ? { ...items, [state.chatId]: { ...items[state.chatId], at: shift(items[state.chatId].at) } } : items))
+      }
+      setChat((value) => (value && value.id === state.chatId ? { ...value, messages: [...added, ...value.messages] } : value))
+      setOlder({ chatId: state.chatId, cursor: nextCursor, loading: false })
+    }).catch(() => setOlder({ ...state, loading: false }))
+  }, [])
+
   const openChat = useCallback(async (id: string) => {
     selectedChatRef.current = id
     setSelectedChatId(id)
     setPendingMessage(null)
     try {
-      const document = await readChat(id)
+      const document = await readChatPaged(id, true)
       if (selectedChatRef.current === id) setChat(document)
     } catch (error) {
       if (selectedChatRef.current === id) setChat(null)
@@ -795,7 +833,7 @@ function App() {
     setGeneratingChatId(null)
     setStreamText('')
     void refreshChats()
-    void readChat(chatId).then((document) => {
+    void readChatPaged(chatId).then((document) => {
       if (selectedChatRef.current !== chatId) return
       setChat(document)
       setPendingMessage(null)
@@ -820,7 +858,7 @@ function App() {
         window.dispatchEvent(new CustomEvent('momso:media-changed'))
         refreshChatItems(chatId, true)
         if (selectedChatRef.current === chatId) {
-          void readChat(chatId).then((document) => {
+          void readChatPaged(chatId).then((document) => {
             if (selectedChatRef.current === chatId) setChat((current) => (current && current.id === chatId ? { ...current, messages: document.messages } : current))
           }).catch(() => {})
         }
@@ -1206,7 +1244,7 @@ function App() {
       }
       // 보낸 말은 백엔드가 대화에 붙였다. 목록과 맨 위 줄을 새로 읽는다.
       void refreshChats()
-      void readChat(targetId).then((document) => {
+      void readChatPaged(targetId).then((document) => {
         if (selectedChatRef.current !== targetId) return
         setChat(document)
         setPendingMessage(null)
@@ -1313,7 +1351,7 @@ function App() {
       const chatId = selectedChatRef.current
       if (!chatId) return
       refreshChatItems(chatId, true)
-      void readChat(chatId).then((document) => {
+      void readChatPaged(chatId).then((document) => {
         if (selectedChatRef.current === chatId) setChat((current) => (current && current.id === chatId ? { ...current, messages: document.messages } : current))
       }).catch(() => {})
     }
@@ -1350,7 +1388,7 @@ function App() {
           lastSentTextRef.current = { chatId, text: text ?? '', userMessageId }
         }
         if (selectedChatRef.current === chatId) {
-          void readChat(chatId).then((document) => {
+          void readChatPaged(chatId).then((document) => {
             if (selectedChatRef.current === chatId) setChat((current) => (current && current.id === chatId ? { ...current, messages: document.messages } : current))
           }).catch(() => {})
         }
@@ -1700,6 +1738,10 @@ function App() {
             <AssistantPanel
               failure={failureView}
               retrying={retryingText}
+              chatKey={selectedChatId}
+              hasOlder={Boolean(older && older.chatId === selectedChatId && older.cursor)}
+              loadingOlder={Boolean(older?.loading)}
+              onLoadOlder={loadOlderMessages}
               headerActions={zetPanelToggle}
               title={shownChat?.title ?? ''}
               canRename={Boolean(shownChat)}

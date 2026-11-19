@@ -25,7 +25,9 @@ fn directory(root: &Path) -> Result<PathBuf, String> {
     if !meta.is_dir() || crate::archive_location::is_link_or_reparse(&meta) {
         return Err("recovery_unavailable".into());
     }
-    Ok(dir)
+    // tempfile uses native Windows move calls that need an extended-length path.
+    dir.canonicalize()
+        .map_err(|_| "recovery_unavailable".into())
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -105,6 +107,7 @@ fn document_path(root: &Path, id: &str, create_parents: bool) -> Result<PathBuf,
             return Err("recovery_unavailable".into());
         }
     }
+    let parent = parent.canonicalize().map_err(|_| "recovery_unavailable")?;
     Ok(parent.join(relative.file_name().ok_or("invalid_id")?))
 }
 
@@ -376,6 +379,31 @@ mod tests {
         let (git, _) = crate::archive::storage_tool(&root).unwrap();
         crate::archive::run_storage_tool(&git, &root, &["init"]).unwrap();
         (dir, root, git)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nested_document_recovery_supports_long_windows_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let padding = 190usize.saturating_sub(temp.path().to_string_lossy().len() + 1);
+        let root = temp.path().join("l".repeat(padding.max(1)));
+        fs::create_dir_all(root.join("zettels/classes")).unwrap();
+        fs::create_dir_all(root.join("objects")).unwrap();
+        let (git, _) = crate::archive::storage_tool(&root).unwrap();
+        crate::archive::run_storage_tool(&git, &root, &["init"]).unwrap();
+        let id = "document-path:classes/lesson.md";
+        let path = root.join("zettels/classes/lesson.md");
+        fs::write(&path, b"original").unwrap();
+        let saved_path = root.join(".git/momso-ai-recovery").join(format!(
+            "{}-{}.md",
+            reference_parts(id).unwrap().0,
+            digest(b"original")
+        ));
+        assert!(saved_path.to_string_lossy().len() > 260);
+        capture(&root).unwrap();
+        fs::write(&path, b"changed").unwrap();
+        restore(&root, None, id, &digest(b"original")).unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"original");
     }
 
     #[test]

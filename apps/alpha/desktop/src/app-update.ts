@@ -2,6 +2,7 @@
 //   app_version → { version, buildDate }
 //   update_check → { state: up_to_date | available | unavailable | failed, currentVersion, latestVersion, notes, publishedAt }
 //     unavailable = 업데이트 주소·키가 설정되지 않음(화면은 업데이트 쪽을 눌리지 않게).
+//     no_release = 공개된 릴리스가 아직 없음(2026-11-19 첫째 줄 M16 D40, 오류가 아님). 화면은 up_to_date 와 같게 "최신 버전입니다"로 본다.
 //   update_install → { state: downloaded | failed | unavailable | busy } (내려받고 서명 검증까지, 설치는 안 함)
 //   update_restart → { state } (화면이 미저장·AI 작업 확인을 마친 뒤)
 //   이벤트 update-available(update_check 와 같은 모양), update-progress { downloadedBytes, totalBytes },
@@ -27,7 +28,9 @@ export async function getAppVersion() {
 
 export async function checkUpdate() {
   if (!isDesktopRuntime()) throw new Error('update_check needs the desktop runtime')
-  return invoke<UpdateInfo>('update_check')
+  const info = await invoke<Omit<UpdateInfo, 'state'> & { state: UpdateInfo['state'] | 'no_release' }>('update_check')
+  // 공개된 릴리스가 없으면 오류가 아니라 지금 판이 최신인 것으로 본다(D40).
+  return (info.state === 'no_release' ? { ...info, state: 'up_to_date' } : info) as UpdateInfo
 }
 
 export async function installUpdate() {

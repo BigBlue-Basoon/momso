@@ -114,17 +114,131 @@ pub(crate) struct ArchiveStatus {
     rules_modified: bool,
 }
 
+pub(crate) fn managed_zet_path(path: &str) -> bool {
+    path.strip_prefix("zettels/")
+        .and_then(|name| name.strip_suffix(".md"))
+        .is_some_and(crate::archive_zet::valid_zet_id)
+}
+
+pub(crate) fn managed_receipt_path(path: &str) -> bool {
+    path.strip_prefix("receipts/")
+        .and_then(|name| name.strip_suffix(".md"))
+        .is_some_and(crate::archive_receipt::valid_id)
+}
+
+/// Files outside momso's managed namespaces, without its private runtime data.
+pub(crate) fn additional_file_path(path: &str) -> bool {
+    if path.is_empty()
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|p| p.is_empty() || p == "." || p == "..")
+    {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    let first = lower.split('/').next().unwrap_or("");
+    if matches!(
+        first,
+        ".git" | ".momso" | "objects" | "chats" | ".agents" | ".claude"
+    ) || lower.split('/').any(|p| p == ".git")
+        || matches!(
+            lower.as_str(),
+            ".gitignore"
+                | "agents.md"
+                | "claude.md"
+                | "gemini.md"
+                | "profile.md"
+                | "zettels/.folders.json"
+        )
+        || first == "momso.db"
+        || first.starts_with("momso.db-")
+        || crate::yoga_dictionary::is_path(path)
+        || crate::archive_remote::safe_skill_path(path)
+    {
+        return false;
+    }
+    !managed_zet_path(path) && !managed_receipt_path(path)
+}
+
+pub(crate) fn additional_files(root: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            if fs::symlink_metadata(entry.path())
+                .is_ok_and(|meta| crate::archive_location::is_link_or_reparse(&meta))
+            {
+                return false;
+            }
+            let relative = match entry.path().strip_prefix(root) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            if relative.components().any(|part| {
+                part.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(".git")
+            }) {
+                return false;
+            }
+            let first = relative
+                .components()
+                .next()
+                .and_then(|p| p.as_os_str().to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            !matches!(
+                first.as_str(),
+                ".git" | ".momso" | "objects" | "chats" | ".agents" | ".claude"
+            )
+        });
+    for entry in walker {
+        let entry = entry.map_err(|_| "unavailable".to_string())?;
+        let meta = fs::symlink_metadata(entry.path()).map_err(|_| "unavailable".to_string())?;
+        if crate::archive_location::is_link_or_reparse(&meta) {
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| "unavailable".to_string())?;
+        let path = relative.to_str().ok_or("unavailable")?.replace('\\', "/");
+        if additional_file_path(&path) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 pub(crate) fn storage_tool(_resources: &Path) -> Result<(PathBuf, bool), String> {
     crate::git_tool::resolve()
         .map(|(path, _)| (path, false))
         .ok_or_else(|| "저장 도구를 찾지 못했습니다".into())
 }
 
+#[cfg(test)]
+pub(crate) static BENCH_FOLLOW_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static BENCH_FOLLOW_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn run_storage_tool(
     executable: &Path,
     root: &Path,
     args: &[&str],
 ) -> Result<String, String> {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
     let output = crate::process::hidden_command(executable)
         .args(args)
         .current_dir(root)
@@ -137,10 +251,81 @@ pub(crate) fn run_storage_tool(
             log::warn!("Storage tool launch failed: {:?}", error.kind());
             "저장 도구를 실행하지 못했습니다".to_string()
         })?;
+    #[cfg(test)]
+    if args.contains(&"--follow") && std::env::var_os("MOMSO_B84_BACKUP_MEASURE").is_some() {
+        BENCH_FOLLOW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BENCH_FOLLOW_MICROS.fetch_add(
+            started.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     if !output.status.success() {
         return Err("몸소 폴더 저장 작업을 완료하지 못했습니다".into());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn storage_tool_with_paths(
+    executable: &Path,
+    root: &Path,
+    args: &[&str],
+    paths: &[String],
+    allow_no_match: bool,
+) -> Result<String, String> {
+    if paths.is_empty() {
+        return Ok(String::new());
+    }
+    let mut child = crate::process::hidden_command(executable)
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "저장 도구를 실행하지 못했습니다".to_string())?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or("저장 도구를 실행하지 못했습니다")?;
+    let mut bytes = Vec::new();
+    for path in paths {
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.push(0);
+    }
+    let writer = std::thread::spawn(move || input.write_all(&bytes));
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "저장 도구를 실행하지 못했습니다")?;
+    writer
+        .join()
+        .map_err(|_| "저장 도구를 실행하지 못했습니다")?
+        .map_err(|_| "저장 도구를 실행하지 못했습니다")?;
+    if !output.status.success() && !(allow_no_match && output.status.code() == Some(1)) {
+        return Err("몸소 폴더 저장 작업을 완료하지 못했습니다".into());
+    }
+    String::from_utf8(output.stdout).map_err(|_| "파일 경로를 읽지 못했습니다".into())
+}
+
+pub(crate) fn ignored_paths(
+    executable: &Path,
+    root: &Path,
+    paths: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
+    let result = storage_tool_with_paths(
+        executable,
+        root,
+        &["check-ignore", "--no-index", "-z", "--stdin"],
+        paths,
+        true,
+    )?;
+    Ok(result
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 pub(crate) fn commit_paths(
@@ -297,10 +482,6 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
                 .open(&ignore)
                 .and_then(|mut file| file.write_all(suffix))
                 .map_err(|_| "몸소 폴더 설정을 갱신하지 못했습니다".to_string())?;
-        } else if current != b"objects/\n.momso/outputs/\n"
-            && current != b"objects/\r\n.momso/outputs/\r\n"
-        {
-            return Err("몸소 폴더의 원자료 제외 설정을 확인해 주세요".into());
         }
     } else {
         fs::write(&ignore, b"objects/\n.momso/outputs/\n")
@@ -308,6 +489,14 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
     }
     if !root.join(".git").exists() {
         run_storage_tool(&executable, root, &["init", "--initial-branch=main"])?;
+    }
+    let protected = vec![
+        "objects/momso-ignore-check".to_owned(),
+        ".momso/outputs/momso-ignore-check".to_owned(),
+    ];
+    let ignored = ignored_paths(&executable, root, &protected)?;
+    if protected.iter().any(|path| !ignored.contains(path)) {
+        return Err("몸소 폴더의 원자료 제외 설정을 확인해 주세요".into());
     }
     if !upgraded.is_empty() {
         if upgraded.iter().any(|(name, _)| {
@@ -341,9 +530,15 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
             return Err(error);
         }
     }
-    crate::yoga_dictionary::initialize(root)?;
+    {
+        let _timer = crate::startup_timing::start("dictionary_initialize");
+        crate::yoga_dictionary::initialize(root)?;
+    }
     drop(_rule_guard);
-    crate::skills::install_bundled(root, resources).map_err(str::to_owned)?;
+    {
+        let _timer = crate::startup_timing::start("skills_install_bundled");
+        crate::skills::install_bundled(root, resources).map_err(str::to_owned)?;
+    }
     Ok(())
 }
 
@@ -657,9 +852,13 @@ pub(crate) fn reindex(root: &Path, database: &Path) -> Result<ReindexResult, Str
             {
                 continue;
             }
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            let relative = format!("{folder}/{filename}");
+            if additional_file_path(&relative) {
+                continue;
+            }
             let text = fs::read_to_string(entry.path())
                 .map_err(|_| "몸소 폴더 파일을 읽지 못했습니다".to_string())?;
-            let filename = entry.file_name().to_string_lossy().into_owned();
             if is_zet {
                 let (head, _) = crate::archive_zet::parse(&text)?;
                 if filename != format!("{}.md", head.id) {
@@ -981,13 +1180,8 @@ fn id_time_mismatch_with_context(
         .from_local_datetime(&number_time)
         .earliest()
         .ok_or_else(|| "번호의 시각을 확인하지 못했습니다".to_string())?;
-    let cached = context
-        .additions
-        .as_ref()
-        .and_then(|items| items.get(relative))
-        .copied();
-    let first = if cached.is_some() {
-        cached
+    let first = if let Some(additions) = &context.additions {
+        additions.get(relative).copied()
     } else if let Some(head) = &context.head {
         let history = run_storage_tool(
             &context.tool,
@@ -1099,6 +1293,9 @@ fn check_selected(
                 if crate::archive_zet::read_folder_registry(root).is_err() {
                     issues.push(issue("invalid_folders".into()));
                 }
+                continue;
+            }
+            if additional_file_path(&file) {
                 continue;
             }
             if !entry
@@ -1239,53 +1436,63 @@ fn save_unlocked(root: &Path, resources: &Path, database: &Path) -> Result<(), S
                 "receipts/",
             ],
         )?;
-        if !changed.trim().is_empty() {
+        if changed.lines().any(managed_receipt_path) {
             return Err("이미 저장한 작업 기록은 바꿀 수 없습니다".into());
         }
     }
-    for folder in ["zettels", "receipts"] {
-        let has_files = fs::read_dir(root.join(folder))
-            .map_err(|_| "몸소 폴더를 읽지 못했습니다".to_string())?
-            .next()
-            .is_some();
-        let tracked = run_storage_tool(&tool, root, &["ls-files", "--", folder])?;
-        if has_files || !tracked.trim().is_empty() {
-            run_storage_tool(&tool, root, &["add", "-A", "--", folder])?;
-        }
-    }
-    if !pending {
-        let chat_tracked = run_storage_tool(&tool, root, &["ls-files", "--", "chats"])?;
-        if root.join("chats").exists() || !chat_tracked.trim().is_empty() {
-            run_storage_tool(&tool, root, &["add", "-A", "--", "chats"])?;
-        }
-    }
-    run_storage_tool(
+    let dictionary_paths = crate::yoga_dictionary::paths();
+    let candidates = run_storage_tool(
         &tool,
         root,
-        &["add", "--", "AGENTS.md", "CLAUDE.md", "GEMINI.md"],
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
     )?;
-    let dictionary_paths = crate::yoga_dictionary::paths();
-    let mut add_dictionary = vec!["add", "--"];
-    add_dictionary.extend(dictionary_paths.iter().map(String::as_str));
-    run_storage_tool(&tool, root, &add_dictionary)?;
-    let mut diff_paths = vec![
-        "diff",
-        "--cached",
-        "--name-only",
-        "--no-renames",
-        "--",
-        "zettels/",
-        "receipts/",
-        "AGENTS.md",
-        "CLAUDE.md",
-        "GEMINI.md",
-    ];
-    if !pending {
-        diff_paths.push("chats/");
-    }
-    diff_paths.extend(dictionary_paths.iter().map(String::as_str));
-    let changed = run_storage_tool(&tool, root, &diff_paths)?;
-    let paths: Vec<String> = changed.lines().map(str::to_owned).collect();
+    let mut candidates: Vec<String> = candidates
+        .split('\0')
+        .filter(|path| {
+            additional_file_path(path)
+                || managed_zet_path(path)
+                || managed_receipt_path(path)
+                || *path == "zettels/.folders.json"
+                || [".gitignore", "AGENTS.md", "CLAUDE.md", "GEMINI.md"].contains(path)
+                || dictionary_paths.iter().any(|name| name == path)
+                || (!pending && path.starts_with("chats/"))
+        })
+        .map(str::to_owned)
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    let ignored = ignored_paths(&tool, root, &candidates)?;
+    candidates.retain(|path| !ignored.contains(path));
+    storage_tool_with_paths(
+        &tool,
+        root,
+        &[
+            "--literal-pathspecs",
+            "add",
+            "-A",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        &candidates,
+        false,
+    )?;
+    let changed = run_storage_tool(
+        &tool,
+        root,
+        &["diff", "--cached", "--name-only", "--no-renames", "-z"],
+    )?;
+    let allowed: std::collections::HashSet<_> = candidates.iter().map(String::as_str).collect();
+    let paths: Vec<String> = changed
+        .split('\0')
+        .filter(|p| allowed.contains(p))
+        .map(str::to_owned)
+        .collect();
     if paths.is_empty() {
         return Err("저장할 변경 사항이 없습니다".into());
     }
@@ -1294,7 +1501,8 @@ fn save_unlocked(root: &Path, resources: &Path, database: &Path) -> Result<(), S
         if path == "zettels/.folders.json" {
             continue;
         }
-        if let Some(name) = path.strip_prefix("zettels/") {
+        if managed_zet_path(path) {
+            let name = path.strip_prefix("zettels/").unwrap();
             let id = name
                 .strip_suffix(".md")
                 .ok_or_else(|| "글 파일 이름이 올바르지 않습니다".to_string())?;
@@ -1311,10 +1519,7 @@ fn save_unlocked(root: &Path, resources: &Path, database: &Path) -> Result<(), S
     let message = save_message(&titles);
     let indexed_paths: Vec<String> = paths
         .iter()
-        .filter(|path| {
-            (path.starts_with("zettels/") && path.as_str() != "zettels/.folders.json")
-                || path.starts_with("receipts/")
-        })
+        .filter(|path| managed_zet_path(path) || managed_receipt_path(path))
         .cloned()
         .collect();
     index_changed(root, database, &indexed_paths)?;
@@ -1699,6 +1904,26 @@ mod tests {
         assert!(id_time_context(root, root).unwrap().additions.is_none());
     }
     #[test]
+    fn complete_history_without_new_path_uses_file_time_without_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("zettels")).unwrap();
+        let id = format!("zet_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+        let relative = format!("zettels/{id}.md");
+        fs::write(root.join(&relative), "fixture").unwrap();
+        let context = IdTimeContext {
+            tool: root.join("no-git-executable"),
+            head: Some("fixture-head".into()),
+            additions: Some(Default::default()),
+        };
+        assert!(!id_time_mismatch_with_context(root, &context, &relative, &id).unwrap());
+        let uncertain = IdTimeContext {
+            additions: None,
+            ..context
+        };
+        assert!(id_time_mismatch_with_context(root, &uncertain, &relative, &id).is_err());
+    }
+    #[test]
     fn reindex_waits_until_document_writer_releases_lock() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("archive");
@@ -2074,7 +2299,14 @@ mod tests {
         run_storage_tool(
             &tool,
             &root,
-            &["add", "--", "AGENTS.md", "CLAUDE.md", "GEMINI.md"],
+            &[
+                "add",
+                "--",
+                "AGENTS.md",
+                "CLAUDE.md",
+                "GEMINI.md",
+                ".gitignore",
+            ],
         )
         .unwrap();
         run_storage_tool(

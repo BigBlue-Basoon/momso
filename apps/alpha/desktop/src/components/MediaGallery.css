@@ -418,3 +418,6 @@ body:has(.media-lightbox) .zet-confirm-backdrop { z-index: 72; }
 .media-side-button.is-primary:disabled:hover { background: var(--ink); }
 
 .media-prompt-missing { margin: 0; color: var(--muted); font-size: 12.5px; }
+
+/* 화면 밖 날짜 묶음은 브라우저가 그리기를 미룬다(2026-11-18 성능). 크기 짐작은 줄 하나 높이. */
+.media-day { content-visibility: auto; contain-intrinsic-size: auto 260px; }

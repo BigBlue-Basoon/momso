@@ -22,6 +22,7 @@ const PREVIOUS_BUNDLES: &[&str] = &[
     include_str!("../bundled-dictionary/yoga-v3.json"),
     include_str!("../bundled-dictionary/yoga-v4.json"),
     include_str!("../bundled-dictionary/yoga-v5.json"),
+    include_str!("../bundled-dictionary/yoga-v6.json"),
 ];
 
 pub(crate) fn known_bundle_version(content: &str) -> Option<u64> {

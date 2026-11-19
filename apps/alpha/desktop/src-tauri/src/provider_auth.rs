@@ -1055,6 +1055,25 @@ where
 }
 
 async fn read_status_inner(provider: &'static str, retry_unavailable: bool) -> ProviderStatus {
+    let stage = |phase| match (provider, phase) {
+        ("codex", "total") => "codex_status",
+        ("claude", "total") => "claude_status",
+        ("gemini", "total") => "gemini_status",
+        ("codex", "resolve") => "codex_resolve",
+        ("claude", "resolve") => "claude_resolve",
+        ("gemini", "resolve") => "gemini_resolve",
+        ("codex", "key") => "codex_key_check",
+        ("claude", "key") => "claude_key_check",
+        ("gemini", "key") => "gemini_key_check",
+        ("codex", "version") => "codex_version",
+        ("claude", "version") => "claude_version",
+        ("gemini", "version") => "gemini_version",
+        ("codex", "account") => "codex_account",
+        ("claude", "account") => "claude_account",
+        _ => "provider_other",
+    };
+    let _timer = crate::startup_timing::start(stage("total"));
+    let resolve_timer = crate::startup_timing::start(stage("resolve"));
     let executable = if provider == "gemini" {
         gemini_access::executable()
     } else if provider == "claude" {
@@ -1062,7 +1081,9 @@ async fn read_status_inner(provider: &'static str, retry_unavailable: bool) -> P
     } else {
         process::resolve_interactive_tool(provider)
     };
+    drop(resolve_timer);
     let installed = executable.is_some();
+    let key_timer = crate::startup_timing::start(stage("key"));
     let key = key_provider(provider)
         .and_then(|p| credentials::ai_key_name(p).ok())
         .map(credentials::get_secret);
@@ -1078,6 +1099,7 @@ async fn read_status_inner(provider: &'static str, retry_unavailable: bool) -> P
         }
         _ => (false, "unavailable", None),
     };
+    drop(key_timer);
     let mut status = ProviderStatus {
         provider,
         installed,
@@ -1096,6 +1118,7 @@ async fn read_status_inner(provider: &'static str, retry_unavailable: bool) -> P
         active: None,
     };
     if let Some(path) = executable {
+        let _timer = crate::startup_timing::start(stage("version"));
         if !crate::provider_install::executable_works(&path).await {
             return status;
         }
@@ -1114,6 +1137,7 @@ async fn read_status_inner(provider: &'static str, retry_unavailable: bool) -> P
         return status;
     }
     if provider == "codex" {
+        let _timer = crate::startup_timing::start(stage("account"));
         let result = retry_codex_account_read(|| async { process::run_json_rpc_tool("codex", &["app-server"], None, &process::empty_environment(), process::JsonRpcRequest {
             initialize_params: serde_json::json!({"clientInfo": {"name":"momso", "title":"momso", "version":env!("CARGO_PKG_VERSION")}}),
             method: "account/read", params: serde_json::json!({"refreshToken":true}),
@@ -1144,6 +1168,7 @@ async fn read_status_inner(provider: &'static str, retry_unavailable: bool) -> P
             }
         }
     } else {
+        let _timer = crate::startup_timing::start(stage("account"));
         let result = process::run_tool(
             "claude",
             &["auth", "status", "--json"],
@@ -1175,6 +1200,7 @@ async fn read_status_inner(provider: &'static str, retry_unavailable: bool) -> P
 
 #[tauri::command]
 pub(crate) async fn provider_auth_status(app: AppHandle) -> Vec<ProviderStatus> {
+    let _timer = crate::startup_timing::start("provider_auth_status");
     let (codex, claude, gemini) = tokio::join!(
         read_status("codex"),
         read_status("claude"),
@@ -1189,7 +1215,30 @@ pub(crate) async fn provider_auth_status(app: AppHandle) -> Vec<ProviderStatus> 
 
 #[tauri::command]
 pub(crate) async fn provider_first_run_eligible(app: AppHandle) -> bool {
-    first_run_allowed(&provider_auth_status(app).await)
+    let _timer = crate::startup_timing::start("provider_first_run_eligible");
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    for provider in ["codex", "claude", "gemini"] {
+        let sender = sender.clone();
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let status = read_status(provider).await;
+            ensure_key_retry(&app, &status);
+            let _ = sender.send(status);
+        });
+    }
+    drop(sender);
+    first_run_eligible_from(receiver).await
+}
+
+async fn first_run_eligible_from(
+    mut statuses: tokio::sync::mpsc::UnboundedReceiver<ProviderStatus>,
+) -> bool {
+    while let Some(status) = statuses.recv().await {
+        if first_run_allowed(&[status]) {
+            return true;
+        }
+    }
+    false
 }
 
 #[tauri::command]
@@ -1469,6 +1518,45 @@ pub(crate) fn provider_api_key_clear(app: AppHandle, provider: String) -> &'stat
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn first_run_returns_when_one_provider_is_ready_and_does_not_cancel_others() {
+        use super::*;
+        let status = |state| ProviderStatus {
+            provider: "codex",
+            installed: true,
+            runnable: true,
+            state,
+            account_label: None,
+            plan_label: None,
+            api_key_saved: false,
+            key_verification: "notConfigured",
+            checked_key_fingerprint: None,
+            methods: vec!["account"],
+            active: None,
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let slow = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = slow.send(status("signedOut"));
+            let _ = completed_tx.send(());
+        });
+        tx.send(status("account")).unwrap();
+        drop(tx);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), first_run_eligible_from(rx))
+                .await
+                .unwrap()
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(1), completed_rx)
+            .await
+            .is_ok());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(status("signedOut")).unwrap();
+        drop(tx);
+        assert!(!first_run_eligible_from(rx).await);
+    }
     #[test]
     fn login_timeout_has_a_distinct_reason() {
         assert_eq!(

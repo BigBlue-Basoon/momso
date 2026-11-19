@@ -52,6 +52,8 @@ mod credentials;
 mod dictionary;
 #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
 pub mod g61_test_probe;
+#[cfg(all(test, windows))]
+mod g70_login_resume_test;
 mod gemini_access;
 mod gemini_api_relay;
 mod generated_output;
@@ -68,6 +70,7 @@ mod momso_archive_read;
 mod momso_document_read;
 mod momso_document_write;
 mod momso_mcp;
+mod object_store_auto_upload;
 mod panel_browser;
 pub mod panel_cdp;
 mod panel_download;
@@ -112,6 +115,7 @@ mod source_assets;
 mod source_delete;
 mod source_integrity;
 mod source_search;
+mod startup_timing;
 mod storage;
 mod usage_status;
 mod voice_typing;
@@ -326,6 +330,18 @@ async fn archive_check(
 }
 
 #[tauri::command]
+async fn archive_additional_files_count(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let root = state.paths.archive.current.clone().read_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(serde_json::json!({"count": archive::additional_files(&root)?.len()}))
+    })
+    .await
+    .map_err(|_| "unavailable".to_string())?
+}
+
+#[tauri::command]
 async fn zet_history(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -447,6 +463,7 @@ async fn chat_attach_asset<R: tauri::Runtime>(
 async fn yoga_terms_list(
     state: State<'_, AppState>,
 ) -> Result<yoga_dictionary::DictionaryList, String> {
+    let _timer = startup_timing::start("yoga_terms_list");
     let root = state.paths.archive.current.clone().read_owned().await;
     tauri::async_runtime::spawn_blocking(move || yoga_dictionary::list(&root))
         .await
@@ -1131,6 +1148,7 @@ async fn runtime_info(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RuntimeInfo, String> {
+    let _timer = startup_timing::start("runtime_info");
     let paths = state.paths.scoped().await;
     let database_path = paths.database_path.clone();
     let app_version = app.package_info().version.to_string();
@@ -1230,6 +1248,7 @@ async fn delete_transcription_term(
 async fn user_owned_backup_overview(
     state: State<'_, AppState>,
 ) -> Result<backup::BackupOverview, String> {
+    let _timer = startup_timing::start("user_owned_backup_overview");
     let paths = state.paths.scoped().await;
     backup::overview(&paths)
         .await
@@ -1276,6 +1295,7 @@ async fn usage_status(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<usage_status::UsageStatus>, String> {
+    let _timer = startup_timing::start("usage_status");
     let archive = Arc::new(state.paths.archive.current.clone().read_owned().await);
     usage_status::start_monitor(app.clone(), state.usage_monitor.clone());
     Ok(usage_status::cached(
@@ -1306,6 +1326,7 @@ async fn usage_refresh(
 
 #[tauri::command]
 async fn ai_models(state: State<'_, AppState>) -> Result<Vec<ai_models::ProviderModels>, String> {
+    let _timer = startup_timing::start("ai_models");
     let archive = state.paths.archive.current.clone().read_owned().await;
     Ok(ai_models::all(&archive).await)
 }
@@ -1339,6 +1360,7 @@ async fn chat_send(
     retry_message_id: Option<String>,
     regenerate_of: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let _timer = startup_timing::start("chat_send_start");
     {
         let root = state.paths.archive.current.clone().read_owned().await;
         if archive_remote::first_receive_pending(&root, &state.paths.database_path) {
@@ -1604,7 +1626,7 @@ async fn chat_send(
     };
     let mut provider_text = handoff.prompt;
     let output_dir = chat_output::create(&archive, &chat_id)?;
-    let output_instruction = chat_output::instruction(&output_dir)?;
+    let output_instruction = chat_output::instruction(&output_dir, &provider)?;
     provider_text.push_str(&output_instruction);
     if let Some(value) = fallback.as_mut() {
         value.prompt.push_str(&output_instruction);
@@ -2555,6 +2577,23 @@ async fn panel_agent_take_over(
 }
 
 #[tauri::command]
+async fn panel_agent_external_login_open(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    chat_id: String,
+) -> Result<serde_json::Value, &'static str> {
+    let event_app = app.clone();
+    let notify: browser_runtime::Notify = Arc::new(move |name, payload| {
+        let _ = event_app.emit(name, payload);
+    });
+    state
+        .browser
+        .open_external_login(&chat_id, &state.paths.data_root, &notify)
+        .await?;
+    Ok(serde_json::json!({"state":"login"}))
+}
+
+#[tauri::command]
 async fn panel_agent_resume(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -2753,6 +2792,7 @@ async fn chat_unarchive(
 
 #[tauri::command]
 async fn chat_archived_list(state: State<'_, AppState>) -> Result<Vec<chat::ArchivedChat>, String> {
+    let _timer = startup_timing::start("chat_archived_list");
     let path = state.paths.database_path.clone();
     tauri::async_runtime::spawn_blocking(move || chat::archived_list(&path))
         .await
@@ -2761,6 +2801,7 @@ async fn chat_archived_list(state: State<'_, AppState>) -> Result<Vec<chat::Arch
 
 #[tauri::command]
 async fn chat_group_list(state: State<'_, AppState>) -> Result<Vec<chat_group::ChatGroup>, String> {
+    let _timer = startup_timing::start("chat_group_list");
     let path = state.paths.database_path.clone();
     tauri::async_runtime::spawn_blocking(move || chat_group::list(&path))
         .await
@@ -2861,6 +2902,7 @@ async fn chat_context(
 }
 #[tauri::command]
 async fn chat_list(state: State<'_, AppState>) -> Result<Vec<chat::ChatSummary>, String> {
+    let _timer = startup_timing::start("chat_list");
     let path = state.paths.database_path.clone();
     tauri::async_runtime::spawn_blocking(move || chat::list(&path))
         .await
@@ -2872,6 +2914,7 @@ async fn chat_list_page(
     state: State<'_, AppState>,
     offset: Option<u32>,
 ) -> Result<chat::ChatListPage, String> {
+    let _timer = startup_timing::start("chat_list_page");
     let path = state.paths.database_path.clone();
     tauri::async_runtime::spawn_blocking(move || chat::list_page(&path, offset.unwrap_or(0)))
         .await
@@ -2904,10 +2947,25 @@ async fn chat_create<R: tauri::Runtime>(
 }
 #[tauri::command]
 async fn chat_read(state: State<'_, AppState>, id: String) -> Result<chat::ChatDetail, String> {
+    let _timer = startup_timing::start("chat_read");
     let path = state.paths.database_path.clone();
     tauri::async_runtime::spawn_blocking(move || chat::read(&path, &id))
         .await
         .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?
+}
+#[tauri::command]
+async fn chat_read_page(
+    state: State<'_, AppState>,
+    id: String,
+    before: Option<String>,
+    limit: Option<usize>,
+) -> Result<chat::ChatPage, String> {
+    let path = state.paths.database_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        chat::read_page(&path, &id, before.as_deref(), limit.unwrap_or(100))
+    })
+    .await
+    .map_err(|_| "채팅방을 읽지 못했습니다".to_string())?
 }
 #[tauri::command]
 async fn chat_rename<R: tauri::Runtime>(
@@ -3131,20 +3189,25 @@ fn prepare_archive_for_start(
     paths: &RuntimePaths,
     resources: &std::path::Path,
 ) -> Result<(), std::io::Error> {
+    let _timer = startup_timing::start("archive_prepare");
     let archive_root = paths
         .archive
         .current
         .try_read()
         .map_err(std::io::Error::other)?
         .clone();
+    let git_timer = startup_timing::start("git_resolve");
     let git_available = git_tool::resolve().is_some();
+    drop(git_timer);
     let receive_setup_guard = archive_remote::lock_first_receive(&paths.database_path).ok();
     let receive_pending = receive_setup_guard.is_none()
         || archive_remote::first_receive_pending(&archive_root, &paths.database_path);
     if git_available && !receive_pending {
+        let _timer = startup_timing::start("archive_initialize");
         archive::initialize(&archive_root, resources).map_err(std::io::Error::other)?;
     }
     if git_available && !receive_pending && paths.archive.needs_initial_index {
+        let _timer = startup_timing::start("archive_reindex");
         archive::reindex(&archive_root, &paths.database_path).map_err(std::io::Error::other)?;
         let connection = storage::open_writable_connection(&paths.database_path)
             .map_err(std::io::Error::other)?;
@@ -3160,6 +3223,7 @@ fn prepare_archive_for_start(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    startup_timing::begin();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             log::info!(
@@ -3230,9 +3294,8 @@ pub fn run() {
                 let paths = state.paths.clone();
                 let window = window.clone();
                 tauri::async_runtime::spawn(async move {
-                    if let archive_auto_backup::CloseResult::Finished(Some(error)) =
-                        archive_auto_backup::close_backup(app.clone(), paths, resources).await
-                    {
+                    let close_result = archive_auto_backup::close_all(app.clone(), paths, resources).await;
+                    if let Ok((archive_auto_backup::CloseResult::Finished(Some(error)), _)) = close_result {
                         if error != "redaction_pending" {
                             report_chat_archive(&app, None, Err(error));
                         }
@@ -3246,6 +3309,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            let _timer = startup_timing::start("app_setup");
             log::info!("lifecycle setup_started pid={}", std::process::id());
             if let Some(view) = app.get_webview("main") {
                 app_lifecycle::observe_webview(&view);
@@ -3332,6 +3396,8 @@ pub fn run() {
             });
             app.manage(archive_auto_backup::AutoBackup::default());
             archive_auto_backup::start(app.handle().clone());
+            app.manage(object_store_auto_upload::AutoUpload::default());
+            object_store_auto_upload::start(app.handle().clone());
             chat_redaction_recheck::start(
                 app.handle().clone(),
                 app.state::<AppState>().paths.clone(),
@@ -3382,6 +3448,8 @@ pub fn run() {
             archive_remote::archive_remote_status,
             archive_auto_backup::archive_auto_backup_get,
             archive_auto_backup::archive_auto_backup_set,
+            object_store_auto_upload::object_store_auto_upload_get,
+            object_store_auto_upload::object_store_auto_upload_set,
             archive_remote::momso_username_get,
             archive_remote::momso_username_set,
             archive_remote::archive_remote_create,
@@ -3419,6 +3487,7 @@ pub fn run() {
             source_asset_open,
             archive_reindex,
             archive_check,
+            archive_additional_files_count,
             user_profile_get,
             user_profile_set,
             archive_save,
@@ -3464,6 +3533,7 @@ pub fn run() {
             panel_agent_status,
             panel_agent_take_over,
             panel_agent_resume,
+            panel_agent_external_login_open,
             browser_choice_get,
             browser_choice_set,
             chat_delete,
@@ -3481,6 +3551,7 @@ pub fn run() {
             chat_list,
             chat_create,
             chat_read,
+            chat_read_page,
             chat_rename,
             chat_search,
             chat_search_page,

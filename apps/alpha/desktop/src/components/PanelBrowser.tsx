@@ -10,6 +10,7 @@ import {
   resumePanelAgent,
   takeOverPanel,
   navigatePanelBrowser,
+  openExternalLogin,
   openHumanBrowser,
   openPanelBrowser,
   panelBrowserAction,
@@ -245,7 +246,8 @@ export function PanelBrowserView({
   // ended·available → 줄 없음. 처음에는 panel_agent_status 로 내가 가져가 있는지만 본다(AI 가 지금 움직이는지는 이벤트로만 안다).
   // login(2026-11-18 G57b): 로그인·인증을 사람이 해야 함. 끝나면 [AI에게 돌려주기]. 구글 로그인은 바깥 창(몸소 브라우저 창)에서.
   // 채팅방 이름(title)은 지금 보는 채팅방이 아닐 때 "○○ 채팅방의 AI가…"로만 쓴다. 회사 이름은 줄을 짧게 두려고 적지 않는다.
-  type AgentLine = { chatId: string; state: 'ai' | 'human' | 'login'; reason: string | null; title: string | null; loginUrl?: string | null }
+  // external: 로그인 뒤 AI 가 몸소 브라우저 창(바깥)에서 이어 하는 중(G75). login 의 reason external_opened 는 그 창을 연 뒤.
+  type AgentLine = { chatId: string; state: 'ai' | 'human' | 'login' | 'external'; reason: string | null; title: string | null; loginUrl?: string | null }
   const [agent, setAgent] = useState<AgentLine | null>(null)
   const [agentWorking, setAgentWorking] = useState(false)
   useEffect(() => {
@@ -260,6 +262,11 @@ export function PanelBrowserView({
         // 사람이 [AI에게 돌려주기](→ available), 다른 턴 시작(started), 직접 쓰기(human), 패널 닫기 때 거둔다.
         else if (state === 'ended') setAgent((current) => (current && current.state === 'login' && current.chatId === owner && reason !== 'panel_not_opened' ? current : null))
         else if (state === 'available') setAgent(null)
+      },
+      // 바깥 로그인(G75): 몸소 브라우저 창이 열리면 "그 창에서 로그인한 뒤 돌려주세요", AI 가 그 창에서 이어 하면 "…이어서 하고 있습니다".
+      onExternalOpened: (owner) => setAgent((current) => (current && current.chatId === owner ? { ...current, state: 'login', reason: 'external_opened' } : { chatId: owner, state: 'login', reason: 'external_opened', title: null })),
+      onExternalContinued: (owner, state) => {
+        if (state === 'started') setAgent((current) => ({ chatId: owner, state: 'external', reason: null, title: current?.chatId === owner ? current.title : null }))
       },
       // [AI에게 돌려주기] 뒤 이어 하기 턴이 시작됨(G68): 줄을 "AI가 이 패널을 쓰고 있습니다"로.
       onResumeStarted: ({ chatId: owner }) => setAgent((current) => ({ chatId: owner, state: 'ai', reason: null, title: current?.chatId === owner ? current.title : null })),
@@ -301,15 +308,25 @@ export function PanelBrowserView({
   }
   // 구글 로그인: 뒤쪽이 준 로그인 주소(loginUrl, 2026-11-18 G58b)를 몸소 브라우저 창으로 연다. 없으면(옛 뒤쪽) 지금 패널의 사이트, 그것도 없으면 구글 로그인 첫 화면.
   function openOutside() {
-    const page = pageRef.current?.url && /^https:/i.test(pageRef.current.url) ? pageRef.current.url : null
-    const site = agent?.loginUrl ?? page ?? 'https://accounts.google.com/'
-    void openHumanBrowser(site).catch((error) => callbacks.current.onNotice(panelBrowserError(error) === 'browser_missing' ? B.browserMissing : B.humanFailed))
+    // 새 뒤쪽(G75): 그 채팅방의 몸소 전용 창으로 원래 사이트를 연다(뒤쪽이 opened 이벤트를 보냄). 명령이 없는 뒤쪽이면 예전처럼 주소로 연다.
+    const fallback = () => {
+      const page = pageRef.current?.url && /^https:/i.test(pageRef.current.url) ? pageRef.current.url : null
+      const site = agent?.loginUrl ?? page ?? 'https://accounts.google.com/'
+      void openHumanBrowser(site).catch((error) => callbacks.current.onNotice(panelBrowserError(error) === 'browser_missing' ? B.browserMissing : B.humanFailed))
+    }
+    if (!agent) { fallback(); return }
+    openExternalLogin(agent.chatId).catch((error) => {
+      if (String(error).includes('not found')) fallback()
+      else callbacks.current.onNotice(panelBrowserError(error) === 'browser_missing' ? B.browserMissing : B.humanFailed)
+    })
   }
   const agentOther = !!agent && !!chatId && agent.chatId !== chatId
   const agentText = !agent ? null
     : agent.state === 'human' ? B.agentHuman
+      : agent.state === 'external' ? B.agentExternalWorking
       : agent.state === 'login'
-        ? (agent.reason === 'google_login_external' ? B.agentLoginOutside
+        ? (agent.reason === 'external_opened' ? B.agentExternalOpened
+          : agent.reason === 'google_login_external' ? B.agentLoginOutside
           : agent.reason === 'one_time_code' ? B.agentCode
             : agent.reason === 'captcha' || agent.reason === 'verification' ? B.agentCheck
               : B.agentLogin)
@@ -394,9 +411,12 @@ export function PanelBrowserView({
           {agent.state === 'login' && agent.reason === 'google_login_external' && (
             <button className="secondary-button" type="button" onClick={openOutside}>{B.agentOpenOutside}</button>
           )}
-          <button className="secondary-button" type="button" disabled={agentWorking} onClick={() => control(agent.state === 'ai' ? 'take' : 'resume')}>
-            {agent.state === 'ai' ? B.agentTakeOver : B.agentResume}
-          </button>
+          {/* AI 가 바깥 창에서 이어 하는 동안은 패널에서 할 일이 없어 단추를 두지 않는다. */}
+          {agent.state !== 'external' && (
+            <button className="secondary-button" type="button" disabled={agentWorking} onClick={() => control(agent.state === 'ai' ? 'take' : 'resume')}>
+              {agent.state === 'ai' ? B.agentTakeOver : B.agentResume}
+            </button>
+          )}
         </div>
       )}
       <div ref={spot} className="panel-browser-spot">

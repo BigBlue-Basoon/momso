@@ -1,4 +1,5 @@
 import {
+  cloneElement,
   createContext,
   useCallback,
   useContext,
@@ -9,7 +10,9 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactElement,
   type ReactNode,
+  type RefObject,
 } from 'react'
 import { createPortal } from 'react-dom'
 import { getCurrentWindow } from '@tauri-apps/api/window'
@@ -977,6 +980,72 @@ function PaneMessage({ text, onRetry }: { text: string; onRetry?: () => void }) 
   )
 }
 
+/**
+ * 보이는 줄만 그리는 목록(2026-11-18, 문서 1,000개에서 문서 화면이 8.9초 걸린 일 뒤 — 줄을 한꺼번에 다 그렸다).
+ * 120줄 이하는 예전처럼 다 그린다. 그보다 많으면 스크롤 칸(scroller)에서 보이는 자리 위아래 600px 안의 줄만 그리고,
+ * 나머지는 위·아래 빈 칸으로 높이만 둔다. 줄 높이는 그려진 줄을 재서 기억하고(처음엔 estimate), 바뀌면 다시 계산한다.
+ * 줄은 key 가 있는 <li> 여야 한다.
+ */
+function VirtualRows({ rows, scroller, estimate = 88 }: { rows: ReactElement[]; scroller: RefObject<HTMLElement | null>; estimate?: number }) {
+  const list = useRef<HTMLUListElement>(null)
+  const heights = useRef(new Map<string, number>())
+  const pending = useRef(false)
+  const [, setVersion] = useState(0)
+  const [view, setView] = useState({ top: 0, height: 900 })
+  const many = rows.length > 120
+  useEffect(() => {
+    const element = scroller.current
+    if (!element || !many) return
+    const update = () => {
+      const listTop = list.current ? list.current.getBoundingClientRect().top - element.getBoundingClientRect().top + element.scrollTop : 0
+      setView((current) => {
+        const next = { top: element.scrollTop - listTop, height: element.clientHeight }
+        return Math.abs(next.top - current.top) < 40 && next.height === current.height ? current : next
+      })
+    }
+    update()
+    element.addEventListener('scroll', update, { passive: true })
+    const observer = new ResizeObserver(update)
+    observer.observe(element)
+    return () => { element.removeEventListener('scroll', update); observer.disconnect() }
+  }, [scroller, many])
+  if (!many) return <ul className="zet-rows">{rows}</ul>
+
+  const keyOf = (row: ReactElement) => String(row.key)
+  const measure = (key: string) => (element: HTMLLIElement | null) => {
+    if (!element) return
+    const height = element.offsetHeight
+    if (!height || heights.current.get(key) === height) return
+    heights.current.set(key, height)
+    if (pending.current) return
+    pending.current = true
+    queueMicrotask(() => { pending.current = false; setVersion((value) => value + 1) })
+  }
+  const from = view.top - 600
+  const to = view.top + Math.max(view.height, 400) + 600
+  let offset = 0
+  let first = -1
+  let last = -1
+  let before = 0
+  for (let index = 0; index < rows.length; index += 1) {
+    const height = heights.current.get(keyOf(rows[index])) ?? estimate
+    if (first < 0 && offset + height >= from) { first = index; before = offset }
+    if (offset <= to) last = index
+    offset += height
+  }
+  if (first < 0) { first = Math.max(0, rows.length - 1); before = 0 }
+  let shown = 0
+  for (let index = first; index <= last; index += 1) shown += heights.current.get(keyOf(rows[index])) ?? estimate
+  const after = Math.max(0, offset - before - shown)
+  return (
+    <ul ref={list} className="zet-rows">
+      {before > 0 && <li className="zet-rows-gap" aria-hidden style={{ height: before }} />}
+      {rows.slice(first, last + 1).map((row) => cloneElement(row as ReactElement<{ ref?: unknown }>, { ref: measure(keyOf(row)) }))}
+      {after > 0 && <li className="zet-rows-gap" aria-hidden style={{ height: after }} />}
+    </ul>
+  )
+}
+
 type FolderNode = { name: string; path: string; children: FolderNode[]; docs: ZetListEntry[]; total: number }
 
 const parentOf = (path: string) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '')
@@ -1053,6 +1122,8 @@ function ZetFolderView({
 }) {
   const notice = useContext(PanelNoticeContext)
   const [query, setQuery] = useState('')
+  // 목록의 스크롤 칸(보이는 줄만 그리는 VirtualRows 가 쓴다).
+  const mainRef = useRef<HTMLDivElement>(null)
   // 펼친 폴더. 지금 폴더까지는 저절로 펼친다.
   const [openFolders, setOpenFolders] = useState<ReadonlySet<string>>(new Set())
   const entries = list.state === 'ready' ? list.value : null
@@ -1249,7 +1320,7 @@ function ZetFolderView({
           </ul>
         </nav>
       )}
-      <div className="zet-list zet-folder-main">
+      <div ref={mainRef} className="zet-list zet-folder-main">
         <div className="zet-folder-bar">
           {found === null ? (
             <nav className="zet-crumbs" aria-label={W.zetPanel.folderPath}>
@@ -1280,14 +1351,14 @@ function ZetFolderView({
           </div>
         </div>
         {found !== null ? (
-          found.length === 0 ? <PaneMessage text={W.zetPanel.text29} /> : <ul className="zet-rows">{found.map((entry) => docRow(entry, true))}</ul>
+          found.length === 0 ? <PaneMessage text={W.zetPanel.text29} /> : <VirtualRows scroller={mainRef} rows={found.map((entry) => docRow(entry, true))} />
         ) : list.value.length === 0 && root.children.length === 0 ? (
           <PaneMessage text={W.zetPanel.text27} />
         ) : current.children.length === 0 && current.docs.length === 0 ? (
           <PaneMessage text={W.zetPanel.folderEmpty} />
         ) : (
-          <ul className="zet-rows">
-            {current.children.map((child) => (
+          <VirtualRows scroller={mainRef} rows={[
+            ...current.children.map((child) => (
               <li key={child.path} className="zet-folder-item">
                 {renaming === child.path ? (
                   <div className="zet-row zet-folder-row is-renaming">
@@ -1331,9 +1402,9 @@ function ZetFolderView({
                   </RowMenu>
                 )}
               </li>
-            ))}
-            {current.docs.map((entry) => docRow(entry, false))}
-          </ul>
+            )),
+            ...current.docs.map((entry) => docRow(entry, false)),
+          ]} />
         )}
       </div>
       {ghost && createPortal(<div className="zet-drag-ghost" style={{ left: ghost.x + 12, top: ghost.y + 10 }}>{ghost.label}</div>, document.body)}

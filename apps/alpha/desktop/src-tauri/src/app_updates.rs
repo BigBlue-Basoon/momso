@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::sync::Mutex;
@@ -9,7 +9,12 @@ use tokio::sync::Mutex;
 mod local_test;
 
 #[derive(Default)]
-pub(crate) struct UpdateState(Mutex<Inner>);
+pub(crate) struct UpdateState(Mutex<Inner>, Mutex<CheckCache>);
+#[derive(Default)]
+struct CheckCache {
+    result: Option<(Instant, UpdateInfo)>,
+}
+const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 #[derive(Default)]
 struct Inner {
     pending: Option<Update>,
@@ -163,18 +168,44 @@ async fn check(app: &tauri::AppHandle) -> UpdateInfo {
             }
             info("up_to_date", &version)
         }
+        Err(tauri_plugin_updater::Error::NoRelease) => {
+            let state = app.state::<UpdateState>();
+            let mut inner = state.0.lock().await;
+            if !inner.busy {
+                inner.pending = None;
+                inner.downloaded = None;
+            }
+            info("no_release", &version)
+        }
         Err(error) => check_failed(&version, updater_reason(&error)),
     }
+}
+
+async fn cached_check<F, Fut>(state: &UpdateState, run: F) -> UpdateInfo
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = UpdateInfo>,
+{
+    let mut cache = state.1.lock().await;
+    if let Some((checked, result)) = &cache.result {
+        if checked.elapsed() < CHECK_INTERVAL {
+            return result.clone();
+        }
+    }
+    let result = run().await;
+    cache.result = Some((Instant::now(), result.clone()));
+    result
 }
 
 pub(crate) fn start_monitor(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let result = check(&app).await;
+            let state = app.state::<UpdateState>();
+            let result = cached_check(&state, || check(&app)).await;
             if result.state == "available" {
                 let _ = app.emit("update-available", result);
             }
-            tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+            tokio::time::sleep(CHECK_INTERVAL).await;
         }
     });
 }
@@ -187,7 +218,8 @@ pub(crate) fn app_version(app: tauri::AppHandle) -> VersionInfo {
 }
 #[tauri::command]
 pub(crate) async fn update_check(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
-    Ok(check(&app).await)
+    let state = app.state::<UpdateState>();
+    Ok(cached_check(&state, || check(&app)).await)
 }
 
 #[tauri::command]
@@ -510,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_release_returns_failed_without_an_available_update() {
+    async fn simultaneous_checks_share_one_request_and_missing_release_is_quiet() {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -543,10 +575,59 @@ mod tests {
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
-        assert!(updater.check().await.is_err());
-        let result = check_failed("0.1.0", "release_unavailable");
-        assert_eq!(result.state, "failed");
-        assert!(result.latest_version.is_none());
+        let state = UpdateState::default();
+        let run = || async {
+            match updater.check().await {
+                Err(tauri_plugin_updater::Error::NoRelease) => info("no_release", "0.1.0"),
+                result => panic!("unexpected updater result: {}", result.is_ok()),
+            }
+        };
+        let (a, b, c) = tokio::join!(
+            cached_check(&state, run),
+            cached_check(&state, run),
+            cached_check(&state, run)
+        );
+        assert_eq!(
+            (a.state, b.state, c.state),
+            ("no_release", "no_release", "no_release")
+        );
+        assert!(a.latest_version.is_none());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_error_is_not_mistaken_for_missing_release() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_fixture_headers(&mut stream).unwrap();
+            stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let mut context = tauri::test::mock_context(tauri::test::noop_assets());
+        context.config_mut().plugins.0.insert(
+            "updater".into(),
+            serde_json::json!({"pubkey":"", "endpoints":[], "dangerousInsecureTransportProtocol":true}),
+        );
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .build(context)
+            .unwrap();
+        let updater = app
+            .handle()
+            .updater_builder()
+            .endpoints(vec![format!("http://127.0.0.1:{port}/latest.json")
+                .parse()
+                .unwrap()])
+            .unwrap()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        assert!(matches!(
+            updater.check().await,
+            Err(tauri_plugin_updater::Error::Network(_))
+        ));
         server.join().unwrap();
     }
 

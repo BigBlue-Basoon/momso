@@ -264,7 +264,6 @@ export function Composer({
                   ? <span className="slash-item-description">{skillUnavailableText(item)}</span>
                   : item.description && <span className="slash-item-description">{item.description}</span>}
               </span>
-              <span className="slash-item-name">/{item.name}</span>
             </button>
           ))}
         </div>

@@ -401,7 +401,12 @@ fn document_files(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, Str
         std::fs::read_dir(folder_directory(root)?).map_err(|_| "unavailable".to_string())?
     {
         let entry = entry.map_err(|_| "unavailable".to_string())?;
-        if entry.path().extension().is_some_and(|ext| ext == "md") {
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_suffix(".md"))
+            .is_some_and(valid_zet_id)
+        {
             ensure_regular_file(&entry.path())?;
             paths.push(entry.path());
         }

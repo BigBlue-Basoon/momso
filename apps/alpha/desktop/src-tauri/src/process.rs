@@ -17,6 +17,18 @@ static LOCAL_AI_TOOLS: OnceLock<PathBuf> = OnceLock::new();
 
 pub(crate) use crate::hidden_process::hidden_command;
 
+fn cli_timer(name: &str) -> Option<crate::startup_timing::Timer> {
+    let stage = match name {
+        "codex" => "cli_codex",
+        "claude" => "cli_claude",
+        "agy" => "cli_agy",
+        "gh" => "cli_gh",
+        "wrangler" => "cli_wrangler",
+        _ => return None,
+    };
+    Some(crate::startup_timing::start(stage))
+}
+
 pub(crate) fn hidden_async_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     Command::from(hidden_command(program))
 }
@@ -239,6 +251,7 @@ pub(crate) async fn run_tool_cancellable(
     timeout: Duration,
     cancellation: Option<CancellationToken>,
 ) -> Result<ProcessOutput, ProcessError> {
+    let _timer = cli_timer(name);
     let executable = resolve_tool(name).ok_or_else(|| ProcessError::MissingTool(name.into()))?;
     run_resolved_tool_cancellable(
         &executable,
@@ -369,6 +382,7 @@ pub(crate) async fn run_json_rpc_tool(
     request: JsonRpcRequest<'_>,
     timeout: Duration,
 ) -> Result<serde_json::Value, ProcessError> {
+    let _timer = cli_timer(name);
     let executable =
         resolve_interactive_tool(name).ok_or_else(|| ProcessError::MissingTool(name.into()))?;
     run_json_rpc_resolved(&executable, args, cwd, environment, request, timeout).await
@@ -566,6 +580,7 @@ mod tests {
                     | "scale_benchmark.rs"
                     | "provider_engine_smoke.rs"
                     | "command_entry_tests.rs"
+                    | "g70_login_resume_test.rs"
                     | "capability_security_tests.rs"
                     | "instagram_preview_contract_tests.rs"
             ) {

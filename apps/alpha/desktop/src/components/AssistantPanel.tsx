@@ -84,6 +84,11 @@ type AssistantPanelProps = {
   failure?: { text: string; actions: Array<{ id: string; label: string; run: () => void }> } | null
   /** 회사가 스스로 다시 시도하는 중일 때 답 아래 조용한 한 줄(chat-provider-retrying). */
   retrying?: string | null
+  /** 지금 채팅방(바뀌면 맨 아래부터 다시 그린다). 긴 채팅방 페이지(chat_read_page): 더 옛 말이 있는지, 불러오는 중인지, 불러오기. */
+  chatKey?: string | null
+  hasOlder?: boolean
+  loadingOlder?: boolean
+  onLoadOlder?: () => void
 }
 
 /**
@@ -109,6 +114,10 @@ export function AssistantPanel({
   onCancelSecret,
   failure = null,
   retrying = null,
+  chatKey = null,
+  hasOlder = false,
+  loadingOlder = false,
+  onLoadOlder,
 }: AssistantPanelProps) {
   // 답은 보는 창과 같은 도구로 그린다(목록, 굵은 글씨, 제목, 코드, 표, 링크). 링크는 앱의 여는 방식(opener)으로.
   // 두 손잡이는 늘 같은 함수로 넘긴다: 입력창에 글자를 칠 때나 답이 흘러 들어올 때 지난 말들을 다시 그리지 않게(2026-11-17 많이 쌓였을 때 재기).
@@ -124,24 +133,34 @@ export function AssistantPanel({
   const lastAssistantIndex = messages.map((message) => message.role).lastIndexOf('assistant')
   const shownTitle = title.trim() || W.assistantPanel.text1
 
-  // 채팅방이 바뀌면(첫 말이 다르면) 맨 아래 FIRST_WINDOW 개만 먼저 그리고, 옛 말은 쉬는 틈마다 FILL_STEP 개씩 위에 더한다.
+  // 채팅방이 바뀌면 맨 아래 FIRST_WINDOW 개만 그린다. 옛 말은 위로 올려 읽을 때만 FILL_STEP 개씩 위에 더하고(2026-11-18: 예전에는
+  // 쉬는 틈마다 다 그려 2,000개 채팅방에서 말풍선이 모두 그려졌다), 불러온 말을 다 그렸으면 이전 페이지를 부른다(onLoadOlder).
+  // 같은 채팅방에 옛 말이 앞에 붙으면(이전 페이지) 그린 범위를 그만큼 밀어 보던 말이 그대로 있게 한다.
   const firstId = messages[0]?.id ?? ''
-  const [windowStart, setWindowStart] = useState(() => ({ firstId, from: Math.max(0, messages.length - FIRST_WINDOW) }))
-  if (windowStart.firstId !== firstId) setWindowStart({ firstId, from: Math.max(0, messages.length - FIRST_WINDOW) })
-  const shownFrom = windowStart.firstId === firstId ? Math.min(windowStart.from, messages.length) : 0
-  useEffect(() => {
-    if (shownFrom <= 0) return
-    const timer = window.setTimeout(() => {
-      const stream = streamRef.current
-      fillAnchor.current = stream ? stream.scrollHeight - stream.scrollTop : null
-      setWindowStart((current) => (current.firstId === firstId ? { firstId, from: Math.max(0, current.from - FILL_STEP) } : current))
-    }, 16)
-    return () => window.clearTimeout(timer)
-  }, [firstId, shownFrom])
+  const [windowStart, setWindowStart] = useState(() => ({ key: chatKey, firstId, from: Math.max(0, messages.length - FIRST_WINDOW) }))
+  if (windowStart.key !== chatKey) setWindowStart({ key: chatKey, firstId, from: Math.max(0, messages.length - FIRST_WINDOW) })
+  else if (windowStart.firstId !== firstId) {
+    const added = messages.findIndex((message) => message.id === windowStart.firstId)
+    setWindowStart({ key: chatKey, firstId, from: added >= 0 ? windowStart.from + added : Math.max(0, messages.length - FIRST_WINDOW) })
+  }
+  const shownFrom = windowStart.key === chatKey && windowStart.firstId === firstId ? Math.min(windowStart.from, messages.length) : Math.max(0, messages.length - FIRST_WINDOW)
+  const olderRef = useRef({ shownFrom, hasOlder, loadingOlder, onLoadOlder })
+  olderRef.current = { shownFrom, hasOlder, loadingOlder, onLoadOlder }
+  const onStreamScroll = useCallback(() => {
+    const stream = streamRef.current
+    // 사람이 위로 올려 읽을 때만(휠·키·막대 끌기). 처음 열 때 맨 위에서 맨 아래로 내려가는 사이의 스크롤은 치지 않는다.
+    if (!stream || !readingUp.current || stream.scrollTop > 400) return
+    const now = olderRef.current
+    if (now.shownFrom > 0) {
+      readingUp.current = true
+      fillAnchor.current = stream.scrollHeight - stream.scrollTop
+      setWindowStart((current) => ({ ...current, from: Math.max(0, current.from - FILL_STEP) }))
+    } else if (now.hasOlder && !now.loadingOlder) now.onLoadOlder?.()
+  }, [])
   // 옛 말을 위에 더해도 보던 자리를 지킨다: 위로 올려 읽지 않았으면 맨 아래에, 올려 읽는 중이면 보던 말 그대로.
   const fillAnchor = useRef<number | null>(null)
   const readingUp = useRef(false)
-  useEffect(() => { readingUp.current = false }, [firstId])
+  useEffect(() => { readingUp.current = false }, [chatKey])
   useLayoutEffect(() => {
     const stream = streamRef.current
     const anchor = fillAnchor.current
@@ -171,11 +190,12 @@ export function AssistantPanel({
     />
   )
 
-  // 새 말이나 물음이 붙으면 맨 아래로 내린다.
+  // 새 말이나 물음이 붙으면 맨 아래로 내린다(옛 말이 앞에 붙는 것은 새 말이 아니라서 마지막 말 id 로 본다).
+  const lastId = messages[messages.length - 1]?.id ?? ''
   useEffect(() => {
     const stream = streamRef.current
     if (stream) stream.scrollTo({ top: stream.scrollHeight, behavior: 'smooth' })
-  }, [messages.length, isGenerating, pendingApprovals.length, pendingSecrets.length])
+  }, [lastId, isGenerating, pendingApprovals.length, pendingSecrets.length])
 
   // 입력 칸이 자라면 대화의 마지막 말이 그 뒤에 가리지 않게 아래 여백을 함께 늘린다.
   useEffect(() => {
@@ -204,6 +224,7 @@ export function AssistantPanel({
         ref={streamRef}
         className="message-stream"
         aria-live="polite"
+        onScroll={onStreamScroll}
         onWheel={(event) => { if (event.deltaY < 0) readingUp.current = true }}
         onKeyDown={(event) => { if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) readingUp.current = true }}
         onPointerDown={(event) => { if (event.target === event.currentTarget) readingUp.current = true }}

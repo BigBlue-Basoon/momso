@@ -1472,3 +1472,6 @@ button.zet-link-row:hover {
 }
 .zet-move-targets button:hover:not(:disabled) { background: var(--surface-muted); color: var(--ink); }
 .zet-move-targets button:disabled { color: var(--faint); cursor: default; }
+
+/* 보이는 줄만 그릴 때 위·아래 빈 칸(높이만). */
+.zet-rows-gap { padding: 0; border: 0; list-style: none; pointer-events: none; }
