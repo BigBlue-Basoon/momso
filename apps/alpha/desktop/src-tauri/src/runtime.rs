@@ -145,7 +145,7 @@ impl RuntimePaths {
     pub(crate) fn prepare(
         app: &tauri::AppHandle,
     ) -> Result<(Self, crate::storage::StorageStatus), std::io::Error> {
-        let _timer = crate::startup_timing::start("runtime_prepare");
+        let _timer = crate::startup_timing::start_startup("runtime_prepare");
         let test_root = r2_test_root(
             &app.config().identifier,
             std::env::var_os("MOMSO_R2_TEST_ROOT").map(PathBuf::from),
@@ -170,7 +170,7 @@ impl RuntimePaths {
             fs::create_dir_all(directory)?;
         }
         let database_path = data_root.join("momso.db");
-        let storage_timer = crate::startup_timing::start("storage_initialize");
+        let storage_timer = crate::startup_timing::start_startup("storage_initialize");
         let storage = crate::storage::initialize_with_progress(
             &database_path,
             &backups_path,
@@ -196,7 +196,7 @@ impl RuntimePaths {
             .filter_map(std::env::var_os)
             .map(PathBuf::from)
             .collect();
-        let location_timer = crate::startup_timing::start("archive_location_load");
+        let location_timer = crate::startup_timing::start_startup("archive_location_load");
         let archive = crate::archive_location::ArchiveLocation::load(
             database_path.clone(),
             &home,

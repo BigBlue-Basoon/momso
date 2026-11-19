@@ -531,12 +531,12 @@ pub(crate) fn initialize(root: &Path, resources: &Path) -> Result<(), String> {
         }
     }
     {
-        let _timer = crate::startup_timing::start("dictionary_initialize");
+        let _timer = crate::startup_timing::start_startup("dictionary_initialize");
         crate::yoga_dictionary::initialize(root)?;
     }
     drop(_rule_guard);
     {
-        let _timer = crate::startup_timing::start("skills_install_bundled");
+        let _timer = crate::startup_timing::start_startup("skills_install_bundled");
         crate::skills::install_bundled(root, resources).map_err(str::to_owned)?;
     }
     Ok(())

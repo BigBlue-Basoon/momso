@@ -2,6 +2,10 @@
 use serde_json::{json, Value};
 use std::{io::Read, path::Path};
 
+// Serialize index refreshes before taking the nonblocking first-receive lock.
+// A real first receive still fails closed; concurrent readers wait their turn.
+static DOCUMENT_INDEX_REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn read_current(
     root: &Path,
     id: &str,
@@ -74,6 +78,7 @@ fn read_current_in_directory(
 /// a file is missing or unreadable: another writer may be replacing it.
 pub(crate) fn sync_document_index(root: &Path, database: &Path) -> Result<(), &'static str> {
     use std::collections::BTreeSet;
+    let _refresh_guard = DOCUMENT_INDEX_REFRESH.lock().map_err(|_| "unavailable")?;
     let _receive_guard =
         crate::archive_remote::lock_first_receive(database).map_err(|_| "unavailable")?;
     crate::archive_remote::ensure_document_write_allowed(root, database)
@@ -387,6 +392,46 @@ mod tests {
         std::fs::write(&path, vec![b'x'; 1_048_577]).unwrap();
         assert!(read_current(&root, &id).is_err());
     }
+    #[test]
+    fn concurrent_document_index_refreshes_wait_instead_of_failing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        crate::archive::initialize(&root, temp.path()).unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let id = crate::archive_zet::create(
+            &root,
+            &db,
+            crate::archive_zet::ZetCreate {
+                title: "fixture".into(),
+                summary: "fixture".into(),
+                kind: "note".into(),
+                body: "fixture".into(),
+                assets: vec![],
+                edges: vec![],
+            },
+        )
+        .unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let barrier = &barrier;
+                    let root = &root;
+                    let db = &db;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        sync_document_index(root, db)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(()));
+            }
+        });
+        assert!(read_current(&root, &id).is_ok());
+    }
+
     #[test]
     fn index_sync_detects_external_header_edits_on_repeated_calls() {
         let temp = tempfile::tempdir().unwrap();

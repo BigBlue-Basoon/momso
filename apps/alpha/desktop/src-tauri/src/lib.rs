@@ -3189,25 +3189,25 @@ fn prepare_archive_for_start(
     paths: &RuntimePaths,
     resources: &std::path::Path,
 ) -> Result<(), std::io::Error> {
-    let _timer = startup_timing::start("archive_prepare");
+    let _timer = startup_timing::start_startup("archive_prepare");
     let archive_root = paths
         .archive
         .current
         .try_read()
         .map_err(std::io::Error::other)?
         .clone();
-    let git_timer = startup_timing::start("git_resolve");
+    let git_timer = startup_timing::start_startup("git_resolve");
     let git_available = git_tool::resolve().is_some();
     drop(git_timer);
     let receive_setup_guard = archive_remote::lock_first_receive(&paths.database_path).ok();
     let receive_pending = receive_setup_guard.is_none()
         || archive_remote::first_receive_pending(&archive_root, &paths.database_path);
     if git_available && !receive_pending {
-        let _timer = startup_timing::start("archive_initialize");
+        let _timer = startup_timing::start_startup("archive_initialize");
         archive::initialize(&archive_root, resources).map_err(std::io::Error::other)?;
     }
     if git_available && !receive_pending && paths.archive.needs_initial_index {
-        let _timer = startup_timing::start("archive_reindex");
+        let _timer = startup_timing::start_startup("archive_reindex");
         archive::reindex(&archive_root, &paths.database_path).map_err(std::io::Error::other)?;
         let connection = storage::open_writable_connection(&paths.database_path)
             .map_err(std::io::Error::other)?;
@@ -3309,18 +3309,21 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let _timer = startup_timing::start("app_setup");
+            let _timer = startup_timing::start_startup("app_setup");
+            let ready_timer = startup_timing::start_startup("setup_until_runtime_ready");
             log::info!("lifecycle setup_started pid={}", std::process::id());
             if let Some(view) = app.get_webview("main") {
                 app_lifecycle::observe_webview(&view);
             }
             let (paths, status) = RuntimePaths::prepare(app.handle())?;
             panel_browser::start_cache_maintenance(app.handle().clone());
+            let panel_cleanup_timer = startup_timing::start_startup("panel_download_cleanup");
             if let Ok(root) = app.path().app_data_dir() {
                 if let Err(error) = panel_download::cleanup_staging(&root) {
                     log::warn!("Panel download staging cleanup failed: {error}");
                 }
             }
+            drop(panel_cleanup_timer);
             chat_search_index::start(paths.database_path.clone());
             git_tool::configure(paths.data_root.clone());
             gh_owned::configure(&paths.data_root);
@@ -3329,6 +3332,7 @@ pub fn run() {
             r2_oauth::configure_resources(&resources);
             process::set_local_ai_tools(paths.data_root.join("ai-tools"));
             prepare_archive_for_start(&paths, &resources)?;
+            let pending_outputs_timer = startup_timing::start_startup("pending_output_recovery_setup");
             match generated_output::pending(&paths.database_path) {
                 Ok(turns) if !turns.is_empty() => {
                     let recovery_paths = paths.clone();
@@ -3362,6 +3366,8 @@ pub fn run() {
                 Ok(_) => {}
                 Err(_) => log::warn!("Could not read pending generated outputs"),
             }
+            drop(pending_outputs_timer);
+            let source_cleanup_timer = startup_timing::start_startup("source_staging_cleanup");
             match source_assets::cleanup_staging(&paths.objects_path) {
                 Ok(removed) if removed > 0 => {
                     log::warn!("Removed {removed} interrupted source import temporary file(s)");
@@ -3369,6 +3375,8 @@ pub fn run() {
                 Ok(_) => {}
                 Err(error) => log::warn!("Source import staging cleanup failed: {error}"),
             }
+            drop(source_cleanup_timer);
+            drop(ready_timer);
             log::info!(
                 "momso desktop runtime ready: schema={}, health={}",
                 status.schema_version,

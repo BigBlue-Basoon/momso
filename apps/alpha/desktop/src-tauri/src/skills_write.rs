@@ -348,16 +348,6 @@ fn state(root: &Path, name: &str, fallback_hash: &str) -> Result<State, &'static
     }
 }
 
-pub(crate) fn validate_repository(root: &Path, resources: &Path) -> Result<(), &'static str> {
-    let tool = crate::archive::storage_tool(resources)
-        .map_err(|_| "save_failed")?
-        .0;
-    if git(&tool, root, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
-        return Err("save_failed");
-    }
-    Ok(())
-}
-
 pub(crate) fn install_builtins(
     root: &Path,
     resources: &Path,
@@ -366,10 +356,12 @@ pub(crate) fn install_builtins(
     let _lock = crate::archive_zet::WRITE_LOCK
         .lock()
         .map_err(|_| "io_error")?;
-    validate_repository(root, resources)?;
     let tool = crate::archive::storage_tool(resources)
         .map_err(|_| "save_failed")?
         .0;
+    if git(&tool, root, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
+        return Err("save_failed");
+    }
     let mut has_history = git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok();
     let clean_tracked = if has_history
         && git(
