@@ -242,8 +242,12 @@ fn fingerprint(root: &Path, db: &Path) -> Result<u64, &'static str> {
         "CLAUDE.md",
         "GEMINI.md",
         "profile.md",
+        ".gitignore",
     ] {
         fingerprint_path(root, Path::new(name), &mut hasher)?;
+    }
+    for path in crate::archive::additional_files(root).map_err(|_| "local_state_unavailable")? {
+        fingerprint_path(root, Path::new(&path), &mut hasher)?;
     }
     chat_archive_tracking::changes(db)?.hash(&mut hasher);
     Ok(hasher.finish())
@@ -420,9 +424,187 @@ pub(crate) async fn close_backup<R: tauri::Runtime>(
     }
 }
 
+pub(crate) async fn close_all<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    paths: crate::runtime::RuntimePaths,
+    resources: PathBuf,
+) -> Result<(CloseResult, bool), tokio::time::error::Elapsed> {
+    tokio::time::timeout(CLOSE_TIMEOUT, async {
+        tokio::join!(
+            close_backup(app.clone(), paths, resources),
+            crate::object_store_auto_upload::close_upload(app)
+        )
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_files_survive_save_automatic_backup_and_first_receive() {
+        use crate::{
+            archive,
+            archive_location::ArchiveLocation,
+            archive_remote::{self, TestRemote},
+            runtime::RuntimePaths,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path();
+        let root = base.join("old");
+        let bare = base.join("remote.git");
+        let db = base.join("old.db");
+        let backups = base.join("backups");
+        let git = crate::process::resolve_tool("git.exe").unwrap();
+        archive_remote::git(&git, base, &["init", "--bare", bare.to_str().unwrap()]).unwrap();
+        storage::initialize(&db, &backups, "fixture").unwrap();
+        let location = ArchiveLocation::load(db.clone(), base, vec![]).unwrap();
+        *location.current.try_write().unwrap() = root.clone();
+        archive::initialize(&root, base).unwrap();
+        let paths = RuntimePaths {
+            data_root: base.to_path_buf(),
+            database_path: db.clone(),
+            objects_path: root.join("objects"),
+            exports_path: base.join("exports"),
+            backups_path: backups,
+            logs_path: base.join("logs"),
+            archive: location,
+            archive_lease: None,
+        };
+        let app = tauri::test::mock_builder()
+            .manage(AppState {
+                paths,
+                approvals: Default::default(),
+                setup_secrets: Default::default(),
+                usage_monitor: Default::default(),
+                usage_cache: Default::default(),
+                chat_active: Default::default(),
+                browser: Default::default(),
+                selections: Default::default(),
+            })
+            .manage(AutoBackup::default())
+            .manage(TestRemote {
+                tool: git.clone(),
+                target: bare.to_string_lossy().into_owned(),
+            })
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let document = crate::archive_zet::create(
+            &root,
+            &db,
+            crate::archive_zet::ZetCreate {
+                title: "fixture".into(),
+                summary: "fixture".into(),
+                kind: "note".into(),
+                body: "body".into(),
+                assets: vec![],
+                edges: vec![],
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("zettels/manual")).unwrap();
+        std::fs::write(
+            root.join("zettels/manual/수업.md"),
+            b"unmanaged\r\nlesson\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("수업 사진.png"), [0, 1, 255, 10]).unwrap();
+        std::fs::write(root.join("zettels/loose.md"), b"loose text").unwrap();
+        std::fs::write(root.join("objects/private-original"), b"private original").unwrap();
+        std::fs::write(root.join(".gitignore"), "objects/\n.momso/outputs/\nlocal-private.txt\nzettels/manual/secret*.md\n!zettels/manual/secret-allowed.md\n").unwrap();
+        std::fs::write(root.join("local-private.txt"), b"ignored private data").unwrap();
+        std::fs::write(
+            root.join("zettels/manual/secret-hidden.md"),
+            b"ignored nested data",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("zettels/manual/secret-allowed.md"),
+            b"allowed by negation",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".momso/outputs/test/turn")).unwrap();
+        std::fs::write(
+            root.join(".momso/outputs/test/turn/output.png"),
+            b"ignored output",
+        )
+        .unwrap();
+        archive::initialize(&root, base).unwrap();
+        assert!(std::fs::read_to_string(root.join(".gitignore"))
+            .unwrap()
+            .contains("local-private.txt"));
+        archive_remote::git(&git, &root, &["add", "-f", "--", "local-private.txt"]).unwrap();
+        assert_eq!(archive::additional_files(&root).unwrap().len(), 6);
+        archive::save(&root, base, &db).unwrap();
+        assert!(crate::archive_zet::folders(&root).unwrap().is_empty());
+        assert_eq!(crate::archive_zet::list(&db, None, None).unwrap().len(), 1);
+        tauri::async_runtime::block_on(attempt(app.handle().clone(), false));
+        app.state::<AutoBackup>().0.lock().unwrap().changed_at = Some(Instant::now() - QUIET);
+        tauri::async_runtime::block_on(attempt(app.handle().clone(), false));
+        assert_eq!(
+            archive_auto_backup_get(app.state(), app.state())
+                .unwrap()
+                .state,
+            "idle"
+        );
+        std::fs::write(
+            root.join("zettels/manual/수업.md"),
+            b"new unmanaged bytes\r\n",
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(attempt(app.handle().clone(), false));
+        app.state::<AutoBackup>().0.lock().unwrap().changed_at = Some(Instant::now() - QUIET);
+        tauri::async_runtime::block_on(attempt(app.handle().clone(), false));
+        assert_eq!(
+            archive_auto_backup_get(app.state(), app.state())
+                .unwrap()
+                .state,
+            "idle"
+        );
+        let fresh = base.join("fresh");
+        let fresh_db = base.join("fresh.db");
+        storage::initialize(&fresh_db, &base.join("fresh-backups"), "fixture").unwrap();
+        archive::initialize(&fresh, base).unwrap();
+        archive_remote::connect_local(&git, &fresh, bare.to_str().unwrap()).unwrap();
+        archive_remote::receive_connected(&git, &fresh, &fresh_db, bare.to_str().unwrap(), "main")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(fresh.join("zettels/manual/수업.md")).unwrap(),
+            b"new unmanaged bytes\r\n"
+        );
+        assert_eq!(
+            std::fs::read(fresh.join("zettels/loose.md")).unwrap(),
+            b"loose text"
+        );
+        assert_eq!(
+            std::fs::read(fresh.join("수업 사진.png")).unwrap(),
+            [0, 1, 255, 10]
+        );
+        assert_eq!(
+            std::fs::read(fresh.join("zettels/manual/secret-allowed.md")).unwrap(),
+            b"allowed by negation"
+        );
+        assert!(!fresh.join("local-private.txt").exists());
+        assert!(!fresh.join("zettels/manual/secret-hidden.md").exists());
+        assert!(!fresh.join(".momso/outputs/test/turn/output.png").exists());
+        assert_eq!(
+            std::fs::read(root.join("local-private.txt")).unwrap(),
+            b"ignored private data"
+        );
+        assert!(fresh
+            .join("zettels")
+            .join(format!("{document}.md"))
+            .is_file());
+        assert_eq!(
+            crate::archive_zet::list(&fresh_db, None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(archive::additional_files(&fresh).unwrap().len(), 4);
+        assert!(!fresh.join("objects/private-original").exists());
+    }
 
     #[test]
     fn batches_changes_retries_and_flushes_on_close() {
@@ -499,6 +681,48 @@ mod tests {
             .unwrap();
         crate::chat::create(&db).unwrap();
         crate::chat::create(&db).unwrap();
+        if std::env::var_os("MOMSO_B84_BACKUP_MEASURE").is_some() {
+            let id = crate::archive_zet::create(
+                &root,
+                &db,
+                crate::archive_zet::ZetCreate {
+                    title: "fixture".into(),
+                    summary: "fixture".into(),
+                    kind: "note".into(),
+                    body: "synthetic fixture".into(),
+                    assets: vec![],
+                    edges: vec![],
+                },
+            )
+            .unwrap();
+            let template =
+                std::fs::read_to_string(root.join("zettels").join(format!("{id}.md"))).unwrap();
+            let base_time = chrono::Local::now().naive_local() - chrono::Duration::seconds(2000);
+            let extra = if std::env::var("MOMSO_B84_BACKUP_MEASURE").as_deref() == Ok("small") {
+                0
+            } else {
+                999
+            };
+            for n in 0..extra {
+                let next = format!(
+                    "zet_{}",
+                    (base_time + chrono::Duration::seconds(n)).format("%Y%m%d_%H%M%S")
+                );
+                std::fs::write(
+                    root.join("zettels").join(format!("{next}.md")),
+                    template.replace(&id, &next),
+                )
+                .unwrap();
+            }
+            if extra != 0 {
+                for n in 0..2000 {
+                    let hash = format!("{n:064x}");
+                    let directory = root.join("objects").join("sha256").join(&hash[..2]);
+                    std::fs::create_dir_all(&directory).unwrap();
+                    std::fs::write(directory.join(hash), [b'x'; 256]).unwrap();
+                }
+            }
+        }
         tauri::async_runtime::block_on(attempt(app.handle().clone(), false));
         assert!(archive_remote::git(
             &git,
@@ -512,7 +736,26 @@ mod tests {
         )
         .is_err());
         app.state::<AutoBackup>().0.lock().unwrap().changed_at = Some(Instant::now() - QUIET);
+        if std::env::var_os("MOMSO_B84_BACKUP_MEASURE").is_some() {
+            crate::archive::BENCH_FOLLOW_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+            crate::archive::BENCH_FOLLOW_MICROS.store(0, std::sync::atomic::Ordering::Relaxed);
+            println!("B84_BACKUP_START");
+        }
         tauri::async_runtime::block_on(attempt(app.handle().clone(), false));
+        if std::env::var_os("MOMSO_B84_BACKUP_MEASURE").is_some() {
+            println!("B84_BACKUP_END");
+            println!(
+                "B85_FOLLOW count={} ms={}",
+                crate::archive::BENCH_FOLLOW_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+                crate::archive::BENCH_FOLLOW_MICROS.load(std::sync::atomic::Ordering::Relaxed)
+                    / 1000
+            );
+            println!(
+                "B84_BACKUP_STATUS {}",
+                serde_json::to_string(&archive_auto_backup_get(app.state(), app.state()).unwrap())
+                    .unwrap()
+            );
+        }
         let remote_head = || {
             archive_remote::git(
                 &git,

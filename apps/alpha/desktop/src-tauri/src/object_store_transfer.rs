@@ -599,6 +599,10 @@ fn prepare_journal(
             Err(_) => return Err("local_read_failed"),
         }
     }
+    // tempfile uses native rename calls on Windows; canonical paths include
+    // the extended-length prefix needed when the staging path exceeds MAX_PATH.
+    let canonical_stage = stage.canonicalize().map_err(|_| "local_read_failed")?;
+    let stage = canonical_stage.as_path();
     let id = object_store::digest(format!("{kind}\0{relative}\0{sha256}").as_bytes());
     let journal_path = stage.join(format!("{id}.json"));
     let cipher_path = stage.join(format!("{id}.age"));
@@ -833,8 +837,9 @@ where
         bytes
     } else {
         let bytes = encrypt_bytes(&plain, identity)?;
+        let staging = journal_path.parent().ok_or("local_state_invalid")?;
         let mut file =
-            tempfile::NamedTempFile::new_in(spec.stage).map_err(|_| "local_write_failed")?;
+            tempfile::NamedTempFile::new_in(staging).map_err(|_| "local_write_failed")?;
         file.write_all(&bytes).map_err(|_| "local_write_failed")?;
         file.as_file()
             .sync_all()
@@ -1246,8 +1251,38 @@ pub(crate) async fn object_store_backup<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
 ) -> Result<BackupProgress, &'static str> {
+    backup_with_mode(app, state, false).await
+}
+
+pub(crate) async fn backup_with_mode<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    automatic: bool,
+) -> Result<BackupProgress, &'static str> {
     let paths = state.paths.scoped().await;
     let _guard = object_store::CONNECTION_LOCK.lock().await;
+    if automatic && !crate::object_store_auto_upload::enabled(&paths.database_path)? {
+        return Err("disabled");
+    }
+    let _receive_guard = if automatic {
+        Some(
+            crate::archive_remote::lock_backup_against_first_receive(&paths.database_path)
+                .map_err(|_| "first_receive_in_progress")?,
+        )
+    } else {
+        None
+    };
+    if automatic
+        && crate::archive_remote::first_receive_pending(
+            paths
+                .objects_path
+                .parent()
+                .ok_or("local_state_unavailable")?,
+            &paths.database_path,
+        )
+    {
+        return Err("first_receive_in_progress");
+    }
     let mut active_file = None;
     let result: Result<BackupProgress, &'static str> = async {
         let mut config = object_store::load_config(&paths.data_root)?.ok_or("not_connected")?;
@@ -1449,6 +1484,33 @@ mod tests {
             validate_content_address(wrong_directory.to_str().unwrap(), &expected),
             Err("source_integrity_mismatch")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn long_windows_staging_path_creates_encrypted_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::write(&source, b"fixture content").unwrap();
+        let hash = object_store::digest(b"fixture content");
+        let relative = format!("sha256/{}/{}", &hash[..2], hash);
+        let deep = temp.path().join("x".repeat(165));
+        fs::create_dir(&deep).unwrap();
+        let stage = deep
+            .join("object-store-staging")
+            .join(Uuid::new_v4().to_string());
+        assert!(
+            stage
+                .join(format!("{}.json", "x".repeat(64)))
+                .as_os_str()
+                .len()
+                > 260
+        );
+        let identity = x25519::Identity::generate();
+        let (_, journal, ciphertext) =
+            prepare_journal(&source, &relative, "object", &stage, &identity, true).unwrap();
+        assert!(journal.is_file());
+        assert!(ciphertext.is_file());
     }
 
     #[test]
@@ -2063,7 +2125,13 @@ mod tests {
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         let original = vec![b'Z'; CHUNK_SIZE + 1000];
         fs::write(&source, &original).unwrap();
-        let stage = temp.path().join("stage");
+        let stage = if cfg!(windows) && oauth {
+            let deep = temp.path().join("x".repeat(165));
+            fs::create_dir(&deep).unwrap();
+            deep.join("stage")
+        } else {
+            temp.path().join("stage")
+        };
         assert!(matches!(
             upload_file(
                 &config,

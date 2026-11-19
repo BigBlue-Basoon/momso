@@ -19,21 +19,35 @@ pub(crate) fn read_current(
     if !dir.starts_with(&archive) {
         return Err("unavailable");
     }
+    read_current_in_directory(&dir, id)
+}
+
+fn read_current_in_directory(
+    dir: &Path,
+    id: &str,
+) -> Result<(crate::archive_zet::ZetHead, String), &'static str> {
     let candidate = dir.join(format!("{id}.md"));
-    let meta = std::fs::symlink_metadata(&candidate).map_err(|_| "not_found")?;
+    #[cfg(windows)]
+    let mut file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&candidate)
+            .map_err(|_| "not_found")?
+    };
+    #[cfg(not(windows))]
+    let mut file = std::fs::File::open(&candidate).map_err(|_| "not_found")?;
+    let meta = file.metadata().map_err(|_| "unavailable")?;
     if !meta.is_file()
         || crate::archive_location::is_link_or_reparse(&meta)
         || meta.len() > 1_048_576
     {
         return Err("unavailable");
     }
-    let canonical = candidate.canonicalize().map_err(|_| "unavailable")?;
-    if canonical.parent() != Some(dir.as_path()) {
-        return Err("unavailable");
-    }
-    let mut file = std::fs::File::open(&canonical).map_err(|_| "unavailable")?;
     #[cfg(windows)]
-    if !crate::chat_items::opened_path_matches(&file, &canonical) {
+    if !crate::chat_items::opened_path_matches(&file, &candidate) {
         return Err("unavailable");
     }
     #[cfg(not(windows))]
@@ -80,6 +94,14 @@ pub(crate) fn sync_document_index(root: &Path, database: &Path) -> Result<(), &'
     let entries = std::fs::read_dir(&directory).map_err(|_| "unavailable")?;
     let mut conn = crate::storage::open_writable_connection(database).map_err(|_| "unavailable")?;
     let tx = conn.transaction().map_err(|_| "unavailable")?;
+    let mut matches_statement = tx.prepare("SELECT EXISTS(SELECT 1 FROM archive_zets WHERE id=?1 AND title=?2 AND summary=?3 AND kind=?4 AND status=?5 AND created_at=?6 AND updated_at=?7 AND file_path=?8)").map_err(|_| "unavailable")?;
+    let mut assets_statement = tx
+        .prepare("SELECT asset_id FROM archive_zets_assets WHERE zet_id=?1")
+        .map_err(|_| "unavailable")?;
+    let mut edges_statement = tx
+        .prepare("SELECT edge_type,target_id FROM archive_zets_edges WHERE zet_id=?1")
+        .map_err(|_| "unavailable")?;
+    let mut ids = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|_| "unavailable")?;
         let name = entry.file_name();
@@ -89,66 +111,92 @@ pub(crate) fn sync_document_index(root: &Path, database: &Path) -> Result<(), &'
         if !crate::archive_zet::valid_zet_id(id) {
             continue;
         }
-        let Ok((head, _)) = read_current(root, id) else {
-            continue;
-        };
-        let relative = format!("zettels/{id}.md");
-        let matches: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM archive_zets WHERE id=?1 AND title=?2 AND summary=?3 AND kind=?4 AND status=?5 AND created_at=?6 AND updated_at=?7 AND file_path=?8)",
-            rusqlite::params![head.id,head.title,head.summary,head.kind,head.status,head.created_at,head.updated_at,relative], |row| row.get(0),
-        ).map_err(|_| "unavailable")?;
-        let actual_assets: BTreeSet<String> = {
-            let mut statement = tx
-                .prepare("SELECT asset_id FROM archive_zets_assets WHERE zet_id=?1")
+        ids.push(id.to_owned());
+    }
+    for batch in ids.chunks(4) {
+        let heads = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|id| {
+                    let directory = &directory;
+                    scope.spawn(move || read_current_in_directory(directory, id))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().map_err(|_| "unavailable"))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        for (id, result) in batch.iter().zip(heads) {
+            let Ok((head, _)) = result else {
+                continue;
+            };
+            let relative = format!("zettels/{id}.md");
+            let matches: bool = matches_statement
+                .query_row(
+                    rusqlite::params![
+                        head.id,
+                        head.title,
+                        head.summary,
+                        head.kind,
+                        head.status,
+                        head.created_at,
+                        head.updated_at,
+                        relative
+                    ],
+                    |row| row.get(0),
+                )
                 .map_err(|_| "unavailable")?;
-            let values = statement
-                .query_map([id], |row| row.get(0))
-                .map_err(|_| "unavailable")?
-                .collect::<Result<_, _>>()
-                .map_err(|_| "unavailable")?;
-            values
-        };
-        let actual_edges: BTreeSet<(String, String)> = {
-            let mut statement = tx
-                .prepare("SELECT edge_type,target_id FROM archive_zets_edges WHERE zet_id=?1")
-                .map_err(|_| "unavailable")?;
-            let values = statement
-                .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|_| "unavailable")?
-                .collect::<Result<_, _>>()
-                .map_err(|_| "unavailable")?;
-            values
-        };
-        let expected_assets: BTreeSet<String> = head.assets.iter().cloned().collect();
-        let expected_edges: BTreeSet<(String, String)> = head
-            .edges
-            .iter()
-            .map(|edge| (edge.kind.clone(), edge.target.clone()))
-            .collect();
-        if matches && actual_assets == expected_assets && actual_edges == expected_edges {
-            continue;
-        }
-        tx.execute("INSERT INTO archive_zets(id,title,summary,kind,status,created_at,updated_at,file_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET title=excluded.title,summary=excluded.summary,kind=excluded.kind,status=excluded.status,created_at=excluded.created_at,updated_at=excluded.updated_at,file_path=excluded.file_path",
+            let actual_assets: BTreeSet<String> = {
+                let values = assets_statement
+                    .query_map([id], |row| row.get(0))
+                    .map_err(|_| "unavailable")?
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| "unavailable")?;
+                values
+            };
+            let actual_edges: BTreeSet<(String, String)> = {
+                let values = edges_statement
+                    .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .map_err(|_| "unavailable")?
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| "unavailable")?;
+                values
+            };
+            let expected_assets: BTreeSet<String> = head.assets.iter().cloned().collect();
+            let expected_edges: BTreeSet<(String, String)> = head
+                .edges
+                .iter()
+                .map(|edge| (edge.kind.clone(), edge.target.clone()))
+                .collect();
+            if matches && actual_assets == expected_assets && actual_edges == expected_edges {
+                continue;
+            }
+            tx.execute("INSERT INTO archive_zets(id,title,summary,kind,status,created_at,updated_at,file_path) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET title=excluded.title,summary=excluded.summary,kind=excluded.kind,status=excluded.status,created_at=excluded.created_at,updated_at=excluded.updated_at,file_path=excluded.file_path",
             rusqlite::params![head.id,head.title,head.summary,head.kind,head.status,head.created_at,head.updated_at,relative]).map_err(|_| "unavailable")?;
-        tx.execute("DELETE FROM archive_zets_assets WHERE zet_id=?1", [id])
-            .map_err(|_| "unavailable")?;
-        tx.execute("DELETE FROM archive_zets_edges WHERE zet_id=?1", [id])
-            .map_err(|_| "unavailable")?;
-        for asset in expected_assets {
-            tx.execute(
-                "INSERT INTO archive_zets_assets(zet_id,asset_id) VALUES (?1,?2)",
-                rusqlite::params![id, asset],
-            )
-            .map_err(|_| "unavailable")?;
-        }
-        for (kind, target) in expected_edges {
-            tx.execute(
-                "INSERT INTO archive_zets_edges(zet_id,edge_type,target_id) VALUES (?1,?2,?3)",
-                rusqlite::params![id, kind, target],
-            )
-            .map_err(|_| "unavailable")?;
+            tx.execute("DELETE FROM archive_zets_assets WHERE zet_id=?1", [id])
+                .map_err(|_| "unavailable")?;
+            tx.execute("DELETE FROM archive_zets_edges WHERE zet_id=?1", [id])
+                .map_err(|_| "unavailable")?;
+            for asset in expected_assets {
+                tx.execute(
+                    "INSERT INTO archive_zets_assets(zet_id,asset_id) VALUES (?1,?2)",
+                    rusqlite::params![id, asset],
+                )
+                .map_err(|_| "unavailable")?;
+            }
+            for (kind, target) in expected_edges {
+                tx.execute(
+                    "INSERT INTO archive_zets_edges(zet_id,edge_type,target_id) VALUES (?1,?2,?3)",
+                    rusqlite::params![id, kind, target],
+                )
+                .map_err(|_| "unavailable")?;
+            }
         }
     }
+    drop(matches_statement);
+    drop(assets_statement);
+    drop(edges_statement);
     tx.commit().map_err(|_| "unavailable")
 }
 
@@ -301,6 +349,79 @@ pub(crate) fn dispatch(root: &Path, database: &Path, method: &str, args: &Value)
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    #[test]
+    fn document_handle_rejects_reparse_points_and_oversized_files() {
+        use std::os::windows::fs::symlink_file;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        crate::archive::initialize(&root, temp.path()).unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let id = crate::archive_zet::create(
+            &root,
+            &db,
+            crate::archive_zet::ZetCreate {
+                title: "fixture".into(),
+                summary: "fixture".into(),
+                kind: "note".into(),
+                body: "fixture".into(),
+                assets: vec![],
+                edges: vec![],
+            },
+        )
+        .unwrap();
+        assert!(read_current(&root, &id).is_ok());
+        let path = root.join("zettels").join(format!("{id}.md"));
+        let outside = temp.path().join("outside.md");
+        std::fs::copy(&path, &outside).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        match symlink_file(&outside, &path) {
+            Ok(()) => {
+                assert!(read_current(&root, &id).is_err());
+                std::fs::remove_file(&path).unwrap();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) if error.raw_os_error() == Some(1314) => {}
+            Err(error) => panic!("symlink fixture failed: {error}"),
+        }
+        std::fs::write(&path, vec![b'x'; 1_048_577]).unwrap();
+        assert!(read_current(&root, &id).is_err());
+    }
+    #[test]
+    fn index_sync_detects_external_header_edits_on_repeated_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        crate::archive::initialize(&root, temp.path()).unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let id = crate::archive_zet::create(
+            &root,
+            &db,
+            crate::archive_zet::ZetCreate {
+                title: "original fixture".into(),
+                summary: "summary".into(),
+                kind: "note".into(),
+                body: "body".into(),
+                assets: vec![],
+                edges: vec![],
+            },
+        )
+        .unwrap();
+        let path = root.join("zettels").join(format!("{id}.md"));
+        for title in ["edited fixture", "edited again"] {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let (head, _) = crate::archive_zet::parse(&text).unwrap();
+            std::fs::write(&path, text.replacen(&head.title, title, 1)).unwrap();
+            sync_document_index(&root, &db).unwrap();
+            let stored: String = crate::storage::open_writable_connection(&db)
+                .unwrap()
+                .query_row("SELECT title FROM archive_zets WHERE id=?1", [&id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(stored, title);
+        }
+    }
     #[test]
     fn index_repair_preserves_unreadable_entries_and_respects_first_receive() {
         let temp = tempfile::tempdir().unwrap();

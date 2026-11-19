@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Database, GitBranch, Info, LoaderCircle } from 'lucide-react'
 import {
+  additionalFilesCount,
   errorState,
   listenStoreFailed,
   listenStoreProgress,
@@ -17,6 +18,8 @@ import {
   remoteStatus,
   autoBackupGet,
   autoBackupSet,
+  storeAutoUploadGet,
+  storeAutoUploadSet,
   type AutoBackupStatus,
   storeBackup,
   storeConnect,
@@ -48,8 +51,75 @@ function size(bytes: number | null) {
   return `${(bytes / 1024 ** 3).toFixed(1)}GB`
 }
 const message = (state: string | null) => (state && B.reason[state]) || B.failed
+
+/**
+ * 자동 올리기 한 줄을 GitHub 자동 백업과 원자료 자동 업로드가 함께 쓴다(2026-11-18: 같은 기능의 단추·글이 따로 놀지 않게).
+ * 연결된 동안만 묻고, 곧 올리거나 올리는 중이면 3초마다, 그 밖에는 15초마다(이벤트가 없음). 올리기가 끝나면(running → 다른 상태) onFinished.
+ * 명령이 없는 뒤쪽이면 줄을 그리지 않는다.
+ */
+function useAutoSync(connected: boolean, get: () => Promise<AutoBackupStatus>, set: (enabled: boolean) => Promise<AutoBackupStatus>, onFinished: () => void, onError: (error: unknown) => void) {
+  const [auto, setAuto] = useState<AutoBackupStatus | null>(null)
+  const [working, setWorking] = useState(false)
+  const getRef = useRef(get)
+  getRef.current = get
+  const read = useCallback(() => {
+    getRef.current().then(setAuto).catch((error) => { if (isMissingCommand(error)) setAuto(null) })
+  }, [])
+  const busy = auto?.state === 'running' || auto?.state === 'pending'
+  useEffect(() => {
+    if (!connected) return
+    read()
+    const timer = window.setInterval(read, busy ? 3000 : 15000)
+    return () => window.clearInterval(timer)
+  }, [connected, busy, read])
+  const finishedRef = useRef(onFinished)
+  finishedRef.current = onFinished
+  const lastState = useRef<string | null>(null)
+  useEffect(() => {
+    const state = auto?.state ?? null
+    if (lastState.current === 'running' && state !== 'running') finishedRef.current()
+    lastState.current = state
+  }, [auto?.state])
+  async function toggle() {
+    if (!auto) return
+    setWorking(true)
+    try { setAuto(await set(!auto.enabled)) } catch (error) { onError(error) }
+    setWorking(false)
+  }
+  return { auto, working, toggle, read }
+}
+
+/** 켜고 끄기(스킬 목록과 같은 단추)와 지금 형편 한 줄, 다시 시도를 기다리면 그 까닭 한 줄. 조용한 때(idle)·연결 안 됨은 형편 줄이 없다. */
+function AutoSyncRow({ label, auto, working, onToggle, reasonText }: { label: string; auto: AutoBackupStatus; working: boolean; onToggle: () => void; reasonText: (reason: string) => string }) {
+  const line = !auto.enabled ? null
+    : auto.state === 'running' ? B.autoRunning
+      : auto.state === 'pending' ? B.autoPending
+        : auto.state === 'retry_pending'
+          ? (auto.retryInSeconds !== null && auto.retryInSeconds >= 60 ? B.autoRetry(Math.ceil(auto.retryInSeconds / 60)) : B.autoRetrySoon)
+          : null
+  const reason = auto.enabled && auto.state === 'retry_pending' && auto.reason ? reasonText(auto.reason) : null
+  return (
+    <div className="backup-row backup-auto">
+      <span className="backup-auto-text">
+        <span>{label}</span>
+        {line && <span className="backup-auto-state" role={auto.state === 'retry_pending' ? 'alert' : 'status'}>{line}</span>}
+        {reason && <span className="backup-auto-state">{reason}</span>}
+      </span>
+      <button
+        className={auto.enabled ? 'skills-switch is-on' : 'skills-switch'}
+        type="button"
+        role="switch"
+        aria-checked={auto.enabled}
+        aria-label={label}
+        disabled={working}
+        onClick={onToggle}
+      />
+    </div>
+  )
+}
 // GitHub 칸의 까닭: 글을 정해 둔 것은 그 글, 정해 두지 않은 값은 그 값을 붙여 보인다("하지 못했습니다"만 남지 않게, 2026-11-18).
-const githubMessage = (state: string | null) => (state && B.reason[state]) || (state ? B.unknownReason(state) : B.failed)
+// 모르는 새 값이 오면 영어 값 대신 일반 문구(2026-11-19).
+const githubMessage = (state: string | null) => (state && B.reason[state]) || (state ? B.unknownReason : B.failed)
 // GitHub 의 까닭 한 줄. 예전에는 이력이 막힌 까닭이 사용자 정보("나에 대해")면 따로 적었지만, 2026-11-16 그가 사용자 정보도 올린다고 정해
 // 뒤쪽은 historyReason 을 늘 비워 준다(archive_remote.rs). 그래서 그 갈래와 글을 지웠다.
 // 풀지 못한 것이 남았으면(diverged) "멈췄다"가 아니라 몇 개가 남았는지. 경로 목록을 계산하지 못했으면(null) 수 없이(2026-11-17).
@@ -113,8 +183,11 @@ function GithubBackup() {
   // 읽는 데 2초쯤 걸린다(2026-11-17 실제 앱). 그동안 "불러오는 중", 명령은 있는데 읽지 못했으면 그 줄과 다시 시도(명령이 없는 옛 뒤쪽은 글 없이 막기만).
   const [statusFailed, setStatusFailed] = useState(false)
   const [statusError, setStatusError] = useState<string | null>(null)
+  // 따로 넣은 파일 수(M17). 상태를 다시 읽을 때 함께 읽는다. 읽지 못하면 줄 없음.
+  const [extraFiles, setExtraFiles] = useState<number | null>(null)
   const refresh = useCallback(() => {
     remoteStatus().then((value) => { setStatus(value); setStatusFailed(false); setStatusError(null) }).catch((error) => { setStatus(null); setStatusFailed(!isMissingCommand(error)); setStatusError(errorState(error)) })
+    additionalFilesCount().then(setExtraFiles).catch(() => setExtraFiles(null))
   }, [])
   useEffect(() => { refresh() }, [refresh])
   // 채팅방 사본 쓰기 실패(chat-archive-changed unavailable): 까닭 줄과 같은 자리·같은 꼴의 한 줄. 까닭을 모르면(앱을 다시 켬) 남은 쓰기 수로.
@@ -146,41 +219,9 @@ function GithubBackup() {
     : status?.reason === 'first_receive_conflict' && Array.isArray(status.conflictPaths) ? status.conflictPaths : []
   // 자동 백업(2026-11-18): 연결된 동안만 켜고 끄기 한 줄과 형편 한 줄. 명령이 없는 뒤쪽이면 줄을 그리지 않는다.
   // 이벤트가 없어 연결된 동안 15초마다 다시 묻는다(2분 묶음·1~30분 다시 시도를 따라가기에 넉넉하다).
-  const [auto, setAuto] = useState<AutoBackupStatus | null>(null)
-  const [autoWorking, setAutoWorking] = useState(false)
-  const readAuto = useCallback(() => {
-    autoBackupGet().then(setAuto).catch((error) => { if (isMissingCommand(error)) setAuto(null) })
-  }, [])
   const isConnected = status?.state === 'connected'
-  // 곧 올리거나 올리는 중이면 3초마다, 그 밖에는 15초마다 묻는다.
-  const autoBusy = auto?.state === 'running' || auto?.state === 'pending'
-  useEffect(() => {
-    if (!isConnected) return
-    readAuto()
-    const timer = window.setInterval(readAuto, autoBusy ? 3000 : 15000)
-    return () => window.clearInterval(timer)
-  }, [isConnected, autoBusy, readAuto])
-  // 자동 업로드가 끝나면(running → 다른 상태) "업로드할 것" 숫자와 마지막으로 올린 때를 곧바로 다시 읽는다(2026-11-18 뒤쪽 93e3974).
-  const lastAutoState = useRef<string | null>(null)
-  useEffect(() => {
-    const state = auto?.state ?? null
-    if (lastAutoState.current === 'running' && state !== 'running') refresh()
-    lastAutoState.current = state
-  }, [auto?.state, refresh])
-  async function toggleAuto() {
-    if (!auto) return
-    setAutoWorking(true)
-    try { setAuto(await autoBackupSet(!auto.enabled)) } catch (error) { setNote(githubMessage(errorState(error))) }
-    setAutoWorking(false)
-  }
-  const autoLine = !auto || !auto.enabled ? null
-    : auto.state === 'running' ? B.autoRunning
-      : auto.state === 'pending' ? B.autoPending
-        : auto.state === 'retry_pending'
-          ? (auto.retryInSeconds !== null && auto.retryInSeconds >= 60 ? B.autoRetry(Math.ceil(auto.retryInSeconds / 60)) : B.autoRetrySoon)
-          : null
-  // 다시 시도를 기다리는 동안 그 까닭(앞서 만든 GitHub 까닭 글과 같은 길) 한 줄을 그 아래에.
-  const autoReason = auto?.enabled && auto.state === 'retry_pending' && auto.reason ? githubMessage(auto.reason) : null
+  // 자동 백업(함께 쓰는 useAutoSync): 올리기가 끝나면 "업로드할 것" 숫자와 마지막으로 올린 때를 곧바로 다시 읽는다(2026-11-18 뒤쪽 93e3974).
+  const { auto, working: autoWorking, toggle: toggleAuto, read: readAuto } = useAutoSync(isConnected, autoBackupGet, autoBackupSet, refresh, (error) => setNote(githubMessage(errorState(error))))
   // 저장소 만들기(archive_remote_create)는 username 이 있을 때만 누를 수 있다. 명령이 없으면 눌리지 않는다(누른 뒤 알게 되면 막는다).
   const [createAvailable, setCreateAvailable] = useState(true)
   const newRepoName = username ? `momso-${username}` : null
@@ -240,28 +281,12 @@ function GithubBackup() {
             {status?.signedInAs && <div><dt>{B.account}</dt><dd>{status.signedInAs}</dd></div>}
             {when(status?.lastPushedAt ?? null) && <div><dt>{B.lastPushed}</dt><dd>{when(status?.lastPushedAt ?? null)}</dd></div>}
           </dl>
-          {/* 자동 백업: 켜고 끄기(스킬 목록과 같은 단추)와 지금 형편 한 줄. 조용한 때(idle)는 형편 줄이 없다. */}
-          {auto && (
-            <div className="backup-row backup-auto">
-              <span className="backup-auto-text">
-                <span>{B.autoBackup}</span>
-                {autoLine && <span className="backup-auto-state" role={auto.state === 'retry_pending' ? 'alert' : 'status'}>{autoLine}</span>}
-                {autoReason && <span className="backup-auto-state">{autoReason}</span>}
-              </span>
-              <button
-                className={auto.enabled ? 'skills-switch is-on' : 'skills-switch'}
-                type="button"
-                role="switch"
-                aria-checked={auto.enabled}
-                aria-label={B.autoBackup}
-                disabled={autoWorking}
-                onClick={() => void toggleAuto()}
-              />
-            </div>
-          )}
+          {/* 자동 백업: 켜고 끄기와 지금 형편 한 줄(원자료 자동 업로드와 같은 AutoSyncRow). */}
+          {auto && <AutoSyncRow label={B.autoBackup} auto={auto} working={autoWorking} onToggle={() => void toggleAuto()} reasonText={(reason) => githubMessage(reason)} />}
           <div className="backup-actions">
             {(status?.ahead ?? 0) > 0 && <span className="backup-count">{B.ahead(status?.ahead)}</span>}
             {(status?.behind ?? 0) > 0 && <span className="backup-count">{B.behind(status?.behind)}</span>}
+            {(extraFiles ?? 0) > 0 && <span className="backup-count">{B.additionalFiles(extraFiles)}</span>}
             <button className="secondary-button" type="button" disabled={working} onClick={() => void run(remotePull)}>{B.pull}</button>
             <button className="secondary-button" type="button" disabled={working} onClick={() => void run(remotePush)}>{B.push}</button>
             <button className="secondary-button subtle" type="button" disabled={working} onClick={() => setAsking('disconnect')}>{B.disconnect}</button>
@@ -317,6 +342,10 @@ function GithubBackup() {
           {/* 상태가 unavailable 이면(로그인 안 됨·연결 도구 없음 등) 그 까닭 줄에 다시 시도(고친 뒤 다시 읽는다). */}
           {!note && status?.state === 'unavailable' && (
             <button className="secondary-button backup-inline-retry" type="button" disabled={working} onClick={() => { setStatus(undefined); refresh() }}>{W.firstRun.retry}</button>
+          )}
+          {/* 백업에서 빼는 파일 때문에 멈췄으면(ignored_history) 다시 업로드해 본다(몸소가 기록을 정리했으면 올라간다, D41). */}
+          {status?.reason === 'ignored_history' && status.state !== 'unavailable' && (
+            <button className="secondary-button backup-inline-retry" type="button" disabled={working} onClick={() => void run(remotePush)}>{W.firstRun.retry}</button>
           )}
         </p>
       )}
@@ -483,6 +512,8 @@ function StoreBackup() {
   }, [refresh])
   const supported = Boolean(status)
   const connected = status?.state === 'connected'
+  // 원자료 자동 업로드(넷째 줄 D38): GitHub 자동 백업과 같은 줄. 올리기가 끝나면 남은 수·마지막 백업 때를 다시 읽는다.
+  const storeAuto = useAutoSync(connected, storeAutoUploadGet, storeAutoUploadSet, refresh, (error) => setNote(message(errorState(error))))
   const needsRegion = provider === 'aws' || provider === 'ncp'
   const needsEndpoint = provider === 'cloudflare' || provider === 'ncp'
   // 버킷 이름을 비워 두면 뒤쪽이 저장된 username 으로 momso-<username> 버킷을 만들어 연결한다(GCP 는 더 필요한 값이 있어 이름을 받는다).
@@ -527,6 +558,7 @@ function StoreBackup() {
             <div><dt>{B.bucket}</dt><dd>{status?.bucket}</dd></div>
             {when(status?.lastBackupAt ?? null) && <div><dt>{B.lastBackup}</dt><dd>{when(status?.lastBackupAt ?? null)}</dd></div>}
           </dl>
+          {storeAuto.auto && <AutoSyncRow label={B.autoUpload} auto={storeAuto.auto} working={storeAuto.working} onToggle={() => void storeAuto.toggle()} reasonText={(reason) => B.storeAutoReason[reason] ?? B.reason[reason] ?? B.storeAutoUnknown} />}
           {(status?.pendingCount ?? 0) > 0 && <p className="backup-count">{B.pending(status?.pendingCount, size(status?.pendingBytes ?? null))}</p>}
           {working && progress && progress.totalBytes > 0 && (
             <div className="app-update-progress" role="status"><span style={{ width: `${Math.max(4, (progress.completedBytes / progress.totalBytes) * 100)}%` }} /></div>
@@ -584,10 +616,11 @@ function StoreBackup() {
             <label className="backup-field">
               <span>{B.bucket}</span>
               <input value={fields.bucket} disabled={!supported} spellCheck={false} onChange={(event) => setFields({ ...fields, bucket: event.target.value })} />
+              <small className="backup-field-hint">{B.bucketHelp}</small>
               {autoBucket && !fields.bucket.trim() && <small className="backup-field-hint">{B.autoBucket(autoBucket)}</small>}
             </label>
-            <label className="backup-field"><span>{B.accessKey}</span><input type="password" autoComplete="off" value={keyId} disabled={!supported} onChange={(event) => setKeyId(event.target.value)} /></label>
-            <label className="backup-field"><span>{B.secretKey}</span><input type="password" autoComplete="off" value={secret} disabled={!supported} onChange={(event) => setSecret(event.target.value)} /></label>
+            <label className="backup-field"><span>{B.accessKey}</span><input type="password" autoComplete="off" value={keyId} disabled={!supported} onChange={(event) => setKeyId(event.target.value)} /><small className="backup-field-hint">{W.secretRequest.help.accessKeyId}</small></label>
+            <label className="backup-field"><span>{B.secretKey}</span><input type="password" autoComplete="off" value={secret} disabled={!supported} onChange={(event) => setSecret(event.target.value)} /><small className="backup-field-hint">{W.secretRequest.help.secretAccessKey}</small></label>
           </div>
           <div className="backup-actions">
             <button className="secondary-button" type="submit" disabled={!ready || working}>{B.connect}</button>

@@ -237,6 +237,25 @@ fn synthetic_year_capacity() {
         .unwrap();
     }
     crate::archive::reindex(&archive_root, &db_path).unwrap();
+    if std::env::var_os("MOMSO_SCALE_DOCUMENT_LIST_ONLY").is_some() {
+        let start = Instant::now();
+        crate::momso_document_read::sync_document_index(&archive_root, &db_path).unwrap();
+        let sync_ms = start.elapsed().as_millis();
+        let start = Instant::now();
+        let mut entries = crate::archive_zet::list(&db_path, None, None).unwrap();
+        let query_ms = start.elapsed().as_millis();
+        let start = Instant::now();
+        crate::archive_zet::add_folders(&archive_root, &mut entries).unwrap();
+        println!(
+            "BENCH document_list count={} sync_ms={} query_ms={} folders_ms={}",
+            entries.len(),
+            sync_ms,
+            query_ms,
+            start.elapsed().as_millis()
+        );
+        assert_eq!(entries.len(), usize::try_from(document_count).unwrap());
+        return;
+    }
     if std::env::var_os("MOMSO_SCALE_CHECK_ONLY").is_some() {
         let start = Instant::now();
         let issues = crate::archive::check(&archive_root, root).unwrap();

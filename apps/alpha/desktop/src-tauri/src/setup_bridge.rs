@@ -438,6 +438,10 @@ mod tests {
                     "object-store-connect" => {
                         ("momso_object_store_r2_connect", serde_json::json!({}))
                     }
+                    "marketing-preparation" => (
+                        "momso_document_create",
+                        serde_json::json!({"title":"Test","summary":"Test","body":"Test"}),
+                    ),
                     _ => ("browser_open", serde_json::json!({})),
                 };
                 assert!(
@@ -502,6 +506,7 @@ mod tests {
                                 | "object_store_r2_connect"
                                 | "import_conversations"
                                 | "browser_open"
+                                | "momso_document_create"
                         )
                     ) {
                         return serde_json::json!({"status":"denied"});
@@ -564,7 +569,8 @@ mod tests {
                 .unwrap();
             assert!(
                 output.status.success(),
-                "fake provider {provider} failed: {}",
+                "fake provider {provider} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
             drop(guard);

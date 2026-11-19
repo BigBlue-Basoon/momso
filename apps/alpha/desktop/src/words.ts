@@ -7,12 +7,24 @@
 // - 한 곳만 고치면 그 글이 쓰이는 화면 전체가 바뀐다. 화면에 보이는 글을 코드에 새로 박지 않는다.
 // - 김성균 개발자가 보는 목록: momso-public-prep/ui-words-ko.md (이 파일에서 뽑았다).
 
-/** 앞 낱말의 끝에 받침이 있으면 첫째, 없으면 둘째 조사(을/를). 값이 바뀌어도 문장이 맞게. */
+/**
+ * 앞 낱말의 끝에 받침이 있으면 첫째, 없으면 둘째 조사(을/를). 값이 바뀌어도 문장이 맞게.
+ * 끝이 숫자면 한국어로 읽은 소리로 본다(영·일·삼·육·칠·팔은 받침). '으로/로'는 ㄹ 받침이면 '로'(2026-11-18: "메모 56를", "홍보 글으로"를 고침).
+ */
+const DIGIT_FINAL = [21, 8, 0, 16, 0, 0, 1, 8, 8, 0] // 영(ㅇ) 일(ㄹ) 이 삼(ㅁ) 사 오 육(ㄱ) 칠(ㄹ) 팔(ㄹ) 구
 function josa(word: unknown, withFinal: string, without: string) {
-  const text = String(word)
-  const last = text.charCodeAt(text.length - 1)
-  if (last < 0xac00 || last > 0xd7a3) return without
-  return (last - 0xac00) % 28 ? withFinal : without
+  const text = String(word).trim()
+  const last = text.charAt(text.length - 1)
+  let final = 0
+  if (last >= '0' && last <= '9') final = DIGIT_FINAL[Number(last)]
+  else {
+    const code = last.charCodeAt(0)
+    if (code < 0xac00 || code > 0xd7a3) return without
+    final = (code - 0xac00) % 28
+  }
+  if (!final) return without
+  if (withFinal === '으로' && final === 8) return without
+  return withFinal
 }
 
 const ko = {
@@ -104,10 +116,15 @@ const ko = {
     lastPushed: '마지막으로 올린 때',
     ahead: (a: unknown) => `업로드할 것 ${a}`,
     behind: (a: unknown) => `다운로드할 것 ${a}`,
+    /** 탐색기에서 몸소 폴더에 따로 넣은 일반 파일 수(2026-11-19 첫째 줄 M17 archive_additional_files_count). GitHub 업로드할 것 곁에. 새로 씀, 그의 확인 전. */
+    additionalFiles: (a: unknown) => `따로 넣은 파일 ${a}개`,
     githubDisconnectTitle: 'GitHub 연결을 해제할까요?',
     githubDisconnectText: 'GitHub의 저장소와 문서는 지워지지 않습니다.',
     storeTitle: '오브젝트 스토리지',
-    storeWhat: '원자료',
+    /** 제목 "오브젝트 스토리지" 아래 한 줄(2026-11-19 G81 8: 낱말은 그 회사 화면에서 찾는 말이라 두고 처음 나오는 자리에 풀이). 새로 씀, 그의 확인 전. */
+    storeWhat: '원자료를 보관하는 인터넷 저장 공간입니다',
+    /** 버킷 칸 아래 풀이(G81 8). 새로 씀, 그의 확인 전. */
+    bucketHelp: '오브젝트 스토리지 안에서 원자료를 담는 곳의 이름입니다',
     provider: '회사',
     region: '지역',
     bucket: '버킷',
@@ -127,12 +144,24 @@ const ko = {
     failed: '하지 못했습니다',
     /** GitHub 자동 백업(2026-11-18). 새로 씀, 그의 확인 전. */
     autoBackup: '자동 백업',
+    /** 원자료 자동 업로드(2026-11-18 넷째 줄 D38). 형편 줄은 GitHub 자동 백업과 같은 글을 쓴다. 새로 씀, 그의 확인 전. */
+    autoUpload: '자동 업로드',
+    storeAutoReason: {
+      interrupted: '업로드가 중간에 멈췄습니다',
+      local_read_failed: '이 컴퓨터의 원자료를 읽지 못했습니다',
+      local_state_unavailable: '업로드 기록을 읽지 못했습니다',
+      remote_unavailable: '저장소에 연결하지 못했습니다. 저장소 연결과 키를 확인해 주세요',
+      first_receive_in_progress: 'GitHub에서 처음 받아 오는 중이라 끝난 뒤에 업로드합니다',
+    } as Record<string, string>,
+    /** 원자료 자동 업로드에 글을 정하지 않은 까닭이 오면(2026-11-19: 영어 값이나 "하지 못했습니다"만 보이지 않게). 새로 씀, 그의 확인 전. */
+    storeAutoUnknown: '원자료를 업로드하는 중 문제가 생겼습니다',
     autoPending: '바뀐 내용을 곧 업로드합니다',
     autoRunning: '자동으로 업로드하는 중',
     autoRetry: (a: unknown) => `업로드하지 못해 ${a}분 뒤에 다시 시도합니다`,
     autoRetrySoon: '업로드하지 못해 곧 다시 시도합니다',
     /** GitHub 칸: 글을 정해 두지 않은 까닭이 오면 그 값을 그대로 붙인다(무엇이 안 됐는지 알 수 있게). 2026-11-18 새로 씀, 그의 확인 전. */
-    unknownReason: (a: unknown) => `GitHub 상태를 확인하지 못했습니다(${a})`,
+    /** 글을 정하지 않은 까닭이 오면(2026-11-19 본부: 영어 값을 보이지 않는다). 새로 씀, 그의 확인 전. */
+    unknownReason: 'GitHub 연결에 문제가 있습니다. 다시 시도해 주세요',
     /** 뒤쪽 상태 값 → 쉬운 말(실패 알림). */
     /** 원자료 저장소 회사 이름: 영어 그대로(2026-11-16 김성균 개발자가 정함, "저거는 그냥 AWS GCP 이렇게 적고"). */
     storeName: { aws: 'AWS', gcp: 'GCP', cloudflare: 'Cloudflare', ncp: 'NCP' } as Record<'aws' | 'gcp' | 'cloudflare' | 'ncp', string>,
@@ -165,6 +194,22 @@ const ko = {
       git_unavailable: 'Git을 실행하지 못했습니다. 다시 시도해 주세요',
       unsafe_git_configuration: '이 PC의 Git 설정이 GitHub 주소를 바꾸고 있어 멈췄습니다. Git 설정을 확인해 주세요',
       unsafe_history: '기록에 확인할 수 없는 부분이 있어 멈췄습니다',
+      /** 2026-11-18 넷째 줄 D39: 아직 올리지 않은 저장 기록에 백업에서 빼는 파일이 있어 멈춤. 본부 결정: 선생님께 파일을 고치게 하지 않는다
+          (몸소가 스스로 정리하도록 넷째 줄 D41). 화면은 [다시 시도]를 함께 둔다. 새로 씀, 그의 확인 전. */
+      ignored_history: '백업에서 빼기로 한 파일 때문에 업로드를 멈췄습니다',
+      /** 몸소가 그 파일을 기록에서 정리하는 중(D41 의 상태 값이 오면 잇는다). */
+      ignored_history_cleaning: '백업에서 빼기로 한 파일을 기록에서 정리하고 다시 업로드합니다',
+      // 2026-11-19 본부(여섯째 줄이 실제 앱에서 찾음): GitHub 줄에 영어 값(not_connected 등)이 그대로 보였다. 뒤쪽 archive_remote.rs 가 주는데
+      // 글이 없던 값과 넷째 줄 desktop-document-folders.md 의 새 멈춤 까닭. 새로 씀, 그의 확인 전.
+      not_connected: 'GitHub가 아직 연결되지 않았습니다',
+      auto_backup_disabled: '자동 백업이 꺼져 있습니다',
+      redaction_pending: '채팅방 사본에서 키를 가리는 중이라 업로드를 미뤘습니다',
+      unsaved_skill_changes: '바뀐 스킬을 저장하지 못해 업로드를 멈췄습니다',
+      local_save_failed: '이 PC에서 문서를 저장하지 못해 업로드를 멈췄습니다',
+      first_receive_conflict: 'GitHub에서 처음 받아 온 내용과 이 PC의 내용이 달라 확인이 필요합니다',
+      ignored_history_published: '백업에서 빼기로 한 파일이 이미 GitHub에 올라가 있어 업로드를 멈췄습니다',
+      ignored_history_unverified: 'GitHub에 이미 올라간 기록인지 확인하지 못해 업로드를 멈췄습니다. 다시 시도해 주세요',
+      ignored_history_locked: '다른 Git 작업이 끝나지 않아 업로드를 멈췄습니다. 잠시 뒤 다시 시도해 주세요',
       redaction_required: '기록에 가려야 할 값이 있어 업로드하지 않았습니다',
       first_receive_in_progress: 'GitHub에서 처음 받아 오는 중입니다. 끝난 뒤에 다시 해 주세요',
       merge_report_unavailable: '합친 결과를 확인하지 못했습니다. 다시 시도해 주세요',
@@ -499,6 +544,9 @@ const ko = {
     agentCode: '인증 코드는 직접 입력해 주세요. 끝나면 AI에게 돌려주세요',
     agentCheck: '확인 절차는 직접 해 주세요. 끝나면 AI에게 돌려주세요',
     agentLoginOutside: '구글 로그인은 몸소 브라우저 창에서 해 주세요. 끝나면 AI에게 돌려주세요',
+    /** 바깥 로그인 뒤 이어 하기(2026-11-18 여섯째 줄 G75): 몸소 브라우저 창이 열림 / AI 가 그 창에서 이어 함. 새로 씀, 그의 확인 전. */
+    agentExternalOpened: '몸소 브라우저 창에서 로그인한 뒤 AI에게 돌려주세요',
+    agentExternalWorking: 'AI가 몸소 브라우저 창에서 이어서 하고 있습니다',
     agentOpenOutside: '열기',
     agentLoginNotYet: '아직 로그인이 끝나지 않았습니다',
     /** [AI에게 돌려주기] 뒤 이어 하기가 안 될 때(2026-11-18 여섯째 줄 G68 panel_agent_resume 오류). 새로 씀, 그의 확인 전. */
@@ -506,7 +554,7 @@ const ko = {
       in_progress: '이미 AI에게 이어서 하라고 보냈습니다',
       login_wait_ended: '로그인 기다림이 끝났습니다. AI에게 다시 부탁해 주세요.',
       resume_unavailable: 'AI가 이어서 하지 못했습니다. AI에게 다시 부탁해 주세요.',
-      external_login_unavailable: '구글 로그인은 몸소 브라우저 창에서 마친 뒤 AI에게 다시 부탁해 주세요.',
+      external_login_unavailable: '먼저 [열기]로 몸소 브라우저 창을 열어 로그인해 주세요.',
     } as Record<string, string>,
   },
   // ---- 작업 내역 지우기(2026-11-17 본부 결정, 오른쪽 패널 작업 내역 탭 머리의 ⋯ 메뉴). 새로 씀, 그의 확인 전. ----
@@ -685,6 +733,9 @@ const ko = {
     outsideSandbox: (a: unknown) => `${a}${josa(a, '이', '가')} 보호 장치 밖에서 명령을 다시 실행하려고 합니다`,
     outsideSandboxWarn: '보호 장치 밖에서는 몸소 폴더 밖의 파일도 바꿀 수 있습니다. 명령을 확인한 뒤에만 허락해 주세요.',
     showCommand: '명령 보기',
+    /** 2026-11-19 G81: 알 수 없는 도구의 원문, 원자료 파일의 정확한 경로를 펼쳐 보는 단추 / 원자료(objects/…) 파일의 이름 대신. 새로 씀, 그의 확인 전. */
+    showDetail: '자세히 보기',
+    sourceFile: '원자료 파일',
     /**
      * 2026-11-16 새로 쓴 글(그가 아직 정하지 않음): 파일을 어떻게 바꾸려는지(change)에 따른 머리 글.
      * edit 는 위 text2/text3 을 그대로 쓴다. 종류를 모르면(null) "바꾸려고"로 짐작하지 않고 적는다.

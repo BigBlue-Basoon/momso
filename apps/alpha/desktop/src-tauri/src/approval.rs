@@ -128,7 +128,14 @@ pub(crate) fn browser_scope_request(
 ) -> ApprovalRequest {
     let mut request = browser_request(chat_id, provider, site, skill, "scope", action);
     request.kind = "browser_action_scope".into();
-    request.description = format!("{skill} · {action} · {description}");
+    let label = crate::skills::BUNDLED_SKILLS
+        .iter()
+        .find(|(name, _)| *name == skill)
+        .and_then(|(_, source)| crate::skills::parse(skill, source).ok())
+        .map(|(head, _)| head.title)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| skill.to_owned());
+    request.description = format!("{label} · {action} · {description}");
     request
 }
 
@@ -408,6 +415,29 @@ impl ApprovalBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_scope_displays_bundled_skill_title() {
+        for (name, title) in [
+            ("naver-smartplace", "네이버 스마트플레이스 운영"),
+            ("soomgo-operations", "숨고 서비스 운영"),
+            ("sssd-host-operations", "솜씨당 수업 운영"),
+            ("frip-host-operations", "프립 수업 운영"),
+            ("onstudio-operations", "온스튜디오 운영"),
+            ("studiomate-operations", "스튜디오메이트 운영"),
+        ] {
+            let request = browser_scope_request(
+                "chat",
+                "codex",
+                "https://example.test",
+                name,
+                "사이트 범위",
+                "패널에서 사이트를 엽니다",
+            );
+            assert!(request.description.starts_with(title));
+            assert!(!request.description.contains(name));
+        }
+    }
 
     #[tokio::test]
     async fn closed_event_distinguishes_timeout_answer_and_cancellation() {

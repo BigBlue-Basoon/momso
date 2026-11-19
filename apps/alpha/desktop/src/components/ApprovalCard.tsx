@@ -46,6 +46,21 @@ function fileName(path: string) {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path
 }
 
+/** 원자료(objects/sha256/…) 파일인지. 해시 조각은 사람이 읽을 이름이 아니다(2026-11-19 G81 5). */
+function isSourcePath(path: string) {
+  return /(^|[\\/])objects[\\/]sha256[\\/]/i.test(path)
+}
+
+/** 대상 하나의 보이는 이름: 원자료면 "원자료 파일"(물음에 원자료 이름이 오지 않아 짐작하지 않는다), 그 밖은 파일 이름. */
+function targetName(path: string) {
+  return isSourcePath(path) ? W.approvalCard.sourceFile : fileName(path)
+}
+
+/** 몸소 문서 쪽 대상(zettels/ 또는 zettels/<id>.md). 뒤쪽 문서 만들기 물음은 description 에 문서 제목을 준다(approval.rs document_request). */
+function isDocumentTarget(path: string) {
+  return /^zettels[\\/]([^\\/]+\.md)?$/.test(path)
+}
+
 /**
  * 물음의 글에서 파일 경로와 명령을 읽는다. 코덱스는 경로·명령 글 그대로, 클로드는 "도구: {입력 JSON}"(chat_claude.rs)으로 온다.
  * JSON 이면 그 안의 file_path·path·notebook_path, command 칸을 읽고, 아니면 받은 글 그대로.
@@ -247,10 +262,14 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
   const place: 'file' | 'folder' | 'none' = request.kind !== 'file_change' || targets.length > 0 || read.path
     ? 'file'
     : !request.description.trim() ? 'none' : request.provider === 'codex' ? 'folder' : 'file'
-  const title = useZetTitle(request, targets.length > 1 ? null : path, change)
+  const zetTitle = useZetTitle(request, targets.length > 1 ? null : path, change)
+  // 문서 만들기(G81 4): 경로 끝(zettels) 대신 이미 받은 문서 제목. 물음에 폴더 값은 오지 않는다.
+  const docTitle = request.kind === 'file_change' && targets.length <= 1 && isDocumentTarget(path) && !read.path && request.description.trim() && request.description !== path
+    ? request.description.trim() : null
+  const title = zetTitle ?? docTitle
   const command = read.command ?? request.description
   const subject = request.kind === 'file_change'
-    ? (targets.length > 1 ? targets.map((target) => fileName(target.path)).join(', ') : title ?? fileName(path))
+    ? (targets.length > 1 ? targets.map((target) => targetName(target.path)).join(', ') : title ?? targetName(path))
     : request.kind === 'command' ? command : request.description
 
   if (request.kind === 'setup_change' && request.setup) return <SetupApprovalCard item={item} setup={request.setup} onAnswer={onAnswer} />
@@ -290,22 +309,43 @@ export function ApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
           </details>
         </>
       ) : request.kind === 'command' ? (
-        <pre className="approval-command">{command}</pre>
+        // 명령(G81 7): 머리 글이 쉬운 한 줄. 실제 명령과 AI 가 보낸 까닭은 펼치면 받은 그대로(허락 전에 꼭 볼 수 있게).
+        <details className="approval-more">
+          <summary>{W.approvalCard.showCommand}</summary>
+          <pre className="approval-command">{command}</pre>
+          {request.reason && <p className="approval-reason">{request.reason}</p>}
+        </details>
       ) : targets.length > 1 ? (
         <ul className="approval-targets">
           {targets.map((target, index) => (
             <li key={`${target.path}-${index}`} title={target.path}>
-              <span className="approval-target-name">{fileName(target.path)}</span>
+              <span className="approval-target-name">{targetName(target.path)}</span>
               {target.change && <span className="approval-target-change">{W.approvalCard.targetChange[target.change]}</span>}
             </li>
           ))}
         </ul>
       ) : request.kind === 'file_change' ? (
-        subject && <p className="approval-subject" title={path}>{subject}</p>
+        <>
+          {subject && <p className="approval-subject" title={isSourcePath(path) ? undefined : path}>{subject}</p>}
+          {/* 원자료 파일은 정확한 경로를 펼쳐 보기에(G81 5). */}
+          {isSourcePath(path) && (
+            <details className="approval-more">
+              <summary>{W.approvalCard.showDetail}</summary>
+              <pre className="approval-command">{path}</pre>
+            </details>
+          )}
+        </>
       ) : (
-        request.description.trim() && <p className="approval-subject is-plain">{request.description}</p>
+        // 알 수 없는 도구(G81 6): 머리 글이 쉬운 한 줄. 받은 설명과 까닭은 펼치면 그대로.
+        (request.description.trim() || request.reason) && (
+          <details className="approval-more">
+            <summary>{W.approvalCard.showDetail}</summary>
+            {request.description.trim() && <pre className="approval-command">{request.description}</pre>}
+            {request.reason && <p className="approval-reason">{request.reason}</p>}
+          </details>
+        )
       )}
-      {request.reason && !outside && <p className="approval-reason">{request.reason}</p>}
+      {request.reason && !outside && request.kind === 'file_change' && <p className="approval-reason">{request.reason}</p>}
       {item.error && <p className="approval-error" role="alert">{item.error}</p>}
       <div className="approval-actions">
         {choices.map((choice) => (

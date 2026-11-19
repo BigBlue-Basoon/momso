@@ -194,6 +194,21 @@
     }
   }
 
+  // ?manydocs=1000 이면 문서를 그만큼 더 만든다(문서 화면 성능 확인, 2026-11-18). 다섯 폴더에 나눠 담고 일부는 맨 위.
+  const manyDocs = Number(new URLSearchParams(location.search).get('manydocs') || 0)
+  if (manyDocs > 0 && !window.__manyDocsMade) {
+    window.__manyDocsMade = true
+    // 기본은 모두 맨 위(가장 무거운 꼴). ?manyfolders=1 이면 다섯 자리에 나눠 담는다.
+    const folders = new URLSearchParams(location.search).get('manyfolders') ? ['', '수업 기록/2026-11', '수업 기록/2026-10', '홍보 글', '회원 메모'] : ['']
+    window.__zetFolderOf = window.__zetFolderOf || {}
+    for (let i = 0; i < manyDocs; i += 1) {
+      const id = `zet_many_${String(i).padStart(4, '0')}`
+      const day = String(1 + (i % 28)).padStart(2, '0')
+      zets[id] = { head: { id, title: `수업 메모 ${i + 1}`, summary: `${i + 1}번째 메모의 요약입니다. 호흡과 자세를 적었다.`, kind: i % 3 === 0 ? 'summary' : 'note', status: i % 2 ? 'draft' : 'confirmed', created_at: `2026-10-${day}T09:00:00Z`, updated_at: `2026-11-${day}T09:${String(i % 60).padStart(2, '0')}:00Z`, assets: [], edges: [] }, body: `${i + 1}번째 메모.` }
+      window.__zetFolderOf[id] = folders[i % folders.length]
+    }
+  }
+
   function listEntries() {
     return Object.values(zets)
       .map(({ head }) => ({
@@ -272,6 +287,9 @@
       say('assistant', '태양 경배 B 의 팔 올리기를 어깨 높이까지만 하는 판으로 바꾸고, 전사 자세 2 에서 팔을 옆으로 뻗는 동안 숨을 길게 내쉬게 하세요. 마지막 휴식 전에 어깨 돌리기를 한 번 넣으면 좋습니다.', { provider: 'gemini', model: 'test-gemini-pro' }),
     ]
     chats[id] = { id, title: '세 회사의 답이 섞인 대화', createdAt, updatedAt: messages[messages.length - 1].createdAt, messages }
+  } else if (chatMode === 'long') {
+    // ?chats=long&longcount=2000: 긴 채팅방 하나(성능 확인, 2026-11-18). 말 수는 longcount(기본 2000).
+    seedChat('긴 채팅방', Math.round(Number(new URLSearchParams(location.search).get('longcount') || 2000) / 2))
   } else if (chatMode === 'many') {
     for (let i = 1; i <= 40; i += 1) seedChat(`${i}번째 대화, 이름이 길면 줄 끝이 말줄임표로 줄어드는지 보려고 길게 쓴 이름`, i === 40 ? 60 : 1)
   }
@@ -710,7 +728,17 @@
         panelBox(); return null
       case 'panel_agent_status': return { ownerChatId: s.agentOwner || null, humanControls: Boolean(s.agentHuman) }
       case 'panel_agent_take_over': s.agentHuman = true; emit('panel-agent-control-changed', { chatId: args.chatId, state: 'human' }); return null
+      // 바깥 로그인(가짜, G75): 몸소 전용 창을 연 것으로 치고 opened 를 보낸다. 그 뒤 돌려주기는 external-continued started.
+      case 'panel_agent_external_login_open':
+        s.externalOpened = true
+        emit('panel-agent-external-login-opened', { chatId: args.chatId, state: 'login', message: '' })
+        return { state: 'login' }
       case 'panel_agent_resume':
+        if (s.externalOpened) {
+          s.externalOpened = false; s.agentLogin = false
+          emit('panel-agent-external-continued', { chatId: args.chatId, state: 'started', message: '' })
+          return { state: 'started', userMessageId: 'ext-1' }
+        }
         if (s.agentLogin) {
           if (query.get('agentlogin') === 'notyet') throw 'human_required'
           s.agentLogin = false
@@ -1100,11 +1128,25 @@
   window.__backupCalls = []
   function backupCommand(command, args) {
     window.__backupCalls.push([command, command === 'object_store_connect' ? { ...args, accessKeyId: '(가림)', secretAccessKey: '(가림)' } : args])
-    // 자동 백업(가짜): ?autobackup=retry 면 연속 실패 2번 · 4분 뒤, pending·running 도. window.__auto 로 바꿀 수 있다.
+    // 자동 백업(가짜): ?autobackup=retry 면 연속 실패 2번 · 4분 뒤, pending·running 도. window.__auto 로 바꿀 수 있다. ?autoreason=<값> 이면 retry 의 까닭(두 자동 줄 함께).
+      // 원자료 자동 업로드(가짜, 2026-11-18 D38): ?storeauto=retry|pending|running|off. window.__storeAuto 로 바꿀 수 있다.
+      // 따로 넣은 파일 수(M17): ?extrafiles=N(기본 0), =fail 이면 unavailable.
+      if (command === 'archive_additional_files_count') {
+        if (query.get('extrafiles') === 'fail') throw 'unavailable'
+        return { count: Number(query.get('extrafiles') || 0) }
+      }
+      if (command === 'object_store_auto_upload_get' || command === 'object_store_auto_upload_set') {
+        if (!window.__storeAuto) {
+          const mode = query.get('storeauto') || 'idle'
+          window.__storeAuto = { enabled: mode !== 'off', state: mode === 'off' ? 'disabled' : mode === 'retry' ? 'retry_pending' : mode, consecutiveFailures: mode === 'retry' ? 3 : 0, reason: mode === 'retry' ? (query.get('autoreason') || 'remote_unavailable') : null, retryInSeconds: mode === 'retry' ? 480 : null }
+        }
+        if (command === 'object_store_auto_upload_set') Object.assign(window.__storeAuto, { enabled: args.enabled, state: args.enabled ? 'pending' : 'disabled' })
+        return { ...window.__storeAuto }
+      }
       if (command === 'archive_auto_backup_get' || command === 'archive_auto_backup_set') {
         if (!window.__auto) {
           const mode = query.get('autobackup') || 'idle'
-          window.__auto = { enabled: mode !== 'off', state: mode === 'off' ? 'disabled' : mode === 'retry' ? 'retry_pending' : mode, consecutiveFailures: mode === 'retry' ? 2 : 0, reason: mode === 'retry' ? 'connection_failed' : null, retryInSeconds: mode === 'retry' ? 240 : null }
+          window.__auto = { enabled: mode !== 'off', state: mode === 'off' ? 'disabled' : mode === 'retry' ? 'retry_pending' : mode, consecutiveFailures: mode === 'retry' ? 2 : 0, reason: mode === 'retry' ? (query.get('autoreason') || 'connection_failed') : null, retryInSeconds: mode === 'retry' ? 240 : null }
         }
         if (command === 'archive_auto_backup_set') Object.assign(window.__auto, { enabled: args.enabled, state: args.enabled ? 'pending' : 'disabled' })
         return { ...window.__auto }
@@ -1272,6 +1314,8 @@
         const mode = query.get('update') || 'latest'
         if (mode === 'none') throw 'Command update_check not found'
         if (mode === 'failed') return { state: 'failed', currentVersion: '0.1.0', latestVersion: null, notes: null, publishedAt: null }
+        // ?update=norelease: 공개된 릴리스가 없음(D40, 오류 아님).
+        if (mode === 'norelease') return { state: 'no_release', currentVersion: '0.1.0', latestVersion: null, notes: null, publishedAt: null }
         if (mode === 'available') return { state: 'available', currentVersion: '0.1.0', latestVersion: '0.2.0', notes: ['보기 설명: 채팅방 목록을 읽기 쉽게 고쳤습니다.', '보기 설명: 검색 창을 더했습니다.'].join(String.fromCharCode(10)), publishedAt: '2026-11-16T09:00:00+09:00' }
         return { state: 'up_to_date', currentVersion: '0.1.0', latestVersion: '0.1.0', notes: null, publishedAt: null }
       }
@@ -1347,6 +1391,8 @@
         return { state: query.get('voiceopen') || 'requested' }
       case 'archive_auto_backup_get': case 'archive_auto_backup_set':
       case 'archive_remote_status': case 'archive_remote_connect': case 'archive_remote_push': case 'archive_remote_pull': case 'archive_remote_disconnect': case 'archive_remote_create':
+      case 'object_store_auto_upload_get': case 'object_store_auto_upload_set':
+      case 'archive_additional_files_count':
       case 'object_store_status': case 'object_store_connect': case 'object_store_disconnect': case 'object_store_backup': case 'object_store_restore': case 'app_state_backup': case 'app_state_restore':
       case 'user_owned_backup_overview': case 'export_backup_recovery_key': case 'confirm_backup_recovery_key': case 'import_backup_recovery_key':
         return backupCommand(command, args)
@@ -1386,7 +1432,7 @@
         return mediaList()
       case 'source_asset_open': case 'source_asset_delete_preview': case 'source_asset_trash': case 'source_asset_restore_trashed': case 'source_asset_purge': case 'source_asset_deleted_list':
         return sourceCommand(command, args)
-      case 'panel_browser_open': case 'panel_browser_close': case 'panel_browser_visibility': case 'panel_browser_bounds': case 'panel_browser_navigate': case 'panel_browser_action': case 'panel_browser_open_human': case 'panel_browser_download_select': case 'panel_download_reveal': case 'panel_browser_open_agent': case 'panel_agent_status': case 'panel_agent_take_over': case 'panel_agent_resume':
+      case 'panel_browser_open': case 'panel_browser_close': case 'panel_browser_visibility': case 'panel_browser_bounds': case 'panel_browser_navigate': case 'panel_browser_action': case 'panel_browser_open_human': case 'panel_browser_download_select': case 'panel_download_reveal': case 'panel_browser_open_agent': case 'panel_agent_status': case 'panel_agent_take_over': case 'panel_agent_resume': case 'panel_agent_external_login_open':
         return panelCommand(command, args)
       case 'chat_items':
         return chatItems(args.chatId)
@@ -1527,6 +1573,19 @@
         const id = chatIdFor(createdAt)
         chats[id] = { id, title: '', createdAt, updatedAt: createdAt, messages: [] }
         return chatEntry(chats[id])
+      }
+      // 긴 채팅방 페이지(2026-11-18 둘째 줄 B84 꼴): 최근부터 limit 개(기본 100, 1~200), 오래된 순, nextCursor 는 그 페이지 첫 말 id(더 없으면 null).
+      case 'chat_read_page': {
+        const chat = chats[args.id]
+        if (!chat) throw '대화를 읽지 못했습니다'
+        const limit = args.limit ?? 100
+        if (limit < 1 || limit > 200) throw 'invalid_limit'
+        let end = chat.messages.length
+        if (args.before) { end = chat.messages.findIndex((m) => m.id === args.before); if (end < 0) throw 'invalid_cursor' }
+        const start = Math.max(0, end - limit)
+        const copy = JSON.parse(JSON.stringify({ ...chat, messages: chat.messages.slice(start, end) }))
+        window.__pageCalls = (window.__pageCalls || 0) + 1
+        return { ...copy, nextCursor: start > 0 ? chat.messages[start].id : null }
       }
       case 'chat_read': {
         const chat = chats[args.id]

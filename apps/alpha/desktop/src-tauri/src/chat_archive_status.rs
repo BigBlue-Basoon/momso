@@ -38,6 +38,7 @@ fn status_state(
 pub(crate) async fn chat_archive_sync_status(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<SyncStatus, &'static str> {
+    let _timer = crate::startup_timing::start("chat_archive_sync_status");
     let db = state.paths.database_path.clone();
     let root = state.paths.archive.current.clone().read_owned().await;
     tauri::async_runtime::spawn_blocking(move || {

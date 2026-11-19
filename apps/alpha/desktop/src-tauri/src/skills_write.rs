@@ -358,15 +358,86 @@ pub(crate) fn validate_repository(root: &Path, resources: &Path) -> Result<(), &
     Ok(())
 }
 
-pub(crate) fn install_builtin(
+pub(crate) fn install_builtins(
     root: &Path,
     resources: &Path,
-    name: &str,
-    text: &str,
+    bundled: &[(&str, &str)],
 ) -> Result<(), &'static str> {
     let _lock = crate::archive_zet::WRITE_LOCK
         .lock()
         .map_err(|_| "io_error")?;
+    validate_repository(root, resources)?;
+    let tool = crate::archive::storage_tool(resources)
+        .map_err(|_| "save_failed")?
+        .0;
+    let mut has_history = git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok();
+    let clean_tracked = if has_history
+        && git(
+            &tool,
+            root,
+            &[
+                "diff",
+                "--quiet",
+                "HEAD",
+                "--",
+                "skills",
+                ".agents/skills",
+                ".claude/skills",
+            ],
+        )
+        .is_ok()
+    {
+        git(
+            &tool,
+            root,
+            &[
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "HEAD",
+                "--",
+                "skills",
+                ".agents/skills",
+                ".claude/skills",
+            ],
+        )
+        .ok()
+        .map(|text| {
+            text.lines()
+                .map(str::to_owned)
+                .collect::<std::collections::HashSet<_>>()
+        })
+    } else {
+        None
+    };
+    for &(name, text) in bundled {
+        install_builtin_locked(
+            root,
+            resources,
+            name,
+            text,
+            has_history,
+            clean_tracked.as_ref(),
+        )?;
+        if !has_history
+            && !crate::skills::BUNDLED_SKILLS
+                .iter()
+                .any(|(builtin_name, builtin_text)| *builtin_name == name && *builtin_text == text)
+        {
+            has_history = git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok();
+        }
+    }
+    Ok(())
+}
+
+fn install_builtin_locked(
+    root: &Path,
+    resources: &Path,
+    name: &str,
+    text: &str,
+    has_history: bool,
+    clean_tracked: Option<&std::collections::HashSet<String>>,
+) -> Result<(), &'static str> {
     skills::parse(name, text)?;
     let path = skills::skill_path(root, "skills", name)?;
     let before = snapshot(&path)?;
@@ -424,6 +495,18 @@ pub(crate) fn install_builtin(
         after: Some(serde_json::to_vec(&builtins).map_err(|_| "io_error")?),
     });
     if edits.iter().all(|change| change.before == change.after) {
+        if !has_history {
+            return Ok(());
+        }
+        if clean_tracked.is_some_and(|tracked| {
+            ["skills", ".agents/skills", ".claude/skills"]
+                .into_iter()
+                .map(|folder| format!("{folder}/{name}/SKILL.md"))
+                .filter(|path| root.join(path).is_file())
+                .all(|path| tracked.contains(&path))
+        }) {
+            return Ok(());
+        }
         let tool = crate::archive::storage_tool(resources)
             .map_err(|_| "save_failed")?
             .0;
@@ -454,13 +537,6 @@ pub(crate) fn install_builtin(
     }
     // A freshly initialized archive must remain unborn until the first remote
     // receive. Otherwise default skills create an unrelated local history.
-    let tool = crate::archive::storage_tool(resources)
-        .map_err(|_| "save_failed")?
-        .0;
-    if git(&tool, root, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
-        return Err("save_failed");
-    }
-    let has_history = git(&tool, root, &["rev-parse", "--verify", "HEAD"]).is_ok();
     let is_original_builtin = crate::skills::BUNDLED_SKILLS
         .iter()
         .any(|(builtin_name, builtin_text)| *builtin_name == name && *builtin_text == text);

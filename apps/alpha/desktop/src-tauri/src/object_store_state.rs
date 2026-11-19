@@ -591,27 +591,57 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_snapshot_round_trip_preserves_current_state_before_restore() {
-        exercise_new_pc_round_trip("s3_compatible").await;
+        exercise_new_pc_round_trip("s3_compatible", false).await;
     }
 
     #[tokio::test]
     async fn oauth_r2_new_pc_recovers_documents_sources_and_chat_state() {
-        exercise_new_pc_round_trip("r2_oauth").await;
+        exercise_new_pc_round_trip("r2_oauth", false).await;
     }
 
     #[tokio::test]
     async fn ncp_new_pc_recovers_documents_sources_and_chat_state() {
-        exercise_new_pc_round_trip("ncp").await;
+        exercise_new_pc_round_trip("ncp", false).await;
     }
 
     #[tokio::test]
     async fn aws_new_pc_recovers_documents_sources_and_chat_state() {
-        exercise_new_pc_round_trip("aws").await;
+        exercise_new_pc_round_trip("aws", false).await;
     }
 
     #[tokio::test]
     async fn r2_key_new_pc_recovers_documents_sources_and_chat_state() {
-        exercise_new_pc_round_trip("cloudflare").await;
+        exercise_new_pc_round_trip("cloudflare", false).await;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_pc_r2_restore_after_interrupted_first_receive() {
+        if std::env::var_os("MOMSO_D35_CHILD").is_some() {
+            assert!(std::env::var_os("MOMSO_TEST_FAKE_CREDENTIAL_STORE").is_some());
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(exercise_new_pc_round_trip("r2_oauth", true));
+            return;
+        }
+        let output = crate::process::hidden_command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "object_store_state::tests::new_pc_r2_restore_after_interrupted_first_receive",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOMSO_D35_CHILD", "1")
+            .env("MOMSO_TEST_FAKE_CREDENTIAL_STORE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated fake restore failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -705,7 +735,7 @@ mod tests {
         );
     }
 
-    async fn exercise_new_pc_round_trip(provider: &'static str) {
+    async fn exercise_new_pc_round_trip(provider: &'static str, crash_first_receive: bool) {
         let oauth = provider == "r2_oauth";
         let ncp = provider == "ncp";
         let temp = tempfile::tempdir().unwrap();
@@ -979,6 +1009,107 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             asset["id"].as_str().unwrap(),
         )
         .expect("stage 3: attach");
+        struct FixtureCleanup(Vec<std::path::PathBuf>);
+        impl Drop for FixtureCleanup {
+            fn drop(&mut self) {
+                #[cfg(windows)]
+                for path in &self.0 {
+                    let _ = crate::source_assets::clear_readonly_attribute(path);
+                }
+            }
+        }
+        let mut cleanup = FixtureCleanup(Vec::new());
+        let mut media_fixtures: Vec<(String, Vec<u8>, String)> = Vec::new();
+        let mut generation_receipts = Vec::new();
+        if crash_first_receive {
+            for (index, (extension, mime, base)) in [
+                (
+                    "png",
+                    "image/png",
+                    &include_bytes!("../icons/32x32.png")[..],
+                ),
+                (
+                    "png",
+                    "image/png",
+                    &include_bytes!("../icons/128x128.png")[..],
+                ),
+                (
+                    "webm",
+                    "video/webm",
+                    &include_bytes!("../tests/fixtures/d35-video-one.webm")[..],
+                ),
+                (
+                    "webm",
+                    "video/webm",
+                    &include_bytes!("../tests/fixtures/d35-video-two.webm")[..],
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let bytes = base.to_vec();
+                let file = root.join(format!("generated-{index}.{extension}"));
+                fs::write(&file, &bytes).unwrap();
+                let proposal = serde_json::json!({"sourcePath":file,"assetKind":"other","mediaType":mime,"recordLink":null,"actor":"test"});
+                let plan = serde_json::to_value(
+                    crate::source_assets::plan_import(
+                        &paths.database_path,
+                        &paths.objects_path,
+                        serde_json::from_value(proposal.clone()).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let input = serde_json::from_value(serde_json::json!({"proposal":proposal,"planDigest":plan["planDigest"],"importConfirmed":true})).unwrap();
+                let item = serde_json::to_value(
+                    crate::source_assets::apply_import(
+                        &paths.database_path,
+                        &paths.objects_path,
+                        input,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let digest = item["contentSha256"].as_str().unwrap().to_owned();
+                let relative = format!("sha256/{}/{digest}", &digest[..2]);
+                for pc in ["momso", "storage-only-pc/momso", "new-pc/momso"] {
+                    cleanup
+                        .0
+                        .push(root.join(pc).join("objects").join(&relative));
+                }
+                let reference = format!("sha256:{digest}");
+                if index == 0 {
+                    crate::archive_receipt::attach_asset(
+                        &archive_root,
+                        &paths.database_path,
+                        &chat_id,
+                        item["id"].as_str().unwrap(),
+                    )
+                    .unwrap();
+                }
+                let previous = if index == 1 || index == 3 {
+                    vec![format!("sha256:{}", media_fixtures[index - 1].0)]
+                } else {
+                    vec![]
+                };
+                let receipt = crate::archive_receipt::create(
+                    &archive_root,
+                    &paths.database_path,
+                    crate::archive_receipt::ReceiptCreate {
+                        tool: "codex".into(),
+                        model: "fixture-model".into(),
+                        chat: Some(chat_id.clone()),
+                        read: previous,
+                        wrote: vec![reference],
+                        prompt: format!("fixture generation prompt {index}"),
+                        changes: format!("fixture version {index}"),
+                    },
+                )
+                .unwrap();
+                generation_receipts.push(receipt);
+                media_fixtures.push((digest, bytes, mime.into()));
+            }
+        }
         let page = serde_json::to_value(
             crate::chat_items::read_attachment_text(
                 &archive_root,
@@ -1006,6 +1137,37 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             },
         )
         .unwrap();
+        if crash_first_receive {
+            crate::archive_zet::set_folder(
+                &archive_root,
+                &paths.database_path,
+                &id,
+                "classes/morning",
+            )
+            .unwrap();
+            let nested_id = crate::archive_zet::create_in_folder(
+                &archive_root,
+                &paths.database_path,
+                crate::archive_zet::ZetCreate {
+                    title: "folder document".into(),
+                    summary: "folder summary".into(),
+                    kind: "note".into(),
+                    body: "folder document body".into(),
+                    assets: vec![],
+                    edges: vec![],
+                },
+                "classes/evening",
+            )
+            .unwrap();
+            crate::archive_zet::create_folder(&archive_root, &paths.database_path, "empty/folder")
+                .unwrap();
+            for document in [&id, &nested_id] {
+                assert!(archive_root
+                    .join("zettels")
+                    .join(format!("{document}.md"))
+                    .is_file());
+            }
+        }
         let tool = crate::process::resolve_tool("git.exe").unwrap();
         let bare = root.join("remote.git");
         fs::write(
@@ -1101,6 +1263,28 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                 .contains("edited body"),
             "stage 4: restored content"
         );
+        let document_listing = |root: &Path, database: &Path| {
+            crate::momso_document_read::sync_document_index(root, database).unwrap();
+            let mut entries = crate::archive_zet::list(database, None, None).unwrap();
+            crate::archive_zet::add_folders(root, &mut entries).unwrap();
+            serde_json::to_value(entries).unwrap()
+        };
+        let old_documents =
+            crash_first_receive.then(|| document_listing(&archive_root, &paths.database_path));
+        let old_folders =
+            crash_first_receive.then(|| crate::archive_zet::folders(&archive_root).unwrap());
+        if let Some(folders) = &old_folders {
+            assert_eq!(
+                folders,
+                &[
+                    "classes",
+                    "classes/evening",
+                    "classes/morning",
+                    "empty",
+                    "empty/folder"
+                ]
+            );
+        }
         assert!(
             archive_root
                 .join("skills/object-store-connect/SKILL.md")
@@ -1124,6 +1308,11 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             "ok"
         );
         let secret = format!("sk-proj-{}", "Z".repeat(30));
+        let connection_secret = format!("sk-proj-{}", "Q".repeat(30));
+        if crash_first_receive {
+            crate::credentials::put_secret_unlocked("ai:openai:api-key", &connection_secret)
+                .unwrap();
+        }
         crate::chat::append(
             &paths.database_path,
             &chat_id,
@@ -1191,6 +1380,8 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         let objects = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
         let remote = Arc::clone(&objects);
         let stopped = Arc::new(AtomicBool::new(false));
+        let reconnected = Arc::new(AtomicBool::new(false));
+        let server_reconnected = reconnected.clone();
         let server_stopped = stopped.clone();
         let server_bucket = selected_bucket.clone();
         let server = std::thread::spawn(move || {
@@ -1229,11 +1420,21 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                     "/client/v4/accounts/{}/r2/buckets/momso-fixture/objects",
                     "a".repeat(32)
                 );
+                let oauth_bucket = oauth_path.strip_suffix("/objects").unwrap();
+                if oauth && crash_first_receive && path == oauth_bucket {
+                    server_reconnected.store(true, Ordering::SeqCst);
+                }
+                if oauth && crash_first_receive && server_reconnected.load(Ordering::SeqCst) {
+                    assert!(head
+                        .lines()
+                        .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-token")));
+                }
                 if oauth {
                     assert!(
                         path == oauth_path
                             || path.starts_with(&format!("{oauth_path}/"))
                             || path.starts_with(&format!("{oauth_path}?"))
+                            || (crash_first_receive && path == oauth_bucket)
                     );
                 }
                 let oauth_prefix = format!("{oauth_path}/");
@@ -1256,7 +1457,19 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                     assert_ne!(n, 0);
                     received.extend_from_slice(&buffer[..n]);
                 }
-                let (status, body) = if method == "GET"
+                let (status, body) = if oauth
+                    && crash_first_receive
+                    && method == "GET"
+                    && path == oauth_bucket
+                {
+                    (
+                        "200 OK",
+                        serde_json::to_vec(
+                            &serde_json::json!({"success":true,"result":{"name":"momso-fixture"}}),
+                        )
+                        .unwrap(),
+                    )
+                } else if method == "GET"
                     && ((oauth && path.starts_with(&format!("{oauth_path}?")))
                         || (!oauth && path.starts_with(&format!("/{server_bucket}?"))))
                 {
@@ -1344,6 +1557,23 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         )
         .await
         .unwrap();
+        for (index, (digest, _, _)) in media_fixtures.iter().enumerate() {
+            let relative = format!("sha256/{}/{digest}", &digest[..2]);
+            transfer::upload_file(
+                &config,
+                &keys,
+                &identity,
+                transfer::UploadSpec {
+                    source: &paths.objects_path.join(&relative),
+                    relative: &relative,
+                    kind: "object",
+                    stage: &root.join("stage").join(format!("media-{index}")),
+                },
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+        }
         let _manifest = backup_snapshot(&config, &keys, &identity, &paths)
             .await
             .unwrap();
@@ -1415,6 +1645,18 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         )
         .unwrap();
         let source_archive_root = archive_root.clone();
+        if crash_first_receive {
+            assert_eq!(
+                crate::credentials::get_secret("ai:openai:api-key")
+                    .unwrap()
+                    .as_deref(),
+                Some(connection_secret.as_str())
+            );
+            crate::credentials::remove_secret_unlocked("ai:openai:api-key").unwrap();
+            assert!(crate::credentials::get_secret("ai:openai:api-key")
+                .unwrap()
+                .is_none());
+        }
         let new_pc = root.join("new-pc");
         fs::create_dir_all(&new_pc).unwrap();
         let database_path = new_pc.join("momso.db");
@@ -1427,6 +1669,29 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         let archive_root = new_pc.join("momso");
         crate::archive::initialize(&archive_root, &new_pc).unwrap();
         crate::archive_remote::connect_local(&tool, &archive_root, bare.to_str().unwrap()).unwrap();
+        if crash_first_receive {
+            let status = crate::process::hidden_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "archive_remote::tests::first_receive_checkout_crash_child",
+                    "--nocapture",
+                ])
+                .env("MOMSO_C28_ROOT", &archive_root)
+                .env("MOMSO_C28_DB", &database_path)
+                .env("MOMSO_C28_GIT", &tool)
+                .env("MOMSO_C28_TARGET", &bare)
+                .env("MOMSO_C28_CRASH_AFTER_CHECKOUT", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.code(),
+                Some(73),
+                "first receive is interrupted after checkout"
+            );
+        }
         crate::archive_remote::receive_connected(
             &tool,
             &archive_root,
@@ -1435,6 +1700,38 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             "main",
         )
         .unwrap();
+        if crash_first_receive {
+            assert_eq!(
+                document_listing(&archive_root, &database_path),
+                *old_documents.as_ref().unwrap(),
+                "zet_list matches the old PC after interrupted first receive"
+            );
+            assert_eq!(
+                crate::archive_zet::folders(&archive_root).unwrap(),
+                *old_folders.as_ref().unwrap()
+            );
+            for (index, receipt) in generation_receipts.iter().enumerate() {
+                let text =
+                    fs::read_to_string(archive_root.join("receipts").join(format!("{receipt}.md")))
+                        .unwrap();
+                assert!(text.contains(&format!("fixture generation prompt {index}")));
+                let (head, _) = crate::archive_receipt::parse(&text).unwrap();
+                assert_eq!(
+                    head.wrote,
+                    vec![format!("sha256:{}", media_fixtures[index].0)]
+                );
+                if index == 1 || index == 3 {
+                    assert_eq!(
+                        head.read,
+                        vec![format!("sha256:{}", media_fixtures[index - 1].0)]
+                    );
+                }
+            }
+            assert!(
+                object_store::load_config(&new_pc).unwrap().is_none(),
+                "new PC must reconnect the object store"
+            );
+        }
         assert!(
             archive_root
                 .join("zettels")
@@ -1763,9 +2060,69 @@ $null = [Console]::ReadLine()
         )
         .unwrap();
         drop(db);
-        let (downloaded, _) = download_latest_snapshot(&config, &keys, &identity, &paths)
+        let reconnected_config = if crash_first_receive {
+            #[cfg(windows)]
+            {
+                let config = crate::r2_oauth::fake_reconnect_existing(
+                    &format!("http://{address}/"),
+                    &new_pc,
+                )
+                .await
+                .expect("new PC reconnects to the existing account-scoped R2 bucket");
+                let stored = fs::read(new_pc.join("object-store.json")).unwrap();
+                assert!(!stored
+                    .windows(b"test-token".len())
+                    .any(|part| part == b"test-token"));
+                assert_eq!(config.bucket, "momso-fixture");
+                assert!(reconnected.load(Ordering::SeqCst));
+                config
+            }
+            #[cfg(not(windows))]
+            {
+                unreachable!("the reconnect fixture is Windows-only")
+            }
+        } else {
+            config.clone()
+        };
+        let reconnected_keys = if crash_first_receive {
+            object_store::load_keys(&reconnected_config).unwrap()
+        } else {
+            object_store::Keys {
+                access_key_id: keys.access_key_id.clone(),
+                secret_access_key: keys.secret_access_key.clone(),
+            }
+        };
+        if crash_first_receive {
+            object_store_restore::restore_selected(
+                &reconnected_config,
+                &reconnected_keys,
+                &identity,
+                &paths,
+                None,
+            )
             .await
             .unwrap();
+            for (digest, expected, _) in &media_fixtures {
+                let relative = format!("sha256/{}/{digest}", &digest[..2]);
+                assert_eq!(
+                    fs::read(paths.objects_path.join(relative)).unwrap(),
+                    *expected
+                );
+            }
+        }
+        let (downloaded, _) =
+            download_latest_snapshot(&reconnected_config, &reconnected_keys, &identity, &paths)
+                .await
+                .unwrap();
+        if crash_first_receive {
+            let bytes = fs::read(downloaded.path()).unwrap();
+            assert!(
+                !bytes
+                    .windows(connection_secret.len())
+                    .any(|part| part == connection_secret.as_bytes()),
+                "connection credentials must not be present in the restored backup"
+            );
+        }
         assert_eq!(
             snapshot_workspace_id(downloaded.path()).unwrap(),
             profile.workspace_id
@@ -1817,6 +2174,29 @@ $null = [Console]::ReadLine()
         assert_eq!(indexed, 1);
         drop(after_failure);
         let safety = apply_snapshot(downloaded.path(), &paths).unwrap();
+        if crash_first_receive {
+            let folders_by_id = |list: &serde_json::Value| {
+                list.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry["id"].as_str().unwrap().to_owned(),
+                            entry["folder"].as_str().unwrap().to_owned(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            assert_eq!(
+                folders_by_id(&document_listing(&archive_root, &paths.database_path)),
+                folders_by_id(old_documents.as_ref().unwrap()),
+                "document folders survive app-state restore"
+            );
+            assert_eq!(
+                crate::archive_zet::folders(&archive_root).unwrap(),
+                *old_folders.as_ref().unwrap()
+            );
+        }
         let restored = storage::open_writable_connection(&paths.database_path).unwrap();
         let restored_path: String = restored
             .query_row(
@@ -1859,9 +2239,67 @@ $null = [Console]::ReadLine()
             .unwrap();
         assert_eq!(message, ("hello".into(), 1, 1));
         drop(restored);
-        object_store_restore::restore_selected(&config, &keys, &identity, &paths, None)
-            .await
+        object_store_restore::restore_selected(
+            &reconnected_config,
+            &reconnected_keys,
+            &identity,
+            &paths,
+            None,
+        )
+        .await
+        .unwrap();
+        if crash_first_receive {
+            for (digest, expected, _) in &media_fixtures {
+                let relative = format!("sha256/{}/{digest}", &digest[..2]);
+                let restored = paths.objects_path.join(relative);
+                assert_eq!(fs::read(&restored).unwrap(), *expected);
+                assert_eq!(transfer::hash_file(&restored).unwrap().0, *digest);
+            }
+            let items = serde_json::to_value(
+                crate::chat_items::list(&archive_root, &paths.database_path, &chat_id).unwrap(),
+            )
             .unwrap();
+            let media = items["media"].as_array().unwrap();
+            for (digest, _, _) in &media_fixtures {
+                assert!(media
+                    .iter()
+                    .any(|entry| entry["id"] == format!("sha256:{digest}")));
+            }
+            for (index, receipt) in generation_receipts.iter().enumerate() {
+                let value = serde_json::to_value(
+                    crate::archive_receipt::read(&archive_root, &paths.database_path, receipt)
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(value["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("fixture generation prompt {index}")));
+                assert_eq!(
+                    value["head"]["wrote"][0]["id"],
+                    format!("sha256:{}", media_fixtures[index].0)
+                );
+                if index == 1 || index == 3 {
+                    assert_eq!(
+                        value["head"]["read"][0]["id"],
+                        format!("sha256:{}", media_fixtures[index - 1].0)
+                    );
+                }
+            }
+            let stored = fs::read(new_pc.join("object-store.json")).unwrap();
+            assert!(
+                !stored
+                    .windows(b"test-token".len())
+                    .any(|part| part == b"test-token"),
+                "restoring application state must not restore credentials"
+            );
+            assert!(
+                crate::credentials::get_secret("ai:openai:api-key")
+                    .unwrap()
+                    .is_none(),
+                "the new PC must reconnect the provider"
+            );
+        }
         assert_eq!(
             fs::read(paths.objects_path.join(&object_relative)).unwrap(),
             b"original bytes"

@@ -37,10 +37,14 @@ pub(crate) fn create(root: &Path, chat_id: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub(crate) fn instruction(path: &Path) -> Result<String, String> {
+pub(crate) fn instruction(path: &Path, provider: &str) -> Result<String, String> {
     let path = path.to_str().ok_or("unavailable")?;
     let quoted = serde_json::to_string(path).map_err(|_| "unavailable")?;
-    Ok(format!("\n\nSave generated images, videos, and exported files in this turn's output directory: {quoted}. After creating an image or video, call media_register_generated with its absolute path and the actual generation prompt; supply regenerateOf when applicable."))
+    if provider == "codex" {
+        Ok(format!("\n\nFor images made with $imagegen, leave the generated file where the tool saved it. Do not use a shell to move or copy it and do not call media_register_generated for that file: momso imports and registers images reported by this Codex session automatically, including regenerated versions. Save other generated images, videos, and exported files in this turn's output directory: {quoted}. For those images or videos call media_register_generated with the absolute path and actual generation prompt; supply regenerateOf when applicable."))
+    } else {
+        Ok(format!("\n\nSave generated images, videos, and exported files in this turn's output directory: {quoted}. After creating an image or video, call media_register_generated with its absolute path and the actual generation prompt; supply regenerateOf when applicable."))
+    }
 }
 
 pub(crate) fn add_dir(command: &mut tokio::process::Command, path: &Path) {
@@ -59,9 +63,14 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_dir());
         assert_eq!(first.parent().unwrap().file_name().unwrap(), "chat_abc-123");
-        let instruction = instruction(&first).unwrap();
-        assert!(instruction.contains("output directory"));
-        assert!(instruction.contains(&serde_json::to_string(first.to_str().unwrap()).unwrap()));
+        let claude_instruction = instruction(&first, "claude").unwrap();
+        assert!(claude_instruction.contains("output directory"));
+        assert!(
+            claude_instruction.contains(&serde_json::to_string(first.to_str().unwrap()).unwrap())
+        );
+        let codex_instruction = instruction(&first, "codex").unwrap();
+        assert!(codex_instruction.contains("Do not use a shell to move or copy it"));
+        assert!(codex_instruction.contains("momso imports and registers"));
         assert!(create(root.path(), "../outside").is_err());
         for cli in ["claude", "agy"] {
             let mut command = tokio::process::Command::new(cli);

@@ -50,6 +50,13 @@ export async function navigatePanelBrowser(url: string) {
 export async function panelBrowserAction(action: 'back' | 'forward' | 'reload' | 'stop') {
   await invoke('panel_browser_action', { action })
 }
+/**
+ * 바깥 로그인(2026-11-18 여섯째 줄 G75, panel-agent-integration-g52.md): panel_agent_external_login_open({ chatId }) → { state: 'login' }.
+ * 몸소가 원래 허용된 사이트를 그 채팅방의 몸소 전용 브라우저 프로필로 연다(구글 인증 주소를 옮기지 않음). 패널과 쿠키를 나누지 않는다.
+ */
+export async function openExternalLogin(chatId: string) {
+  await invoke('panel_agent_external_login_open', { chatId })
+}
 export async function openHumanBrowser(url: string) {
   await invoke('panel_browser_open_human', { url })
 }
@@ -98,7 +105,11 @@ export async function listenPanelAgent(handlers: { onOpenRequest?: (chatId: stri
    * 로그인 뒤 [AI에게 돌려주기]로 몸소가 그 채팅방에 "로그인을 마쳤습니다. 이어서 해 주세요."를 보내 새 턴이 시작됨
    * (2026-11-18 여섯째 줄 G68): panel-agent-resume-started { chatId, userMessageId, text, provider, skill, originalMessageId }.
    */
-  onResumeStarted?: (event: { chatId: string; userMessageId: string | null; text: string | null; provider: string | null }) => void }) {
+  onResumeStarted?: (event: { chatId: string; userMessageId: string | null; text: string | null; provider: string | null }) => void
+  /** panel-agent-external-login-opened { chatId, state: 'login', message }: 몸소 브라우저 창이 열림. 뒤쪽 message 는 화면에 쓰지 않는다. */
+  onExternalOpened?: (chatId: string) => void
+  /** panel-agent-external-continued { chatId, state: 'started', message }: 로그인 뒤 AI 가 그 바깥 창에서 이어 함. */
+  onExternalContinued?: (chatId: string, state: string) => void }) {
   if (!isDesktopRuntime()) return () => {}
   const stops = await Promise.all([
     listen<{ chatId?: unknown }>('panel-agent-open-request', (event) => handlers.onOpenRequest?.(typeof event.payload?.chatId === 'string' ? event.payload.chatId : null)),
@@ -108,6 +119,13 @@ export async function listenPanelAgent(handlers: { onOpenRequest?: (chatId: stri
       if (typeof p.chatId === 'string' && typeof p.state === 'string') {
         handlers.onControl?.({ chatId: p.chatId, state: p.state, reason: text(p.reason), provider: text(p.provider), chatTitle: text(p.chatTitle), loginUrl: text(p.loginUrl), siteUrl: text(p.siteUrl) })
       }
+    }),
+    listen<{ chatId?: unknown }>('panel-agent-external-login-opened', (event) => {
+      if (typeof event.payload?.chatId === 'string') handlers.onExternalOpened?.(event.payload.chatId)
+    }),
+    listen<{ chatId?: unknown; state?: unknown }>('panel-agent-external-continued', (event) => {
+      const p = event.payload ?? {}
+      if (typeof p.chatId === 'string') handlers.onExternalContinued?.(p.chatId, typeof p.state === 'string' ? p.state : 'started')
     }),
     listen<{ chatId?: unknown; userMessageId?: unknown; text?: unknown; provider?: unknown }>('panel-agent-resume-started', (event) => {
       const p = event.payload ?? {}

@@ -178,6 +178,23 @@ export async function readChat(id: string) {
   return invoke<ChatDocument>('chat_read', { id })
 }
 
+/**
+ * 긴 채팅방 페이지 읽기(2026-11-18 둘째 줄 B84, desktop-chat-page-b84.md): chat_read_page({ id, before?, limit? }) →
+ * chat_read 와 같은 채팅방 + messages(그 범위 안에서 오래된 순) + nextCursor(그 앞으로 더 읽을 때 before 로, 더 없으면 null).
+ * 기본 limit 100(1~200). 명령이 없는 예전 뒤쪽이면 chat_read 로 전체를 읽고 nextCursor 는 null.
+ */
+export async function readChatPage(id: string, before: string | null = null, limit = 100): Promise<{ document: ChatDocument; nextCursor: string | null }> {
+  requireChats()
+  try {
+    const page = await invoke<ChatDocument & { nextCursor?: string | null }>('chat_read_page', { id, before, limit })
+    const { nextCursor, ...document } = page
+    return { document: document as ChatDocument, nextCursor: typeof nextCursor === 'string' && nextCursor ? nextCursor : null }
+  } catch (error) {
+    if (!isMissingCommand(error) || before) throw error
+    return { document: await readChat(id), nextCursor: null }
+  }
+}
+
 export async function renameChat(id: string, title: string) {
   requireChats()
   await invoke<null>('chat_rename', { id, title })

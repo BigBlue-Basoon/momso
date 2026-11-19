@@ -200,6 +200,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn marketing_skill_creates_approved_document_in_promotion_folder() {
+        let skill = include_str!("../bundled-skills/marketing-preparation/SKILL.md");
+        assert!(skill.contains("momso_document_create"));
+        assert!(skill.contains("folder: \"홍보\""));
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("archive");
+        std::fs::create_dir_all(root.join("zettels")).unwrap();
+        let db = temp.path().join("db.sqlite");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        crate::archive_zet::create_folder(&root, &db, "홍보").unwrap();
+        assert!(crate::archive_zet::folders(&root)
+            .unwrap()
+            .contains(&"홍보".to_string()));
+        let ask: crate::browser_runtime::Ask = Arc::new(|request, _| {
+            assert_eq!(request.kind, "file_change");
+            Box::pin(async { true })
+        });
+        let result = dispatch(
+            (root.clone(), db),
+            "chat",
+            "codex",
+            "momso_document_create",
+            json!({"title":"홍보 글","summary":"요약","body":"수업 안내","folder":"홍보"}),
+            ask,
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(result["status"], "ok");
+        let (head, body) =
+            crate::momso_document_read::read_current(&root, result["id"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(head.folder, "홍보");
+        assert_eq!(body, "수업 안내");
+    }
+
+    #[tokio::test]
     async fn approved_create_edit_and_stale_edit_preserve_document() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("archive");

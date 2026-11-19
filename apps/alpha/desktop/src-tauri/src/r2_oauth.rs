@@ -120,6 +120,7 @@ async fn run_wrangler(
     timeout: Duration,
     cancel: CancellationToken,
 ) -> Result<crate::process::ProcessOutput, &'static str> {
+    let _timer = crate::startup_timing::start("cli_wrangler");
     let mut environment = HashMap::new();
     if let Some((node, npx)) = BUNDLED_NODE.get() {
         let node_dir = node.parent().ok_or("runtime_missing")?;
@@ -571,7 +572,21 @@ async fn create_exact_bucket(target: &R2Target, token: &OAuthToken) -> Result<()
         .map_err(|_| "bucket_lookup_failed")?;
     match result.status() {
         reqwest::StatusCode::NOT_FOUND => (),
-        reqwest::StatusCode::OK => return Err("bucket_exists"),
+        reqwest::StatusCode::OK => {
+            let bytes = crate::object_store_transfer::read_bounded(result, 64 * 1024)
+                .await
+                .map_err(|_| "bucket_lookup_failed")?;
+            let metadata: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| "bucket_exists")?;
+            return if metadata.get("success").and_then(|v| v.as_bool()) == Some(true)
+                && metadata.pointer("/result/name").and_then(|v| v.as_str())
+                    == Some(target.bucket.as_str())
+            {
+                Ok(())
+            } else {
+                Err("bucket_exists")
+            };
+        }
         reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
             return Err("access_denied")
         }
@@ -772,33 +787,30 @@ async fn complete_connection(
         crate::object_store::PREFIX,
         uuid::Uuid::new_v4()
     );
-    let response = request(
-        &config,
-        &keys,
-        reqwest::Method::PUT,
-        &key,
-        &[],
-        b"momso-probe".to_vec(),
-    )
-    .await
-    .map_err(|_| "created_not_connected")?;
-    if !response.status().is_success() {
-        return Err("created_not_connected");
-    }
-    crate::object_store_transfer::read_bounded(response, 64 * 1024)
+    crate::object_store_transfer::put_once(&config, &keys, &key, b"momso-probe".to_vec())
         .await
         .map_err(|_| "created_not_connected")?;
-    let actual =
-        crate::object_store_transfer::get_bytes(&config, &keys, &key, b"momso-probe".len())
-            .await
-            .map_err(|_| "created_not_connected")?;
-    if actual.as_deref() != Some(b"momso-probe".as_slice()) {
-        return Err("created_not_connected");
-    }
     if cancel.is_cancelled() {
         return Err("created_not_connected");
     }
     crate::object_store::save_config(data_root, &config).map_err(|_| "created_not_connected")
+}
+
+#[cfg(all(test, windows))]
+pub(crate) async fn fake_reconnect_existing(
+    endpoint: &str,
+    data_root: &std::path::Path,
+) -> Result<crate::object_store::Config, &'static str> {
+    let target = R2Target::new(endpoint, &"a".repeat(32), "fixture")?;
+    complete_connection(
+        data_root,
+        target,
+        OAuthToken("test-token".into()),
+        CancellationToken::new(),
+    )
+    .await?;
+    let bytes = std::fs::read(data_root.join("object-store.json")).map_err(|_| "unavailable")?;
+    serde_json::from_slice(&bytes).map_err(|_| "unavailable")
 }
 
 #[cfg(test)]
@@ -1375,7 +1387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_only_approved_bucket_and_refuses_existing_one() {
+    async fn creates_only_approved_bucket_and_refuses_mismatched_existing() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -1441,7 +1453,7 @@ mod tests {
                         assert!(
                             line.starts_with("GET ") && line.contains("/buckets/momso-fixture ")
                         );
-                        ("200 OK", "{}".to_owned())
+                        ("200 OK", serde_json::json!({"success":true,"result":{"name":"someone-elses-archive-bucket"}}).to_string())
                     }
                 };
                 write!(

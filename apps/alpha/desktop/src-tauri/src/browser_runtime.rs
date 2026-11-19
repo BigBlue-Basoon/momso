@@ -181,6 +181,10 @@ async fn request_scope(
 #[derive(Default)]
 pub(crate) struct BrowserManager {
     entries: AsyncMutex<HashMap<String, Arc<Entry>>>,
+    external_sites: Arc<Mutex<HashMap<String, String>>>,
+    external_sessions: AsyncMutex<HashMap<String, Session>>,
+    #[cfg(test)]
+    fake_external: Mutex<HashMap<String, Arc<AtomicBool>>>,
     turns: Mutex<HashMap<String, ResumeTurn>>,
     pub(crate) resume_lock: AsyncMutex<()>,
     pub(crate) panel_ownership: crate::panel_ownership::PanelOwnership,
@@ -378,6 +382,47 @@ async fn call<T: Send + 'static>(
 }
 
 impl BrowserManager {
+    #[cfg(test)]
+    pub(crate) async fn install_fake_login_panel(
+        &self,
+        chat_id: &str,
+        skill: &str,
+        policy: Policy,
+        completed: Arc<AtomicBool>,
+    ) {
+        let lease = Arc::new(self.panel_ownership.claim(chat_id).unwrap());
+        let entry = Arc::new(Entry {
+            policy,
+            skill: skill.to_owned(),
+            action: "fixture".into(),
+            grant: Mutex::new(None),
+            extra_origins: Mutex::new(BTreeSet::new()),
+            blocked_origin: Mutex::new(None),
+            serial: AsyncMutex::new(()),
+            session: Arc::new(Mutex::new(Some(Session::fake_login_panel(completed)))),
+            panel_lease: Some(lease),
+            waiting_for_human: AtomicBool::new(false),
+            external_login: AtomicBool::new(false),
+        });
+        self.entries.lock().await.insert(chat_id.to_owned(), entry);
+    }
+    #[cfg(test)]
+    pub(crate) async fn install_fake_external_login(
+        &self,
+        chat_id: &str,
+        completed: Arc<AtomicBool>,
+    ) {
+        let entry = self.entries.lock().await.get(chat_id).cloned().unwrap();
+        entry.external_login.store(true, Ordering::Release);
+        self.external_sites
+            .lock()
+            .unwrap()
+            .insert(chat_id.to_owned(), entry.policy.origins()[0].clone());
+        self.fake_external
+            .lock()
+            .unwrap()
+            .insert(chat_id.to_owned(), completed);
+    }
     pub(crate) async fn wait_for_login_turn_end(
         &self,
         active: &crate::chat_codex::Active,
@@ -409,6 +454,103 @@ impl BrowserManager {
             entry.waiting_for_human.store(true, Ordering::Release);
         }
     }
+    pub(crate) async fn open_external_login(
+        &self,
+        chat_id: &str,
+        root: &std::path::Path,
+        notify: &Notify,
+    ) -> Result<(), &'static str> {
+        let entry = self
+            .entries
+            .lock()
+            .await
+            .get(chat_id)
+            .cloned()
+            .ok_or("unavailable")?;
+        if !entry.waiting_for_human.load(Ordering::Acquire)
+            || !entry.external_login.load(Ordering::Acquire)
+        {
+            return Err("unavailable");
+        }
+        let _serial = entry.serial.lock().await;
+        if self.external_sessions.lock().await.contains_key(chat_id) {
+            return Ok(());
+        }
+        let site = self
+            .external_sites
+            .lock()
+            .map_err(|_| "unavailable")?
+            .get(chat_id)
+            .cloned()
+            .ok_or("unavailable")?;
+        if !entry.allows(&site) {
+            return Err("unavailable");
+        }
+        #[cfg(test)]
+        {
+            let completed = self
+                .fake_external
+                .lock()
+                .ok()
+                .and_then(|fakes| fakes.get(chat_id).cloned());
+            if let Some(completed) = completed {
+                self.external_sessions
+                    .lock()
+                    .await
+                    .insert(chat_id.to_owned(), Session::fake_login_panel(completed));
+                notify(
+                    "panel-agent-external-login-opened",
+                    json!({"chatId":chat_id,"state":"login","message":"패널과 바깥 창의 로그인은 따로 유지됩니다. 바깥 창에서 로그인해 주세요."}),
+                );
+                return Ok(());
+            }
+        }
+        let mut origins = entry.policy.origins().to_vec();
+        origins.extend(
+            entry
+                .extra_origins
+                .lock()
+                .map_err(|_| "unavailable")?
+                .iter()
+                .cloned(),
+        );
+        let mut login_origins = entry.policy.login_origins().to_vec();
+        login_origins.push("https://accounts.google.com".to_owned());
+        let login_paths = entry.policy.login_paths().to_vec();
+        let profile = root
+            .join("browser-profiles")
+            .join(format!("{:x}", Sha256::digest(chat_id.as_bytes())));
+        let choice = crate::browser_choice::read(root).map_err(|_| "unavailable")?;
+        let session = tokio::task::spawn_blocking(move || {
+            let mut session = browser_driver::launch_with_login_choice(
+                &profile,
+                &origins,
+                &login_origins,
+                &login_paths,
+                true,
+                choice,
+            )?;
+            match session.navigate(&site) {
+                Ok(_) | Err(DriverError::HumanRequired(_)) => Ok(session),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(|_| "unavailable")?
+        .map_err(|_| "unavailable")?;
+        if !entry.waiting_for_human.load(Ordering::Acquire) {
+            return Err("unavailable");
+        }
+        self.external_sessions
+            .lock()
+            .await
+            .insert(chat_id.to_owned(), session);
+        notify(
+            "panel-agent-external-login-opened",
+            json!({"chatId":chat_id,"state":"login","message":"패널과 바깥 창의 로그인은 따로 유지됩니다. 바깥 창에서 로그인해 주세요."}),
+        );
+        Ok(())
+    }
     pub(crate) async fn resume_after_login(
         &self,
         chat_id: &str,
@@ -419,10 +561,33 @@ impl BrowserManager {
         if entry.panel_lease.is_none() || !entry.waiting_for_human.load(Ordering::Acquire) {
             return Ok(false);
         }
-        if entry.external_login.load(Ordering::Acquire) {
-            return Err("external_login_unavailable");
-        }
         let _serial = entry.serial.lock().await;
+        if entry.external_login.load(Ordering::Acquire) {
+            let mut external = self.external_sessions.lock().await;
+            let session = external
+                .get_mut(chat_id)
+                .ok_or("external_login_unavailable")?;
+            session
+                .adopt_after_human_login()
+                .map_err(|error| match error {
+                    DriverError::HumanRequired(_) | DriverError::Blocked(_) => "login_incomplete",
+                    _ => "unavailable",
+                })?;
+            let session = external.remove(chat_id).ok_or("unavailable")?;
+            let old = entry
+                .session
+                .lock()
+                .map_err(|_| "unavailable")?
+                .replace(session);
+            drop(old);
+            entry.external_login.store(false, Ordering::Release);
+            self.panel_ready(&entry, chat_id, notify);
+            notify(
+                "panel-agent-external-continued",
+                json!({"chatId":chat_id,"state":"started","message":"패널과 바깥 창의 로그인은 따로 유지됩니다. 바깥 창에서 이어서 작업합니다."}),
+            );
+            return Ok(true);
+        }
         call(&entry, |session| session.adopt_after_human_login())
             .await
             .map_err(|error| match error {
@@ -494,12 +659,16 @@ impl BrowserManager {
         active
     }
     pub(crate) async fn close(&self, chat_id: &str, notify: &Notify) {
+        if let Ok(mut sites) = self.external_sites.lock() {
+            sites.remove(chat_id);
+        }
         if let Ok(mut turns) = self.turns.lock() {
             turns.remove(chat_id);
         }
         let entry = self.entries.lock().await.remove(chat_id);
         if let Some(entry) = entry {
             let _serial = entry.serial.lock().await;
+            self.external_sessions.lock().await.remove(chat_id);
             let session = entry.session.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if let Ok(mut guard) = session.lock() {
@@ -519,6 +688,8 @@ impl BrowserManager {
                     self.panel_event(chat_id, "ended", None),
                 );
             }
+        } else {
+            self.external_sessions.lock().await.remove(chat_id);
         }
     }
     pub(crate) async fn dispatch(&self, context: RequestContext<'_>, input: Value) -> Value {
@@ -783,6 +954,8 @@ impl BrowserManager {
             let entry = entry.clone();
             let identity = self.panel_event(chat_id, "login", None);
             let app = self.app.get().cloned();
+            let sites = self.external_sites.clone();
+            let current_chat = chat_id.to_owned();
             Arc::new(move |name: &str, mut payload: Value| {
                 if name == "browser-human-required" {
                     entry.waiting_for_human.store(true, Ordering::Release);
@@ -803,6 +976,11 @@ impl BrowserManager {
                         let site = app
                             .as_ref()
                             .and_then(crate::panel_browser::current_site_url);
+                        if let Some(site) = site.as_ref().filter(|site| entry.allows(site)) {
+                            if let Ok(mut stored) = sites.lock() {
+                                stored.insert(current_chat.clone(), site.clone());
+                            }
+                        }
                         payload["siteUrl"] = json!(site);
                         event["loginUrl"] = payload["loginUrl"].clone();
                         event["siteUrl"] = payload["siteUrl"].clone();

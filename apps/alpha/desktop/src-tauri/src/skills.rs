@@ -4,6 +4,10 @@ use std::path::Path;
 
 pub(crate) const BUNDLED_SKILLS: &[(&str, &str)] = &[
     (
+        "marketing-preparation",
+        include_str!("../bundled-skills/marketing-preparation/SKILL.md"),
+    ),
+    (
         "naver-smartplace",
         include_str!("../bundled-skills/naver-smartplace/SKILL.md"),
     ),
@@ -62,11 +66,7 @@ fn existing_bundled_skills_are_readable(root: &Path) -> bool {
 }
 
 fn install(root: &Path, resources: &Path, bundled: &[(&str, &str)]) -> Result<(), &'static str> {
-    crate::skills_write::validate_repository(root, resources)?;
-    for (name, content) in bundled {
-        crate::skills_write::install_builtin(root, resources, name, content)?;
-    }
-    Ok(())
+    crate::skills_write::install_builtins(root, resources, bundled)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -280,6 +280,7 @@ pub(crate) async fn skill_read(
 pub(crate) async fn skill_list(
     state: tauri::State<'_, crate::AppState>,
 ) -> Result<Vec<SkillSummary>, String> {
+    let _timer = crate::startup_timing::start("skill_list");
     let root = state.paths.archive.current.clone().read_owned().await;
     tauri::async_runtime::spawn_blocking(move || list(&root).map_err(str::to_owned))
         .await
@@ -400,6 +401,25 @@ mod tests {
                 assert!(root.join(folder).join(name).join("SKILL.md").is_file());
             }
         }
+    }
+    #[test]
+    fn repeated_builtin_install_keeps_unborn_history_and_user_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        let tool = crate::archive::storage_tool(dir.path()).unwrap().0;
+        let path = root.join("skills/naver-smartplace/SKILL.md");
+        let edited = format!(
+            "{}\nuser addition\n",
+            std::fs::read_to_string(&path).unwrap()
+        );
+        std::fs::write(&path, &edited).unwrap();
+        install_bundled(&root, dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), edited);
+        assert!(
+            crate::archive::run_storage_tool(&tool, &root, &["rev-parse", "--verify", "HEAD"])
+                .is_err()
+        );
     }
     #[test]
     fn korean_and_yaml_punctuation_round_trip() {

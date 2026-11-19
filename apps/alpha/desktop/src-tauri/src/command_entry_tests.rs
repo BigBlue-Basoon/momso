@@ -401,16 +401,54 @@ fn disconnect_object_store_keeps_local_and_remote_fixture() {
 
 #[test]
 fn oauth_r2_commands_import_backup_purge_and_retry() {
-    oauth_r2_flow(false);
+    oauth_r2_flow(false, false, false);
 }
 
 #[cfg(windows)]
 #[test]
 fn claude_r2_login_approval_backup_and_remote_purge() {
-    oauth_r2_flow(true);
+    oauth_r2_flow(true, false, false);
 }
 
-fn oauth_r2_flow(with_claude: bool) {
+#[test]
+fn auto_upload_r2_batches_retries_disables_and_flushes() {
+    if std::env::var_os("MOMSO_AUTO_UPLOAD_CHILD").is_some() {
+        oauth_r2_flow(false, true, false);
+        return;
+    }
+    let status = crate::process::hidden_command(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "command_entry_tests::auto_upload_r2_batches_retries_disables_and_flushes",
+            "--test-threads=1",
+        ])
+        .env("MOMSO_AUTO_UPLOAD_CHILD", "1")
+        .env("MOMSO_TEST_FAKE_CREDENTIAL_STORE", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn simultaneous_automatic_backups_and_close_timeout_resume() {
+    if std::env::var_os("MOMSO_AUTO_BOTH_CHILD").is_some() {
+        oauth_r2_flow(false, false, true);
+        return;
+    }
+    let status = crate::process::hidden_command(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "command_entry_tests::simultaneous_automatic_backups_and_close_timeout_resume",
+            "--test-threads=1",
+        ])
+        .env("MOMSO_AUTO_BOTH_CHILD", "1")
+        .env("MOMSO_TEST_FAKE_CREDENTIAL_STORE", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn oauth_r2_flow(with_claude: bool, automatic_upload: bool, concurrent: bool) {
     use std::{
         collections::BTreeMap,
         io::{Read, Write},
@@ -438,6 +476,7 @@ fn oauth_r2_flow(with_claude: bool) {
         root: std::path::PathBuf,
         credential: String,
         stop: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
         server: Option<std::thread::JoinHandle<()>>,
     }
     impl Drop for Cleanup {
@@ -447,6 +486,7 @@ fn oauth_r2_flow(with_claude: bool) {
                 let _ = credentials::remove_secret_unlocked(&self.credential);
             }
             self.stop.store(true, Ordering::Relaxed);
+            self.release.store(true, Ordering::SeqCst);
             if let Some(server) = self.server.take() {
                 let _ = server.join();
             }
@@ -467,9 +507,17 @@ fn oauth_r2_flow(with_claude: bool) {
     let objects = Arc::new(Mutex::new(BTreeMap::<String, Vec<u8>>::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let fail = Arc::new(AtomicBool::new(false));
+    let fail_upload = Arc::new(AtomicBool::new(false));
+    let pause_upload = Arc::new(AtomicBool::new(false));
+    let upload_started = Arc::new(AtomicBool::new(false));
+    let release_upload = Arc::new(AtomicBool::new(false));
     let bucket_created = Arc::new(AtomicBool::new(false));
     let (remote, stopped, fail_delete) = (objects.clone(), stop.clone(), fail.clone());
     let created = bucket_created.clone();
+    let fail_next_upload = fail_upload.clone();
+    let pause = pause_upload.clone();
+    let started = upload_started.clone();
+    let release = release_upload.clone();
     let server = std::thread::spawn(move || {
         let base = format!(
             "/client/v4/accounts/{}/r2/buckets/momso-basoon/objects",
@@ -515,6 +563,16 @@ fn oauth_r2_flow(with_claude: bool) {
                 let n = stream.read(&mut buffer).unwrap();
                 assert_ne!(n, 0);
                 raw.extend_from_slice(&buffer[..n]);
+            }
+            if method == "PUT" && pause.swap(false, Ordering::SeqCst) {
+                started.store(true, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) && !stopped.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            if fail_next_upload.swap(false, Ordering::SeqCst) {
+                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                continue;
             }
             let mut map = remote.lock().unwrap();
             let bucket_base = format!("/client/v4/accounts/{}/r2/buckets", "a".repeat(32));
@@ -572,24 +630,38 @@ fn oauth_r2_flow(with_claude: bool) {
                     _ => panic!("unexpected method"),
                 }
             };
-            write!(
+            if write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             )
-            .unwrap();
-            stream.write_all(&body).unwrap();
+            .is_ok()
+            {
+                let _ = stream.write_all(&body);
+            }
         }
     });
     let _cleanup = Cleanup {
         root: root.to_path_buf(),
         credential: format!("backup:{}:age-identity", profile.workspace_id),
         stop,
+        release: release_upload.clone(),
         server: Some(server),
     };
     let archive = archive_location::ArchiveLocation::load(db.clone(), root, vec![]).unwrap();
     let archive_root = root.join("momso");
     archive::initialize(&archive_root, root).unwrap();
+    let git_remote = if concurrent {
+        let tool = crate::process::resolve_tool("git.exe").unwrap();
+        let bare = root.join("fake-github.git");
+        archive_remote::git(&tool, root, &["init", "--bare", bare.to_str().unwrap()]).unwrap();
+        Some(archive_remote::TestRemote {
+            tool,
+            target: bare.to_string_lossy().into_owned(),
+        })
+    } else {
+        None
+    };
     #[cfg(windows)]
     let mut claude_completion = None;
     #[cfg(windows)]
@@ -732,7 +804,7 @@ fn oauth_r2_flow(with_claude: bool) {
     };
     let app = mock_builder()
         .manage(AppState {
-            paths,
+            paths: paths.clone(),
             approvals: Default::default(),
             setup_secrets: Default::default(),
             usage_monitor: Default::default(),
@@ -741,12 +813,22 @@ fn oauth_r2_flow(with_claude: bool) {
             browser: Default::default(),
             selections: Default::default(),
         })
+        .manage(object_store_auto_upload::AutoUpload::default())
+        .manage(archive_auto_backup::AutoBackup::default());
+    let app = if let Some(remote) = git_remote.clone() {
+        app.manage(remote)
+    } else {
+        app
+    };
+    let app = app
         .invoke_handler(tauri::generate_handler![
             plan_source_asset_import,
             apply_source_asset_import,
             chat_create,
             chat_attach_asset,
             object_store_transfer::object_store_backup,
+            object_store_auto_upload::object_store_auto_upload_get,
+            object_store_auto_upload::object_store_auto_upload_set,
             object_store_state::app_state_backup,
             source_delete::source_asset_delete_preview,
             source_delete::source_asset_trash,
@@ -789,8 +871,208 @@ fn oauth_r2_flow(with_claude: bool) {
         json!({"chatId":chat["id"],"assetId":imported[0]["id"]}),
     );
     assert!(attachment.is_string());
-    let backup = invoke(&window, "object_store_backup", json!({}));
-    assert_eq!(backup["completedCount"], 2);
+    if concurrent {
+        while !crate::chat_redaction_recheck::step(&archive_root, &paths)
+            .unwrap()
+            .available
+        {}
+        let remote = git_remote.clone().unwrap();
+        let show_chat = |id: &str| {
+            archive_remote::git(
+                &remote.tool,
+                root,
+                &[
+                    "--git-dir",
+                    &remote.target,
+                    "show",
+                    &format!("refs/heads/main:chats/{id}.json"),
+                ],
+            )
+            .is_ok()
+        };
+        let chat_id = chat["id"].as_str().unwrap().to_owned();
+        pause_upload.store(true, Ordering::SeqCst);
+        release_upload.store(false, Ordering::SeqCst);
+        upload_started.store(false, Ordering::SeqCst);
+        tauri::async_runtime::block_on(async {
+            let handle = app.handle().clone();
+            let upload = tauri::async_runtime::spawn(async move {
+                object_store_auto_upload::attempt(handle, true).await;
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                while !upload_started.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let github = tokio::time::timeout(
+                std::time::Duration::from_secs(90),
+                archive_auto_backup::attempt(app.handle().clone(), true),
+            )
+            .await;
+            let saved_while_upload_waited = show_chat(&chat_id);
+            let github_status = serde_json::to_value(
+                archive_auto_backup::archive_auto_backup_get(app.state(), app.state()).unwrap(),
+            )
+            .unwrap();
+            release_upload.store(true, Ordering::SeqCst);
+            upload.await.unwrap();
+            assert!(github.is_ok());
+            assert!(
+                saved_while_upload_waited,
+                "GitHub backup must finish while R2 is held: {github_status}"
+            );
+        });
+        assert!(!objects.lock().unwrap().is_empty());
+        let before = objects.lock().unwrap().len();
+        std::fs::write(
+            archive_root.join("objects/fixture-close-retry"),
+            b"pending after close",
+        )
+        .unwrap();
+        let next_chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        pause_upload.store(true, Ordering::SeqCst);
+        upload_started.store(false, Ordering::SeqCst);
+        release_upload.store(false, Ordering::SeqCst);
+        let elapsed = std::time::Instant::now();
+        let close_result = tauri::async_runtime::block_on(archive_auto_backup::close_all(
+            app.handle().clone(),
+            paths.clone(),
+            root.to_path_buf(),
+        ));
+        assert!(upload_started.load(Ordering::SeqCst));
+        assert!(elapsed.elapsed() >= std::time::Duration::from_secs(19));
+        assert!(elapsed.elapsed() < std::time::Duration::from_secs(24));
+        assert!(close_result.is_err() || matches!(close_result, Ok((_, false))));
+        release_upload.store(true, Ordering::SeqCst);
+        drop(window);
+        drop(app);
+        let restarted = mock_builder()
+            .manage(AppState {
+                paths: paths.clone(),
+                approvals: Default::default(),
+                setup_secrets: Default::default(),
+                usage_monitor: Default::default(),
+                usage_cache: Default::default(),
+                chat_active: Default::default(),
+                browser: Default::default(),
+                selections: Default::default(),
+            })
+            .manage(object_store_auto_upload::AutoUpload::default())
+            .manage(archive_auto_backup::AutoBackup::default())
+            .manage(remote.clone())
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        tauri::async_runtime::block_on(async {
+            for _ in 0..30 {
+                archive_auto_backup::attempt(restarted.handle().clone(), true).await;
+                object_store_auto_upload::attempt(restarted.handle().clone(), true).await;
+                let state = serde_json::to_value(
+                    object_store_auto_upload::object_store_auto_upload_get(
+                        restarted.state(),
+                        restarted.state(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if show_chat(&next_chat)
+                    && objects.lock().unwrap().len() > before
+                    && state["state"] == "idle"
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        });
+        assert!(show_chat(&next_chat));
+        assert!(objects.lock().unwrap().len() > before);
+        assert_eq!(
+            serde_json::to_value(
+                object_store_auto_upload::object_store_auto_upload_get(
+                    restarted.state(),
+                    restarted.state()
+                )
+                .unwrap()
+            )
+            .unwrap()["state"],
+            "idle"
+        );
+        return;
+    }
+    if automatic_upload {
+        let get = || invoke(&window, "object_store_auto_upload_get", json!({}));
+        assert_eq!(get()["enabled"], true);
+        tauri::async_runtime::block_on(object_store_auto_upload::attempt(
+            app.handle().clone(),
+            false,
+        ));
+        assert_eq!(get()["state"], "pending");
+        assert!(objects.lock().unwrap().is_empty());
+        let receive_marker = archive_root.join(".git/momso-first-receive-in-progress");
+        std::fs::write(&receive_marker, b"fixture").unwrap();
+        object_store_auto_upload::expedite(&app.state::<object_store_auto_upload::AutoUpload>());
+        tauri::async_runtime::block_on(object_store_auto_upload::attempt(
+            app.handle().clone(),
+            false,
+        ));
+        assert_eq!(get()["reason"], "first_receive_in_progress");
+        assert!(objects.lock().unwrap().is_empty());
+        std::fs::remove_file(receive_marker).unwrap();
+        object_store_auto_upload::expedite(&app.state::<object_store_auto_upload::AutoUpload>());
+        fail_upload.store(true, Ordering::SeqCst);
+        tauri::async_runtime::block_on(object_store_auto_upload::attempt(
+            app.handle().clone(),
+            false,
+        ));
+        assert_eq!(get()["state"], "retry_pending");
+        assert_eq!(get()["consecutiveFailures"], 2);
+        object_store_auto_upload::expedite(&app.state::<object_store_auto_upload::AutoUpload>());
+        tauri::async_runtime::block_on(object_store_auto_upload::attempt(
+            app.handle().clone(),
+            false,
+        ));
+        assert_eq!(get()["state"], "idle");
+        assert!(!objects.lock().unwrap().is_empty());
+        assert_eq!(
+            invoke(
+                &window,
+                "object_store_auto_upload_set",
+                json!({"enabled":false})
+            )["state"],
+            "disabled"
+        );
+        let before = objects.lock().unwrap().len();
+        std::fs::write(
+            archive_root.join("objects/fixture-after-disable"),
+            b"pending fixture",
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(object_store_auto_upload::attempt(
+            app.handle().clone(),
+            true,
+        ));
+        assert_eq!(objects.lock().unwrap().len(), before);
+        assert_eq!(
+            invoke(
+                &window,
+                "object_store_auto_upload_set",
+                json!({"enabled":true})
+            )["state"],
+            "pending"
+        );
+        assert!(tauri::async_runtime::block_on(
+            object_store_auto_upload::close_upload(app.handle().clone())
+        ));
+        assert_eq!(get()["state"], "idle");
+        assert!(objects.lock().unwrap().len() > before);
+    } else {
+        let backup = invoke(&window, "object_store_backup", json!({}));
+        assert_eq!(backup["completedCount"], 2);
+    }
     assert_eq!(
         invoke(&window, "app_state_backup", json!({}))["state"],
         "complete"
@@ -874,6 +1156,24 @@ fn oauth_r2_flow(with_claude: bool) {
     assert!(other_keys.iter().all(|key| map.contains_key(key)));
     assert!(state_keys.iter().all(|key| map.contains_key(key)));
     drop(map);
+    if automatic_upload {
+        tauri::async_runtime::block_on(object_store_auto_upload::attempt(
+            app.handle().clone(),
+            true,
+        ));
+        let map = objects.lock().unwrap();
+        for (key, value) in map.iter().filter(|(key, _)| key.contains("/manifests/")) {
+            let decoded =
+                object_store_transfer::decrypt_bytes(value, &identity, 1024 * 1024).unwrap();
+            let manifest: object_store_transfer::Manifest =
+                serde_json::from_slice(&decoded).unwrap();
+            assert_ne!(
+                manifest.sha256,
+                imported[0]["contentSha256"].as_str().unwrap(),
+                "purged source must not be uploaded again: {key}"
+            );
+        }
+    }
     #[cfg(windows)]
     if let Some(mut completion) = claude_completion {
         std::fs::write(&completion.marker, b"done").unwrap();
