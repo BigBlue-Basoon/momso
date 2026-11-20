@@ -82,6 +82,7 @@ mod provider_engine_smoke;
 mod redaction_wait;
 #[cfg(test)]
 mod scale_benchmark;
+mod tray_lifecycle;
 mod yoga_dictionary;
 
 pub fn serve_mcp_stdio(pipe: Option<String>) -> std::io::Result<()> {
@@ -100,6 +101,8 @@ mod provider_install;
 mod r2_oauth;
 mod records;
 mod runtime;
+#[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
+pub mod s5b_window_probe;
 mod selection_grants;
 #[cfg(windows)]
 mod setup_actions;
@@ -3250,15 +3253,15 @@ fn prepare_archive_for_start(
 pub fn run() {
     startup_timing::begin();
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             log::info!(
                 "lifecycle single_instance_activation pid={}",
                 std::process::id()
             );
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
+            if tray_lifecycle::is_test_exit(&args, std::env::var_os("MOMSO_TEST_EXIT_ALLOWED").as_deref() == Some(std::ffi::OsStr::new("1"))) {
+                tray_lifecycle::finish_exit(app.clone());
+            } else {
+                tray_lifecycle::show_main(app);
             }
         }))
         .plugin(
@@ -3303,34 +3306,7 @@ pub fn run() {
                 state.selections.record_window_event(event);
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                static CLOSING: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                let app = window.app_handle().clone();
-                let Some(state) = app.try_state::<AppState>() else {
-                    return;
-                };
-                let Ok(resources) = app.path().resource_dir() else {
-                    return;
-                };
-                api.prevent_close();
-                if CLOSING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    return;
-                }
-                let paths = state.paths.clone();
-                let window = window.clone();
-                tauri::async_runtime::spawn(async move {
-                    let close_result = archive_auto_backup::close_all(app.clone(), paths, resources).await;
-                    if let Ok((archive_auto_backup::CloseResult::Finished(Some(error)), _)) = close_result {
-                        if error != "redaction_pending" {
-                            report_chat_archive(&app, None, Err(error));
-                        }
-                    }
-                    log::info!("lifecycle main_window_destroy_requested");
-                    if let Err(error) = window.destroy() {
-                        log::warn!("lifecycle main_window_destroy_failed error={error}");
-                    }
-                    CLOSING.store(false, std::sync::atomic::Ordering::SeqCst);
-                });
+                tray_lifecycle::hide_on_close(window, api);
             }
         })
         .setup(|app| {
@@ -3428,8 +3404,10 @@ pub fn run() {
                 selections: Default::default(),
             });
             app.manage(archive_auto_backup::AutoBackup::default());
-            archive_auto_backup::start(app.handle().clone());
             app.manage(object_store_auto_upload::AutoUpload::default());
+            app.manage(tray_lifecycle::ExitBroker::default());
+            tray_lifecycle::install(app.handle())?;
+            archive_auto_backup::start(app.handle().clone());
             object_store_auto_upload::start(app.handle().clone());
             chat_redaction_recheck::start(
                 app.handle().clone(),
@@ -3447,6 +3425,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            tray_lifecycle::app_exit_respond,
             panel_browser::panel_browser_open,
             panel_browser::panel_browser_open_agent,
             panel_browser::panel_browser_open_human,

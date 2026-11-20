@@ -38,12 +38,12 @@ import {
   type RuntimeSession,
 } from './runtime'
 import { archiveErrorMessage } from './archive'
+import { listenAppExit } from './app-exit'
 import { GROUP_WORD, W } from './words'
 import {
   cancelChatMessage,
   chatRedactionCount,
   listenChatArchiveChanged,
-  createChat,
   createChatWithMessage,
   probeSendableProviders,
   createChatGroup,
@@ -1146,18 +1146,13 @@ function App() {
 
     let chatId = selectedChatId
     // 새 채팅방이면 방과 첫 말을 한 번에 저장한다(chat_create_with_message, 2026-11-20 뒤쪽 f2b1547). 말이 없는 방이 생기는 순간이 없다.
-    // 그 뒤의 보내기는 저장된 그 말(firstMessageId)을 다시 쓴다. 스킬만 고르고 글이 없으면 뒤쪽이 empty_message 로 받지 않아 예전처럼 방을 먼저 만든다.
+    // 그 뒤의 보내기는 저장된 그 말(firstMessageId)을 다시 쓴다. 스킬만 고르고 글이 없어도 같다(2026-11-20 뒤쪽 1b3ef51: 스킬이 있으면 빈 글도 받고 제목은 빈 글).
     let firstMessageId: string | null = null
     try {
       if (!chatId) {
-        let created
-        if (text) {
-          const made = await createChatWithMessage(text, skill?.name ?? null)
-          created = made.chat
-          firstMessageId = made.messageId
-        } else {
-          created = await createChat()
-        }
+        const made = await createChatWithMessage(text, skill?.name ?? null)
+        const created = made.chat
+        firstMessageId = made.messageId
         chatId = created.id
         const waiting = pendingAttachmentsRef.current[NEW_CHAT_KEY] ?? []
         if (waiting.length > 0) {
@@ -1380,6 +1375,13 @@ function App() {
     void listenChatItems((chatId) => refreshChatItems(chatId, true)).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
   }, [refreshChatItems])
+  // 트레이 "종료"(app-exit-requested)를 앱에 하나 듣는다. 오른쪽 패널이 떠 있으면 고치던 글을 묻고, 없으면(첫 실행 화면 등) 바로 exit(app-exit.ts).
+  useEffect(() => {
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenAppExit().then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [])
 
   // 원자료를 삭제·되돌리기·완전히 삭제하면(어느 화면에서든, source-assets.ts 가 알림) 지금 채팅방의 첨부 목록을 바로 다시 읽고,
   // 말풍선의 첨부 표시(지운 것은 줄 그음)도 고친다. 뒤쪽이 chat_read 에 말의 첨부를 주면 그 값도 다시 읽는다(2026-11-18).

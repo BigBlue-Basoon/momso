@@ -135,7 +135,7 @@ pub(crate) async fn media_save_as(
     tauri::async_runtime::spawn_blocking(move || {
         let (source, name) = prepare(&worker_root, &database, &asset_id)?;
         let mut dialog = app.dialog().file().set_file_name(name);
-        if let Some(window) = app.get_webview_window("main") {
+        if let Some(window) = app.get_window("main") {
             dialog = dialog.set_parent(&window);
         }
         let Some(destination) = dialog

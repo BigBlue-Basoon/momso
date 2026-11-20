@@ -7,6 +7,14 @@ fn main() {
     #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
     if first
         .as_ref()
+        .is_some_and(|arg| arg == "--momso-s5b-window-probe")
+    {
+        momso_desktop_lib::s5b_window_probe::run();
+        return;
+    }
+    #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
+    if first
+        .as_ref()
         .is_some_and(|arg| arg == "--momso-g83-test-probe")
     {
         momso_desktop_lib::g61_test_probe::run_g83();

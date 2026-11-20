@@ -456,6 +456,20 @@ async fn open_panel(
     if app.get_webview(LABEL).is_some() {
         return Err("already_open".into());
     }
+    #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
+    let profile = if let Some(root) = std::env::var_os("MOMSO_S5B_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        if !root.is_absolute() || !root.starts_with(std::env::temp_dir()) {
+            return Err("unavailable".into());
+        }
+        root.join("panel-browser-profile")
+    } else {
+        app.path()
+            .app_data_dir()
+            .map_err(|_| "unavailable")?
+            .join("panel-browser-profile")
+    };
+    #[cfg(not(all(windows, debug_assertions, feature = "g61-test-probe")))]
     let profile = app
         .path()
         .app_data_dir()

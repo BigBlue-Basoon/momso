@@ -440,7 +440,8 @@ pub(crate) fn create_with_message(
     text: &str,
     skill: Option<&str>,
 ) -> Result<CreatedChatWithMessage, String> {
-    if text.trim().is_empty() {
+    let skill = skill.filter(|name| !name.trim().is_empty());
+    if text.trim().is_empty() && skill.is_none() {
         return Err("empty_message".into());
     }
     let mut c = db(path)?;
@@ -450,18 +451,21 @@ pub(crate) fn create_with_message(
     let id = format!("chat_{}", Uuid::new_v4());
     let message_id = Uuid::new_v4().to_string();
     let time = stamp();
-    let title: String = text
-        .replace("\r\n", " ")
-        .replace(['\r', '\n'], " ")
-        .chars()
-        .take(40)
-        .collect();
+    let title: String = if text.trim().is_empty() {
+        String::new()
+    } else {
+        text.replace("\r\n", " ")
+            .replace(['\r', '\n'], " ")
+            .chars()
+            .take(40)
+            .collect()
+    };
     tx.execute(
         "INSERT INTO chats(id,title,created_at,updated_at) VALUES (?1,?2,?3,?3)",
         params![id, title, time],
     )
     .map_err(|_| "storage_error".to_owned())?;
-    tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,skill,retryable_fast) VALUES (?1,?2,'user',?3,?4,?5,1)", params![message_id,id,text,time,skill.filter(|name| !name.is_empty())]).map_err(|_| "storage_error".to_owned())?;
+    tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,skill,retryable_fast) VALUES (?1,?2,'user',?3,?4,?5,1)", params![message_id,id,text,time,skill]).map_err(|_| "storage_error".to_owned())?;
     let chat = one(&tx, &id)?;
     tx.commit().map_err(|_| "storage_error".to_owned())?;
     Ok(CreatedChatWithMessage { chat, message_id })
@@ -1699,6 +1703,33 @@ mod tests {
         assert_eq!(list(&p).unwrap().len(), 1);
         append(&p, &empty.id, Role::User, "arrived", None, None).unwrap();
         assert_eq!(archived_list(&p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn skill_only_first_message_can_be_retried_without_duplicate() {
+        let (_dir, path) = database();
+        for (text, skill) in [("", None), ("  ", Some("  ")), ("", Some(""))] {
+            assert!(
+                matches!(create_with_message(&path, text, skill), Err(error) if error == "empty_message")
+            );
+        }
+        let created = create_with_message(&path, "", Some("sample-skill")).unwrap();
+        assert_eq!(created.chat.title, "");
+        assert_eq!(created.chat.message_count, 1);
+        assert_eq!(
+            retry_input(&path, &created.chat.id, &created.message_id).unwrap(),
+            Some((String::new(), Some("sample-skill".to_owned())))
+        );
+        assert_eq!(read(&path, &created.chat.id).unwrap().messages.len(), 1);
+        let spaced = create_with_message(&path, " \n ", Some("sample-skill")).unwrap();
+        assert_eq!(spaced.chat.title, "");
+        assert_eq!(
+            retry_input(&path, &spaced.chat.id, &spaced.message_id)
+                .unwrap()
+                .unwrap()
+                .0,
+            " \n "
+        );
     }
     #[test]
     fn independent_databases_create_distinct_chat_ids() {

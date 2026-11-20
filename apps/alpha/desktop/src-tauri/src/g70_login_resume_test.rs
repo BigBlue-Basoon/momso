@@ -151,12 +151,24 @@ fn main() {
             browser: browser.clone(),
             selections: Default::default(),
         });
-        let id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        chat::rename(&db, &id, "fixture").unwrap();
         let skill = "naver-smartplace";
+        let skill_only = std::env::var_os("MOMSO_SKILL_ONLY_FIRST").is_some();
+        let (id, first_message_id) = if skill_only {
+            let created = chat::create_with_message(&db, "", Some(skill)).unwrap();
+            let value = serde_json::to_value(&created).unwrap();
+            assert_eq!(value["chat"]["title"], "");
+            (
+                value["chat"]["id"].as_str().unwrap().to_owned(),
+                Some(created.message_id),
+            )
+        } else {
+            let id = serde_json::to_value(chat::create(&db).unwrap()).unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            chat::rename(&db, &id, "fixture").unwrap();
+            (id, None)
+        };
         let policy = browser_gateway::Policy::from_skill(&archive_root, skill)
             .unwrap()
             .unwrap();
@@ -168,7 +180,7 @@ fn main() {
             handle.clone(),
             handle.state(),
             id.clone(),
-            "fixture request".into(),
+            if skill_only { "" } else { "fixture request" }.into(),
             "codex".into(),
             None,
             None,
@@ -176,7 +188,7 @@ fn main() {
             None,
             None,
             None,
-            None,
+            first_message_id,
             None,
         )
         .await
@@ -250,6 +262,18 @@ fn main() {
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect();
         assert_eq!(turns.len(), 2);
+        if skill_only {
+            let first = serde_json::to_value(chat::read(&db, &id).unwrap()).unwrap();
+            let messages = first["messages"].as_array().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m["role"] == "user" && m["text"] == "" && m["skill"] == skill)
+                    .count(),
+                1
+            );
+            assert!(turns[0].to_string().contains(skill));
+        }
         let text = turns[1]["params"]["input"][0]["text"].as_str().unwrap();
         assert!(text.contains("로그인을 마쳤습니다. 이어서 해 주세요."));
         assert!(text.contains(skill));
@@ -260,6 +284,20 @@ fn main() {
             .iter()
             .any(|m| m["text"] == "로그인을 마쳤습니다. 이어서 해 주세요." && m["skill"] == skill));
     });
+}
+
+#[test]
+fn skill_only_first_message_sends_via_retry_message_id() {
+    let status = crate::hidden_process::hidden_command(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "g70_login_resume_test::fake_cli_login_finished_resume_sends_one_scoped_turn",
+            "--nocapture",
+        ])
+        .env("MOMSO_SKILL_ONLY_FIRST", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[test]
