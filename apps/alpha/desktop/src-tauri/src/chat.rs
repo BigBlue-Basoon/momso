@@ -349,7 +349,7 @@ pub(crate) async fn archive_if_idle(
 
 pub(crate) fn archived_list(path: &Path) -> Result<Vec<ArchivedChat>, String> {
     let c = db(path)?;
-    let mut query = c.prepare("SELECT c.id,c.title,c.group_id,c.updated_at,c.archived_at,(SELECT m.provider FROM chat_messages m WHERE m.chat_id=c.id AND m.provider IS NOT NULL ORDER BY m.rowid DESC LIMIT 1) FROM chats c WHERE c.archived_at IS NOT NULL ORDER BY c.archived_at DESC,c.rowid DESC").map_err(|_| "storage_error".to_string())?;
+    let mut query = c.prepare("SELECT c.id,c.title,c.group_id,c.updated_at,c.archived_at,(SELECT m.provider FROM chat_messages m WHERE m.chat_id=c.id AND m.provider IS NOT NULL ORDER BY m.rowid DESC LIMIT 1) FROM chats c WHERE c.archived_at IS NOT NULL AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id) ORDER BY c.archived_at DESC,c.rowid DESC").map_err(|_| "storage_error".to_string())?;
     let rows = query
         .query_map([], |row| {
             Ok(ArchivedChat {
@@ -427,11 +427,50 @@ pub(crate) fn create(path: &Path) -> Result<ChatSummary, String> {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CreatedChatWithMessage {
+    pub(crate) chat: ChatSummary,
+    pub(crate) message_id: String,
+}
+
+pub(crate) fn create_with_message(
+    path: &Path,
+    text: &str,
+    skill: Option<&str>,
+) -> Result<CreatedChatWithMessage, String> {
+    if text.trim().is_empty() {
+        return Err("empty_message".into());
+    }
+    let mut c = db(path)?;
+    let tx = c
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| "storage_error".to_owned())?;
+    let id = format!("chat_{}", Uuid::new_v4());
+    let message_id = Uuid::new_v4().to_string();
+    let time = stamp();
+    let title: String = text
+        .replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
+        .chars()
+        .take(40)
+        .collect();
+    tx.execute(
+        "INSERT INTO chats(id,title,created_at,updated_at) VALUES (?1,?2,?3,?3)",
+        params![id, title, time],
+    )
+    .map_err(|_| "storage_error".to_owned())?;
+    tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,skill,retryable_fast) VALUES (?1,?2,'user',?3,?4,?5,1)", params![message_id,id,text,time,skill.filter(|name| !name.is_empty())]).map_err(|_| "storage_error".to_owned())?;
+    let chat = one(&tx, &id)?;
+    tx.commit().map_err(|_| "storage_error".to_owned())?;
+    Ok(CreatedChatWithMessage { chat, message_id })
+}
 pub(crate) fn list(path: &Path) -> Result<Vec<ChatSummary>, String> {
     let c = db(path)?;
     let mut q = c
         .prepare(&format!(
-            "{SELECT_SUMMARY} WHERE c.archived_at IS NULL ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC"
+            "{SELECT_SUMMARY} WHERE c.archived_at IS NULL AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id) ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC"
         ))
         .map_err(|_| "채팅방 목록을 읽지 못했습니다".to_string())?;
     let rows = q
@@ -452,7 +491,7 @@ pub(crate) struct ChatListPage {
 pub(crate) fn list_page(path: &Path, offset: u32) -> Result<ChatListPage, String> {
     const PAGE_SIZE: usize = 80;
     let c = db(path)?;
-    let mut q = c.prepare(&format!("{SELECT_SUMMARY} WHERE c.id IN (SELECT id FROM chats WHERE archived_at IS NULL ORDER BY pinned_order IS NULL,pinned_order,updated_at DESC,rowid DESC LIMIT 81 OFFSET ?1) ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC")).map_err(|_| "채팅방 목록을 읽지 못했습니다".to_owned())?;
+    let mut q = c.prepare(&format!("{SELECT_SUMMARY} WHERE c.id IN (SELECT id FROM chats WHERE archived_at IS NULL AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id=chats.id) ORDER BY pinned_order IS NULL,pinned_order,updated_at DESC,rowid DESC LIMIT 81 OFFSET ?1) ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC")).map_err(|_| "채팅방 목록을 읽지 못했습니다".to_owned())?;
     let mut items = q
         .query_map([offset], summary)
         .map_err(|_| "채팅방 목록을 읽지 못했습니다".to_owned())?
@@ -1058,8 +1097,9 @@ pub(crate) fn search(path: &Path, query: &str) -> Result<Vec<ChatSearchResult>, 
     } else {
         "SELECT c.id,c.title,NULLIF(c.created_at,''),NULLIF(c.updated_at,''),(SELECT count(*) FROM chat_messages m WHERE m.chat_id=c.id),c.group_id,c.pinned_order,(SELECT source_provider FROM chat_imports i WHERE i.chat_id=c.id),(SELECT text FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0 ORDER BY m.rowid LIMIT 1) AS match_text FROM chats c WHERE c.archived_at IS NULL AND (instr(c.title,?1)>0 OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0)) ORDER BY c.pinned_order IS NULL,c.pinned_order,c.updated_at DESC,c.rowid DESC"
     };
+    let sql = sql.replace("WHERE c.archived_at IS NULL AND (", "WHERE c.archived_at IS NULL AND EXISTS(SELECT 1 FROM chat_messages visible WHERE visible.chat_id=c.id) AND (");
     let mut q = c
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
     let phrase = if indexed {
         grams
@@ -1105,7 +1145,7 @@ pub(crate) struct ChatSearchPage {
 pub(crate) fn search_page(path: &Path, query: &str, offset: u32) -> Result<ChatSearchPage, String> {
     const PAGE_SIZE: usize = 80;
     let c = db(path)?;
-    let mut statement = c.prepare("WITH selected AS MATERIALIZED (SELECT c.id FROM chats c WHERE c.archived_at IS NULL AND (instr(c.title,?1)>0 OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0)) ORDER BY (c.pinned_order IS NULL),c.pinned_order,c.updated_at DESC,c.id DESC LIMIT 81 OFFSET ?2) SELECT c.id,c.title,NULLIF(c.created_at,''),NULLIF(c.updated_at,''),(SELECT count(*) FROM chat_messages m WHERE m.chat_id=c.id),c.group_id,c.pinned_order,(SELECT source_provider FROM chat_imports i WHERE i.chat_id=c.id),(SELECT text FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0 ORDER BY m.rowid LIMIT 1) FROM selected s JOIN chats c ON c.id=s.id ORDER BY (c.pinned_order IS NULL),c.pinned_order,c.updated_at DESC,c.id DESC").map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
+    let mut statement = c.prepare("WITH selected AS MATERIALIZED (SELECT c.id FROM chats c WHERE c.archived_at IS NULL AND EXISTS(SELECT 1 FROM chat_messages visible WHERE visible.chat_id=c.id) AND (instr(c.title,?1)>0 OR EXISTS (SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0)) ORDER BY (c.pinned_order IS NULL),c.pinned_order,c.updated_at DESC,c.id DESC LIMIT 81 OFFSET ?2) SELECT c.id,c.title,NULLIF(c.created_at,''),NULLIF(c.updated_at,''),(SELECT count(*) FROM chat_messages m WHERE m.chat_id=c.id),c.group_id,c.pinned_order,(SELECT source_provider FROM chat_imports i WHERE i.chat_id=c.id),(SELECT text FROM chat_messages m WHERE m.chat_id=c.id AND instr(m.text,?1)>0 ORDER BY m.rowid LIMIT 1) FROM selected s JOIN chats c ON c.id=s.id ORDER BY (c.pinned_order IS NULL),c.pinned_order,c.updated_at DESC,c.id DESC").map_err(|_| "채팅방을 검색하지 못했습니다".to_string())?;
     let rows = statement
         .query_map(params![query, offset], |row| {
             let text: Option<String> = row.get(8)?;
@@ -1454,6 +1494,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&db).unwrap();
         for n in 0..163 {
             conn.execute("INSERT INTO chats(id,title,created_at,updated_at,archived_at) VALUES(?1,?2,'2026-01-01','2026-01-01',?3)", rusqlite::params![format!("chat_{n:08x}-0000-4000-8000-{n:012x}"),format!("fixture-{n}"),if n == 162 { Some("2026-01-01") } else { None }]).unwrap();
+            conn.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at) VALUES (?1,?2,'user','hello','2026-01-01')", rusqlite::params![format!("message-{n}"),format!("chat_{n:08x}-0000-4000-8000-{n:012x}")]).unwrap();
         }
         let first = serde_json::to_value(list_page(&db, 0).unwrap()).unwrap();
         let second = serde_json::to_value(list_page(&db, 80).unwrap()).unwrap();
@@ -1535,6 +1576,7 @@ mod tests {
         let (_d, p) = database();
         let first = create(&p).unwrap();
         let second = create(&p).unwrap();
+        append(&p, &second.id, Role::User, "second", None, None).unwrap();
         let conn = db(&p).unwrap();
         conn.execute(
             "INSERT INTO chat_groups(id,name,position,created_at) VALUES ('group','group',0,'now')",
@@ -1605,6 +1647,58 @@ mod tests {
         assert!(c.id.starts_with("chat_"));
         assert_eq!(c.message_count, 0);
         assert_eq!(read(&p, &c.id).unwrap().messages.len(), 0);
+    }
+    #[test]
+    fn first_message_is_atomic_and_empty_rooms_are_hidden() {
+        let _d = tempfile::tempdir().unwrap();
+        let p = _d.path().join("test.db");
+        crate::storage::initialize(&p, &_d.path().join("backups"), "test").unwrap();
+        let empty = create(&p).unwrap();
+        assert!(list(&p).unwrap().is_empty());
+        assert!(list_page(&p, 0).unwrap().items.is_empty());
+        assert!(search(&p, "").unwrap().is_empty());
+        assert!(search_page(&p, "", 0).unwrap().items.is_empty());
+        assert_eq!(set_archived(&p, &empty.id, true).state, "ok");
+        assert!(archived_list(&p).unwrap().is_empty());
+        let c = db(&p).unwrap();
+        c.execute_batch("CREATE TRIGGER reject_message BEFORE INSERT ON chat_messages BEGIN SELECT RAISE(ABORT, 'rejected'); END;").unwrap();
+        assert!(create_with_message(&p, "hello", None).is_err());
+        let count: i64 = c
+            .query_row("SELECT count(*) FROM chats", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        c.execute_batch("DROP TRIGGER reject_message;").unwrap();
+        let created = create_with_message(&p, "hello", Some("")).unwrap();
+        assert_eq!(created.chat.message_count, 1);
+        assert_eq!(
+            retry_input(&p, &created.chat.id, &created.message_id)
+                .unwrap()
+                .unwrap()
+                .0,
+            "hello"
+        );
+        assert_eq!(
+            retry_input(&p, &created.chat.id, &created.message_id)
+                .unwrap()
+                .unwrap()
+                .1,
+            None
+        );
+        let fixture = Connection::open(&p).unwrap();
+        fixture.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES ('fixture-asset','other',?1,1,'sha256/fixture','fixture.txt','fixture','now')", ["a".repeat(64)]).unwrap();
+        fixture.execute("INSERT INTO chat_attachments(receipt_id,chat_id,asset_id) VALUES ('fixture',?1,'fixture-asset')", [&created.chat.id]).unwrap();
+        claim_retry_attachments(&p, &created.chat.id, &created.message_id).unwrap();
+        let attached: String = fixture
+            .query_row(
+                "SELECT message_id FROM chat_attachments WHERE receipt_id='fixture'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attached, created.message_id);
+        assert_eq!(list(&p).unwrap().len(), 1);
+        append(&p, &empty.id, Role::User, "arrived", None, None).unwrap();
+        assert_eq!(archived_list(&p).unwrap().len(), 1);
     }
     #[test]
     fn independent_databases_create_distinct_chat_ids() {
@@ -1951,6 +2045,6 @@ mod tests {
         let second = create(&p).unwrap();
         assert_ne!(first.id, second.id);
         assert!(start.elapsed() < Duration::from_secs(3));
-        assert_eq!(list(&p).unwrap().len(), 2);
+        assert!(list(&p).unwrap().is_empty());
     }
 }

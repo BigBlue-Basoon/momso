@@ -6,7 +6,7 @@ import { useAppUpdate } from './components/AppUpdate'
 import { QuestionDialog } from './components/ZetPanel'
 import { restartApp } from './app-update'
 import { isMissingCommand as isMissingMediaCommand } from './ai-models'
-import { EMPTY_CHAT_ITEMS, attachFileToChat, chatItemCount, getChatItems, listenChatItems, readMessageAttachments, type AttachedFile, type ChatItems } from './chat-items'
+import { EMPTY_CHAT_ITEMS, attachFileToChat, chatItemCount, getChatItems, importAttachment, linkAttachment, listenChatItems, readMessageAttachments, type AttachedFile, type ChatItems } from './chat-items'
 import { listSkills, type SkillEntry } from './skills'
 import { listMedia, mediaChat, mediaSrc, type MediaItem } from './media'
 import { AssistantPanel, type ChatViewMessage } from './components/AssistantPanel'
@@ -44,6 +44,7 @@ import {
   chatRedactionCount,
   listenChatArchiveChanged,
   createChat,
+  createChatWithMessage,
   probeSendableProviders,
   createChatGroup,
   listChatGroups,
@@ -164,6 +165,9 @@ function shortcutFor(event: KeyboardEvent): ShortcutAction | null {
   return null
 }
 
+/** 아직 방이 없는 새 채팅방에서 첨부해 둔 것을 담는 열쇠(방은 첫 말을 보낼 때 생긴다). */
+const NEW_CHAT_KEY = 'new'
+
 function App() {
   const desktopRuntime = isDesktopRuntime()
   // 첫 실행 화면을 보일지(설치판과 개발용 앱 모두). 'checking' 동안은 빈 창만 둔다.
@@ -199,9 +203,12 @@ function App() {
   const [pendingMessage, setPendingMessage] = useState<ChatViewMessage | null>(null)
   // 첨부(2026-11-18): 채팅방마다 보내기 전까지 붙인 것. 보내면 그 말(chat_send 의 userMessageId)에 붙여 말풍선에 보인다.
   // 뒤쪽이 chat_read 에 말의 첨부를 돌려주면 그 값을 쓴다(앱을 다시 켜도 보이게). 그 전에는 이 앱을 켠 동안만 보인다.
+  // 채팅방 id(새 채팅방은 NEW_CHAT_KEY)마다 첨부해 두고 아직 보내지 않은 것.
   const [pendingAttachments, setPendingAttachments] = useState<Record<string, AttachedFile[]>>({})
   const pendingAttachmentsRef = useRef(pendingAttachments)
   pendingAttachmentsRef.current = pendingAttachments
+  // 새 채팅방에서 원자료로 보존만 하고 아직 방에 잇지 않은 첨부(원자료 번호). 첫 말을 보낼 때(또는 그 말을 다시 보낼 때) 잇는다.
+  const unlinkedRef = useRef(new Set<string>())
   const [sentAttachments, setSentAttachments] = useState<Record<string, AttachedFile[]>>({})
   // 채팅방 고정·보관 명령이 있는지(앱을 열 때 알아본다).
   const [chatKeep, setChatKeep] = useState(false)
@@ -658,31 +665,23 @@ function App() {
     showPlace(next)
   }
 
-  // 클립(또는 끌어 놓기)으로 고른 파일을 지금 채팅방에 첨부한다. 채팅방이 아직 없으면(새 채팅방) 보낼 때처럼 먼저 만든다
-  // (뒤쪽 chat_attach_asset 은 있는 채팅방에만 첨부된다). 첨부한 것은 오른쪽 패널의 "이 채팅방에서 다룬 것"에 보인다.
+  // 클립(또는 끌어 놓기)으로 고른 파일을 지금 채팅방에 첨부한다. 첨부한 것은 오른쪽 패널의 "이 채팅방에서 다룬 것"에 보인다.
+  // 채팅방이 아직 없으면(새 채팅방) 방을 만들지 않는다: 원자료로 보존만 해 두고, 첫 말을 보낼 때 방을 만든 뒤 잇는다
+  // (2026-11-20 본부: 방은 첫 말이 저장될 때만 생긴다. 첨부만 하고 보내지 않으면 빈 방이 남았다).
   const attachingRef = useRef(false)
   async function attachFiles(paths: string[]) {
     if (paths.length === 0 || attachingRef.current) return
     attachingRef.current = true
     try {
-      let chatId = selectedChatId
-      if (!chatId) {
-        const created = await createChat()
-        chatId = created.id
-        selectedChatRef.current = chatId
-        replacePlace.current = true
-        setSelectedChatId(chatId)
-        setChat({ id: created.id, title: created.title, createdAt: created.createdAt, updatedAt: created.updatedAt, messages: [] })
-        rememberChatModel(created.id, chosen)
-        void refreshChats()
-      }
+      const chatId = selectedChatId
+      const key = chatId ?? NEW_CHAT_KEY
       // 폴더를 놓으면 뒤쪽이 그 경로만 source_folder_not_allowed 로 거절한다(2026-11-17). 폴더는 건너뛰고 파일은 계속 붙인다.
       const names: string[] = []
       const attached: AttachedFile[] = []
       let folders = 0
       for (const path of paths) {
         try {
-          const file = await attachFileToChat(chatId, path)
+          const file = chatId ? await attachFileToChat(chatId, path) : await importAttachment(path)
           attached.push(file)
           names.push(file.name)
         } catch (error) {
@@ -690,9 +689,10 @@ function App() {
           folders += 1
         }
       }
-      if (names.length > 0) refreshChatItems(chatId, true)
+      if (chatId && names.length > 0) refreshChatItems(chatId, true)
       if (attached.length > 0) {
-        const target = chatId
+        const target = key
+        if (!chatId) for (const file of attached) unlinkedRef.current.add(file.assetId)
         setPendingAttachments((current) => ({ ...current, [target]: [...(current[target] ?? []).filter((old) => !attached.some((file) => file.assetId === old.assetId)), ...attached] }))
       }
       // 붙인 것과 폴더를 한 줄에 함께(둘 다 알 수 있게).
@@ -1135,7 +1135,7 @@ function App() {
     // 답을 받지 못한 마지막 말과 같은 글을 다시 보내면 백엔드가 그 말을 다시 쓸 수 있다(고속 모드 실패 뒤). 그때는 같은 말을 한 번 더 그리지 않는다.
     const last = chat && chat.id === selectedChatId ? chat.messages[chat.messages.length - 1] : undefined
     const resending = Boolean(retryMessageId) || (last?.role === 'user' && last.text === text)
-    const attachedNow = (selectedChatId && pendingAttachmentsRef.current[selectedChatId]) || []
+    const attachedNow = pendingAttachmentsRef.current[selectedChatId ?? NEW_CHAT_KEY] ?? []
     setPendingMessage(resending ? null : { id: `pending-${Date.now()}`, role: 'user', text, skill: skill?.title ?? null, createdAt: new Date().toISOString(), attachments: attachedNow })
     const giveBack = (error: unknown, fallback: string) => {
       setPendingMessage(null)
@@ -1145,10 +1145,27 @@ function App() {
     }
 
     let chatId = selectedChatId
+    // 새 채팅방이면 방과 첫 말을 한 번에 저장한다(chat_create_with_message, 2026-11-20 뒤쪽 f2b1547). 말이 없는 방이 생기는 순간이 없다.
+    // 그 뒤의 보내기는 저장된 그 말(firstMessageId)을 다시 쓴다. 스킬만 고르고 글이 없으면 뒤쪽이 empty_message 로 받지 않아 예전처럼 방을 먼저 만든다.
+    let firstMessageId: string | null = null
     try {
       if (!chatId) {
-        const created = await createChat()
+        let created
+        if (text) {
+          const made = await createChatWithMessage(text, skill?.name ?? null)
+          created = made.chat
+          firstMessageId = made.messageId
+        } else {
+          created = await createChat()
+        }
         chatId = created.id
+        const waiting = pendingAttachmentsRef.current[NEW_CHAT_KEY] ?? []
+        if (waiting.length > 0) {
+          const moved = { ...pendingAttachmentsRef.current, [created.id]: waiting }
+          delete moved[NEW_CHAT_KEY]
+          pendingAttachmentsRef.current = moved
+          setPendingAttachments(moved)
+        }
         selectedChatRef.current = chatId
         replacePlace.current = true
         setSelectedChatId(chatId)
@@ -1161,6 +1178,30 @@ function App() {
       return
     }
     const targetId = chatId
+    // 이미 저장된 내 말(새 방의 첫 말이거나 다시 보내는 말). 보내기 준비가 실패해도 그 말은 방에 남으므로 글을 입력창에 돌려놓지 않는다(같은 말이 두 번 생긴다).
+    const savedId = firstMessageId ?? retryMessageId ?? null
+    const keepSaved = (kind: string, actions: string[]) => {
+      generatingRef.current = null
+      setGeneratingChatId(null)
+      setPendingMessage(null)
+      if (!savedId) return
+      setChatFailures((current) => ({ ...current, [targetId]: { kind, retryAt: null, actions: [...actions, 'retry'], provider: target.provider, text, userMessageId: savedId, regenerateOf } }))
+      void refreshChats()
+      void readChatPaged(targetId).then((document) => { if (selectedChatRef.current === targetId) setChat(document) }).catch(() => {})
+    }
+    // 새 채팅방에서 보존만 해 둔 첨부를 이 방에 잇는다. 못 이으면 저장된 첫 말은 방에 두고 "다시 보내기" 줄을 둔다(다시 보내면 남은 것을 잇고 그 말로 보낸다).
+    try {
+      for (const file of pendingAttachmentsRef.current[targetId] ?? []) {
+        if (!unlinkedRef.current.has(file.assetId)) continue
+        await linkAttachment(targetId, file.assetId)
+        unlinkedRef.current.delete(file.assetId)
+      }
+    } catch (error) {
+      showToast(archiveErrorMessage(error, W.attach.failed))
+      if (savedId) keepSaved('unknown', [])
+      else giveBack(null, W.attach.failed)
+      return
+    }
     lastSentTextRef.current = { chatId: targetId, text, regenerateOf }
     // 브라우저에서 직접 한 뒤 채팅으로 알린 것이므로 "직접 해 주세요" 줄을 거둔다.
     setBrowserHuman((current) => {
@@ -1184,7 +1225,7 @@ function App() {
       const targetModel = models?.find((list) => list.provider === target.provider)?.models.find((model) => model.id === target.model)
       const refused = Boolean(fastRefused[`${target.provider}:${target.model ?? ''}`])
       lastSendRef.current = { chatId: targetId, provider: target.provider, model: target.model }
-      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null, retryMessageId ?? null, regenerateOf)
+      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null, savedId, regenerateOf)
       if (result?.status === 'started' && lastSentTextRef.current?.chatId === targetId) {
         lastSentTextRef.current = { ...lastSentTextRef.current, userMessageId: result.userMessageId ?? null }
       }
@@ -1208,7 +1249,7 @@ function App() {
         // 고른 스킬이 그사이 꺼졌거나 없어졌다(말은 저장되지 않았다). 적은 말은 돌려놓고, 쓸 수 없는 스킬 조각은 빼고, 목록을 새로 읽는다.
         generatingRef.current = null
         setGeneratingChatId(null)
-        giveBack(null, W.skills.unavailable)
+        if (firstMessageId) { keepSaved('unknown', []); showToast(W.skills.unavailable) } else giveBack(null, W.skills.unavailable)
         setChosenSkill(null)
         refreshSkills()
         return
@@ -1218,8 +1259,8 @@ function App() {
         generatingRef.current = null
         setGeneratingChatId(null)
         setPendingMessage(null)
-        setPrompt(text)
-        setChosenSkill(skill)
+        if (firstMessageId) keepSaved('authentication', ['signIn', 'switchProvider'])
+        else { setPrompt(text); setChosenSkill(skill) }
         showToast(W.app.authFailed(PROVIDER_NAME[target.provider]))
         return
       }
@@ -1228,8 +1269,8 @@ function App() {
         generatingRef.current = null
         setGeneratingChatId(null)
         setPendingMessage(null)
-        setPrompt(text)
-        setChosenSkill(skill)
+        if (firstMessageId) keepSaved('unknown', [])
+        else { setPrompt(text); setChosenSkill(skill) }
         refuseFast(lastSendRef.current)
         return
       }
@@ -1238,7 +1279,8 @@ function App() {
         generatingRef.current = null
         setGeneratingChatId(null)
         setPendingMessage(null)
-        setPrompt(text)
+        if (firstMessageId) keepSaved('unknown', ['switchProvider'])
+        else setPrompt(text)
         setSendableProviders((current) => current.filter((provider) => provider !== target.provider))
         return
       }
@@ -1252,7 +1294,7 @@ function App() {
     } catch (error) {
       generatingRef.current = null
       setGeneratingChatId(null)
-      giveBack(error, W.app.text10)
+      if (firstMessageId) { keepSaved('unknown', []); showToast(archiveErrorMessage(error, W.app.text10)) } else giveBack(error, W.app.text10)
     }
   }
 
@@ -1303,7 +1345,7 @@ function App() {
   // 창에 파일을 끌어 놓으면 클립과 같게 지금 채팅방에 첨부한다(채팅방 화면일 때만).
   const attachDropRef = useRef<(paths: string[]) => void>(() => {})
   attachDropRef.current = (paths) => { if (screen === 'home' && !settingsOpen) void attachFiles(paths) }
-  // 패널에서 다 받은 파일의 "채팅방에 첨부"(2026-11-18). 지금 보는 채팅방에 붙인다(없으면 새로 만든다).
+  // 패널에서 다 받은 파일의 "채팅방에 첨부"(2026-11-18). 지금 보는 채팅방에 붙인다(없으면 첫 말을 보낼 때 방을 만들어 잇는다).
   useEffect(() => {
     const onAttach = (event: Event) => {
       const paths = (event as CustomEvent<{ paths?: string[] }>).detail?.paths

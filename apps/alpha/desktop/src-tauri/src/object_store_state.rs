@@ -1328,6 +1328,15 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             .as_str()
             .unwrap()
             .to_owned();
+        crate::chat::append(
+            &paths.database_path,
+            &archived,
+            crate::chat::Role::User,
+            "archived message",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             crate::chat::set_archived(&paths.database_path, &archived, true).state,
             "ok"

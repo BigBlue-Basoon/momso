@@ -279,6 +279,9 @@ pub(crate) fn write_known(
     if deleted_at(db, id)?.is_some() {
         return Err("chat_deleted");
     }
+    if !should_process(root, db, id)? {
+        return Ok(());
+    }
     let path = target(root, id)?;
     let mut existing = None;
     let received = match fs::symlink_metadata(&path) {
@@ -298,6 +301,15 @@ pub(crate) fn write_known(
             if data.pointer("/room/id").and_then(serde_json::Value::as_str) != Some(id) {
                 return Err("invalid_snapshot");
             }
+            if !has_messages(db, id)?
+                && data
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or("invalid_snapshot")?
+                    .is_empty()
+            {
+                return Ok(());
+            }
             let safe = crate::chat_archive_snapshot::redact_historical_snapshot(&data, known)?;
             crate::chat_archive_snapshot::restore_append(db, &safe)?;
             existing = Some(bytes);
@@ -306,6 +318,9 @@ pub(crate) fn write_known(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(io_failure("file", &error)),
     };
+    if !has_messages(db, id)? {
+        return Ok(());
+    }
     let data = crate::chat_archive_snapshot::snapshot_with_known(db, id, known).map_err(|e| {
         if e == "sensitive_metadata" {
             "redaction_failed"
@@ -378,6 +393,31 @@ pub(crate) fn write_known(
     tmp.persist(&path)
         .map_err(|e| io_failure("file", &e.error))?;
     remember_snapshot(db, id, &bytes)
+}
+
+fn has_messages(db: &Path, id: &str) -> Result<bool, &'static str> {
+    rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "storage_error")?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE chat_id=?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "storage_error")
+}
+
+fn should_process(root: &Path, db: &Path, id: &str) -> Result<bool, &'static str> {
+    if !crate::archive_receipt::valid_chat_id(id) {
+        return Err("invalid_chat_id");
+    }
+    if has_messages(db, id)? {
+        return Ok(true);
+    }
+    match fs::symlink_metadata(root.join("chats").join(format!("{id}.json"))) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("unavailable"),
+    }
 }
 
 fn known_values_with(
@@ -461,6 +501,9 @@ pub(crate) fn write(
     id: &str,
 ) -> Result<(), &'static str> {
     let result = (|| {
+        if !should_process(root, &paths.database_path, id)? {
+            return Ok(());
+        }
         let known = known_values(&paths.data_root, &paths.database_path)?;
         let refs: Vec<&str> = known.iter().map(String::as_str).collect();
         write_known(root, &paths.database_path, id, &refs)
@@ -764,6 +807,9 @@ fn save_pending_changes(
             #[cfg(test)]
             let started = std::time::Instant::now();
             write_known(root, &paths.database_path, id, &refs)?;
+            if !has_messages(&paths.database_path, id)? {
+                continue;
+            }
             #[cfg(test)]
             {
                 redaction_time += started.elapsed();
@@ -1008,6 +1054,24 @@ pub(crate) fn restore_with_progress(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_rooms_neither_create_nor_replace_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("test.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let room = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
+        let id = room["id"].as_str().unwrap();
+        let chats = temp.path().join("chats");
+        write_known(temp.path(), &db, id, &[]).unwrap();
+        assert!(!chats.exists());
+        std::fs::create_dir_all(&chats).unwrap();
+        let existing = chats.join(format!("{id}.json"));
+        let bytes =
+            serde_json::to_vec(&crate::chat_archive_snapshot::snapshot(&db, id).unwrap()).unwrap();
+        std::fs::write(&existing, &bytes).unwrap();
+        write_known(temp.path(), &db, id, &[]).unwrap();
+        assert_eq!(std::fs::read(&existing).unwrap(), bytes);
+    }
     use super::*;
 
     #[test]
@@ -1302,6 +1366,7 @@ mod tests {
         fs::create_dir(&archive).unwrap();
         let room = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
         let id = room["id"].as_str().unwrap();
+        crate::chat::append(&db, id, crate::chat::Role::User, "first", None, None).unwrap();
         write_known(&archive, &db, id, &[]).unwrap();
         let other_db = root.join("other.sqlite");
         crate::storage::initialize(&other_db, &root.join("other-backups"), "test").unwrap();
@@ -1447,6 +1512,7 @@ mod tests {
         fs::create_dir(&archive).unwrap();
         let room = serde_json::to_value(crate::chat::create(&remote).unwrap()).unwrap();
         let id = room["id"].as_str().unwrap();
+        crate::chat::append(&remote, id, crate::chat::Role::User, "first", None, None).unwrap();
         write_known(&archive, &remote, id, &[]).unwrap();
         restore(&archive, &local).unwrap();
         crate::chat::rename(&local, id, "renamed").unwrap();
@@ -1540,6 +1606,7 @@ mod tests {
         crate::storage::initialize(&dest, &dir.path().join("other-backups"), "test").unwrap();
         let room = serde_json::to_value(crate::chat::create(&source).unwrap()).unwrap();
         let id = room["id"].as_str().unwrap();
+        crate::chat::append(&source, id, crate::chat::Role::User, "first", None, None).unwrap();
         write_known(dir.path(), &source, id, &[]).unwrap();
         let invalid = dir
             .path()
@@ -1560,6 +1627,15 @@ mod tests {
         crate::storage::initialize(&source, &dir.path().join("backups"), "test").unwrap();
         crate::storage::initialize(&dest, &dir.path().join("other-backups"), "test").unwrap();
         let room = serde_json::to_value(crate::chat::create(&source).unwrap()).unwrap();
+        crate::chat::append(
+            &source,
+            room["id"].as_str().unwrap(),
+            crate::chat::Role::User,
+            "first",
+            None,
+            None,
+        )
+        .unwrap();
         write_known(dir.path(), &source, room["id"].as_str().unwrap(), &[]).unwrap();
         let mut events = Vec::new();
         restore_with_progress(dir.path(), &dest, |event| {

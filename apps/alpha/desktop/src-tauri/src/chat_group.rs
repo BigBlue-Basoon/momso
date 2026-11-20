@@ -32,7 +32,7 @@ fn read_group(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChatGroup> {
         chat_count: row.get(3)?,
     })
 }
-const GROUP_SELECT: &str = "SELECT g.id,g.name,g.position,(SELECT count(*) FROM chats c WHERE c.group_id=g.id) FROM chat_groups g";
+const GROUP_SELECT: &str = "SELECT g.id,g.name,g.position,(SELECT count(*) FROM chats c WHERE c.group_id=g.id AND EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id)) FROM chat_groups g";
 fn one(connection: &Connection, id: &str) -> Result<ChatGroup, String> {
     connection
         .query_row(&format!("{GROUP_SELECT} WHERE g.id=?1"), [id], read_group)
@@ -198,6 +198,16 @@ mod tests {
             .unwrap()
             .to_owned();
         set_group(&path, &chat_id, Some(g.id.clone())).unwrap();
+        assert_eq!(list(&path).unwrap()[0].chat_count, 0);
+        crate::chat::append(
+            &path,
+            &chat_id,
+            crate::chat::Role::User,
+            "hello",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(list(&path).unwrap()[0].chat_count, 1);
         let value = serde_json::to_value(crate::chat::list(&path).unwrap()).unwrap();
         assert_eq!(value[0]["groupId"], g.id);

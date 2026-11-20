@@ -173,6 +173,16 @@ export async function createChat() {
   return invoke<ChatEntry>('chat_create')
 }
 
+/**
+ * 채팅방과 내 첫 말을 한 번에 저장한다(2026-11-20 뒤쪽 f2b1547, desktop-screen-backend-contract.md "첫 말과 채팅방 만들기").
+ * 빈 글은 empty_message, 첫 받아 오기 중이면 first_receive_in_progress, 저장 실패는 storage_error. 실패하면 방도 말도 남지 않는다.
+ * 보내기는 그 뒤 chat_send 에 retryMessageId = messageId 로 한다(같은 말을 새로 저장하지 않고 첨부를 그 말에 묶는다).
+ */
+export async function createChatWithMessage(text: string, skill: string | null) {
+  requireChats()
+  return invoke<{ chat: ChatEntry; messageId: string }>('chat_create_with_message', { text, skill })
+}
+
 export async function readChat(id: string) {
   requireChats()
   return invoke<ChatDocument>('chat_read', { id })

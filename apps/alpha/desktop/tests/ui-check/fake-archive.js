@@ -568,9 +568,13 @@
     if (provider === 'claude' && fast && query.get('fast') === 'refusenow') return { status: 'fast_unavailable' }
     const last = chat.messages[chat.messages.length - 1]
     // retryMessageId(T52·T55): 답을 받지 못한 내 말을 그대로 다시 쓴다(새 말을 더하지 않음). 그런 말이 아니거나 ?retryfail 이면 retry_unavailable.
-    const retried = retryMessageId ? chat.messages.find((m) => m.id === retryMessageId && m.role === 'user' && m.failed) : null
+    // firstSaved: chat_create_with_message 가 방과 함께 저장한 첫 말(뒤쪽 retry_input 의 retryable_fast=1 과 같이 다시 쓸 수 있다).
+    const retried = retryMessageId ? chat.messages.find((m) => m.id === retryMessageId && m.role === 'user' && (m.failed || m.firstSaved)) : null
     if (retryMessageId && (!retried || query.has('retryfail'))) return { status: 'retry_unavailable' }
+    // window.__authNow = true 이면 보내기 전에 로그인이 받아들여지지 않은 것처럼(auth_failed, 새 말은 저장하지 않음).
+    if (window.__authNow) return { status: 'auth_failed' }
     window.__retryCalls = (window.__retryCalls || []).concat(retryMessageId ? [retryMessageId] : [])
+    if (retried) delete retried.firstSaved
     const reuse = Boolean(retried) || (last && last.role === 'user' && last.retryableFast && last.text === text)
     const userMessage = retried || (reuse ? last : { id: `${chatId}-m${chat.messages.length + 1}`, role: 'user', text, createdAt: nextStamp(), skill: skill ?? null })
     if (retried) { delete retried.failed; if (query.get('chaterror') && window.__retryOk) window.__failOff = true }
@@ -938,6 +942,8 @@
     if (command === 'plan_source_asset_import') {
       const p = args.proposal
       const name = p.sourcePath.split(/[\\/]/).pop()
+      // 끌어 놓은 폴더는 뒤쪽이 고르기 확인에서 거절한다(selection_grants.rs). 가짜는 점 없는 이름을 폴더로 본다.
+      if (!name.includes('.')) throw 'source_folder_not_allowed'
       return { planDigest: 'p'.repeat(64), originalFileName: name, assetKind: p.assetKind, contentSha256: (name.length.toString(16) + 'a'.repeat(64)).slice(0, 64), byteLength: 1234567, alreadyStored: false, mediaType: p.mediaType }
     }
     if (command === 'apply_source_asset_import') {
@@ -947,6 +953,8 @@
       return { id, assetKind: p.assetKind, contentSha256: 'a'.repeat(64), byteLength: 1234567, originalFileName: importedAssets[id].name, mediaType: p.mediaType, capturedBy: 'momso-desktop', createdAt: nextStamp(), integrityState: 'active', integrityIssue: null, quarantinedAt: null, quarantinedBy: null }
     }
     if (command === 'chat_attach_asset') {
+      // window.__attachFail = true 이면 잇기에 실패한다(새 채팅방 첫 말 보내기에서 방을 고르지 않는지 볼 때).
+      if (window.__attachFail) throw '원자료를 연결하지 못했습니다'
       if (!chats[args.chatId]) throw '채팅방을 찾을 수 없습니다'
       const asset = importedAssets[args.assetId]
       if (!asset) throw '원자료를 찾을 수 없습니다'
@@ -1573,6 +1581,16 @@
         const id = chatIdFor(createdAt)
         chats[id] = { id, title: '', createdAt, updatedAt: createdAt, messages: [] }
         return chatEntry(chats[id])
+      }
+      // 방과 첫 말을 함께 저장(2026-11-20 뒤쪽 f2b1547). 빈 글은 empty_message. 실패하면 둘 다 저장하지 않는다.
+      case 'chat_create_with_message': {
+        if (!String(args.text || '').trim()) throw 'empty_message'
+        window.__createWithMessage = (window.__createWithMessage || 0) + 1
+        const createdAt = nextStamp()
+        const id = chatIdFor(createdAt)
+        const messageId = `${id}-m1`
+        chats[id] = { id, title: String(args.text).replace(/\r?\n/g, ' ').slice(0, 40), createdAt, updatedAt: createdAt, messages: [{ id: messageId, role: 'user', text: args.text, createdAt, skill: args.skill ?? null, firstSaved: true }] }
+        return { chat: chatEntry(chats[id]), messageId }
       }
       // 긴 채팅방 페이지(2026-11-18 둘째 줄 B84 꼴): 최근부터 limit 개(기본 100, 1~200), 오래된 순, nextCursor 는 그 페이지 첫 말 id(더 없으면 null).
       case 'chat_read_page': {
