@@ -15,7 +15,7 @@ import {
   type RefObject,
 } from 'react'
 import { createPortal } from 'react-dom'
-import { getCurrentWindow } from '@tauri-apps/api/window'
+import { respondAppExit, setExitHandler } from '../app-exit'
 import { ArrowLeft, Check, ChevronRight, FileText, Folder, FolderPlus, Globe, PanelRight, Pencil, RefreshCw, Search, Undo2 } from 'lucide-react'
 import { PanelBrowserView } from './PanelBrowser'
 import { usePanelBrowserHold } from '../panel-browser'
@@ -570,8 +570,16 @@ export function ZetPanel({
     if (key === activeKey) setActiveKey(next[Math.min(index, next.length - 1)].key)
   }
 
-  // 패널이나 앱 창을 닫을 때도 저장하지 않은 내용이 있는 글이 있으면 그 글을 보여 주고 묻는다.
-  // 그런 글이 없으면(또는 다 답했으면) 닫는다.
+  // 트레이 "종료"로 온 종료 요청의 번호(app-exit-requested). 물음이 다 끝나면 이 번호로 답한다.
+  const exitRequestRef = useRef<string | null>(null)
+  function answerExit(decision: 'exit' | 'stay') {
+    const id = exitRequestRef.current
+    exitRequestRef.current = null
+    if (id) void respondAppExit(id, decision)
+  }
+
+  // 패널을 닫을 때나 앱을 끝낼 때(트레이 "종료") 저장하지 않은 내용이 있는 글이 있으면 그 글을 보여 주고 묻는다.
+  // 그런 글이 없으면(또는 다 답했으면) 닫는다. 앱 종료는 창을 직접 없애지 않고 뒤쪽에 exit 로 답한다(뒤쪽이 끝낸다).
   function closeAll(then: 'close-panel' | 'close-window', skipKey?: string) {
     // 패널만 닫을 때는 지금 채팅방의 탭만 본다(다른 채팅방의 탭은 숨어 있을 뿐 그대로 남는다). 창을 닫을 때는 전부.
     const dirty = (then === 'close-panel' ? shown : tabs).find((tab) => tab.key !== skipKey && dirtyKeys.has(tab.key))
@@ -582,7 +590,7 @@ export function ZetPanel({
     }
     setLeaving(null)
     if (then === 'close-panel') onToggle()
-    else void getCurrentWindow().destroy()
+    else answerExit('exit')
   }
 
   // 물음에 답한 뒤: 닫으려던 것을 마저 닫는다.
@@ -592,32 +600,29 @@ export function ZetPanel({
     else closeAll(answered.then, answered.key)
   }
 
-  // 고치던 글이 있을 때 앱 창을 닫으려 하면 붙잡고 묻는다. 고치던 글이 없으면 그냥 닫힌다.
-  const askBeforeWindowClose = useRef<() => boolean>(() => false)
-  askBeforeWindowClose.current = () => {
-    if (!tabs.some((tab) => dirtyKeys.has(tab.key))) return false
+  // 창의 X 는 앱을 끝내지 않고 뒤쪽이 창을 숨긴다(2026-11-20 트레이, tray_lifecycle.rs). 그래서 화면은 닫기 요청을 듣지 않는다:
+  // Tauri 의 onCloseRequested 는 듣는 쪽이 preventDefault 를 하지 않으면 끝에 창을 destroy 해 앱이 끝나 버렸다.
+  // 고치던 글은 숨은 창에 그대로 남으므로 X 때 묻지 않는다. 진짜 종료는 트레이 "종료"의 app-exit-requested 로 와서
+  // closeAll('close-window') 로 묻는다(app-exit.ts). 5분이 지나 뒤쪽이 timeout 으로 닫으면 떠 있던 종료 물음을 거둔다.
+  const askExit = useRef<(requestId: string) => void>(() => {})
+  askExit.current = (requestId) => {
+    exitRequestRef.current = requestId
     closeAll('close-window')
-    return true
   }
-  useEffect(() => {
-    let disposed = false
-    let unlisten: (() => void) | undefined
-    void getCurrentWindow().onCloseRequested((event) => {
-      if (askBeforeWindowClose.current()) event.preventDefault()
-    }).then((stop) => {
-      if (disposed) stop()
-      else unlisten = stop
-    }).catch(() => {})
-    return () => {
-      disposed = true
-      unlisten?.()
-    }
-  }, [])
+  useEffect(() => setExitHandler({
+    ask: (requestId) => askExit.current(requestId),
+    closed: (requestId) => {
+      if (exitRequestRef.current !== requestId) return
+      exitRequestRef.current = null
+      setLeaving((current) => (current?.then === 'close-window' ? null : current))
+    },
+  }), [])
 
   async function answerLeaving(answer: 'save' | 'discard' | 'stay') {
     if (!leaving) return
     if (answer === 'stay') {
       setLeaving(null)
+      if (leaving.then === 'close-window') answerExit('stay')
       return
     }
     const editor = editors.current.get(leaving.key)
@@ -629,9 +634,12 @@ export function ZetPanel({
     setLeaveWorking(true)
     const saved = editor ? await editor.save() : true
     setLeaveWorking(false)
-    // 저장하지 못했으면 닫지 않는다. 왜 못 했는지는 글 화면에 보인다.
+    // 저장하지 못했으면 닫지 않는다(앱 종료면 stay). 왜 못 했는지는 글 화면에 보인다.
     if (saved) finishLeaving(leaving)
-    else setLeaving(null)
+    else {
+      setLeaving(null)
+      if (leaving.then === 'close-window') answerExit('stay')
+    }
   }
 
   function tabTitle(tab: PanelTab) {

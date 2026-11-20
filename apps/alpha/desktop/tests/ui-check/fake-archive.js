@@ -555,6 +555,9 @@
     for (const handler of listeners[event] || []) callbacks[handler]?.({ event, id: handler, payload })
   }
   window.__emit = emit
+  let exitCount = 0
+  window.__exitRequest = () => { exitCount += 1; const requestId = `exit-${exitCount}`; emit('app-exit-requested', { requestId }); return requestId }
+  window.__exitClosed = (requestId, reason) => emit('app-exit-request-closed', { requestId, reason })
   window.__emitCompacted = (chatId) => emit('chat-compacted', { chatId })
   const running = {}
   function chatSend({ chatId, text, provider, model, effort, fast, skill, retryMessageId }) {
@@ -1584,7 +1587,8 @@
       }
       // 방과 첫 말을 함께 저장(2026-11-20 뒤쪽 f2b1547). 빈 글은 empty_message. 실패하면 둘 다 저장하지 않는다.
       case 'chat_create_with_message': {
-        if (!String(args.text || '').trim()) throw 'empty_message'
+        // 1b3ef51: 스킬이 있으면 빈 글도 받는다(제목은 빈 글). 글과 스킬이 모두 비면 empty_message.
+        if (!String(args.text || '').trim() && !String(args.skill || '').trim()) throw 'empty_message'
         window.__createWithMessage = (window.__createWithMessage || 0) + 1
         const createdAt = nextStamp()
         const id = chatIdFor(createdAt)
@@ -1779,6 +1783,10 @@
         }
         return { head: { ...receipt.head, read: receipt.head.read.map(reference), wrote: receipt.head.wrote.map(reference) }, body: receipt.body }
       }
+      // 트레이 "종료"(2026-11-20 뒤쪽 6553614). window.__exitRequest() 로 app-exit-requested, window.__exitClosed(id, reason) 로 닫힘을 흉내 낸다.
+      case 'app_exit_respond':
+        window.__exitResponses = (window.__exitResponses || []).concat([[args.requestId, args.decision]])
+        return { state: args.decision === 'exit' || args.decision === 'stay' ? 'accepted' : 'invalid' }
       case 'plugin:window|destroy':
       case 'plugin:window|close':
         window.__windowCalls = (window.__windowCalls || []).concat([command.split('|')[1]])
