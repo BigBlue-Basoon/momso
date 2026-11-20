@@ -122,9 +122,15 @@ function sampleOrder(image: HTMLImageElement, width: number, height: number) {
 
 export default function BrandMotion({
   onStage,
+  inPlace = false,
   labels = { replay: W.brandMotion.text1, mark: W.brandMotion.text2 },
 }: {
   onStage?: (stage: BrandStage) => void
+  /**
+   * 가운데에 크게 놓는 단계 없이 처음부터 제자리에서 그린다(다시 보기도). 세 획과 끝 장면은 같다.
+   * 첫 화면은 글과 시작 단추를 일찍 보여서, 크게 놓이면 그 위를 덮는다(2026-11-20 본부).
+   */
+  inPlace?: boolean
   /** 화면 낭독기용 설명(언어별). */
   labels?: { replay: string; mark: string }
 }) {
@@ -165,6 +171,7 @@ export default function BrandMotion({
 
         // 히어로 가운데에 크게 놓일 때의 위치·배율(제자리 기준).
         const bigPlace = () => {
+          if (inPlace) return { scale: 1, transform: 'translate(0px, 0px) scale(1)' }
           const slot = button.parentElement?.getBoundingClientRect() ?? button.getBoundingClientRect()
           // Center the visible mark in the window while keeping it below the window controls.
           const area = document.querySelector('.first-launch')?.getBoundingClientRect()
