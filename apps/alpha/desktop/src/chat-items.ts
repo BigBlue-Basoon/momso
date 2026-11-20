@@ -59,7 +59,11 @@ export async function getChatItems(chatId: string) {
 /** 내 말풍선에 보일 첨부 하나(2026-11-18). assetId 는 원자료 번호. */
 export type AttachedFile = { assetId: string; name: string; mediaType: string | null; deleted?: boolean }
 
-export async function attachFileToChat(chatId: string, path: string): Promise<AttachedFile> {
+/**
+ * 첨부의 앞 절반: 고른 파일을 원자료로 보존만 한다(채팅방이 없어도 된다). 폴더면 뒤쪽이 source_folder_not_allowed 로 거절한다.
+ * 새 채팅방(아직 방이 없음)에서는 이것만 하고, 방은 첫 말을 보낼 때 만든 뒤 linkAttachment 로 잇는다(2026-11-20 본부: 방은 첫 말이 저장될 때만).
+ */
+export async function importAttachment(path: string): Promise<AttachedFile> {
   if (!isDesktopRuntime()) throw new Error('attach needs the desktop runtime')
   const fileName = fileNameFromPath(path)
   const proposal: SourceAssetImportProposal = {
@@ -70,8 +74,19 @@ export async function attachFileToChat(chatId: string, path: string): Promise<At
   }
   const plan = await planSourceAssetImport(proposal)
   const asset = await applySourceAssetImport({ ...proposal, assetKind: plan.assetKind }, plan.planDigest, true)
-  await invoke<string>('chat_attach_asset', { chatId, assetId: asset.id })
   return { assetId: asset.id, name: fileName, mediaType: proposal.mediaType ?? null }
+}
+
+/** 첨부의 뒤 절반: 보존한 원자료를 있는 채팅방에 잇는다(chat_attach_asset). */
+export async function linkAttachment(chatId: string, assetId: string) {
+  if (!isDesktopRuntime()) throw new Error('attach needs the desktop runtime')
+  await invoke<string>('chat_attach_asset', { chatId, assetId })
+}
+
+export async function attachFileToChat(chatId: string, path: string): Promise<AttachedFile> {
+  const file = await importAttachment(path)
+  await linkAttachment(chatId, file.assetId)
+  return file
 }
 
 /**

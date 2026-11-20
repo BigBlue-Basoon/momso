@@ -1636,13 +1636,12 @@ async fn chat_send(
     let started_limit = handoff_limit.clone();
     let old_title = chat::title(&db, &chat_id)?;
     let user_message_id = if let Some(id) = retry_id {
-        if !explicit_retry {
-            chat::claim_retry_attachments(&db, &chat_id, &id)?;
-        }
+        chat::claim_retry_attachments(&db, &chat_id, &id)?;
         id
     } else {
         chat::append_for_send(&db, &chat_id, &text, skill.clone())?.id
     };
+    let _ = app.emit("chat-list-updated", serde_json::json!({"chatId": chat_id}));
     let generated_turn_id = generated_output::begin(
         &db,
         &output_dir,
@@ -2946,6 +2945,32 @@ async fn chat_create<R: tauri::Runtime>(
     .map_err(|_| "채팅방을 만들지 못했습니다".to_string())?
 }
 #[tauri::command]
+async fn chat_create_with_message<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    text: String,
+    skill: Option<String>,
+) -> Result<chat::CreatedChatWithMessage, String> {
+    let db = state.paths.database_path.clone();
+    let root = state.paths.archive.current.clone().read_owned().await;
+    if archive_remote::first_receive_pending(&root, &db) {
+        return Err("first_receive_in_progress".into());
+    }
+    let paths = state.paths.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let created = chat::create_with_message(&db, &text, skill.as_deref())?;
+        if let Ok(value) = serde_json::to_value(&created.chat) {
+            if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
+                report_chat_archive(&app, Some(id), chat_archive_store::write(&root, &paths, id));
+                let _ = app.emit("chat-list-updated", serde_json::json!({"chatId": id}));
+            }
+        }
+        Ok(created)
+    })
+    .await
+    .map_err(|_| "storage_error".to_owned())?
+}
+#[tauri::command]
 async fn chat_read(state: State<'_, AppState>, id: String) -> Result<chat::ChatDetail, String> {
     let _timer = startup_timing::start("chat_read");
     let path = state.paths.database_path.clone();
@@ -3558,6 +3583,7 @@ pub fn run() {
             chat_set_group,
             chat_list,
             chat_create,
+            chat_create_with_message,
             chat_read,
             chat_read_page,
             chat_rename,

@@ -725,7 +725,7 @@ fs.writeFileSync(path.join(path.dirname(process.env.npm_config_userconfig), 'obs
                     .as_deref(),
                 Some("teacher")
             );
-            crate::chat::create(&db).unwrap();
+            crate::chat::create_with_message(&db, "hello", None).unwrap();
             assert_eq!(crate::chat::list(&db).unwrap().len(), 1);
         }
     }

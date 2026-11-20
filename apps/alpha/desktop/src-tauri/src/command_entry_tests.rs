@@ -867,6 +867,15 @@ fn oauth_r2_flow(with_claude: bool, automatic_upload: bool, concurrent: bool) {
         imported.push(asset);
     }
     let chat = invoke(&window, "chat_create", json!({}));
+    crate::chat::append(
+        &db,
+        chat["id"].as_str().unwrap(),
+        crate::chat::Role::User,
+        "hello",
+        None,
+        None,
+    )
+    .unwrap();
     let attachment = invoke(
         &window,
         "chat_attach_asset",
@@ -937,6 +946,15 @@ fn oauth_r2_flow(with_claude: bool, automatic_upload: bool, concurrent: bool) {
             .as_str()
             .unwrap()
             .to_owned();
+        crate::chat::append(
+            &db,
+            &next_chat,
+            crate::chat::Role::User,
+            "hello",
+            None,
+            None,
+        )
+        .unwrap();
         pause_upload.store(true, Ordering::SeqCst);
         upload_started.store(false, Ordering::SeqCst);
         release_upload.store(false, Ordering::SeqCst);
@@ -1598,6 +1616,7 @@ fn fresh_chat_commands_use_tauri_entry_points() {
         .invoke_handler(tauri::generate_handler![
             chat_list,
             chat_create,
+            chat_create_with_message,
             chat_read,
             chat_rename,
             chat_search,
@@ -1684,8 +1703,12 @@ fn fresh_chat_commands_use_tauri_entry_points() {
     assert_eq!(invoke(&window, "user_profile_get", json!({}))["name"], "");
     assert!(invoke(&window, "permission_mode_get", json!({"provider":"codex"})).is_string());
     invoke(&window, "archive_reindex", json!({}));
-    let created = invoke(&window, "chat_create", json!({}));
-    let id = created["id"].as_str().unwrap();
+    let empty = invoke(&window, "chat_create", json!({}));
+    assert!(empty["id"].is_string());
+    assert_eq!(invoke(&window, "chat_list", json!({})), json!([]));
+    let created = invoke(&window, "chat_create_with_message", json!({"text":"hello"}));
+    let id = created["chat"]["id"].as_str().unwrap();
+    assert!(created["messageId"].is_string());
     let group = invoke(&window, "chat_group_create", json!({"name":"Yoga"}));
     let group_id = group["id"].as_str().unwrap();
     invoke(
