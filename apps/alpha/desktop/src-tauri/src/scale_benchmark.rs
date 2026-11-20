@@ -173,6 +173,150 @@ fn measure_large_search(db_path: &Path, room_count: usize, short: &str, long: &s
 }
 
 #[test]
+#[ignore = "startup benchmark with saved history and 1000 untracked documents"]
+fn startup_saved_history_untracked_builtins_1000_documents() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let database = root.join("momso.db");
+    let archive = root.join("momso");
+    let backups = root.join("backups");
+    crate::storage::initialize(&database, &backups, "fixture").unwrap();
+    crate::archive_location::ArchiveLocation::load(database.clone(), root, vec![]).unwrap();
+    crate::archive::initialize(&archive, root).unwrap();
+    let (git, _) = crate::archive::storage_tool(root).unwrap();
+    let run = |args: &[&str]| crate::archive::run_storage_tool(&git, &archive, args).unwrap();
+    run(&["add", "--", ".gitignore"]);
+    run(&[
+        "-c",
+        "user.name=momso",
+        "-c",
+        "user.email=archive@momso.local",
+        "commit",
+        "--only",
+        "-m",
+        "fixture",
+        "--",
+        ".gitignore",
+    ]);
+    fs::write(archive.join("staged-fixture.txt"), "preserve").unwrap();
+    run(&["add", "--", "staged-fixture.txt"]);
+    let base = chrono::NaiveDate::from_ymd_opt(2020, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    for n in 0..1000 {
+        let id = format!(
+            "zet_{}",
+            (base + chrono::Duration::seconds(n)).format("%Y%m%d_%H%M%S")
+        );
+        let body = format!("---\nid: {id}\ntitle: Fixture\nsummary: Fixture\nkind: note\nstatus: draft\ncreated_at: '2020-01-01T00:00:00+09:00'\nupdated_at: '2020-01-01T00:00:00+09:00'\nassets: []\nedges: []\n---\nFixture\n");
+        fs::write(archive.join("zettels").join(format!("{id}.md")), body).unwrap();
+    }
+    assert!(run(&[
+        "ls-files",
+        "--",
+        "skills",
+        ".agents/skills",
+        ".claude/skills"
+    ])
+    .is_empty());
+    assert_eq!(
+        run(&[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "zettels"
+        ])
+        .lines()
+        .count(),
+        1000
+    );
+    crate::archive::reindex(&archive, &database).unwrap();
+    assert_eq!(
+        crate::archive_zet::list(&database, None, None)
+            .unwrap()
+            .len(),
+        1000
+    );
+    let db = crate::storage::open_writable_connection(&database).unwrap();
+    db.execute(
+        "UPDATE archive_location_settings SET initialized=1 WHERE id=1",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let start = Instant::now();
+    crate::storage::initialize(&database, &backups, "fixture").unwrap();
+    let location =
+        crate::archive_location::ArchiveLocation::load(database.clone(), root, vec![]).unwrap();
+    assert!(!location.needs_initial_index);
+    let paths = crate::runtime::RuntimePaths {
+        data_root: root.to_path_buf(),
+        database_path: database.clone(),
+        objects_path: archive.join("objects"),
+        exports_path: root.join("exports"),
+        backups_path: backups,
+        logs_path: root.join("logs"),
+        archive: location,
+        archive_lease: None,
+    };
+    crate::prepare_archive_for_start(&paths, root).unwrap();
+    crate::generated_output::pending(&database).unwrap();
+    crate::source_assets::cleanup_staging(&paths.objects_path).unwrap();
+    let elapsed = start.elapsed().as_millis();
+    let count = run(&["rev-list", "--count", "HEAD"]);
+    let skills = run(&[
+        "ls-tree",
+        "-r",
+        "--name-only",
+        "HEAD",
+        "--",
+        "skills",
+        ".agents/skills",
+        ".claude/skills",
+    ]);
+    assert_eq!(
+        skills.lines().count(),
+        crate::skills::BUNDLED_SKILLS.len() * 3
+    );
+    assert_eq!(
+        run(&[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "zettels"
+        ])
+        .lines()
+        .count(),
+        1000
+    );
+    assert_eq!(
+        run(&[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--",
+            "staged-fixture.txt"
+        ])
+        .trim(),
+        "staged-fixture.txt"
+    );
+    println!(
+        "S3_STARTUP documents=1000 elapsed_ms={elapsed} total_commits={} saved_skills={}",
+        count.trim(),
+        skills.lines().count()
+    );
+    assert_eq!(
+        count.trim(),
+        "2",
+        "the default skills must share one commit"
+    );
+    assert!(elapsed < 2000, "startup preparation took {elapsed} ms");
+}
+
+#[test]
 #[ignore = "startup benchmark with 1000 synthetic documents; run explicitly"]
 fn populated_archive_startup_1000_documents() {
     let temp = tempfile::tempdir().unwrap();

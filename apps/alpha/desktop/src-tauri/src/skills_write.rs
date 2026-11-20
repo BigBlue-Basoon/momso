@@ -239,6 +239,101 @@ fn has_head(tool: &Path, root: &Path) -> Result<bool, &'static str> {
     git_predicate(tool, root, &["rev-parse", "--verify", "--quiet", "HEAD"])
 }
 
+// The first saved archive may still have all original bundled skills as
+// untracked files. Commit that exact, unchanged set once instead of running a
+// separate transaction for every skill. Any other state uses the normal path.
+fn save_pristine_untracked_builtins(
+    tool: &Path,
+    root: &Path,
+    bundled: &[(&str, &str)],
+) -> Result<bool, &'static str> {
+    if bundled != crate::skills::BUNDLED_SKILLS || fresh_builtin_state_mode(root) != Ok(true) {
+        return Ok(false);
+    }
+    let metadata_path = root
+        .parent()
+        .ok_or("io_error")?
+        .join("skill-builtin-state.json");
+    let Some(metadata) = snapshot(&metadata_path)? else {
+        return Ok(false);
+    };
+    let Ok(builtins) =
+        serde_json::from_slice::<std::collections::BTreeMap<String, String>>(&metadata)
+    else {
+        return Ok(false);
+    };
+    let mut paths = Vec::new();
+    let mut expected = Vec::new();
+    for &(name, text) in bundled {
+        if builtins.get(name) != Some(&crate::archive_zet::content_hash(text)) {
+            return Ok(false);
+        }
+        for folder in ["skills", ".agents/skills", ".claude/skills"] {
+            let path = skills::skill_path(root, folder, name)?;
+            if snapshot(&path)?.as_deref() != Some(text.as_bytes()) {
+                return Ok(false);
+            }
+            paths.push(format!("{folder}/{name}/SKILL.md"));
+            expected.push((path, text.as_bytes()));
+        }
+    }
+    let mut tracked = vec!["ls-files", "--stage", "--"];
+    tracked.extend(paths.iter().map(String::as_str));
+    if !git(tool, root, &tracked)?.is_empty() {
+        return Ok(false);
+    }
+    let original_head = git(tool, root, &["rev-parse", "--verify", "HEAD"])?;
+    let mut staged_by_us = None;
+    let result = (|| {
+        let mut add = vec!["add", "--"];
+        add.extend(paths.iter().map(String::as_str));
+        git(tool, root, &add)?;
+        staged_by_us = Some(git(tool, root, &tracked)?);
+        for (path, content) in &expected {
+            if snapshot(path)?.as_deref() != Some(*content) {
+                return Err("conflict");
+            }
+        }
+        if git(tool, root, &["rev-parse", "--verify", "HEAD"])? != original_head {
+            return Err("conflict");
+        }
+        let mut commit = vec![
+            "-c",
+            "user.name=momso",
+            "-c",
+            "user.email=archive@momso.local",
+            "commit",
+            "--only",
+            "-m",
+            "몸소 업데이트: 기본 스킬 갱신",
+            "--",
+        ];
+        commit.extend(paths.iter().map(String::as_str));
+        git(tool, root, &commit)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        // Never reset an index against a concurrently changed HEAD.
+        if git(tool, root, &["rev-parse", "--verify", "HEAD"]).as_deref()
+            != Ok(original_head.as_str())
+        {
+            return Err("rollback_failed");
+        }
+        let current_index = git(tool, root, &tracked).map_err(|_| "rollback_failed")?;
+        if staged_by_us
+            .as_ref()
+            .map_or(!current_index.is_empty(), |saved| saved != &current_index)
+        {
+            return Err("rollback_failed");
+        }
+        let mut reset = vec!["reset", "--quiet", "HEAD", "--"];
+        reset.extend(paths.iter().map(String::as_str));
+        git(tool, root, &reset).map_err(|_| "rollback_failed")?;
+        return Err(error);
+    }
+    Ok(true)
+}
+
 fn transact(
     root: &Path,
     resources: &Path,
@@ -394,6 +489,9 @@ pub(crate) fn install_builtins(
         return Err("save_failed");
     }
     let mut has_history = has_head(&tool, root)?;
+    if has_history && save_pristine_untracked_builtins(&tool, root, bundled)? {
+        return Ok(());
+    }
     let clean_tracked = if has_history
         && git_predicate(
             &tool,
@@ -1031,6 +1129,98 @@ pub(crate) async fn skill_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_archive_with_untracked_builtins() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("archive");
+        crate::archive::initialize(&root, dir.path()).unwrap();
+        let tool = crate::archive::storage_tool(dir.path()).unwrap().0;
+        git(&tool, &root, &["add", "--", ".gitignore"]).unwrap();
+        git(
+            &tool,
+            &root,
+            &[
+                "-c",
+                "user.name=momso",
+                "-c",
+                "user.email=archive@momso.local",
+                "commit",
+                "--only",
+                "-m",
+                "fixture",
+                "--",
+                ".gitignore",
+            ],
+        )
+        .unwrap();
+        fs::write(root.join("other.txt"), "preserve").unwrap();
+        git(&tool, &root, &["add", "--", "other.txt"]).unwrap();
+        (dir, root, tool)
+    }
+
+    #[test]
+    fn failed_batched_builtin_commit_preserves_files_and_unrelated_staging() {
+        let (dir, root, tool) = saved_archive_with_untracked_builtins();
+        let old_head = git(&tool, &root, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(root.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 1\n").unwrap();
+        assert_eq!(
+            install_builtins(&root, dir.path(), crate::skills::BUNDLED_SKILLS),
+            Err("save_failed")
+        );
+        assert_eq!(git(&tool, &root, &["rev-parse", "HEAD"]).unwrap(), old_head);
+        assert_eq!(
+            git(&tool, &root, &["diff", "--cached", "--name-only"])
+                .unwrap()
+                .trim(),
+            "other.txt"
+        );
+        assert!(git(
+            &tool,
+            &root,
+            &[
+                "ls-files",
+                "--",
+                "skills",
+                ".agents/skills",
+                ".claude/skills"
+            ]
+        )
+        .unwrap()
+        .is_empty());
+        for (name, text) in crate::skills::BUNDLED_SKILLS {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("skills/{name}/SKILL.md"))).unwrap(),
+                *text
+            );
+        }
+    }
+
+    #[test]
+    fn user_edited_builtin_is_not_overwritten_by_batch() {
+        let (dir, root, tool) = saved_archive_with_untracked_builtins();
+        let name = crate::skills::BUNDLED_SKILLS[0].0;
+        let path = format!("skills/{name}/SKILL.md");
+        let edited = format!(
+            "{}\nuser edit\n",
+            fs::read_to_string(root.join(&path)).unwrap()
+        );
+        fs::write(root.join(&path), &edited).unwrap();
+        install_builtins(&root, dir.path(), crate::skills::BUNDLED_SKILLS).unwrap();
+        assert_eq!(fs::read_to_string(root.join(&path)).unwrap(), edited);
+        assert!(git(&tool, &root, &["ls-files", "--", &path])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            git(
+                &tool,
+                &root,
+                &["diff", "--cached", "--name-only", "--", "other.txt"]
+            )
+            .unwrap()
+            .trim(),
+            "other.txt"
+        );
+    }
 
     #[test]
     fn fresh_builtins_can_be_committed_without_breaking_first_receive() {
