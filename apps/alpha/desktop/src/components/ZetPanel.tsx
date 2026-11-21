@@ -5,6 +5,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -18,7 +19,7 @@ import { createPortal } from 'react-dom'
 import { respondAppExit, setExitHandler } from '../app-exit'
 import { ArrowLeft, Check, ChevronRight, FileText, Folder, FolderPlus, Globe, PanelRight, Pencil, RefreshCw, Search, Undo2 } from 'lucide-react'
 import { PanelBrowserView } from './PanelBrowser'
-import { usePanelBrowserHold } from '../panel-browser'
+import { onPanelDraftAdopted, usePanelBrowserHold, usePanelDraft } from '../panel-browser'
 import { observeSize } from '../resize-later'
 import { MenuItem, RowMenu } from './ChatSidebar'
 import { SourceDeleteDialog, type SourceNotice } from './SourceDelete'
@@ -39,6 +40,7 @@ import {
   readZetHistory,
   readZetLinked,
   readZetVersion,
+  openWebAddress,
   restoreZetVersion,
   saveZet,
   type ReceiptReference,
@@ -284,11 +286,18 @@ type PanelTab =
   | { key: string; kind: 'zet'; id: string; scope: string }
   | { key: string; kind: 'receipt'; id: string; scope: string }
   | { key: string; kind: 'file'; id: string; title: string; scope: string }
-  /** 브라우저 탭(2026-11-17): 앱 전체에 하나. 채팅방을 바꿔도 남는다(scope 'web'). seq 가 바뀌면 같은 주소라도 다시 연다. */
-  /** url 이 null 이면 AI 가 열어 달라고 한 빈 패널(panel_browser_open_agent). */
-  | { key: 'web'; kind: 'web'; url: string | null; seq: number; title: string | null; host: string | null; scope: 'web' }
+  /**
+   * 브라우저 탭: 채팅방마다 하나(2026-11-21 김성균 개발자 "다른 채팅세션에서도 그 브라우저가 공유되서 보이면 어떡하냐", 뒤쪽 3c76dcf).
+   * chat 은 그 방(새 채팅방은 뒤쪽의 임시 방 번호, 받기 전이면 null). 다른 방으로 가면 숨겨 둘 뿐 닫지 않는다. seq 가 바뀌면 같은 주소라도 다시 연다.
+   * 새 채팅방의 첫 말로 방이 생겨 임시 방을 넘겨주면 chat 만 그 방으로 바꾼다(key 는 그대로 두어 브라우저를 다시 만들지 않는다. 찾기는 chat 으로).
+   * url 이 null 이면 빈 브라우저(주소 칸만). agent 가 참이면 AI·로그인이 열어 달라고 한 빈 패널을 곧바로 연다(panel_browser_open_agent).
+   * 고른 탭 값(activeKey)은 자리마다 'web' 하나로 두고, 지금 방의 브라우저 탭으로 읽는다.
+   */
+  | { key: string; kind: 'web'; chat: string | null; url: string | null; seq: number; agent: boolean; title: string | null; host: string | null; scope: 'web' }
 
 const listTab = (scope: string): PanelTab => ({ key: `${scope}|list`, kind: 'list', scope })
+const webKey = (chat: string | null) => `web:${chat ?? 'new'}`
+const webTab = (chat: string | null, url: string | null, agent: boolean): PanelTab => ({ key: webKey(chat), kind: 'web', chat, url, seq: 0, agent, title: null, host: null, scope: 'web' })
 
 /**
  * 오른쪽 패널을 여닫는 단추. 화면 맨 위 줄의 오른쪽 끝에 하나만 둔다:
@@ -365,8 +374,17 @@ export function ZetPanel({
   const setActiveKey = useCallback((key: string) => {
     setActiveByScope((current) => (current[scopeRef.current] === key ? current : { ...current, [scopeRef.current]: key }))
   }, [])
-  // 브라우저 탭은 어느 채팅방에서나 보인다(로그인하다 채팅방을 바꿔도 끊기지 않게).
-  const shown = tabs.filter((tab) => tab.scope === scope || tab.kind === 'web')
+  // 브라우저의 방: 새 채팅방이면 뒤쪽이 준 임시 방(2026-11-21 뒤쪽 50cf562). 받기 전(또는 받지 못함)이면 null.
+  const panelDraft = usePanelDraft()
+  const browserChat = chatId ?? panelDraft
+  const chatIdRef = useRef(browserChat)
+  chatIdRef.current = browserChat
+  // 임시 방을 첫 말로 생긴 방에 넘겨주면 그 브라우저 탭을 그 방 것으로(웹뷰·보던 페이지는 그대로).
+  useEffect(() => onPanelDraftAdopted((draftId, chat) => {
+    setTabs((current) => current.map((tab) => (tab.kind === 'web' && tab.chat === draftId ? { ...tab, chat } : tab)))
+  }), [])
+  // 브라우저 탭은 그 채팅방에서만 보인다(2026-11-21). 문서 화면(scope 'all')에서도 지금 고른 방의 브라우저.
+  const shown = tabs.filter((tab) => (tab.kind === 'web' ? tab.chat === browserChat : tab.scope === scope))
   const [knownTitles, setKnownTitles] = useState<Record<string, string>>({})
   // 패널을 연 횟수. 열 때마다 글 목록을 새로 읽는다.
   const [openCount, setOpenCount] = useState(0)
@@ -411,19 +429,25 @@ export function ZetPanel({
     [entries],
   )
 
+  // 앞 자리(채팅방)에서 브라우저를 보고 있었는지. 채팅방을 옮기면 옮긴 방에서도 그 방의 브라우저를 보인다(아래 효과).
+  const lastMode = useRef<{ scope: string; browser: boolean }>({ scope, browser: false })
+
   // 열린 글이 없으면 글을 고르는 탭으로 시작한다.
   useEffect(() => {
     if (!open) return
     setOpenCount((current) => current + 1)
+    // 브라우저를 보다가 다른 채팅방으로 옮기면 그 방의 브라우저(연 적 없으면 빈 브라우저)를 보인다.
+    const follow = byChat && lastMode.current.browser && lastMode.current.scope !== scope && lastMode.current.scope.startsWith('chat:')
+    if (follow) setActiveKey('web')
     // 이 자리(채팅방)에 열린 탭이 없으면 고르는 탭으로 시작한다. 채팅방을 바꾸면 그 채팅방의 탭이 돌아온다.
     if (!tabsRef.current.some((tab) => tab.scope === scope)) {
       const first = listTab(scope)
       // 개발 모드의 두 번 실행이나 연이은 열기에서 같은 목록 탭이 두 번 들어가지 않게 지금 목록으로 다시 본다(같은 key 경고, 2026-11-18).
       setTabs((current) => (current.some((tab) => tab.key === first.key) ? current : [...current, first]))
       // 링크로 패널을 열었으면 브라우저 탭이 이미 골라져 있다. 그때는 고른 탭을 바꾸지 않는다.
-      if (!activeKeyRef.current) setActiveKey(first.key)
+      if (!activeKeyRef.current && !follow) setActiveKey(first.key)
     }
-  }, [open, scope, setActiveKey])
+  }, [open, scope, setActiveKey, byChat])
 
   const titleOf = useCallback(
     (id: string) => entriesById.get(id)?.title ?? knownTitles[id] ?? null,
@@ -452,27 +476,35 @@ export function ZetPanel({
     setActiveKey(key)
   }, [setActiveKey, single])
 
-  // 바깥 주소는 패널의 브라우저 탭에서 연다(2026-11-17 본부: "우측 패널에서 인터넷"). 탭이 있으면 그 탭에서 이동한다.
-  const openWeb = useCallback((url: string | null) => {
+  // 바깥 주소는 패널의 브라우저 탭에서 연다(2026-11-17 본부: "우측 패널에서 인터넷"). 지금 채팅방의 브라우저 탭이 있으면 그 탭에서 이동한다.
+  // agent: AI·로그인의 열기 요청(url null). 그 방에 브라우저 탭이 있으면 그대로 쓰고(보던 페이지를 바꾸지 않는다), 아직 열지 않은 빈 브라우저면 연다.
+  const openWeb = useCallback((url: string | null, agent = false) => {
+    const chat = chatIdRef.current
+    // 새 채팅방인데 임시 방을 아직 받지 못했으면(뒤쪽이 없거나 실패) 패널을 열지 못한다. 링크는 기본 브라우저로 연다.
+    if (chat === null && url !== null) { void openWebAddress(url).catch(() => onNotice(W.zetPanel.text18)); return }
     setTabs((current) => {
-      const web = current.find((tab) => tab.kind === 'web')
-      // AI 의 열기 요청(url null)은 이미 있는 브라우저 탭을 그대로 쓴다(보던 페이지를 바꾸지 않는다).
-      if (web && web.kind === 'web') return url === null ? current : current.map((tab) => (tab.kind === 'web' ? { ...web, url, seq: web.seq + 1 } : tab))
-      return [...current, { key: 'web', kind: 'web', url, seq: 0, title: null, host: null, scope: 'web' }]
+      const web = current.find((tab) => tab.kind === 'web' && tab.chat === chat)
+      if (web && web.kind === 'web') {
+        const key = web.key
+        if (url === null) return agent && !web.agent ? current.map((tab) => (tab.key === key ? { ...web, agent: true, seq: web.seq + 1 } : tab)) : current
+        return current.map((tab) => (tab.key === key ? { ...web, url, seq: web.seq + 1 } : tab))
+      }
+      return [...current, webTab(chat, url, agent)]
     })
     setActiveKey('web')
-  }, [setActiveKey])
+  }, [setActiveKey, onNotice])
   const openAddress = useCallback((url: string) => openWeb(url), [openWeb])
   useEffect(() => {
     const onOpen = (event: Event) => {
       const detail = (event as CustomEvent<{ url: string | null }>).detail
-      if (detail && (typeof detail.url === 'string' || detail.url === null)) openWeb(detail.url)
+      // 주소 없는 요청(requestPanelBrowser(null))은 AI 의 열기 요청과 로그인에서만 온다.
+      if (detail && (typeof detail.url === 'string' || detail.url === null)) openWeb(detail.url, detail.url === null)
     }
     window.addEventListener('momso:open-web', onOpen)
     return () => window.removeEventListener('momso:open-web', onOpen)
   }, [openWeb])
-  const setWebTitle = useCallback((title: string | null, host: string | null) => {
-    setTabs((current) => current.map((tab) => (tab.kind === 'web' && (tab.title !== title || tab.host !== host) ? { ...tab, title, host } : tab)))
+  const setWebTitle = useCallback((key: string, title: string | null, host: string | null) => {
+    setTabs((current) => current.map((tab) => (tab.key === key && tab.kind === 'web' && (tab.title !== title || tab.host !== host) ? { ...tab, title, host } : tab)))
   }, [])
 
   const openZet = useCallback((id: string) => openDocument('zet', id), [openDocument])
@@ -519,8 +551,16 @@ export function ZetPanel({
   function keepForNextDocument(current: PanelTab[], where: string) {
     return current.filter((tab) => tab.scope !== where || tab.kind === 'list' || tab.kind === 'web' || dirtyKeysRef.current.has(tab.key))
   }
-  const activeTab = shown.find((tab) => tab.key === activeKey)
+  const activeTab = activeKey === 'web' ? shown.find((tab) => tab.kind === 'web') : shown.find((tab) => tab.key === activeKey)
   const mode: 'documents' | 'browser' = activeTab?.kind === 'web' ? 'browser' : 'documents'
+  // 브라우저를 고른 자리인데 지금 채팅방의 브라우저 탭이 없으면(방을 옮김) 빈 브라우저를 둔다(그 방에 패널이 이미 있으면 브라우저가 붙인다).
+  const hasWeb = shown.some((tab) => tab.kind === 'web')
+  useLayoutEffect(() => {
+    if (activeKey !== 'web' || hasWeb) return
+    const tab = webTab(browserChat, null, false)
+    setTabs((current) => (current.some((item) => item.key === tab.key || (item.kind === 'web' && item.chat === browserChat)) ? current : [...current, tab]))
+  }, [activeKey, hasWeb, browserChat])
+  useEffect(() => { lastMode.current = { scope, browser: activeKey === 'web' } })
   // 문서로 돌아오면 마지막에 보던 문서(없으면 목록).
   const lastDocument = useRef<Record<string, string>>({})
   if (activeTab && activeTab.kind !== 'web') lastDocument.current[scope] = activeTab.key
@@ -567,7 +607,7 @@ export function ZetPanel({
       onClose()
       return
     }
-    if (key === activeKey) setActiveKey(next[Math.min(index, next.length - 1)].key)
+    if (key === activeTab?.key) setActiveKey(next[Math.min(index, next.length - 1)].key)
   }
 
   // 트레이 "종료"로 온 종료 요청의 번호(app-exit-requested). 물음이 다 끝나면 이 번호로 답한다.
@@ -738,14 +778,15 @@ export function ZetPanel({
 
         <div className="zet-panel-body">
           {tabs.map((tab) => (
-            <section key={tab.key} className={tab.kind === 'web' ? 'zet-pane panel-browser-pane' : 'zet-pane'} role="tabpanel" aria-label={tabTitle(tab)} hidden={(tab.kind !== 'web' && tab.scope !== scope) || tab.key !== activeKey}>
+            <section key={tab.key} className={tab.kind === 'web' ? 'zet-pane panel-browser-pane' : 'zet-pane'} role="tabpanel" aria-label={tabTitle(tab)} hidden={tab.kind === 'web' ? tab.chat !== browserChat || activeKey !== 'web' : tab.scope !== scope || tab.key !== activeKey}>
               {tab.kind === 'web' ? (
                 <PanelBrowserView
                   url={tab.url}
                   seq={tab.seq}
-                  chatId={chatId}
-                  active={open && tab.key === activeKey}
-                  onTitle={setWebTitle}
+                  agentOpen={tab.agent}
+                  chatId={tab.chat}
+                  active={open && activeKey === 'web' && tab.chat === browserChat}
+                  onTitle={(title, host) => setWebTitle(tab.key, title, host)}
                   onOpenFailed={(code) => {
                     removeTab(tab.key)
                     // Google 로그인은 뒤쪽 이벤트가 따로 알린다.

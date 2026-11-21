@@ -9,6 +9,25 @@ pub(crate) enum Provider {
     Claude,
     Gemini,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserPermission {
+    Ask,
+    Automatic,
+    Plan,
+    AutoReview,
+}
+
+pub(crate) fn browser_permission(provider: &str, mode: &str) -> BrowserPermission {
+    match (provider, mode) {
+        ("codex", "Full access") | ("claude", "bypassPermissions") | ("gemini", "yolo") => {
+            BrowserPermission::Automatic
+        }
+        ("codex", "Approve for me") | ("claude", "auto") => BrowserPermission::AutoReview,
+        (_, "plan") => BrowserPermission::Plan,
+        _ => BrowserPermission::Ask,
+    }
+}
 impl Provider {
     fn key(self) -> &'static str {
         match self {
@@ -307,6 +326,33 @@ pub(crate) fn codex_settings(id: &str) -> Option<CodexSettings> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn browser_actions_follow_provider_permission_mode() {
+        assert_eq!(
+            browser_permission("codex", "Full access"),
+            BrowserPermission::Automatic
+        );
+        assert_eq!(
+            browser_permission("codex", "Ask for approval"),
+            BrowserPermission::Ask
+        );
+        assert_eq!(
+            browser_permission("codex", "Approve for me"),
+            BrowserPermission::AutoReview
+        );
+        assert_eq!(
+            browser_permission("claude", "acceptEdits"),
+            BrowserPermission::Ask
+        );
+        assert_eq!(
+            browser_permission("gemini", "auto_edit"),
+            BrowserPermission::Ask
+        );
+        assert_eq!(
+            browser_permission("claude", "plan"),
+            BrowserPermission::Plan
+        );
+    }
     #[test]
     fn provider_lists_match_their_own_modes() {
         assert_eq!(available(Provider::Codex).len(), 3);

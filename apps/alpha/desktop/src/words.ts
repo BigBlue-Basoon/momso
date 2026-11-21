@@ -757,6 +757,11 @@ const ko = {
       scopeHead: (a: unknown) => `${a}${josa(a, '이', '가')} 브라우저에서 읽기만 하다가 바꾸는 일을 하려고 합니다`,
       actionHead: (a: unknown) => `${a}${josa(a, '이', '가')} 브라우저에서 이 일을 하려고 합니다`,
       scopeNote: '허락해도 누르거나 입력할 때마다 다시 묻습니다.',
+      /**
+       * 사이트 승인(reason site_access, 2026-11-21 뒤쪽 3c76dcf): 허락이 이 채팅방·호스트에 앱이 켜져 있는 동안 기억된다.
+       * 새 글이 아니다: 허락 단추는 approvals.text2, 답한 줄은 approvals.text6 의 앞 문장만(뒷 문장 "AI를 바꾸면 다시 묻습니다"는 이 승인에 맞지 않음).
+       */
+      siteAllowedHere: '이 채팅방에서 계속 허락했습니다',
       site: '사이트',
       result: '누르면',
       effect: {
@@ -1040,6 +1045,61 @@ const ko = {
     /** 2026-11-17 본부 결정으로 고침(뒤쪽 대조 desktop-promise-audit 7): 앱에 되돌리는 단추가 없다는 뜻. 작업 내역의 글과 같은 말. */
     removeTermText: '삭제한 용어는 몸소에서는 되돌릴 수 없습니다.',
     baseTerm: '기본 용어는 삭제할 수 없습니다. 끄기만 할 수 있습니다.',
+  },
+  // ---- components/SavedLoginsSettings.tsx, SavedLoginChoiceCard.tsx: 설정 › 저장된 로그인(2026-11-21 뒤쪽 275e017). ----
+  // 낱말(저장된 로그인, 사이트 주소, 이름, 아이디, 비밀번호, 쓸 때마다 묻기)은 본부가 정해 준 말. 나머지 글은 새로 씀, 그의 확인 전.
+  savedLogins: {
+    title: '저장된 로그인',
+    /** 새 컴퓨터에서는 다시 넣어야 한다는 뜻을 화면에서 알린다(계약 "WebView2와 새 컴퓨터"). */
+    intro: '로그인이 풀리면 몸소가 저장된 로그인으로 다시 들어갑니다. 비밀번호는 AI에게 보내지 않고 이 컴퓨터에만 저장하므로, 새 컴퓨터에서는 저장된 로그인을 다시 넣어 주세요.',
+    add: '새 로그인',
+    total: (n: number) => `로그인 ${n}개`,
+    empty: '저장된 로그인이 없습니다.',
+    fieldSite: '사이트 주소',
+    fieldName: '이름',
+    fieldUsername: '아이디',
+    fieldPassword: '비밀번호',
+    askBeforeUse: '쓸 때마다 묻기',
+    /** 고칠 때 비밀번호 칸의 안내(비워 두면 기존 비밀번호 유지). */
+    keepPassword: '비워 두면 지금 비밀번호를 그대로 씁니다',
+    /** 고칠 때 사이트 주소는 바꿀 수 없다(뒤쪽 origin_change_requires_new_login). */
+    siteFixed: '사이트 주소를 바꾸려면 삭제한 뒤 새로 저장해 주세요.',
+    /** 같은 사이트에 로그인이 둘 이상일 때만 보이는 칸(loginPath). */
+    fieldLoginPath: '로그인 화면 경로',
+    loginPathHint: '같은 사이트에 로그인이 여럿일 때, 이 로그인을 쓸 로그인 화면의 경로(/로 시작)를 적습니다. 비워 두면 모든 로그인 화면에서 씁니다.',
+    /** 같은 사이트·경로에 로그인이 둘 이상일 때만 보이는 스위치(defaultForPath). */
+    defaultForPath: '기본 계정',
+    defaultHint: '같은 로그인 화면에 로그인이 여럿이면 기본 계정을 씁니다. 기본 계정이 없으면 쓸 때 어느 것을 쓸지 묻습니다.',
+    save: '저장',
+    cancel: '취소',
+    edit: '수정',
+    remove: '삭제',
+    saved: '저장했습니다',
+    removed: '삭제했습니다',
+    loadFailed: '저장된 로그인을 읽지 못했습니다',
+    saveFailed: '저장하지 못했습니다',
+    removeFailed: '삭제하지 못했습니다',
+    removeTitle: (a: unknown) => `“${a}” 로그인을 삭제할까요?`,
+    /** 다른 목록의 삭제 확인과 같은 뜻(앱에 되돌리는 단추가 없다). */
+    removeText: '삭제한 로그인은 몸소에서는 되돌릴 수 없습니다.',
+    /** 뒤쪽 오류 값마다의 글. 입력한 값은 담지 않는다. */
+    errors: {
+      capacity_exceeded: '더 저장할 자리가 없습니다. 쓰지 않는 로그인을 삭제한 뒤 다시 해 주세요.',
+      credential_store_unavailable: 'Windows 자격 증명 관리자를 쓰지 못했습니다. 잠시 뒤 다시 해 주세요.',
+      invalid_origin: '사이트 주소는 https://로 시작하는 주소로 적어 주세요.',
+      invalid_input: '이름은 100자, 아이디는 256자, 비밀번호는 1,024자까지 적을 수 있습니다. 로그인 화면 경로는 /로 시작합니다.',
+      duplicate_label: '이 사이트에 같은 이름의 로그인이 이미 있습니다.',
+      origin_change_requires_new_login: '사이트 주소를 바꾸려면 삭제한 뒤 새로 저장해 주세요.',
+      default_conflict: '이 로그인 화면에는 이미 기본 계정이 있습니다.',
+      not_found: '그사이 삭제된 로그인입니다. 목록을 다시 읽었습니다.',
+    } as Record<string, string>,
+    /** 채팅방 안에서 계정을 고르는 카드(saved-login-selection-request). 지금 있는 승인 카드 꼴. */
+    choice: {
+      aria: '저장된 로그인 선택',
+      head: '어느 로그인을 쓸지 선택해 주세요',
+      chosen: '선택했습니다',
+      failed: '선택을 보내지 못했습니다. 다시 눌러 주세요',
+    },
   },
   /** 고른 지 5분이 지나 뒤쪽이 거절했을 때(selection_required). 첨부·대화 가져오기·몸소 폴더가 같은 글을 쓴다. 2026-11-17 새로 씀, 그의 확인 전. */
   selectAgain: '선택한 지 오래되어 진행하지 못했습니다. 파일을 다시 선택해 주세요',

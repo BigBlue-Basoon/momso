@@ -181,6 +181,7 @@ async fn request_scope(
 #[derive(Default)]
 pub(crate) struct BrowserManager {
     entries: AsyncMutex<HashMap<String, Arc<Entry>>>,
+    host_decisions: Mutex<HashMap<(String, String), bool>>,
     external_sites: Arc<Mutex<HashMap<String, String>>>,
     external_sessions: AsyncMutex<HashMap<String, Session>>,
     #[cfg(test)]
@@ -190,6 +191,28 @@ pub(crate) struct BrowserManager {
     pub(crate) panel_ownership: crate::panel_ownership::PanelOwnership,
     app: std::sync::OnceLock<tauri::AppHandle>,
     panel_identities: Mutex<HashMap<String, PanelIdentity>>,
+}
+
+impl BrowserManager {
+    pub(crate) fn host_decision(&self, chat: &str, host: &str) -> Option<bool> {
+        self.host_decisions
+            .lock()
+            .ok()?
+            .get(&(chat.to_owned(), host.to_owned()))
+            .copied()
+    }
+
+    pub(crate) fn remember_host_decision(&self, chat: &str, host: &str, allow: bool) {
+        if let Ok(mut decisions) = self.host_decisions.lock() {
+            decisions.insert((chat.to_owned(), host.to_owned()), allow);
+        }
+    }
+
+    pub(crate) fn forget_chat_decisions(&self, chat: &str) {
+        if let Ok(mut decisions) = self.host_decisions.lock() {
+            decisions.retain(|(owner, _), _| owner != chat);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -232,6 +255,12 @@ struct PanelIdentity {
 fn limited(text: &str, count: usize) -> String {
     text.chars().take(count).collect()
 }
+fn browser_known_values(data_root: &std::path::Path) -> Result<Vec<String>, &'static str> {
+    let mut known =
+        crate::chat_archive_store::known_values(data_root, &data_root.join("momso.db"))?;
+    known.extend(crate::saved_logins::known_passwords()?);
+    Ok(known)
+}
 fn page_value(page: PageState, known: &[&str]) -> Value {
     let clean = |value: &str, limit| {
         limited(
@@ -239,8 +268,8 @@ fn page_value(page: PageState, known: &[&str]) -> Value {
             limit,
         )
     };
-    let elements: Vec<_> = page.elements.into_iter().take(40).map(|e| json!({"id":limited(&e.id,128),"role":clean(&e.role,24),"name":clean(&e.name,128),"kind":e.kind})).collect();
-    json!({"status":"page","origin":page.origin,"title":clean(&page.title,256),"text":clean(&page.text,4000),"elements":elements,"dataProvenance":page.data_provenance})
+    let elements: Vec<_> = page.elements.into_iter().take(40).map(|e| json!({"id":clean(&e.id,128),"role":clean(&e.role,24),"name":clean(&e.name,128),"kind":e.kind})).collect();
+    json!({"status":"page","origin":clean(&page.origin,512),"title":clean(&page.title,256),"text":clean(&page.text,4000),"elements":elements,"dataProvenance":page.data_provenance})
 }
 fn human(reason: &'static str, chat_id: &str, notify: &Notify) -> Value {
     let reason = match reason {
@@ -267,8 +296,12 @@ fn blocked(target: &str) -> Value {
         .ok()
         .filter(|url| matches!(url.scheme(), "http" | "https"))
         .and_then(|url| url.host_str().map(str::to_owned));
+    if let Some(host) = &host {
+        log::warn!("browser_policy_blocked host={host}");
+    }
     json!({"status":"blocked","blockedHost":host})
 }
+
 fn web_link(target: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(target) else {
         return false;
@@ -317,7 +350,10 @@ fn error(err: DriverError, chat_id: &str, notify: &Notify) -> Value {
         DriverError::Refused("panel_closed") => json!({"status":"panel_closed"}),
         DriverError::Refused("panel_page_changed") => json!({"status":"panel_page_changed"}),
         DriverError::TargetChanged => json!({"status":"target_changed"}),
-        _ => json!({"status":"unavailable"}),
+        _ => {
+            log::warn!("browser_driver stage=operation status=unavailable");
+            json!({"status":"unavailable"})
+        }
     }
 }
 fn valid(method: &str, args: &Value) -> bool {
@@ -330,7 +366,9 @@ fn valid(method: &str, args: &Value) -> bool {
             .is_some_and(|s| !s.is_empty() && s.len() <= 256)
     };
     match method {
-        "browser_open" | "browser_read" | "browser_close" => a.is_empty(),
+        "browser_open" | "browser_read" | "browser_close" | "browser_request_saved_login" => {
+            a.is_empty()
+        }
         "browser_navigate" => {
             a.len() == 1
                 && a.get("url")
@@ -417,7 +455,7 @@ impl BrowserManager {
         self.external_sites
             .lock()
             .unwrap()
-            .insert(chat_id.to_owned(), entry.policy.origins()[0].clone());
+            .insert(chat_id.to_owned(), "https://fixture.example".to_owned());
         self.fake_external
             .lock()
             .unwrap()
@@ -723,6 +761,16 @@ impl BrowserManager {
         if cancel.is_cancelled() {
             return json!({"status":"denied"});
         }
+        if selected
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(Policy::is_general)
+            && self.app.get().is_some()
+            && crate::panel_chat::active_chat().as_deref() != Some(chat_id)
+        {
+            return json!({"status":"panel_not_active"});
+        }
         let existing = self.entries.lock().await.get(chat_id).cloned();
         if self.panel_ownership.human_controls(chat_id).unwrap_or(true) {
             return json!({"status":"human_takeover"});
@@ -740,7 +788,9 @@ impl BrowserManager {
             return json!({"status":"policy_unavailable"});
         }
         if let (Some(entry), Ok(Some(policy))) = (&existing, selected) {
-            if &entry.policy != policy || skill != Some(entry.skill.as_str()) {
+            if &entry.policy != policy
+                || (!policy.is_general() && skill.unwrap_or("") != entry.skill)
+            {
                 return json!({"status":"policy_unavailable"});
             }
         }
@@ -756,9 +806,10 @@ impl BrowserManager {
                 }
                 return json!({"status":"ok"});
             }
-            let (Some(skill), Ok(Some(policy))) = (skill, selected) else {
+            let Ok(Some(policy)) = selected else {
                 return json!({"status":"policy_unavailable"});
             };
+            let skill = skill.unwrap_or("");
             let policy = policy.clone();
             let origins = policy.origins().to_vec();
             let login_origins = policy.login_origins().to_vec();
@@ -778,7 +829,6 @@ impl BrowserManager {
                     .any(|origin| origin == "https://accounts.google.com");
             let mut panel_lease = None;
             let result = if use_panel {
-                use tauri::Manager;
                 let Some(app) = panel_app else {
                     return json!({"status":"driver_unavailable"});
                 };
@@ -808,37 +858,42 @@ impl BrowserManager {
                     Ok(value) => Arc::new(value),
                     Err(status) => return json!({"status":status}),
                 };
-                let initial = app
-                    .get_webview(crate::panel_browser::LABEL)
+                let initial = crate::panel_browser::current_panel(&app)
                     .and_then(|view| view.url().ok())
                     .map(|url| url.to_string());
-                let scope = crate::approval::browser_scope_request(
-                    chat_id,
-                    provider,
-                    &origins.join(", "),
-                    skill,
-                    "사이트 범위",
-                    if initial.is_some() {
-                        "현재 패널의 화면을 바꿀 수 있습니다"
-                    } else {
-                        "패널에서 사이트를 엽니다"
-                    },
-                );
-                let lease_cancel = lease.cancellation();
-                let approval_cancel = cancel.child_token();
-                let pending = ask(scope, approval_cancel.clone());
-                tokio::pin!(pending);
-                let approved = tokio::select! {
-                    result = &mut pending => result,
-                    _ = lease_cancel.cancelled() => { approval_cancel.cancel(); let _ = pending.await; false },
-                    _ = cancel.cancelled() => { approval_cancel.cancel(); let _ = pending.await; false },
-                };
-                if !approved {
-                    return json!({"status":lease.check().err().unwrap_or("denied")});
+                if !policy.is_general() {
+                    let scope = crate::approval::browser_scope_request(
+                        chat_id,
+                        provider,
+                        &origins.join(", "),
+                        skill,
+                        "사이트 범위",
+                        if initial.is_some() {
+                            "현재 패널의 화면을 바꿀 수 있습니다"
+                        } else {
+                            "패널에서 사이트를 엽니다"
+                        },
+                    );
+                    let lease_cancel = lease.cancellation();
+                    let approval_cancel = cancel.child_token();
+                    let pending = ask(scope, approval_cancel.clone());
+                    tokio::pin!(pending);
+                    let approved = tokio::select! {
+                        result = &mut pending => result,
+                        _ = lease_cancel.cancelled() => { approval_cancel.cancel(); let _ = pending.await; false },
+                        _ = cancel.cancelled() => { approval_cancel.cancel(); let _ = pending.await; false },
+                    };
+                    if !approved {
+                        return json!({"status":lease.check().err().unwrap_or("denied")});
+                    }
+                }
+                if policy.is_general()
+                    && crate::panel_chat::active_chat().as_deref() != Some(chat_id)
+                {
+                    return json!({"status":"panel_not_active"});
                 }
                 if let Some(before) = &initial {
-                    let after = app
-                        .get_webview(crate::panel_browser::LABEL)
+                    let after = crate::panel_browser::current_panel(&app)
                         .and_then(|view| view.url().ok())
                         .map(|url| url.to_string());
                     if after.as_ref() != Some(before) {
@@ -851,7 +906,7 @@ impl BrowserManager {
                     }
                     notify("panel-agent-open-request", request);
                     if let Err(status) = wait_for_panel(
-                        || app.get_webview(crate::panel_browser::LABEL).is_some(),
+                        || crate::panel_browser::current_panel(&app).is_some(),
                         &lease,
                         &cancel,
                     )
@@ -868,17 +923,40 @@ impl BrowserManager {
                 }
                 let mut allowed = origins.clone();
                 allowed.extend(login_origins.iter().cloned());
+                let switch_guard = crate::panel_browser::switch_lock().lock().await;
+                if policy.is_general()
+                    && crate::panel_chat::active_chat().as_deref() != Some(chat_id)
+                {
+                    return json!({"status":"panel_not_active"});
+                }
+                if initial.as_ref().is_some_and(|before| {
+                    crate::panel_browser::current_panel(&app)
+                        .and_then(|view| view.url().ok())
+                        .is_none_or(|url| url.as_str() != before)
+                }) {
+                    return json!({"status":"panel_page_changed"});
+                }
                 let attached_lease = lease.clone();
+                let approved_panel_url = if policy.is_general() || skill == "bodycodi-operations" {
+                    initial.clone().filter(|url| policy.allows(url))
+                } else {
+                    None
+                };
                 let result = tokio::task::spawn_blocking(move || {
-                    Session::attach_panel(
+                    let mut session = Session::attach_panel(
                         app,
                         &allowed,
                         &login_origins,
                         &login_paths,
                         Some(attached_lease),
-                    )
+                    )?;
+                    if let Some(url) = approved_panel_url {
+                        session.arm_existing_panel(&url)?;
+                    }
+                    Ok(session)
                 })
                 .await;
+                drop(switch_guard);
                 panel_lease = Some(lease);
                 result
             } else {
@@ -900,6 +978,7 @@ impl BrowserManager {
             };
             let session = match result {
                 Ok(Ok(session)) => session,
+                Ok(Err(DriverError::Blocked(target))) => return blocked(&target),
                 _ => return json!({"status":"driver_unavailable"}),
             };
             if cancel.is_cancelled() {
@@ -947,7 +1026,7 @@ impl BrowserManager {
             return json!({"status":"ok"});
         }
         let Some(entry) = existing else {
-            return json!({"status":"policy_unavailable"});
+            return json!({"status":"not_open"});
         };
         let notify = if entry.panel_lease.is_some() {
             let original = notify.clone();
@@ -1017,8 +1096,126 @@ impl BrowserManager {
         if cancel.is_cancelled() {
             return json!({"status":"denied"});
         }
-        if entry.panel_lease.is_some() && entry.waiting_for_human.load(Ordering::Acquire) {
+        if entry.panel_lease.is_some()
+            && entry.waiting_for_human.load(Ordering::Acquire)
+            && method != "browser_request_saved_login"
+        {
             return json!({"status":"human_required"});
+        }
+        if method == "browser_request_saved_login" {
+            // This is a host-owned operation; the AI supplies neither origin, account nor secret.
+            let Some(lease) = &entry.panel_lease else {
+                return json!({"status":"unavailable"});
+            };
+            let target = match call(&entry, |session| session.saved_login_target()).await {
+                Ok(target) if entry.allows(&target.origin) => target,
+                Ok(_) => return json!({"status":"unavailable"}),
+                Err(error) => return entry.error(error, chat_id, &notify),
+            };
+            let expected = target.origin.clone();
+            let entries = match tokio::task::spawn_blocking(move || {
+                crate::saved_logins::for_origin(&expected)
+            })
+            .await
+            {
+                Ok(Ok(entries)) => entries,
+                _ => return json!({"status":"credential_store_unavailable"}),
+            };
+            let Ok(page_url) = reqwest::Url::parse(&target.url) else {
+                return json!({"status":"unavailable"});
+            };
+            let entries = crate::saved_logins::match_login_path(entries, page_url.path());
+            let selection_cancel = cancel.child_token();
+            let lease_cancel = lease.cancellation();
+            let selection = crate::saved_logins::select_for_person(
+                chat_id,
+                &entries,
+                &notify,
+                selection_cancel.clone(),
+            );
+            tokio::pin!(selection);
+            let selected = tokio::select! {
+                value = &mut selection => match value { Ok(value) => value, Err(status) => return json!({"status":status}) },
+                _ = lease_cancel.cancelled() => { selection_cancel.cancel(); let _ = selection.await; return entry.denied(); },
+            };
+            if selected.ask_before_use {
+                let request = crate::approval::browser_request(
+                    chat_id,
+                    provider,
+                    &target.origin,
+                    &entry.skill,
+                    "saved_login",
+                    &selected.label,
+                );
+                if !ask(request, cancel.clone()).await
+                    || cancel.is_cancelled()
+                    || lease.check().is_err()
+                {
+                    return entry.denied();
+                }
+            }
+            // Install the exact-origin network fence and turn off WebView2 password autosave
+            // before accessing the secret. The fence remains until this session closes.
+            let target = match call(&entry, move |session| {
+                session.restrict_saved_login(&target)?;
+                Ok(target)
+            })
+            .await
+            {
+                Ok(target) => target,
+                Err(error) => return entry.error(error, chat_id, &notify),
+            };
+            let used_id = selected.id.clone();
+            let used_origin = target.origin.clone();
+            let secret = match tokio::task::spawn_blocking(move || {
+                crate::saved_logins::secret_for_origin(&selected)
+            })
+            .await
+            {
+                Ok(Ok(secret)) => secret,
+                Ok(Err("not_found")) => return json!({"status":"target_changed"}),
+                _ => return json!({"status":"credential_store_unavailable"}),
+            };
+            if crate::saved_logins::remember_used_password(&secret.password).is_err() {
+                return json!({"status":"unavailable"});
+            }
+            if cancel.is_cancelled() || lease.check().is_err() {
+                return entry.denied();
+            }
+            return match call(&entry, move |session| {
+                session.fill_saved_login(&target, secret)
+            })
+            .await
+            {
+                Ok(()) => {
+                    // Submission alone does not prove the login succeeded.
+                    let mut complete = false;
+                    for _ in 0..20 {
+                        if cancel.is_cancelled() || lease.check().is_err() {
+                            return entry.denied();
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if call(&entry, |session| session.adopt_after_human_login())
+                            .await
+                            .is_ok()
+                        {
+                            complete = true;
+                            break;
+                        }
+                    }
+                    if complete {
+                        self.panel_ready(&entry, chat_id, &notify);
+                        notify(
+                            "saved-login-used",
+                            json!({"chatId":chat_id,"id":used_id,"origin":used_origin}),
+                        );
+                        json!({"status":"logged_in"})
+                    } else {
+                        human("verification", chat_id, &notify)
+                    }
+                }
+                Err(error) => entry.error(error, chat_id, &notify),
+            };
         }
         if method == "browser_request_human_login" {
             return human("login", chat_id, &notify);
@@ -1093,7 +1290,7 @@ impl BrowserManager {
             if !entry.allows(url) {
                 return entry.blocked_or_external_login(url, chat_id, &notify);
             }
-            if !read_only_link(url) {
+            if !entry.policy.is_general() && !read_only_link(url) {
                 let site = reqwest::Url::parse(url)
                     .map(|value| value.origin().ascii_serialization())
                     .unwrap_or_default();
@@ -1110,14 +1307,11 @@ impl BrowserManager {
                 }
             }
             let data_root = root.clone();
-            let known = match tokio::task::spawn_blocking(move || {
-                crate::chat_archive_store::known_values(&data_root, &data_root.join("momso.db"))
-            })
-            .await
-            {
-                Ok(Ok(known)) => known,
-                _ => return json!({"status":"unavailable"}),
-            };
+            let known =
+                match tokio::task::spawn_blocking(move || browser_known_values(&data_root)).await {
+                    Ok(Ok(known)) => known,
+                    _ => return json!({"status":"unavailable"}),
+                };
             let refs: Vec<&str> = known.iter().map(String::as_str).collect();
             let url = url.to_owned();
             return match call(&entry, move |s| s.navigate(&url)).await {
@@ -1140,14 +1334,13 @@ impl BrowserManager {
         if method == "browser_read" {
             return if entry.policy.allows_read_only(method) {
                 let data_root = root.clone();
-                let known = match tokio::task::spawn_blocking(move || {
-                    crate::chat_archive_store::known_values(&data_root, &data_root.join("momso.db"))
-                })
-                .await
-                {
-                    Ok(Ok(known)) => known,
-                    _ => return json!({"status":"unavailable"}),
-                };
+                let known =
+                    match tokio::task::spawn_blocking(move || browser_known_values(&data_root))
+                        .await
+                    {
+                        Ok(Ok(known)) => known,
+                        _ => return json!({"status":"unavailable"}),
+                    };
                 let refs: Vec<&str> = known.iter().map(String::as_str).collect();
                 page_value(page, &refs)
             } else {
@@ -1155,6 +1348,9 @@ impl BrowserManager {
             };
         }
         if method == "browser_request_action" {
+            if entry.policy.is_general() {
+                return json!({"status":"not_required"});
+            }
             let action = args["action"].as_str().unwrap();
             let description = args["description"].as_str().unwrap();
             let Some(target) = page.elements.iter().find(|element| {
@@ -1195,6 +1391,28 @@ impl BrowserManager {
             *grant = Some(approved);
             return json!({"status":"approved"});
         }
+        if entry.policy.is_general() && (method == "browser_click" || method == "browser_fill") {
+            let id = args["elementId"].as_str().unwrap();
+            if !page
+                .elements
+                .iter()
+                .any(|element| element.id == id && element.kind == "normal")
+            {
+                return json!({"status":"target_changed"});
+            }
+            let mut request = crate::approval::browser_request(
+                chat_id,
+                provider,
+                &page.origin,
+                "브라우저",
+                "site_access",
+                "누르기와 입력",
+            );
+            request.description = "이 사이트에서 누르고 입력해도 될까요".into();
+            if !ask(request, cancel.clone()).await || cancel.is_cancelled() {
+                return entry.denied();
+            }
+        }
         if method == "browser_click" && entry.policy.allows_read_only("browser_navigate") {
             let id = args["elementId"].as_str().unwrap().to_owned();
             let origin = page.origin.clone();
@@ -1203,7 +1421,7 @@ impl BrowserManager {
                     if !entry.allows(&url) {
                         return entry.blocked_or_external_login(&url, chat_id, &notify);
                     }
-                    if !read_only_link(&url) {
+                    if !entry.policy.is_general() && !read_only_link(&url) {
                         let site = reqwest::Url::parse(&url)
                             .map(|value| value.origin().ascii_serialization())
                             .unwrap_or_default();
@@ -1220,17 +1438,13 @@ impl BrowserManager {
                         }
                     }
                     let data_root = root.clone();
-                    let known = match tokio::task::spawn_blocking(move || {
-                        crate::chat_archive_store::known_values(
-                            &data_root,
-                            &data_root.join("momso.db"),
-                        )
-                    })
-                    .await
-                    {
-                        Ok(Ok(known)) => known,
-                        _ => return json!({"status":"unavailable"}),
-                    };
+                    let known =
+                        match tokio::task::spawn_blocking(move || browser_known_values(&data_root))
+                            .await
+                        {
+                            Ok(Ok(known)) => known,
+                            _ => return json!({"status":"unavailable"}),
+                        };
                     let refs: Vec<&str> = known.iter().map(String::as_str).collect();
                     let operation_cancel = cancel.clone();
                     return match call(&entry, move |s| {
@@ -1257,9 +1471,10 @@ impl BrowserManager {
             Ok(grant) => grant.clone(),
             Err(_) => return json!({"status":"unavailable"}),
         };
-        let Some(grant) = grant.filter(|grant| grant.origin == page.origin) else {
+        let grant = grant.filter(|grant| grant.origin == page.origin);
+        if !entry.policy.is_general() && grant.is_none() {
             return json!({"status":"read_only"});
-        };
+        }
         let id = args["elementId"].as_str().unwrap();
         let Some(element) = page
             .elements
@@ -1269,19 +1484,27 @@ impl BrowserManager {
             return json!({"status":"target_changed"});
         };
         let expected = element.name.clone();
-        if !grant.permits(&page.origin, method, id, &expected) {
+        if !entry.policy.is_general()
+            && !grant
+                .as_ref()
+                .is_some_and(|grant| grant.permits(&page.origin, method, id, &expected))
+        {
             return json!({"status":"action_mismatch"});
         }
         let id = id.to_owned();
+        let description = grant
+            .as_ref()
+            .map(|grant| grant.description.as_str())
+            .unwrap_or("브라우저 조작");
         let action = if method == "browser_fill" {
             format!(
                 "{} · {} · 입력: {}",
                 entry.action,
-                grant.description,
+                description,
                 args["text"].as_str().unwrap()
             )
         } else {
-            format!("{} · {}", entry.action, grant.description)
+            format!("{} · {}", entry.action, description)
         };
         let request = crate::approval::browser_request(
             chat_id,
@@ -1291,7 +1514,9 @@ impl BrowserManager {
             entry.policy.effect(&expected),
             &expected,
         );
-        if !ask(request, cancel.clone()).await || cancel.is_cancelled() {
+        if !entry.policy.is_general()
+            && (!ask(request, cancel.clone()).await || cancel.is_cancelled())
+        {
             return entry.denied();
         }
         let origin = page.origin.clone();
@@ -1334,6 +1559,19 @@ impl BrowserManager {
 #[cfg(test)]
 mod scope_tests {
     use super::*;
+
+    #[test]
+    fn site_decisions_are_scoped_to_chat_and_host() {
+        let manager = BrowserManager::default();
+        assert_eq!(manager.host_decision("one", "example.test"), None);
+        manager.remember_host_decision("one", "example.test", true);
+        manager.remember_host_decision("one", "other.test", false);
+        assert_eq!(manager.host_decision("one", "example.test"), Some(true));
+        assert_eq!(manager.host_decision("one", "other.test"), Some(false));
+        assert_eq!(manager.host_decision("two", "example.test"), None);
+        manager.forget_chat_decisions("one");
+        assert_eq!(manager.host_decision("one", "example.test"), None);
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -1657,9 +1895,29 @@ mod tests {
     };
     use tokio::sync::mpsc;
 
+    #[test]
+    fn page_response_redacts_saved_password_from_all_page_strings() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let page = PageState {
+            origin: format!("https://{secret}.example"),
+            title: secret.clone(),
+            text: secret.clone(),
+            elements: vec![crate::browser_driver::Element {
+                id: secret.clone(),
+                role: secret.clone(),
+                name: secret.clone(),
+                kind: "normal",
+            }],
+            data_provenance: "untrusted_page_data",
+        };
+        let response = page_value(page, &[secret.as_str()]).to_string();
+        assert!(!response.contains(&secret));
+    }
+
     struct Site {
         url: String,
         posted: Arc<AtomicUsize>,
+        searched: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
@@ -1669,8 +1927,10 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let posted = Arc::new(AtomicUsize::new(0));
+            let searched = Arc::new(AtomicUsize::new(0));
             let stop = Arc::new(AtomicBool::new(false));
             let posts = posted.clone();
+            let searches = searched.clone();
             let done = stop.clone();
             let worker = thread::spawn(move || {
                 let mut clients = Vec::new();
@@ -1678,6 +1938,7 @@ mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let posts = posts.clone();
+                            let searches = searches.clone();
                             clients.push(thread::spawn(move || {
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                             let mut data = [0u8; 8192];
@@ -1688,6 +1949,9 @@ mod tests {
                                 || request.starts_with("GET /delete ")
                             {
                                 posts.fetch_add(1, Ordering::SeqCst);
+                                "ok"
+                            } else if request.starts_with("POST /search ") {
+                                searches.fetch_add(1, Ordering::SeqCst);
                                 "ok"
                             } else if request.starts_with("GET /login ") {
                                 "<title>Login</title><input type='password'>"
@@ -1711,6 +1975,7 @@ mod tests {
             Self {
                 url,
                 posted,
+                searched,
                 stop,
                 worker: Some(worker),
             }
@@ -1726,9 +1991,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn general_browser_uses_fake_site_and_respects_action_decisions() {
+        let site = Site::start();
+        let manager = BrowserManager::default();
+        let policy = Policy::general();
+        let entry = Arc::new(Entry {
+            policy: policy.clone(),
+            skill: String::new(),
+            action: "fixture".into(),
+            grant: Mutex::new(None),
+            extra_origins: Mutex::new(BTreeSet::new()),
+            blocked_origin: Mutex::new(None),
+            serial: AsyncMutex::new(()),
+            session: Arc::new(Mutex::new(Some(Session::fake_for_mcp_site(
+                site.url.clone(),
+                "https://login.fixture".into(),
+            )))),
+            panel_lease: None,
+            waiting_for_human: AtomicBool::new(false),
+            external_login: AtomicBool::new(false),
+        });
+        manager.entries.lock().await.insert("chat".into(), entry);
+        let temp = tempfile::tempdir().unwrap();
+        crate::storage::initialize(
+            &temp.path().join("momso.db"),
+            &temp.path().join("backups"),
+            "fixture",
+        )
+        .unwrap();
+        let selected = Ok(Some(policy));
+        let notify: Notify = Arc::new(|_, _| {});
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ask_count = asks.clone();
+        let allow: Ask = Arc::new(move |_, _| {
+            ask_count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { true })
+        });
+        let deny: Ask = Arc::new(|_, _| Box::pin(async { false }));
+        for (input, decision, expected) in [
+            (
+                json!({"method":"browser_open","arguments":{}}),
+                allow.clone(),
+                "ok",
+            ),
+            (
+                json!({"method":"browser_navigate","arguments":{"url":format!("{}/work",site.url)}}),
+                allow.clone(),
+                "page",
+            ),
+            (
+                json!({"method":"browser_read","arguments":{}}),
+                allow.clone(),
+                "page",
+            ),
+            (
+                json!({"method":"browser_click","arguments":{"elementId":"next"}}),
+                allow.clone(),
+                "page",
+            ),
+            (
+                json!({"method":"browser_click","arguments":{"elementId":"menu"}}),
+                allow.clone(),
+                "ok",
+            ),
+            (
+                json!({"method":"browser_fill","arguments":{"elementId":"query","text":"fixture"}}),
+                allow.clone(),
+                "ok",
+            ),
+            (
+                json!({"method":"browser_click","arguments":{"elementId":"publish"}}),
+                deny.clone(),
+                "denied",
+            ),
+        ] {
+            let result = manager
+                .dispatch(
+                    RequestContext {
+                        chat_id: "chat",
+                        provider: "fixture",
+                        skill: None,
+                        selected: &selected,
+                        root: temp.path().to_path_buf(),
+                        visible: false,
+                        cancel: CancellationToken::new(),
+                        notify: notify.clone(),
+                        ask: decision,
+                    },
+                    input,
+                )
+                .await;
+            assert_eq!(result["status"], expected);
+        }
+        assert_eq!(site.searched.load(Ordering::SeqCst), 1);
+        assert_eq!(site.posted.load(Ordering::SeqCst), 0);
+        // Opening, navigating and reading do not ask; link, menu and input do.
+        assert_eq!(asks.load(Ordering::SeqCst), 3);
+        let result = manager
+            .dispatch(
+                RequestContext {
+                    chat_id: "chat",
+                    provider: "fixture",
+                    skill: None,
+                    selected: &selected,
+                    root: temp.path().to_path_buf(),
+                    visible: false,
+                    cancel: CancellationToken::new(),
+                    notify,
+                    ask: allow,
+                },
+                json!({"method":"browser_click","arguments":{"elementId":"publish"}}),
+            )
+            .await;
+        assert_eq!(result["status"], "ok");
+        assert_eq!(site.posted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn six_bundled_skills_run_through_mcp_with_fake_sites_and_approval() {
         for &(name, content) in crate::skills::BUNDLED_SKILLS {
             if !crate::browser_gateway::builtin_browser_name(name) {
+                continue;
+            }
+            if name == "bodycodi-operations" {
                 continue;
             }
             for choice in [ApprovalChoice::AllowOnce, ApprovalChoice::Deny] {

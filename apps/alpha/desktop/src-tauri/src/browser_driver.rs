@@ -51,11 +51,12 @@ pub(crate) fn authentication_guarded_expression(
     expression: &str,
     login_origins: &BTreeSet<String>,
     login_paths: &BTreeSet<String>,
+    general: bool,
 ) -> Result<String, serde_json::Error> {
     let login = serde_json::to_string(login_origins)?;
     let paths = serde_json::to_string(login_paths)?;
     Ok(format!(
-        r#"(()=>{{let p;try{{p=decodeURIComponent(location.pathname)}}catch{{return {{__momsoHumanLogin:true}}}};if({login}.includes(location.origin)||{paths}.includes(location.origin+p.replace(/\/+$/, ''))||(p.includes('%')&&{paths}.some(v=>v.startsWith(location.origin+'/')))||/(^|\/)(login|signin|oauth|authorize|auth)(\/|$)/i.test(p)||document.querySelector('input[type="password" i],input[autocomplete~="current-password" i],input[autocomplete~="new-password" i],input[autocomplete~="one-time-code" i],input[autocomplete~="webauthn" i]'))return {{__momsoHumanLogin:true}};return ({expression});}})()"#
+        r#"(()=>{{let p;try{{p=decodeURIComponent(location.pathname)}}catch{{return {{__momsoHumanLogin:true}}}};if({login}.includes(location.origin)||{paths}.includes(location.origin+p.replace(/\/+$/, ''))||(p.includes('%')&&{paths}.some(v=>v.startsWith(location.origin+'/')))||(!{general}&&/(^|\/)(login|signin|oauth|authorize|auth)(\/|$)/i.test(p))||document.querySelector('input[type="password" i],input[autocomplete~="current-password" i],input[autocomplete~="new-password" i],input[autocomplete~="one-time-code" i],input[autocomplete~="webauthn" i]'))return {{__momsoHumanLogin:true}};return ({expression});}})()"#
     ))
 }
 
@@ -69,6 +70,20 @@ fn origin(value: &str) -> Option<String> {
     }
     url.host_str()?;
     Some(url.origin().ascii_serialization())
+}
+
+fn origin_allowed(allowed: &BTreeSet<String>, value: &str) -> bool {
+    if allowed.contains("*") {
+        let test_loopback = cfg!(test)
+            && reqwest::Url::parse(value).is_ok_and(|url| {
+                url.scheme() == "http"
+                    && url.host_str() == Some("127.0.0.1")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            });
+        return test_loopback || crate::external_url::validate(value).is_ok();
+    }
+    origin(value).is_some_and(|candidate| allowed.contains(&candidate))
 }
 
 fn navigation_frame_matches(expected: Option<&str>, frames: &Value) -> bool {
@@ -406,8 +421,7 @@ fn worker(
                     .pointer("/params/request/url")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let permitted =
-                    origin(url).is_some_and(|o| allowed.lock().is_ok_and(|set| set.contains(&o)));
+                let permitted = allowed.lock().is_ok_and(|set| origin_allowed(&set, url));
                 if !permitted
                     && v.pointer("/params/resourceType").and_then(Value::as_str) == Some("Document")
                     && !v
@@ -482,6 +496,10 @@ pub(crate) fn launch_with_login_choice(
     let profile_dir = profile_path.as_path();
     let mut allowed = BTreeSet::new();
     for value in allowed_origins.iter().chain(human_origins) {
+        if value == "*" {
+            allowed.insert(value.clone());
+            continue;
+        }
         let url = reqwest::Url::parse(value).map_err(|_| DriverError::Unavailable)?;
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
             return Err(DriverError::Unavailable);
@@ -552,7 +570,195 @@ pub(crate) fn launch_with_login_choice(
     }
 }
 
+pub(crate) struct SavedLoginTarget {
+    pub(crate) origin: String,
+    pub(crate) url: String,
+    frame: String,
+    loader: String,
+    context: i64,
+    token: String,
+}
+
 impl Session {
+    /// A credential is filled only by the host, never by an AI-supplied script.
+    pub(crate) fn saved_login_target(&self) -> Result<SavedLoginTarget, DriverError> {
+        if self.panel.is_none()
+            || self.webauthn_pending.load(Ordering::Acquire)
+            || self.uninspectable_frame.load(Ordering::Acquire)
+        {
+            return Err(DriverError::HumanRequired("verification"));
+        }
+        let tree = self.call("Page.getFrameTree", json!({}))?;
+        if tree
+            .pointer("/frameTree/childFrames")
+            .and_then(Value::as_array)
+            .is_some_and(|v| !v.is_empty())
+        {
+            return Err(DriverError::HumanRequired("verification"));
+        }
+        let frame = tree
+            .pointer("/frameTree/frame/id")
+            .and_then(Value::as_str)
+            .ok_or(DriverError::Unavailable)?
+            .to_owned();
+        let loader = tree
+            .pointer("/frameTree/frame/loaderId")
+            .and_then(Value::as_str)
+            .ok_or(DriverError::Unavailable)?
+            .to_owned();
+        let url = tree
+            .pointer("/frameTree/frame/url")
+            .and_then(Value::as_str)
+            .ok_or(DriverError::Unavailable)?
+            .to_owned();
+        let site = origin(&url).ok_or(DriverError::Unavailable)?;
+        let test_loopback = cfg!(test)
+            && reqwest::Url::parse(&site)
+                .is_ok_and(|url| url.scheme() == "http" && url.host_str() == Some("127.0.0.1"));
+        if (!site.starts_with("https://") && !test_loopback)
+            || !self
+                .allowed
+                .lock()
+                .is_ok_and(|set| origin_allowed(&set, &site))
+        {
+            return Err(DriverError::Blocked(site));
+        }
+        let world = self.call(
+            "Page.createIsolatedWorld",
+            json!({"frameId":frame,"worldName":"momso-saved-login"}),
+        )?;
+        let context = world
+            .get("executionContextId")
+            .and_then(Value::as_i64)
+            .ok_or(DriverError::Unavailable)?;
+        let token = uuid::Uuid::new_v4().to_string();
+        let token_json = serde_json::to_string(&token).map_err(|_| DriverError::Unavailable)?;
+        let expression = format!(
+            r#"(()=>{{
+          if(document.querySelector('input[autocomplete~="one-time-code" i],iframe, [data-sitekey], .g-recaptcha, .h-captcha'))return 'human';
+          const ps=[...document.querySelectorAll('input[type="password" i]')].filter(e=>!e.disabled&&!e.readOnly);
+          if(ps.length!==1)return 'human'; const p=ps[0],f=p.form;
+          if(p.value)return 'human';
+          if(!f||new URL(f.action,location.href).origin!==location.origin)return 'human';
+          const us=[...f.querySelectorAll('input')].filter(e=>!e.disabled&&!e.readOnly&&e!==p&&(/^(text|email)$/i.test(e.type)));
+          if(us.length!==1)return 'human';
+          const extra=[...f.querySelectorAll('input,select,textarea')].some(e=>!e.disabled&&e!==p&&e!==us[0]&&!['hidden','submit','button','checkbox'].includes(e.type));
+          if(extra)return 'human'; const buttons=[...f.querySelectorAll('button[type="submit"],input[type="submit"],button:not([type]),button[type="button"],input[type="button"]')].filter(e=>!e.disabled);
+          if(buttons.length!==1)return 'human';const b=buttons[0];
+          if(['formaction','formmethod','formtarget','formenctype'].some(a=>b.hasAttribute(a))||(f.target&&f.target.toLowerCase()!=='_self'))return 'human';
+          globalThis.__momsoSavedLogin={{token:{token_json},user:us[0],password:p,form:f,button:b,buttonText:b.innerText||b.value||'',href:location.href,action:f.action,method:f.method.toLowerCase()}};
+          return 'ok';}})()"#
+        );
+        let result = self.call("Runtime.evaluate", json!({"expression":expression,"contextId":context,"returnByValue":true,"awaitPromise":false}))?;
+        if result.pointer("/result/value").and_then(Value::as_str) != Some("ok") {
+            return Err(DriverError::HumanRequired("login"));
+        }
+        Ok(SavedLoginTarget {
+            origin: site,
+            url,
+            frame,
+            loader,
+            context,
+            token,
+        })
+    }
+
+    pub(crate) fn restrict_saved_login(
+        &self,
+        target: &SavedLoginTarget,
+    ) -> Result<(), DriverError> {
+        self.panel
+            .as_ref()
+            .ok_or(DriverError::Unavailable)?
+            .restrict_credentials(&target.origin)
+            .map_err(|_| DriverError::Unavailable)
+    }
+
+    pub(crate) fn fill_saved_login(
+        &self,
+        target: &SavedLoginTarget,
+        secret: crate::saved_logins::LoginSecret,
+    ) -> Result<(), DriverError> {
+        if self.panel.is_none()
+            || self.webauthn_pending.load(Ordering::Acquire)
+            || self.uninspectable_frame.load(Ordering::Acquire)
+        {
+            return Err(DriverError::HumanRequired("verification"));
+        }
+        let tree = self.call("Page.getFrameTree", json!({}))?;
+        if tree.pointer("/frameTree/frame/id").and_then(Value::as_str)
+            != Some(target.frame.as_str())
+            || tree
+                .pointer("/frameTree/frame/loaderId")
+                .and_then(Value::as_str)
+                != Some(target.loader.as_str())
+            || tree.pointer("/frameTree/frame/url").and_then(Value::as_str)
+                != Some(target.url.as_str())
+            || tree
+                .pointer("/frameTree/childFrames")
+                .and_then(Value::as_array)
+                .is_some_and(|v| !v.is_empty())
+        {
+            return Err(DriverError::TargetChanged);
+        }
+        let token = serde_json::to_string(&target.token).map_err(|_| DriverError::Unavailable)?;
+        let origin = serde_json::to_string(&target.origin).map_err(|_| DriverError::Unavailable)?;
+        let username =
+            serde_json::to_string(&secret.username).map_err(|_| DriverError::Unavailable)?;
+        let password =
+            serde_json::to_string(&secret.password).map_err(|_| DriverError::Unavailable)?;
+        let expression = format!(
+            r#"(()=>{{const s=globalThis.__momsoSavedLogin;delete globalThis.__momsoSavedLogin;
+          const valid=()=>s&&s.token==={token}&&location.origin==={origin}&&location.href===s.href&&s.user.isConnected&&s.password.isConnected&&s.form.isConnected&&s.button.isConnected&&s.user.form===s.form&&s.password.form===s.form&&s.button.form===s.form&&(s.button.innerText||s.button.value||'')===s.buttonText&&!['formaction','formmethod','formtarget','formenctype'].some(a=>s.button.hasAttribute(a))&&(!s.form.target||s.form.target.toLowerCase()==='_self')&&s.password.type==='password'&&!s.password.disabled&&!s.password.readOnly&&!s.user.disabled&&!s.user.readOnly&&!s.button.disabled&&s.form.action===s.action&&new URL(s.form.action,location.href).origin===location.origin&&s.form.method.toLowerCase()===s.method&&![...s.form.querySelectorAll('input,select,textarea')].some(e=>!e.disabled&&e!==s.user&&e!==s.password&&!['hidden','submit','button','checkbox'].includes(e.type))&&!document.querySelector('input[autocomplete~="one-time-code" i],iframe,[data-sitekey],.g-recaptcha,.h-captcha');
+          if(!valid())return 'changed';
+          const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+          set.call(s.user,{username});s.user.dispatchEvent(new Event('input',{{bubbles:true}}));if(!valid())return 'changed';
+          set.call(s.password,{password});s.password.dispatchEvent(new Event('input',{{bubbles:true}}));if(!valid())return 'changed';
+          if(s.method!=='post')s.form.addEventListener('submit',e=>e.preventDefault(),{{capture:true,once:true}});HTMLElement.prototype.click.call(s.button);return 'ok';}})()"#
+        );
+        let value = self.call("Runtime.evaluate", json!({"expression":expression,"contextId":target.context,"returnByValue":true,"awaitPromise":false}))?;
+        if value.get("exceptionDetails").is_some()
+            || value.pointer("/result/value").and_then(Value::as_str) != Some("ok")
+        {
+            return Err(DriverError::TargetChanged);
+        }
+        Ok(())
+    }
+
+    /// Arm an already-open panel only after its owner has approved access.
+    /// The caller must hold the panel lease and must not navigate the page.
+    pub(crate) fn arm_existing_panel(&mut self, approved_url: &str) -> Result<(), DriverError> {
+        if self.panel.is_none() || self.panel_lease.is_none() {
+            return Err(DriverError::Refused("panel_closed"));
+        }
+        let expected = self
+            .panel_expected_url
+            .as_deref()
+            .ok_or(DriverError::Refused("panel_page_changed"))?;
+        if expected != approved_url {
+            return Err(DriverError::Refused("panel_page_changed"));
+        }
+        let generation = self.navigation_generation();
+        let frames = self.call("Page.getFrameTree", json!({}))?;
+        let current = frames
+            .pointer("/frameTree/frame/url")
+            .and_then(Value::as_str)
+            .ok_or(DriverError::Refused("panel_page_changed"))?;
+        if current != expected || generation != self.navigation_generation() {
+            return Err(DriverError::Refused("panel_page_changed"));
+        }
+        let current_origin = origin(current).ok_or(DriverError::Refused("panel_page_changed"))?;
+        if !self
+            .allowed
+            .lock()
+            .is_ok_and(|allowed| origin_allowed(&allowed, &current_origin))
+        {
+            return Err(DriverError::Blocked(current_origin));
+        }
+        self.panel_armed = true;
+        Ok(())
+    }
+
     /// Only the host can attach a panel after obtaining scope approval.
     pub(crate) fn attach_panel(
         app: tauri::AppHandle,
@@ -561,9 +767,7 @@ impl Session {
         human_paths: &[String],
         lease: Option<Arc<crate::panel_ownership::PanelLease>>,
     ) -> Result<Self, DriverError> {
-        use tauri::Manager;
-        let view = app
-            .get_webview(crate::panel_browser::LABEL)
+        let view = crate::panel_browser::current_panel(&app)
             .ok_or(DriverError::Refused("panel_closed"))?;
         let initial_url = view
             .url()
@@ -571,7 +775,13 @@ impl Session {
             .to_string();
         let allowed = allowed_origins
             .iter()
-            .map(|value| origin(value).ok_or(DriverError::Unavailable))
+            .map(|value| {
+                if value == "*" {
+                    Ok(value.clone())
+                } else {
+                    origin(value).ok_or(DriverError::Unavailable)
+                }
+            })
             .collect::<Result<BTreeSet<_>, _>>()?;
         if allowed.is_empty() {
             return Err(DriverError::Unavailable);
@@ -648,7 +858,9 @@ impl Session {
                                     json!({"origin":worker_site,"title":"fixture","text":"fixture lesson","elements":[
                                         {"id":"next","role":"a","name":"next","kind":"normal"},
                                             {"id":"risky","role":"a","name":"delete","kind":"normal"},
-                                        {"id":"publish","role":"button","name":"게시","kind":"normal"}
+                                        {"id":"publish","role":"button","name":"게시","kind":"normal"},
+                                        {"id":"menu","role":"button","name":"menu","kind":"normal"},
+                                        {"id":"query","role":"input","name":"search","kind":"normal"}
                                     ]})
                                 } else if expression.contains("hasAttribute('href')") {
                                     if expression.contains("\"next\"") {
@@ -659,7 +871,14 @@ impl Session {
                                         json!({"link":null})
                                     }
                                 } else if expression.contains("e.click()") {
-                                    request_site("POST", "/posted");
+                                    if expression.contains("\"menu\"") {
+                                        request_site("GET", "/menu");
+                                    } else {
+                                        request_site("POST", "/posted");
+                                    }
+                                    json!("ok")
+                                } else if expression.contains("dispatchEvent") {
+                                    request_site("POST", "/search");
                                     json!("ok")
                                 } else {
                                     Value::Null
@@ -730,7 +949,7 @@ impl Session {
     pub(crate) fn test_allows_origin(&self, value: &str) -> bool {
         self.allowed
             .lock()
-            .is_ok_and(|allowed| allowed.contains(value))
+            .is_ok_and(|allowed| origin_allowed(&allowed, value))
     }
     pub(crate) fn is_active(&self) -> bool {
         if let Some(panel) = &self.panel {
@@ -759,7 +978,7 @@ impl Session {
         if !self
             .allowed
             .lock()
-            .is_ok_and(|allowed| allowed.contains(&candidate))
+            .is_ok_and(|allowed| origin_allowed(&allowed, &candidate))
         {
             return Err(DriverError::Blocked(candidate));
         }
@@ -770,7 +989,12 @@ impl Session {
             self.panel_armed = true;
         }
         match self.read().and_then(|page| {
-            if has_login_button(&page) {
+            if !self
+                .allowed
+                .lock()
+                .is_ok_and(|allowed| allowed.contains("*"))
+                && has_login_button(&page)
+            {
                 Err(DriverError::HumanRequired("login"))
             } else {
                 Ok(())
@@ -825,7 +1049,7 @@ impl Session {
             if !self
                 .allowed
                 .lock()
-                .is_ok_and(|allowed| allowed.contains(&candidate))
+                .is_ok_and(|allowed| origin_allowed(&allowed, &candidate))
             {
                 return Err(DriverError::Blocked(candidate));
             }
@@ -857,9 +1081,15 @@ impl Session {
         }
         let mut child_frames = Vec::new();
         children(tree, &mut child_frames)?;
-        let check =
-            authentication_guarded_expression("true", &self.login_origins, &self.login_paths)
-                .map_err(|_| DriverError::Unavailable)?;
+        let check = authentication_guarded_expression(
+            "true",
+            &self.login_origins,
+            &self.login_paths,
+            self.allowed
+                .lock()
+                .is_ok_and(|allowed| allowed.contains("*")),
+        )
+        .map_err(|_| DriverError::Unavailable)?;
         for child in child_frames {
             let world = self
                 .call(
@@ -893,9 +1123,15 @@ impl Session {
             .get("executionContextId")
             .and_then(Value::as_i64)
             .ok_or(DriverError::Unavailable)?;
-        let guarded =
-            authentication_guarded_expression(expression, &self.login_origins, &self.login_paths)
-                .map_err(|_| DriverError::Unavailable)?;
+        let guarded = authentication_guarded_expression(
+            expression,
+            &self.login_origins,
+            &self.login_paths,
+            self.allowed
+                .lock()
+                .is_ok_and(|allowed| allowed.contains("*")),
+        )
+        .map_err(|_| DriverError::Unavailable)?;
         let guarded = if let Some(expected) = &self.panel_expected_url {
             let expected = serde_json::to_string(expected).map_err(|_| DriverError::Unavailable)?;
             format!("(()=>{{if(location.href!=={expected})return {{__momsoPageChanged:true}};return ({guarded});}})()")
@@ -944,7 +1180,7 @@ impl Session {
         if !self
             .allowed
             .lock()
-            .is_ok_and(|set| set.contains(&candidate))
+            .is_ok_and(|set| origin_allowed(&set, &candidate))
         {
             return Err(DriverError::Blocked(candidate));
         }
@@ -1042,7 +1278,11 @@ impl Session {
             .and_then(Value::as_str)
             .ok_or(DriverError::Unavailable)?
             .to_owned();
-        if !self.allowed.lock().is_ok_and(|set| set.contains(&origin)) {
+        if !self
+            .allowed
+            .lock()
+            .is_ok_and(|set| origin_allowed(&set, &origin))
+        {
             return Err(DriverError::Blocked(origin));
         }
         let elements = value
@@ -1115,6 +1355,16 @@ impl Session {
                 if let Some(blocked) = self.blocked.lock().ok().and_then(|v| v.clone()) {
                     Err(DriverError::Blocked(blocked))
                 } else {
+                    if self.panel.is_some() {
+                        let frames = self.call("Page.getFrameTree", json!({}))?;
+                        let current = frames
+                            .pointer("/frameTree/frame/url")
+                            .and_then(Value::as_str)
+                            .ok_or(DriverError::Unavailable)?;
+                        if self.panel_expected_url.as_deref() != Some(current) {
+                            self.adopt_after_human_login()?;
+                        }
+                    }
                     Ok(())
                 }
             }

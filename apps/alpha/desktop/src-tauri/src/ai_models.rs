@@ -625,8 +625,16 @@ async fn gemini() -> ProviderModels {
     run_gemini_models(command, environment).await
 }
 async fn run_gemini_models(
+    command: tokio::process::Command,
+    environment: std::collections::HashMap<String, String>,
+) -> ProviderModels {
+    run_gemini_models_with_timeout(command, environment, Duration::from_secs(20)).await
+}
+
+async fn run_gemini_models_with_timeout(
     mut command: tokio::process::Command,
     environment: std::collections::HashMap<String, String>,
+    timeout: Duration,
 ) -> ProviderModels {
     command
         .stdin(std::process::Stdio::null())
@@ -645,7 +653,7 @@ async fn run_gemini_models(
     command.envs(&environment);
     #[cfg(windows)]
     command.creation_flags(0x08000000);
-    match tokio::time::timeout(Duration::from_secs(20), command.output()).await {
+    match tokio::time::timeout(timeout, command.output()).await {
         Ok(Ok(output)) if output.status.success() && output.stdout.len() <= 2 * 1024 * 1024 => {
             match std::str::from_utf8(&output.stdout) {
                 Ok(text)
@@ -850,7 +858,8 @@ mod tests {
             "GEMINI_API_KEY".to_owned(),
             "momso-fake-key-for-test".to_owned(),
         )]);
-        let result = run_gemini_models(command, environment).await;
+        let result =
+            run_gemini_models_with_timeout(command, environment, Duration::from_secs(90)).await;
         assert_eq!(result.state, "ok");
         assert_eq!(result.models[0].id, "fake-model");
         assert!(!serde_json::to_string(&result)

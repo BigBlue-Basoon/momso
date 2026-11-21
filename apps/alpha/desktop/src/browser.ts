@@ -5,6 +5,9 @@
 //     (사람이 창을 직접 닫았으면 이 명령으로 다시 확인한다).
 //   승인은 기존 agent-approval-request: kind 'browser_action_scope'(읽기만에서 바꾸는 일로) / 'browser_action'(누르기·입력 한 번마다).
 //     targets[0].path = 사이트 출처, reason = 'scope' 또는 효과(publish, delete, notify, refund, payment, irreversible, unknown). options allow_once·deny·cancel.
+//     reason 'site_access'(2026-11-21 뒤쪽 3c76dcf): 이 채팅방에서 그 호스트의 누르기·입력에 대한 결정. 허락·거절 모두 앱이 켜져 있는 동안 같은 방·호스트에 기억된다.
+//   자동 심사 단계에서도 브라우저는 위 site_access 승인으로 묻는다(2026-11-21 뒤쪽 50cf562, desktop-browser-chat-isolation-contract.md).
+//     3c76dcf 의 browser-auto-review-unavailable 이벤트는 50cf562 에서 없어졌다(화면도 듣지 않는다).
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { isDesktopRuntime } from './runtime'

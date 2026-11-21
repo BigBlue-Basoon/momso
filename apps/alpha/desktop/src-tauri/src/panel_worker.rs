@@ -8,6 +8,14 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[cfg(test)]
+static FAIL_NEXT_GUARD: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_guard_for_test() {
+    FAIL_NEXT_GUARD.store(true, Ordering::Release);
+}
+
 enum Command {
     Call {
         method: String,
@@ -18,12 +26,16 @@ enum Command {
         origin: String,
         reply: mpsc::Sender<Result<(), &'static str>>,
     },
+    RestrictCredentials {
+        origin: String,
+        reply: mpsc::Sender<Result<(), &'static str>>,
+    },
     Stop,
 }
 
 enum Event {
     Message(&'static str, Value),
-    Failed,
+    Failed(&'static str),
 }
 
 /// Request transport and browser event state. It owns the active navigation lease.
@@ -62,7 +74,6 @@ impl PanelWorker {
                 }
             };
             runtime.block_on(run(
-                app,
                 transport,
                 lease,
                 rx,
@@ -109,6 +120,20 @@ impl PanelWorker {
         let (reply, result) = mpsc::channel();
         self.commands
             .send(Command::AllowOrigin {
+                origin: origin.into(),
+                reply,
+            })
+            .map_err(|_| "unavailable")?;
+        result
+            .recv_timeout(Duration::from_secs(15))
+            .map_err(|_| "unavailable")?
+    }
+
+    /// Retain the restriction until this controlled session ends, including redirects.
+    pub fn restrict_credentials(&self, origin: &str) -> Result<(), &'static str> {
+        let (reply, result) = mpsc::channel();
+        self.commands
+            .send(Command::RestrictCredentials {
                 origin: origin.into(),
                 reply,
             })
@@ -173,7 +198,7 @@ async fn forward_events(
             return;
         }
     }
-    let _ = tx.send(Event::Failed).await;
+    let _ = tx.send(Event::Failed(name)).await;
 }
 
 async fn initialize(
@@ -196,7 +221,9 @@ async fn initialize(
         "Target.detachedFromTarget",
         "Runtime.bindingCalled",
     ] {
-        let stream = transport.subscribe(name).await?;
+        let stream = transport.subscribe(name).await.inspect_err(|_| {
+            log::warn!("panel_worker stage=subscribe event={name} status=unavailable");
+        })?;
         tasks.push(tokio::spawn(forward_events(stream, name, tx.clone())));
     }
     for (method, params) in [
@@ -216,13 +243,14 @@ async fn initialize(
             json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}),
         ),
     ] {
-        transport.call(method, params).await?;
+        transport.call(method, params).await.inspect_err(|_| {
+            log::warn!("panel_worker stage=initialize method={method} status=unavailable");
+        })?;
     }
     Ok((rx, tasks))
 }
 
 async fn run(
-    app: tauri::AppHandle,
     transport: PanelTransport,
     lease: NavigationLease,
     commands: mpsc::Receiver<Command>,
@@ -230,7 +258,6 @@ async fn run(
     blocked: Arc<Mutex<Option<String>>>,
     signals: (Arc<AtomicU64>, Arc<AtomicBool>, Arc<AtomicBool>),
 ) {
-    use tauri::Manager;
     let (navigation, webauthn_pending, uninspectable_frame) = signals;
     let (mut events, tasks) =
         match tokio::time::timeout(Duration::from_secs(15), initialize(&transport)).await {
@@ -252,8 +279,15 @@ async fn run(
     let mut ticking = tokio::time::interval(Duration::from_millis(10));
     let mut frames = std::collections::HashSet::new();
     let mut opaque_sessions = std::collections::HashSet::new();
+    let mut credential_fence = None;
     let mut failed = false;
     loop {
+        #[cfg(test)]
+        if FAIL_NEXT_GUARD.swap(false, Ordering::AcqRel) {
+            log::warn!("panel_worker stage=test_guard_failure status=unavailable");
+            failed = true;
+            break;
+        }
         tokio::select! {
             _ = ticking.tick() => match commands.try_recv() {
                 Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
@@ -262,6 +296,23 @@ async fn run(
                     tokio::spawn(async move { let _ = reply.send(transport.call(&method, params).await); });
                 }
                 Ok(Command::AllowOrigin { origin, reply }) => { let _ = reply.send(lease.allow_origin(&origin)); }
+                Ok(Command::RestrictCredentials { origin, reply }) => {
+                    let result = if credential_fence.as_ref().is_some_and(|(site, _)| site != &origin) {
+                        Err("unavailable")
+                    } else {
+                        if credential_fence.is_none() {
+                            match lease.restrict_credentials(&origin) {
+                                Ok(fence) => credential_fence = Some((origin, fence)),
+                                Err(error) => { let _ = reply.send(Err(error)); continue; }
+                            }
+                        }
+                        match tokio::time::timeout(Duration::from_secs(10), transport.disable_password_autosave()).await {
+                            Ok(value) => value,
+                            Err(_) => Err("unavailable"),
+                        }
+                    };
+                    let _ = reply.send(result);
+                }
                 Err(mpsc::TryRecvError::Empty) => {}
             },
             event = events.recv() => match event {
@@ -275,12 +326,12 @@ async fn run(
                         "Runtime.bindingCalled" if params.get("name").and_then(Value::as_str) == Some(crate::browser_driver::WEBAUTHN_BINDING) => { webauthn_pending.store(true, Ordering::Release); }
                         "Target.detachedFromTarget" => { if let Some(sid) = params.get("sessionId").and_then(Value::as_str) { opaque_sessions.remove(sid); uninspectable_frame.store(!opaque_sessions.is_empty(), Ordering::Release); } }
                         "Target.attachedToTarget" => {
-                            let Some(sid) = params.get("sessionId").and_then(Value::as_str) else { failed = true; break; };
+                            let Some(sid) = params.get("sessionId").and_then(Value::as_str) else { log::warn!("panel_worker stage=target_attach_missing_session status=unavailable"); failed = true; break; };
                             let kind = params.pointer("/targetInfo/type").and_then(Value::as_str).unwrap_or("");
-                            if kind == "page" {
-                                let Some(target) = params.pointer("/targetInfo/targetId").and_then(Value::as_str) else { failed = true; break; };
+                            if kind == "page" && !crate::panel_browser::navigation_gate().general_active() {
+                                let Some(target) = params.pointer("/targetInfo/targetId").and_then(Value::as_str) else { log::warn!("panel_worker stage=target_attach_missing_target status=unavailable"); failed = true; break; };
                                 if let Ok(mut blocked) = blocked.lock() { *blocked = Some("new_window".into()); }
-                                if transport.call("Target.closeTarget", json!({"targetId":target})).await.is_err() { failed = true; break; }
+                                if transport.call("Target.closeTarget", json!({"targetId":target})).await.is_err() { log::warn!("panel_worker stage=target_close status=unavailable"); failed = true; break; }
                             } else {
                                 if kind == "iframe" { opaque_sessions.insert(sid.to_owned()); uninspectable_frame.store(true, Ordering::Release); }
                                 for (method, arguments) in [
@@ -288,13 +339,13 @@ async fn run(
                                     ("Fetch.enable", json!({"patterns":[{"urlPattern":"*"}]})),
                                     ("Runtime.runIfWaitingForDebugger", json!({})),
                                 ] {
-                                    if transport.call_in_session(Some(sid), method, arguments).await.is_err() { failed = true; break; }
+                                    if transport.call_in_session(Some(sid), method, arguments).await.is_err() { log::warn!("panel_worker stage=target_setup method={method} status=unavailable"); failed = true; break; }
                                 }
                                 if failed { break; }
                             }
                         }
                         "Fetch.requestPaused" => {
-                            let Some(id) = params.get("requestId").and_then(Value::as_str).map(str::to_owned) else { failed = true; break; };
+                            let Some(id) = params.get("requestId").and_then(Value::as_str).map(str::to_owned) else { log::warn!("panel_worker stage=request_missing_id status=unavailable"); failed = true; break; };
                             let url = params.pointer("/request/url").and_then(Value::as_str).unwrap_or("");
                             let permitted = crate::panel_browser::navigation_gate().permits_request(url);
                             if !permitted && params.get("resourceType").and_then(Value::as_str) == Some("Document") && !params.get("frameId").and_then(Value::as_str).is_some_and(|frame| frames.contains(frame)) {
@@ -302,18 +353,45 @@ async fn run(
                             }
                             let method = if permitted { "Fetch.continueRequest" } else { "Fetch.failRequest" };
                             let args = if permitted { json!({"requestId":id}) } else { json!({"requestId":id,"errorReason":"BlockedByClient"}) };
-                            if transport.call_in_session(session, method, args).await.is_err() { failed = true; break; }
+                            if transport.call_in_session(session, method, args).await.is_err() { log::warn!("panel_worker stage=request_continue method={method} status=unavailable"); failed = true; break; }
                         }
                         _ => {}
                     }
                 }
-                _ => { failed = true; break; }
+                Some(Event::Failed(name)) => { log::warn!("panel_worker stage=event_stream event={name} status=unavailable"); failed = true; break; }
+                None => { log::warn!("panel_worker stage=event_channel status=unavailable"); failed = true; break; }
             }
         }
     }
-    if failed {
-        if let Some(view) = app.get_webview("panel-browser") {
-            let _ = view.close();
+    if credential_fence.is_some() {
+        // A panel that received saved credentials keeps its fence until it closes.
+        if failed {
+            log::warn!(
+                "panel_worker stage=guard_failed action=close_credential_panel status=unavailable"
+            );
+        }
+        transport.close_view();
+    } else if failed {
+        // Return the panel to ordinary human control when interception can be
+        // safely removed; a failed guard must not silently blank a usable page.
+        let detached = tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.call(
+                "Target.setAutoAttach",
+                json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}),
+            ),
+        )
+        .await;
+        let disabled = tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.call("Fetch.disable", json!({})),
+        )
+        .await;
+        if matches!(detached, Ok(Ok(_))) && matches!(disabled, Ok(Ok(_))) {
+            log::warn!("panel_worker stage=guard_failed action=release_control status=unavailable");
+        } else {
+            log::warn!("panel_worker stage=guard_failed action=close_panel status=unavailable");
+            transport.close_view();
         }
     } else {
         let _ = tokio::time::timeout(

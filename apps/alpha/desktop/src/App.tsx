@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { ActivityRail, type AppScreen } from './components/ActivityRail'
 import { MediaView } from './components/MediaView'
 import { SearchDialog, type SearchAction } from './components/SearchDialog'
@@ -15,6 +15,8 @@ import { listenApprovals, respondApproval, type ApprovalChoice } from './approva
 import { browserSessionStatus, listenBrowser } from './browser'
 import type { SecretItem } from './components/SecretRequestCard'
 import { cancelSecret, listenSecretRequests, submitSecret } from './setup-secrets'
+import type { LoginChoiceItem } from './components/SavedLoginChoiceCard'
+import { cancelLoginChoice, listenLoginChoices, listenLoginChoicesClosed, savedLoginErrorCode, selectSavedLogin } from './saved-logins'
 import { ChatSidebar } from './components/ChatSidebar'
 import { Composer, type PermissionState } from './components/Composer'
 import { SettingsView, type SettingsSection } from './components/SettingsView'
@@ -89,7 +91,7 @@ import {
   saveChatModels,
   savePreferences,
 } from './preferences'
-import { listenPanelAgent, openHumanBrowser, requestPanelBrowser, usePanelBrowserHold, usePanelBrowserShown } from './panel-browser'
+import { adoptPanelDraft, currentPanelDraft, listenPanelAgent, openHumanBrowser, requestPanelBrowser, selectPanelChat, usePanelBrowserHold, usePanelBrowserShown } from './panel-browser'
 import { acknowledgeBrowserLogin, cancelLogin, listenDeviceLogin, listenLoginStorage, type DeviceLogin } from './device-login'
 import { DeviceLoginCard } from './components/DeviceLoginCard'
 import { ErrorBoundary } from './components/ErrorBoundary'
@@ -286,6 +288,8 @@ function App() {
   // AI 가 허락을 구한 물음들. 대화마다 둔다(다른 대화로 갔다 와도 그대로 있다). 앱을 닫으면 사라진다.
   const [approvals, setApprovals] = useState<ApprovalItem[]>([])
   const [secretRequests, setSecretRequests] = useState<SecretItem[]>([])
+  // 저장된 로그인 중 어느 것을 쓸지 묻는 물음(saved-login-selection-request).
+  const [loginChoices, setLoginChoices] = useState<LoginChoiceItem[]>([])
   // 지금 보이는 대화의 말 수(물음이 온 자리를 적어 두려고).
   const shownCountRef = useRef(0)
 
@@ -514,6 +518,7 @@ function App() {
         setApprovals((items) => items.map((item) => (item.chatId === state.chatId ? { ...item, at: shift(item.at) } : item)))
         setCompactions((items) => items.map((item) => (item.chatId === state.chatId ? { ...item, at: shift(item.at) } : item)))
         setSecretRequests((items) => items.map((item) => (item.request.chatId === state.chatId ? { ...item, at: shift(item.at) } : item)))
+        setLoginChoices((items) => items.map((item) => (item.request.chatId === state.chatId ? { ...item, at: shift(item.at) } : item)))
         setBrowserHuman((items) => (items[state.chatId] ? { ...items, [state.chatId]: { ...items[state.chatId], at: shift(items[state.chatId].at) } } : items))
       }
       setChat((value) => (value && value.id === state.chatId ? { ...value, messages: [...added, ...value.messages] } : value))
@@ -986,6 +991,7 @@ function App() {
         setBrowserOpen((current) => ({ ...current, [chatId]: open }))
         if (!open) setBrowserHuman((current) => { if (!current[chatId]) return current; const next = { ...current }; delete next[chatId]; return next })
       },
+      // 자동 심사 단계의 브라우저는 이제 사이트별 승인으로 묻는다(2026-11-21 뒤쪽 50cf562). browser-auto-review-unavailable 줄은 없앴다.
     }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
   }, [desktopRuntime])
@@ -1075,6 +1081,61 @@ function App() {
     return () => { disposed = true; stop?.() }
   }, [desktopRuntime])
 
+  // 저장된 로그인 고르기(saved-login-selection-request, 2026-11-21 뒤쪽 275e017). 채팅방 번호가 없으면 답을 쓰는 중인 대화에 둔다(키 넣기와 같음).
+  useEffect(() => {
+    if (!desktopRuntime) return
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenLoginChoices((request) => {
+      const chatId = request.chatId ?? generatingRef.current?.chatId ?? selectedChatRef.current
+      const at = chatId && chatId === selectedChatRef.current ? shownCountRef.current : Number.MAX_SAFE_INTEGER
+      setLoginChoices((current) => (
+        current.some((item) => item.request.requestId === request.requestId)
+          ? current
+          : [...current, { request: { ...request, chatId }, at, status: 'pending', error: null }]
+      ))
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [desktopRuntime])
+
+  // 고르기 물음이 닫힘(saved-login-selection-closed, 뒤쪽 e8dab5e): 떠 있던 카드를 누를 때까지 기다리지 않고 한 줄로 바꾼다.
+  // 이미 한 줄이 된 카드(고름·취소·닫힘)와, 답을 멈춰 거둔 카드는 그대로 둔다.
+  useEffect(() => {
+    if (!desktopRuntime) return
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenLoginChoicesClosed((requestId, reason) => {
+      setLoginChoices((current) => current.map((item) => {
+        if (item.request.requestId !== requestId || (item.status !== 'pending' && item.status !== 'sending')) return item
+        if (reason === 'selected') return { ...item, status: 'chosen', error: null }
+        if (reason === 'cancelled' && item.cancelling) return { ...item, status: 'cancelled', error: null }
+        return { ...item, status: 'closed', closedReason: reason, error: null }
+      }))
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [desktopRuntime])
+
+  /** loginId 가 null 이면 취소(saved_login_cancel). 닫힘 이벤트가 먼저 와 한 줄이 됐으면 명령 결과로 다시 바꾸지 않는다. */
+  async function answerLoginChoice(requestId: string, loginId: string | null) {
+    const update = (patch: Partial<LoginChoiceItem>) => setLoginChoices((current) => current.map((item) => (
+      item.request.requestId === requestId && item.status === 'sending' ? { ...item, ...patch } : item
+    )))
+    setLoginChoices((current) => current.map((item) => (
+      item.request.requestId === requestId && item.status === 'pending'
+        ? { ...item, status: 'sending', chosenId: loginId ?? undefined, cancelling: loginId === null, error: null }
+        : item
+    )))
+    try {
+      if (loginId) await selectSavedLogin(requestId, loginId)
+      else await cancelLoginChoice(requestId)
+      update(loginId ? { status: 'chosen' } : { status: 'cancelled' })
+    } catch (error) {
+      // 뒤쪽이 이미 닫은 물음(300초가 지났거나 답을 멈춤)이면 unavailable: 승인 카드의 닫힌 줄과 같이 남긴다.
+      if (savedLoginErrorCode(error) === 'unavailable') update({ status: 'closed', closedReason: null, error: null })
+      else update({ status: 'pending', cancelling: false, error: loginId ? W.savedLogins.choice.failed : W.secretRequest.cancelFailed })
+    }
+  }
+
   /** values 가 null 이면 "그만두기"(agent_setup_secret_cancel). */
   async function answerSecret(requestId: string, values: Record<string, string> | null) {
     const update = (patch: Partial<SecretItem>) => setSecretRequests((current) => current.map((item) => (
@@ -1154,6 +1215,9 @@ function App() {
         const created = made.chat
         firstMessageId = made.messageId
         chatId = created.id
+        // 새 채팅방에서 쓰던 패널 브라우저(임시 방)를 이 방에 넘긴다. 이 방을 고르거나 AI 를 부르기 전에(계약, 뒤쪽 50cf562).
+        // 보던 페이지가 그대로 이 방 것이 된다. 넘기지 못하면 이 방은 보통처럼 고르고, 임시 방의 페이지는 새 채팅방에 남는다.
+        await adoptPanelDraft(created.id)
         const waiting = pendingAttachmentsRef.current[NEW_CHAT_KEY] ?? []
         if (waiting.length > 0) {
           const moved = { ...pendingAttachmentsRef.current, [created.id]: waiting }
@@ -1300,6 +1364,8 @@ function App() {
     // 그 채팅방의 기다리는 물음·키 카드에 멈춤 표시를 해 둔다: 뒤쪽이 provider_cancelled 로 닫으면 줄 없이 거둔다.
     setApprovals((current) => current.map((item) => item.chatId === running.chatId && item.status !== 'answered' ? { ...item, stopping: true } : item))
     setSecretRequests((current) => current.map((item) => item.request.chatId === running.chatId && item.status === 'pending' ? { ...item, stopping: true } : item))
+    // 로그인 고르기는 답을 멈추면 뒤쪽이 닫는다(뒤에 cancelled 닫힘이 온다). 승인 카드처럼 줄 없이 거둔다("답을 중간에 멈췄습니다"가 이미 뜬다).
+    setLoginChoices((current) => current.filter((item) => !(item.request.chatId === running.chatId && (item.status === 'pending' || item.status === 'sending'))))
     void cancelChatMessage(running.chatId).catch(() => {})
     finishGenerating(running.chatId)
   }
@@ -1408,6 +1474,9 @@ function App() {
   }, [zetPanelOpen, selectedChatId, freshInPanel])
 
   const toggleZetPanel = () => setZetPanelOpen((current) => !current)
+  // 오른쪽 패널 브라우저는 채팅방마다 따로다(2026-11-21 뒤쪽 3c76dcf). 채팅방을 고를 때마다 다른 패널 명령보다 먼저 뒤쪽에 알린다.
+  // 그리기 뒤 효과보다 앞서 알리려고 useLayoutEffect(패널의 명령은 이 고르기가 끝난 뒤에 나간다, panel-browser.ts).
+  useLayoutEffect(() => { selectPanelChat(selectedChatId) }, [selectedChatId])
   // 몸소 안의 웹 링크(momso:open-web)는 오른쪽 패널의 브라우저 탭에서 연다. 홈에서 패널이 닫혀 있으면 연다(탭은 패널이 연다).
   const screenRef = useRef(screen)
   screenRef.current = screen
@@ -1438,11 +1507,16 @@ function App() {
         }
       },
       onOpenRequest: (requestChatId) => {
+        // 다른 채팅방의 AI 가 열어 달라고 하면 이 방의 브라우저를 내주지 않는다(브라우저는 채팅방마다 따로, 뒤쪽은 panel_not_active 로 멈춘다).
+        // 새 채팅방의 임시 방 번호로 오면(방을 고르지 않고 시작한 로그인, 2026-11-21 뒤쪽 50cf562) 새 채팅방을 보고 있을 때 받는다.
+        const draft = currentPanelDraft()
+        const forDraft = !!requestChatId && requestChatId === draft
+        if (requestChatId && requestChatId !== selectedChatRef.current && !(forDraft && selectedChatRef.current === null)) return
         // 로그인 코드 카드가 떠 있으면(장치 코드 로그인) 그 카드의 [로그인 페이지 열기]가 이 요청을 받는다(알림 줄을 따로 띄우지 않는다).
         if (deviceLoginRef.current?.kind === 'device' && screenRef.current !== 'home' && screenRef.current !== 'documents') { setDevicePanelPending(true); return }
         // 설정·미디어를 보는 중이면 화면을 빼앗지 않고 알림 줄로 묻는다(아래 agentOpenPending). 2026-11-18 본부가 정한 임시 동작(그가 바꿀 수 있음).
         // 채팅방 번호가 없으면 로그인(R2 등, 2026-11-18 뒤쪽 9e54c07 open_oauth_panel)이 패널을 여는 것이라 알림 줄을 로그인 말로.
-        if (screenRef.current !== 'home' && screenRef.current !== 'documents') { setAgentOpenPending(requestChatId ? 'ai' : 'login'); return }
+        if (screenRef.current !== 'home' && screenRef.current !== 'documents') { setAgentOpenPending(requestChatId && !forDraft ? 'ai' : 'login'); return }
         if (screenRef.current === 'home') setZetPanelOpen(true)
         requestPanelBrowser(null)
       },
@@ -1667,9 +1741,11 @@ function App() {
   // 물음이 온 대화(아직 저장 전인 새 대화면 null)와 지금 보는 대화가 같으면 보인다.
   const chatApprovals = approvals.filter((item) => item.chatId === selectedChatId)
   const chatSecrets = secretRequests.filter((item) => item.request.chatId === selectedChatId)
+  const chatLoginChoices = loginChoices.filter((item) => item.request.chatId === selectedChatId)
   const waitingChatIds = [...new Set([
     ...approvals.filter((item) => item.status !== 'answered' && item.status !== 'closed' && item.chatId).map((item) => item.chatId as string),
     ...secretRequests.filter((item) => (item.status === 'pending' || item.status === 'sending') && item.request.chatId).map((item) => item.request.chatId as string),
+    ...loginChoices.filter((item) => (item.status === 'pending' || item.status === 'sending') && item.request.chatId).map((item) => item.request.chatId as string),
   ])]
 
   // 첫 실행: 몸소 첫 화면 → 영어 사용자 이름 → AI 하나 이상 연결(건너뛸 수 없음). 이미 쓰던 사람에게는 뜨지 않는다(first-run.ts).
@@ -1808,6 +1884,9 @@ function App() {
               secretRequests={chatSecrets}
               onSubmitSecret={(requestId, values) => void answerSecret(requestId, values)}
               onCancelSecret={(requestId) => void answerSecret(requestId, null)}
+              loginChoices={chatLoginChoices}
+              onChooseLogin={(requestId, loginId) => void answerLoginChoice(requestId, loginId)}
+              onCancelLogin={(requestId) => void answerLoginChoice(requestId, null)}
               onOpenDocument={(id) => {
                 // 오른쪽 패널을 열고 그 문서를 탭으로 연다.
                 setZetPanelOpen(true)
