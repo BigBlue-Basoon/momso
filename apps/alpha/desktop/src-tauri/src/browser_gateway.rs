@@ -1,5 +1,6 @@
 //! Host-side browser policy and driver boundary. No production driver is bundled yet.
 use serde::Deserialize;
+#[cfg(test)]
 use std::path::Path;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -17,6 +18,23 @@ pub(crate) struct Policy {
 }
 
 impl Policy {
+    /// Host-created general browser policy. The marker is never loaded from a skill.
+    pub(crate) fn general() -> Self {
+        Self {
+            version: 1,
+            origins: vec!["*".into()],
+            login_origins: vec![],
+            login_paths: vec![],
+            irreversible: vec![],
+            read_only: vec!["browser_navigate".into(), "browser_read".into()],
+        }
+    }
+
+    pub(crate) fn is_general(&self) -> bool {
+        self.version == 1 && self.origins.len() == 1 && self.origins[0] == "*"
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_skill(root: &Path, name: &str) -> Result<Option<Self>, &'static str> {
         let Some((_, builtin)) = crate::skills::BUNDLED_SKILLS
             .iter()
@@ -32,7 +50,7 @@ impl Policy {
             return Err("browser_policy_modified");
         }
         let (_, tail) = content
-            .split_once("```momso-browser-policy\n")
+            .split_once("```momso-browser-reference\n")
             .ok_or("browser_policy_invalid")?;
         let (yaml, _) = tail.split_once("\n```").ok_or("browser_policy_invalid")?;
         let policy: Self = serde_yaml::from_str(yaml).map_err(|_| "browser_policy_invalid")?;
@@ -79,8 +97,14 @@ impl Policy {
         let Ok(url) = reqwest::Url::parse(target) else {
             return false;
         };
-        let test_loopback =
-            cfg!(test) && url.scheme() == "http" && url.host_str() == Some("127.0.0.1");
+        let test_loopback = cfg!(test)
+            && url.scheme() == "http"
+            && url.host_str() == Some("127.0.0.1")
+            && url.username().is_empty()
+            && url.password().is_none();
+        if self.is_general() {
+            return test_loopback || crate::external_url::validate(target).is_ok();
+        }
         if (url.scheme() != "https" && !test_loopback)
             || !url.username().is_empty()
             || url.password().is_some()
@@ -154,7 +178,8 @@ impl Policy {
 pub(crate) fn builtin_browser_name(name: &str) -> bool {
     matches!(
         name,
-        "naver-smartplace"
+        "bodycodi-operations"
+            | "naver-smartplace"
             | "onstudio-operations"
             | "studiomate-operations"
             | "soomgo-operations"
@@ -295,7 +320,7 @@ mod tests {
         Arc,
     };
     #[test]
-    fn selected_builtin_policy_cannot_be_broadened_by_ai_or_modified_skill() {
+    fn legacy_reference_parser_detects_modified_reference() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("skills/naver-smartplace");
         std::fs::create_dir_all(&dir).unwrap();
@@ -335,10 +360,22 @@ mod tests {
             .is_none());
     }
     #[test]
+    fn general_policy_allows_public_sites_but_not_local_addresses() {
+        let policy = Policy::general();
+        assert!(policy.allows("https://crm.bodycodi.com/"));
+        assert!(policy.allows("https://other.example/"));
+        assert!(policy.allows("http://other.example/"));
+        assert!(!policy.allows("http://localhost/"));
+        assert!(!policy.allows("http://192.168.1.10/"));
+        assert!(!policy.allows("file:///tmp/test"));
+        assert!(!policy.allows(concat!("https://user:pass", "@", "other.example/")));
+    }
+
+    #[test]
     fn every_bundled_browser_skill_has_valid_policy() {
         let tmp = tempfile::tempdir().unwrap();
         for &(name, content) in crate::skills::BUNDLED_SKILLS {
-            if !builtin_browser_name(name) {
+            if !builtin_browser_name(name) || name == "bodycodi-operations" {
                 continue;
             }
             let path = tmp.path().join("skills").join(name);
@@ -433,7 +470,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut count = 0;
         for &(name, content) in crate::skills::BUNDLED_SKILLS {
-            if !builtin_browser_name(name) {
+            if !builtin_browser_name(name) || name == "bodycodi-operations" {
                 continue;
             }
             count += 1;

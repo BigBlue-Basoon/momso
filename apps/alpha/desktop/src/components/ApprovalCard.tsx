@@ -175,28 +175,39 @@ function SetupApprovalCard({ item, setup, onAnswer }: { item: ApprovalItem; setu
   )
 }
 
+/** 사이트 주소에서 호스트만(읽지 못하면 받은 그대로). */
+function siteHost(site: string) {
+  try { return new URL(site).hostname || site } catch { return site }
+}
+
 /**
  * 몸소 브라우저의 물음(browser.ts). 머리 글, 하려는 일(뒤쪽이 적어 준 글 그대로: 스킬·작업·버튼 이름, 입력이면 입력할 값),
  * 사이트, 누르면 생기는 일(효과 값을 쉬운 말로, 모르는 값이면 적지 않음). 읽기만에서 바꾸는 일로 넘어가는 물음에는
  * "허락해도 누를 때마다 다시 묻는다"는 한 줄. 단추는 "이번만 허락"과 "거절"(orderedChoices).
  * reason 은 AI 의 까닭 글이 아니라 값이라(scope, publish …) 까닭 줄로 보이지 않는다.
+ * 사이트 승인(reason site_access, 2026-11-21): 이 채팅방에서 그 호스트의 누르기·입력을 한 번에 정한다(허락·거절 모두 앱이 켜져 있는 동안 기억).
+ * 한 번짜리로 읽히지 않게 허락 단추는 "이 채팅방에서 계속 허락"(보내는 값은 뒤쪽이 받는 allow_once), 사이트는 호스트만.
  */
 function BrowserApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer: (choice: ApprovalChoice) => void }) {
   const { request } = item
   const words = W.approvalCard.browser
   const who = providerName(request.provider)
   const scope = request.kind === 'browser_action_scope'
-  const site = request.targets?.[0]?.path?.trim() || null
+  const siteAccess = !scope && request.reason === 'site_access'
+  const target = request.targets?.[0]?.path?.trim() || null
+  const site = target && siteAccess ? siteHost(target) : target
   const effect = !scope && request.reason ? (words.effect as Record<string, string>)[request.reason] ?? null : null
   const subject = request.description.trim()
+  // 사이트 승인의 남는 한 줄은 물음 글 대신 호스트를 적는다.
+  const doneSubject = siteAccess ? site : subject || null
 
-  if (item.status === 'closed') return <ClosedLine subject={subject || null} reason={item.closedReason} />
+  if (item.status === 'closed') return <ClosedLine subject={doneSubject} reason={item.closedReason} />
   if (item.status === 'answered' && item.choice) {
     return (
       <p className="approval-done">
         <Check size={13} aria-hidden />
-        <span>{CHOICE_DONE[item.choice]}</span>
-        {subject && <span className="approval-done-subject">{subject}</span>}
+        <span>{siteAccess && item.choice === 'allow_once' ? words.siteAllowedHere : CHOICE_DONE[item.choice]}</span>
+        {doneSubject && <span className="approval-done-subject">{doneSubject}</span>}
       </p>
     )
   }
@@ -227,7 +238,7 @@ function BrowserApprovalCard({ item, onAnswer }: { item: ApprovalItem; onAnswer:
             disabled={item.status === 'sending'}
             onClick={() => onAnswer(choice)}
           >
-            {CHOICE_LABEL[choice]}
+            {siteAccess && choice === 'allow_once' ? CHOICE_LABEL.allow_session : CHOICE_LABEL[choice]}
           </button>
         ))}
       </div>

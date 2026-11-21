@@ -44,6 +44,7 @@ mod chat_output;
 mod chat_recovery;
 mod chat_redaction_recheck;
 mod chat_search_index;
+mod class_student_store;
 #[cfg(test)]
 mod command_entry_tests;
 mod connections;
@@ -73,6 +74,7 @@ mod momso_mcp;
 mod object_store_auto_upload;
 mod panel_browser;
 pub mod panel_cdp;
+mod panel_chat;
 mod panel_download;
 pub mod panel_navigation;
 pub mod panel_ownership;
@@ -80,6 +82,7 @@ pub mod panel_worker;
 #[cfg(test)]
 mod provider_engine_smoke;
 mod redaction_wait;
+mod saved_logins;
 #[cfg(test)]
 mod scale_benchmark;
 mod tray_lifecycle;
@@ -1537,10 +1540,8 @@ async fn chat_send(
         }
     }
     #[cfg(windows)]
-    let browser_policy = match skill.as_deref() {
-        Some(name) => browser_gateway::Policy::from_skill(&archive, name),
-        None => Ok(None),
-    };
+    let browser_policy: Result<Option<browser_gateway::Policy>, &'static str> =
+        Ok(Some(browser_gateway::Policy::general()));
     let permission_mode = permission_modes::get(
         &db,
         if provider == "claude" {
@@ -1701,6 +1702,12 @@ async fn chat_send(
             value.prompt.push_str(&attached);
         }
     }
+    let saved_passwords = saved_logins::known_passwords()
+        .map_err(|_| "저장된 로그인 보관함을 확인하지 못했습니다".to_string())?;
+    provider_text = saved_logins::redact_text(&provider_text, &saved_passwords);
+    if let Some(value) = fallback.as_mut() {
+        value.prompt = saved_logins::redact_text(&value.prompt, &saved_passwords);
+    }
     if let Some(context) = chat_context::switch_provider(&db, &chat_id, &provider)? {
         let _ = app.emit(
             "chat-context-updated",
@@ -1726,6 +1733,7 @@ async fn chat_send(
         let browser_skill = skill.clone();
         let browser_root = state.paths.data_root.clone();
         let browser_broker = state.approvals.clone();
+        let browser_mode = permission_mode.clone();
         let read_paths = state.paths.clone();
         let created_by_tool = created_documents.clone();
         let generated_root = archive.to_path_buf();
@@ -1739,6 +1747,53 @@ async fn chat_send(
         let generated_model_for_tool = generated_model.clone();
         let generated_count_for_tool = generated_count.clone();
         let handler: setup_bridge::Handler = Arc::new(move |input| {
+            if input
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|method| method.starts_with("momso_crm_"))
+            {
+                let paths = read_paths.clone();
+                let app = setup_app.clone();
+                let chat = setup_chat.clone();
+                let provider = setup_provider.clone();
+                let cancel = setup_cancel.clone();
+                let broker = browser_broker.clone();
+                return Box::pin(async move {
+                    let paths = paths.scoped().await;
+                    let Some(root) = paths
+                        .objects_path
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                    else {
+                        return serde_json::json!({"status":"unavailable"});
+                    };
+                    let method = input["method"].as_str().unwrap_or("").to_owned();
+                    let args = input
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let ask: browser_runtime::Ask = Arc::new(move |request, token| {
+                        let app = app.clone();
+                        let broker = broker.clone();
+                        Box::pin(async move {
+                            matches!(
+                                broker.request(&app, request, token).await,
+                                Ok(approval::ApprovalChoice::AllowOnce)
+                            )
+                        })
+                    });
+                    crate::class_student_store::dispatch_approved(
+                        (paths.data_root.clone(), root),
+                        &chat,
+                        &provider,
+                        method,
+                        args,
+                        ask,
+                        cancel,
+                    )
+                    .await
+                });
+            }
             if input.get("method").and_then(serde_json::Value::as_str)
                 == Some("media_register_generated")
             {
@@ -1980,22 +2035,69 @@ async fn chat_send(
                 let provider = setup_provider.clone();
                 let cancel = setup_cancel.clone();
                 let broker = browser_broker.clone();
+                let mode = browser_mode.clone();
                 return Box::pin(async move {
                     let event_app = app.clone();
                     let notify: browser_runtime::Notify = Arc::new(move |name, payload| {
-                        let _ = event_app.emit(name, payload);
+                        if let Ok(safe) = saved_logins::redact_tool_result(payload) {
+                            let _ = event_app.emit(name, safe);
+                        }
                     });
+                    let browser_permission = permission_modes::browser_permission(&provider, &mode);
+                    let review_chat = chat.clone();
+                    let decision_browser = browser.clone();
                     let ask: browser_runtime::Ask = Arc::new(move |request, token| {
                         let app = app.clone();
                         let broker = broker.clone();
+                        let review_chat = review_chat.clone();
+                        let decision_browser = decision_browser.clone();
                         Box::pin(async move {
+                            if token.is_cancelled() {
+                                return false;
+                            }
+                            match browser_permission {
+                                permission_modes::BrowserPermission::Plan => return false,
+                                permission_modes::BrowserPermission::Automatic => return true,
+                                permission_modes::BrowserPermission::AutoReview
+                                | permission_modes::BrowserPermission::Ask => {}
+                            }
+                            let host = if request.kind == "browser_action"
+                                && request.reason.as_deref() == Some("site_access")
+                            {
+                                request
+                                    .targets
+                                    .first()
+                                    .and_then(|target| reqwest::Url::parse(&target.path).ok())
+                                    .and_then(|url| url.host_str().map(str::to_owned))
+                            } else {
+                                None
+                            };
+                            if let Some(host) = host.as_deref() {
+                                if let Some(decision) =
+                                    decision_browser.host_decision(&review_chat, host)
+                                {
+                                    return decision;
+                                }
+                            }
+                            let decision = broker.request(&app, request, token).await;
+                            if let (Some(host), Ok(choice)) = (host.as_deref(), &decision) {
+                                match choice {
+                                    approval::ApprovalChoice::AllowOnce
+                                    | approval::ApprovalChoice::AllowSession => decision_browser
+                                        .remember_host_decision(&review_chat, host, true),
+                                    approval::ApprovalChoice::Deny => decision_browser
+                                        .remember_host_decision(&review_chat, host, false),
+                                    approval::ApprovalChoice::Cancel => {}
+                                }
+                            }
                             matches!(
-                                broker.request(&app, request, token).await,
-                                Ok(approval::ApprovalChoice::AllowOnce)
+                                decision,
+                                Ok(approval::ApprovalChoice::AllowOnce
+                                    | approval::ApprovalChoice::AllowSession)
                             )
                         })
                     });
-                    browser
+                    let result = browser
                         .dispatch(
                             browser_runtime::RequestContext {
                                 chat_id: &chat,
@@ -2010,7 +2112,14 @@ async fn chat_send(
                             },
                             input,
                         )
+                        .await;
+                    tokio::task::spawn_blocking(move || saved_logins::redact_tool_result(result))
                         .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_else(
+                            || serde_json::json!({"status":"credential_store_unavailable"}),
+                        )
                 });
             }
             #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
@@ -2108,109 +2217,158 @@ async fn chat_send(
         let mut observed_writes = std::collections::BTreeSet::new();
         let mut capture = chat_finish::Capture::default();
         let mut used_fallback = false;
-        let mut emit = |name: &str, payload: serde_json::Value| {
-            capture.observe(name, &payload);
-            if name == "momso-internal-observed-model" {
-                if let Some(model) = payload.as_str() {
-                    if generated_output::observe_model(&db, &generated_turn_id, model).is_err() {
-                        log::warn!("Could not save generated-output model");
+        let mut secret_stream = saved_logins::SecretStream::default();
+        let mut stream_passwords = saved_passwords;
+        let mut outcome = {
+            let mut emit = |name: &str, mut payload: serde_json::Value| {
+                if name == "chat-stream" {
+                    let delta = payload
+                        .get("delta")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let Ok(current) = saved_logins::known_passwords() else {
+                        secret_stream.hold(delta);
+                        return;
+                    };
+                    for password in current {
+                        if !stream_passwords.contains(&password) {
+                            stream_passwords.push(password);
+                        }
+                    }
+                    let safe = secret_stream.push(delta, &stream_passwords, false);
+                    if safe.is_empty() {
+                        return;
+                    }
+                    payload["delta"] = serde_json::json!(safe);
+                } else {
+                    payload = saved_logins::redact_tool_result(payload).unwrap_or_else(
+                        |_| serde_json::json!({"status":"credential_store_unavailable"}),
+                    );
+                }
+                capture.observe(name, &payload);
+                if name == "momso-internal-observed-model" {
+                    if let Some(model) = payload.as_str() {
+                        if generated_output::observe_model(&db, &generated_turn_id, model).is_err()
+                        {
+                            log::warn!("Could not save generated-output model");
+                        }
                     }
                 }
-            }
-            #[cfg(windows)]
-            if name == "momso-internal-observed-model" {
-                if let Ok(mut model) = generated_model.lock() {
-                    *model = payload.as_str().map(str::to_owned);
+                #[cfg(windows)]
+                if name == "momso-internal-observed-model" {
+                    if let Ok(mut model) = generated_model.lock() {
+                        *model = payload.as_str().map(str::to_owned);
+                    }
                 }
-            }
-            if name == "chat-done" {
-                done = Some(payload);
-            } else if name == "momso-internal-file-writes" {
-                if let Some(items) = payload.as_array() {
-                    observed_writes.extend(
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_str().map(str::to_owned)),
-                    );
+                if name == "chat-done" {
+                    done = Some(payload);
+                } else if name == "momso-internal-file-writes" {
+                    if let Some(items) = payload.as_array() {
+                        observed_writes.extend(
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_owned)),
+                        );
+                    }
+                } else if matches!(
+                    name,
+                    "momso-internal-observed-model"
+                        | "momso-internal-observed-effort"
+                        | "momso-internal-finish-reason"
+                        | "momso-internal-provider-error"
+                ) {
+                } else if name == "momso-internal-handoff-fallback" {
+                    used_fallback = true;
+                } else if name == "momso-internal-file-reads" {
+                    if let Some(items) = payload.as_array() {
+                        observed_reads.extend(
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_owned)),
+                        );
+                    }
+                } else {
+                    let _ = app.emit(name, payload);
                 }
-            } else if matches!(
-                name,
-                "momso-internal-observed-model"
-                    | "momso-internal-observed-effort"
-                    | "momso-internal-finish-reason"
-                    | "momso-internal-provider-error"
-            ) {
-            } else if name == "momso-internal-handoff-fallback" {
-                used_fallback = true;
-            } else if name == "momso-internal-file-reads" {
-                if let Some(items) = payload.as_array() {
-                    observed_reads.extend(
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_str().map(str::to_owned)),
-                    );
-                }
+            };
+            if provider == "claude" {
+                chat_claude::run_with_skill(
+                    &db,
+                    &archive,
+                    &chat_id,
+                    &provider_text,
+                    model.as_deref(),
+                    effort.as_deref(),
+                    &permission_mode,
+                    fast.unwrap_or(false),
+                    skill.as_deref(),
+                    fallback.as_ref().map(|value| value.prompt.as_str()),
+                    claude_key.as_deref(),
+                    Some(approvals),
+                    cancel,
+                    Some(&output_dir),
+                    &mut emit,
+                )
+                .await
+            } else if provider == "gemini" {
+                chat_gemini::run(
+                    &db,
+                    &archive,
+                    &chat_id,
+                    &provider_text,
+                    &attachment_paths,
+                    model.as_deref(),
+                    effort.as_deref(),
+                    &permission_mode,
+                    skill.as_deref(),
+                    gemini_key.expect("Gemini key checked"),
+                    Some(approvals),
+                    cancel,
+                    Some(&output_dir),
+                    &mut emit,
+                )
+                .await
             } else {
-                let _ = app.emit(name, payload);
+                chat_codex::run_with_skill_auth(
+                    &db,
+                    &archive,
+                    &chat_id,
+                    &provider_text,
+                    model.as_deref(),
+                    effort.as_deref(),
+                    skill.as_deref(),
+                    fast,
+                    fallback.as_ref().map(|value| value.prompt.as_str()),
+                    codex_key.as_deref(),
+                    settings.as_ref().expect("valid Codex permission"),
+                    Some(approvals),
+                    cancel,
+                    Some(&output_dir),
+                    &mut emit,
+                )
+                .await
             }
         };
-        let mut outcome = if provider == "claude" {
-            chat_claude::run_with_skill(
-                &db,
-                &archive,
-                &chat_id,
-                &provider_text,
-                model.as_deref(),
-                effort.as_deref(),
-                &permission_mode,
-                fast.unwrap_or(false),
-                skill.as_deref(),
-                fallback.as_ref().map(|value| value.prompt.as_str()),
-                claude_key.as_deref(),
-                Some(approvals),
-                cancel,
-                Some(&output_dir),
-                &mut emit,
-            )
-            .await
-        } else if provider == "gemini" {
-            chat_gemini::run(
-                &db,
-                &archive,
-                &chat_id,
-                &provider_text,
-                &attachment_paths,
-                model.as_deref(),
-                effort.as_deref(),
-                &permission_mode,
-                skill.as_deref(),
-                gemini_key.expect("Gemini key checked"),
-                Some(approvals),
-                cancel,
-                Some(&output_dir),
-                &mut emit,
-            )
-            .await
-        } else {
-            chat_codex::run_with_skill_auth(
-                &db,
-                &archive,
-                &chat_id,
-                &provider_text,
-                model.as_deref(),
-                effort.as_deref(),
-                skill.as_deref(),
-                fast,
-                fallback.as_ref().map(|value| value.prompt.as_str()),
-                codex_key.as_deref(),
-                settings.as_ref().expect("valid Codex permission"),
-                Some(approvals),
-                cancel,
-                Some(&output_dir),
-                &mut emit,
-            )
-            .await
-        };
+        if let Ok(current) = saved_logins::known_passwords() {
+            for password in current {
+                if !stream_passwords.contains(&password) {
+                    stream_passwords.push(password);
+                }
+            }
+            let tail = secret_stream.push("", &stream_passwords, true);
+            if !tail.is_empty() {
+                let _ = app.emit(
+                    "chat-stream",
+                    serde_json::json!({"chatId":chat_id,"delta":tail}),
+                );
+            }
+        }
+        if let Err(error) = &mut outcome {
+            *error = match saved_logins::known_passwords() {
+                Ok(known) => saved_logins::redact_text(error, &known),
+                Err(_) => "저장된 로그인 보관함을 확인하지 못했습니다".into(),
+            };
+        }
         let user_stopped = cancelled.is_cancelled()
             || stopped_by_approval.load(std::sync::atomic::Ordering::SeqCst);
         #[cfg(windows)]
@@ -2709,6 +2867,7 @@ async fn chat_delete(
             let _ = event_app.emit(name, payload);
         });
         state.browser.close(&chat_id, &notify).await;
+        state.browser.forget_chat_decisions(&chat_id);
         report_chat_archive(
             &app,
             Some(&chat_id),
@@ -3310,6 +3469,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            app_lifecycle::restore_recovery_visibility(app.handle());
             let _timer = startup_timing::start_startup("app_setup");
             let ready_timer = startup_timing::start_startup("setup_until_runtime_ready");
             log::info!("lifecycle setup_started pid={}", std::process::id());
@@ -3427,6 +3587,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             tray_lifecycle::app_exit_respond,
             panel_browser::panel_browser_open,
+            saved_logins::saved_login_list,
+            saved_logins::saved_login_set,
+            saved_logins::saved_login_delete,
+            saved_logins::saved_login_select,
+            saved_logins::saved_login_cancel,
+            panel_browser::panel_browser_select_chat,
+            panel_browser::panel_browser_create_draft,
+            panel_browser::panel_browser_adopt_draft,
             panel_browser::panel_browser_open_agent,
             panel_browser::panel_browser_open_human,
             panel_browser::panel_browser_close,

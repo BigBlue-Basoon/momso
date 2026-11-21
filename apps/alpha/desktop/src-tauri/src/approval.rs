@@ -212,6 +212,20 @@ pub(crate) fn document_request(
     }
 }
 
+pub(crate) fn class_student_request(
+    chat_id: &str,
+    provider: &str,
+    count: Option<usize>,
+) -> ApprovalRequest {
+    let mut request = document_request(chat_id, provider, "수업·수련생 자료", Some("local"), None);
+    request.description = match count {
+        Some(count) => format!("수업·수련생 자료 {count}건 저장"),
+        None => "자료를 읽은 시각 저장".into(),
+    };
+    request.targets[0].path = "수업·수련생 자료".into();
+    request
+}
+
 pub(crate) fn dictionary_delete_request(
     chat_id: &str,
     provider: &str,
@@ -399,7 +413,9 @@ impl ApprovalBroker {
         .await
         .map_err(|_| "unavailable")?;
         let known = tokio::task::spawn_blocking(move || {
-            crate::chat_archive_store::known_values(&data_root, &database)
+            let mut values = crate::chat_archive_store::known_values(&data_root, &database)?;
+            values.extend(crate::saved_logins::known_passwords()?);
+            Ok::<_, &'static str>(values)
         })
         .await
         .map_err(|_| "unavailable")?

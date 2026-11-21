@@ -1,10 +1,12 @@
 """Exercise native close and second-instance activation on a private desktop."""
 import ctypes
 from ctypes import wintypes
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import tempfile
 import time
+import threading
 import uuid
 
 user = ctypes.WinDLL("user32", use_last_error=True)
@@ -31,8 +33,21 @@ user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes
 user.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user.IsWindowVisible.argtypes = [wintypes.HWND]
 user.IsWindowVisible.restype = wintypes.BOOL
+user.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM, wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+user.SendMessageTimeoutW.restype = wintypes.LPARAM
 callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 user.EnumDesktopWindows.argtypes = [wintypes.HANDLE, callback, wintypes.LPARAM]
+
+
+class FixturePage(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"<!doctype html><title>Window fixture</title>")
+
+    def log_message(self, *_args):
+        pass
 
 
 def main_window(desktop, expected_pid):
@@ -51,13 +66,13 @@ def main_window(desktop, expected_pid):
     return found[0] if len(found) == 1 else None
 
 
-def launch(executable, desktop_name, env, finish=False):
+def launch(executable, desktop_name, env, argument=None):
     startup = StartupInfo()
     startup.cb = ctypes.sizeof(startup)
     startup.desktop = desktop_name
     proc = ProcessInfo()
     block = ctypes.create_unicode_buffer("\0".join(f"{k}={v}" for k, v in sorted(env.items(), key=lambda x: x[0].upper())) + "\0\0")
-    suffix = " --probe-finish" if finish else ""
+    suffix = f" {argument}" if argument else ""
     command = ctypes.create_unicode_buffer(f'"{executable}" --momso-s5b-window-probe{suffix}')
     if not kernel.CreateProcessW(executable, command, None, None, False, 0x08000400, block, None, ctypes.byref(startup), ctypes.byref(proc)):
         raise ctypes.WinError(ctypes.get_last_error())
@@ -75,7 +90,12 @@ def wait_until(check, seconds=40):
     raise RuntimeError("fixture timed out")
 
 
-def run_case(executable, with_panel):
+def assert_responsive(hwnd):
+    result = ctypes.c_size_t()
+    assert user.SendMessageTimeoutW(hwnd, 0, 0, 0, 2, 3000, ctypes.byref(result)), "window stopped responding"
+
+
+def run_case(executable, with_panel, url):
     desktop_name = "momso-s5b-" + uuid.uuid4().hex
     desktop = user.CreateDesktopW(desktop_name, None, None, 0, 0x10000000, None)
     if not desktop:
@@ -89,7 +109,7 @@ def run_case(executable, with_panel):
             env = os.environ.copy()
             for key in ("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
                 env.pop(key, None)
-            env.update(USERPROFILE=str(root / "user"), LOCALAPPDATA=str(root / "user" / "AppData" / "Local"), APPDATA=str(root / "user" / "AppData" / "Roaming"), MOMSO_S5B_ROOT=str(root), MOMSO_S5B_IDENTIFIER="app.momso.s5b.fixture." + uuid.uuid4().hex)
+            env.update(USERPROFILE=str(root / "user"), LOCALAPPDATA=str(root / "user" / "AppData" / "Local"), APPDATA=str(root / "user" / "AppData" / "Roaming"), MOMSO_S5B_ROOT=str(root), MOMSO_S5B_IDENTIFIER="app.momso.s5b.fixture." + uuid.uuid4().hex, MOMSO_S5B_URL=url)
             if with_panel:
                 env["MOMSO_S5B_PANEL"] = "1"
             else:
@@ -110,7 +130,20 @@ def run_case(executable, with_panel):
                 if kernel.WaitForSingleObject(again.process, 0) != 0:
                     kernel.TerminateProcess(again.process, 2)
                 kernel.CloseHandle(again.process)
-            finish = launch(executable, desktop_name, env, finish=True)
+            time.sleep(10)
+            assert_responsive(hwnd)
+            loads = root / "loads.txt"
+            before_reload = int(wait_until(lambda: loads.read_text() if loads.is_file() else None))
+            reload_process = launch(executable, desktop_name, env, argument="--probe-reload")
+            try:
+                assert kernel.WaitForSingleObject(reload_process.process, 15000) == 0, "reload process did not complete"
+                wait_until(lambda: int(loads.read_text() or "0") > before_reload)
+                assert_responsive(hwnd)
+            finally:
+                if kernel.WaitForSingleObject(reload_process.process, 0) != 0:
+                    kernel.TerminateProcess(reload_process.process, 2)
+                kernel.CloseHandle(reload_process.process)
+            finish = launch(executable, desktop_name, env, argument="--momso-test-exit")
             try:
                 assert kernel.WaitForSingleObject(finish.process, 15000) == 0, "finish process did not complete"
                 assert kernel.WaitForSingleObject(proc.process, 15000) == 0, "fixture did not exit"
@@ -118,7 +151,7 @@ def run_case(executable, with_panel):
                 if kernel.WaitForSingleObject(finish.process, 0) != 0:
                     kernel.TerminateProcess(finish.process, 2)
                 kernel.CloseHandle(finish.process)
-            print(f"panel={with_panel}: hidden and reopened; {ready}")
+            print(f"panel={with_panel}: responsive after 10 seconds and reload; test exit completed; {ready}")
             time.sleep(5)
         if root.exists():
             print(f"cleanup_required={root}")
@@ -133,5 +166,14 @@ def run_case(executable, with_panel):
 
 if __name__ == "__main__":
     binary = str(Path(os.environ["MOMSO_S5B_EXE"]).resolve(strict=True))
-    run_case(binary, False)
-    run_case(binary, True)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FixturePage)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        address = f"http://127.0.0.1:{server.server_port}/"
+        run_case(binary, False, address)
+        run_case(binary, True, address)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

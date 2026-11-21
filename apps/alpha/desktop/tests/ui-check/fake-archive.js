@@ -675,7 +675,19 @@
   // 키를 넣기 전에 뒤쪽이 요청을 닫은 것처럼(5분 지남). window.__closeSecret('secret-1')
   // ---- 패널 브라우저(가짜). 진짜 웹뷰 대신 받은 자리에 회색 상자를 그려 자리·숨김을 눈으로 본다. ?panelfail=1 이면 unavailable. ----
   //   window.__panelDownload() 는 내려받기 알림, window.__panelGoogle(siteUrl) 은 Google 로그인 알림, window.__panelState 로 받은 값을 본다.
-  window.__panelState = { open: false, visible: false, bounds: null, url: null, history: [], calls: [] }
+  // 채팅방마다 따로(2026-11-21 뒤쪽 3c76dcf): views[chatId] 가 그 방의 웹뷰. panel_browser_select_chat 으로 고른 방(active)만 명령을 받고,
+  //   다른 방이면 panel_not_active. 고르기는 앞 방의 웹뷰를 숨기고 이 방의 웹뷰를 보인다(뒤쪽처럼). 이벤트에 chatId 가 붙는다.
+  //   window.__panelSelectDelay = { chatId: ms } 이면 그 방의 고르기 답이 그만큼 늦는다(빠르게 옮길 때 보기).
+  //   window.__panelStale(chatId, url) 은 그 방의 페이지 이벤트를 지금 보내 본다(다른 방에 그려지지 않는지).
+  // 새 채팅방(2026-11-21 뒤쪽 50cf562): panel_browser_create_draft 는 draft-… 방을 만들어 고르고, panel_browser_adopt_draft 는 그 웹뷰를
+  //   새 방으로 옮긴다(panel_not_active·panel_exists·draft_adopted 도 뒤쪽처럼). calls 에 chat_create_with_message·chat_send 도 같은 줄로 남겨 순서를 본다.
+  //   ?createfail=1 이면 chat_create_with_message 가 실패한다. ?draftfail=1 이면 create_draft 가 실패한다.
+  window.__panelState = { active: null, views: {}, calls: [], known: {}, adopted: {} }
+  window.__panelSelectDelay = {}
+  function panelView(chatId) {
+    const s = window.__panelState
+    return s.views[chatId] || (s.views[chatId] = { open: false, visible: false, bounds: null, url: null, history: [], at: -1 })
+  }
   function panelBox() {
     let box = document.getElementById('fake-panel-webview')
     if (!box) {
@@ -685,53 +697,101 @@
       document.body.appendChild(box)
     }
     const s = window.__panelState
-    box.style.display = s.open && s.visible && s.bounds ? 'flex' : 'none'
-    if (s.bounds) Object.assign(box.style, { left: s.bounds.x + 'px', top: s.bounds.y + 'px', width: s.bounds.width + 'px', height: s.bounds.height + 'px' })
-    box.textContent = '가짜 웹뷰 · ' + (s.url || '')
+    const v = s.active ? s.views[s.active] : null
+    box.style.display = v && v.open && v.visible && v.bounds ? 'flex' : 'none'
+    if (v && v.bounds) Object.assign(box.style, { left: v.bounds.x + 'px', top: v.bounds.y + 'px', width: v.bounds.width + 'px', height: v.bounds.height + 'px' })
+    box.textContent = '가짜 웹뷰 · ' + (s.active || '') + ' · ' + ((v && v.url) || '')
     return box
   }
-  function panelGo(url) {
+  function panelPage(chatId, url, loading) {
+    const p = new URL(url)
+    emit('panel-browser-page', { chatId, url, host: p.hostname, secure: p.protocol === 'https:', loading })
+  }
+  function panelGo(chatId, url) {
     const parsed = (() => { try { return new URL(url) } catch { return null } })()
     if (!parsed || !/^https?:$/.test(parsed.protocol) || /^(localhost|127\.|\[::1\])/.test(parsed.hostname) || parsed.username) throw 'invalid_url'
-    if (parsed.hostname === 'accounts.google.com') { emit('panel-browser-google-login', { host: 'accounts.google.com', siteUrl: window.__panelState.url }); throw 'google_login_required' }
-    const s = window.__panelState
-    s.url = parsed.href
-    s.history = s.history.slice(0, (s.at ?? -1) + 1).concat([parsed.href]); s.at = s.history.length - 1
-    emit('panel-browser-page', { url: parsed.href, host: parsed.hostname, secure: parsed.protocol === 'https:', loading: true })
+    const v = panelView(chatId)
+    if (parsed.hostname === 'accounts.google.com') { emit('panel-browser-google-login', { chatId, host: 'accounts.google.com', siteUrl: v.url }); throw 'google_login_required' }
+    v.url = parsed.href
+    v.history = v.history.slice(0, (v.at ?? -1) + 1).concat([parsed.href]); v.at = v.history.length - 1
+    panelPage(chatId, parsed.href, true)
     setTimeout(() => {
-      emit('panel-browser-page', { url: parsed.href, host: parsed.hostname, secure: parsed.protocol === 'https:', loading: false })
-      emit('panel-browser-title', { title: parsed.hostname === 'example.com' ? 'Example Domain' : parsed.hostname + ' 가짜 제목' })
-      emit('panel-browser-history', { canGoBack: s.at > 0, canGoForward: s.at < s.history.length - 1 })
+      // 뒤쪽처럼 고른 방의 웹뷰 이벤트만 보낸다.
+      if (window.__panelState.active !== chatId) return
+      panelPage(chatId, parsed.href, false)
+      emit('panel-browser-title', { chatId, title: parsed.hostname === 'example.com' ? 'Example Domain' : parsed.hostname + ' 가짜 제목' })
+      emit('panel-browser-history', { chatId, canGoBack: v.at > 0, canGoForward: v.at < v.history.length - 1 })
       panelBox()
     }, 300)
+  }
+  window.__panelStale = (chatId, url) => {
+    panelPage(chatId, url, false)
+    emit('panel-browser-title', { chatId, title: '늦게 온 제목 ' + chatId })
   }
   function panelCommand(command, args) {
     const s = window.__panelState
     s.calls.push([command, JSON.stringify(args || {})])
     if (query.get('panelfail') === '1') throw 'unavailable'
+    if (command === 'panel_browser_adopt_draft') {
+      const { draftId, chatId } = args
+      if (typeof draftId !== 'string' || !/^draft-[0-9a-f-]{36}$/.test(draftId) || draftId === chatId) throw 'invalid_draft'
+      if (s.active !== draftId) throw 'panel_not_active'
+      if (s.known[chatId]) throw 'panel_exists'
+      s.views[chatId] = s.views[draftId] || panelView(chatId)
+      delete s.views[draftId]
+      delete s.known[draftId]
+      s.known[chatId] = true
+      s.adopted[draftId] = chatId
+      s.active = chatId
+      panelBox()
+      return { chatId, hasPanel: Boolean(s.views[chatId] && s.views[chatId].open) }
+    }
+    if (command === 'panel_browser_select_chat' || command === 'panel_browser_create_draft') {
+      if (command === 'panel_browser_create_draft' && query.get('draftfail') === '1') throw 'unavailable'
+      const chatId = command === 'panel_browser_create_draft' ? 'draft-' + crypto.randomUUID() : args.chatId
+      if (typeof chatId !== 'string' || !chatId) throw 'invalid_chat'
+      if (s.adopted[chatId]) throw 'draft_adopted'
+      const answer = () => {
+        s.known[chatId] = true
+        if (s.active && s.active !== chatId && s.views[s.active]) s.views[s.active].visible = false
+        s.active = chatId
+        const v = s.views[chatId]
+        if (v && v.open) v.visible = true
+        panelBox()
+        return { chatId, hasPanel: Boolean(v && v.open) }
+      }
+      const delay = window.__panelSelectDelay[chatId]
+      return delay ? new Promise((resolve) => setTimeout(() => resolve(answer()), delay)) : answer()
+    }
+    const roomCommands = ['panel_browser_open', 'panel_browser_open_agent', 'panel_browser_close', 'panel_browser_visibility', 'panel_browser_bounds', 'panel_browser_navigate', 'panel_browser_action']
+    if (roomCommands.includes(command)) {
+      if (!s.active) throw command === 'panel_browser_open' || command === 'panel_browser_open_agent' ? 'chat_required' : 'panel_not_active'
+      if (args.chatId !== s.active) throw 'panel_not_active'
+    }
+    const v = s.active ? panelView(s.active) : null
     switch (command) {
       case 'panel_browser_open':
-        if (s.open) throw 'already_open'
+        if (v.open) throw 'already_open'
         if (!(args.width > 0 && args.height > 0)) throw 'invalid_bounds'
-        panelGo(args.url)
-        Object.assign(s, { open: true, visible: true, bounds: { x: args.x, y: args.y, width: args.width, height: args.height } })
+        panelGo(s.active, args.url)
+        Object.assign(v, { open: true, visible: true, bounds: { x: args.x, y: args.y, width: args.width, height: args.height } })
         panelBox(); return null
-      case 'panel_browser_close': Object.assign(s, { open: false, visible: false, url: null, history: [], at: -1 }); panelBox(); return null
-      case 'panel_browser_visibility': if (!s.open) throw 'unavailable'; s.visible = args.visible; panelBox(); return null
-      case 'panel_browser_bounds': if (!s.open) throw 'unavailable'; s.bounds = { x: args.x, y: args.y, width: args.width, height: args.height }; panelBox(); return null
-      case 'panel_browser_navigate': if (!s.open) throw 'unavailable'; panelGo(args.url); return null
+      case 'panel_browser_close': Object.assign(v, { open: false, visible: false, url: null, history: [], at: -1 }); panelBox(); return null
+      case 'panel_browser_visibility': if (!v.open) throw 'unavailable'; v.visible = args.visible; panelBox(); return null
+      case 'panel_browser_bounds': if (!v.open) throw 'unavailable'; v.bounds = { x: args.x, y: args.y, width: args.width, height: args.height }; panelBox(); return null
+      case 'panel_browser_navigate': if (!v.open) throw 'unavailable'; panelGo(s.active, args.url); return null
       case 'panel_browser_action': {
-        if (!s.open) throw 'unavailable'
+        if (!v.open) throw 'unavailable'
         const step = args.action === 'back' ? -1 : args.action === 'forward' ? 1 : 0
-        if (step && s.history[s.at + step]) { s.at += step; const url = s.history[s.at]; s.history = s.history.slice(); s.url = url; const p = new URL(url); emit('panel-browser-page', { url, host: p.hostname, secure: p.protocol === 'https:', loading: false }); emit('panel-browser-title', { title: p.hostname + ' 가짜 제목' }); emit('panel-browser-history', { canGoBack: s.at > 0, canGoForward: s.at < s.history.length - 1 }); panelBox() }
+        if (step && v.history[v.at + step]) { v.at += step; const url = v.history[v.at]; v.url = url; const p = new URL(url); panelPage(s.active, url, false); emit('panel-browser-title', { chatId: s.active, title: p.hostname + ' 가짜 제목' }); emit('panel-browser-history', { chatId: s.active, canGoBack: v.at > 0, canGoForward: v.at < v.history.length - 1 }); panelBox() }
         return null
       }
       case 'panel_browser_open_human': if (query.get('humanmissing') === '1') throw 'browser_missing'; s.human = args.url; return null
       case 'panel_browser_download_select': s.selected = args.path; return null
       case 'panel_download_reveal': s.revealed = args.path; return null
       case 'panel_browser_open_agent':
-        if (s.open) throw 'already_open'
-        Object.assign(s, { open: true, visible: true, url: null, agentOpened: true, bounds: { x: args.x, y: args.y, width: args.width, height: args.height } })
+        if (v.open) throw 'already_open'
+        Object.assign(v, { open: true, visible: true, url: null, agentOpened: true, bounds: { x: args.x, y: args.y, width: args.width, height: args.height } })
         panelBox(); return null
       case 'panel_agent_status': return { ownerChatId: s.agentOwner || null, humanControls: Boolean(s.agentHuman) }
       case 'panel_agent_take_over': s.agentHuman = true; emit('panel-agent-control-changed', { chatId: args.chatId, state: 'human' }); return null
@@ -756,12 +816,109 @@
     }
     return undefined
   }
-  // 다운로드(새 꼴): window.__panelDownload('started'|'finished'|'blocked'|'failed', name)
-  window.__panelDownload = (state = 'finished', name = 'class-plan.pdf') => emit('panel-browser-download', { state, name, path: state === 'finished' ? 'D:/Downloads/' + name : null, size: state === 'finished' ? 182400 : null })
+  // 저장된 로그인(가짜, 275e017). 보관함은 window.__savedLogins(비밀번호는 가짜 값), 명령 기록은 window.__savedLoginCalls(비밀번호는 있는지만).
+  //   ?logins=two 면 같은 사이트 로그인 둘로 시작, ?logins=store 면 모든 명령이 credential_store_unavailable.
+  //   window.__loginChoice(chatId) 는 고르기 물음을 보내고 requestId 를 돌려준다. window.__loginChoiceExpire() 는 남은 물음을 timeout 으로 닫고,
+  //   window.__loginChoiceStop(requestId) 는 뒤쪽이 답 멈춤으로 닫은 것처럼 cancelled 로 닫는다(e8dab5e saved-login-selection-closed).
+  //   ?loginclose=silent 면 닫힘 이벤트를 보내지 않는다(닫힌 뒤 고르면 unavailable 만).
+  window.__savedLogins = query.get('logins') === 'two'
+    ? [
+      { id: 'login-a', origin: 'https://crm.bodycodi.com', label: '센터 계정', username: 'center01', password: 'fake-a', askBeforeUse: false, loginPath: null, defaultForPath: false },
+      { id: 'login-b', origin: 'https://crm.bodycodi.com', label: '관리자', username: 'admin01', password: 'fake-b', askBeforeUse: true, loginPath: '/admin', defaultForPath: false },
+    ]
+    : []
+  window.__savedLoginCalls = []
+  window.__loginChoices = {}
+  let loginSeq = 0
+  window.__loginChoice = (chatId, ids) => {
+    loginSeq += 1
+    const requestId = `choice-${loginSeq}`
+    const entries = window.__savedLogins.filter((e) => !ids || ids.includes(e.id)).map(({ password, ...rest }) => rest)
+    window.__loginChoices[requestId] = { ids: entries.map((e) => e.id), chosen: null }
+    emit('saved-login-selection-request', { requestId, chatId, entries })
+    return requestId
+  }
+  const closeChoice = (requestId, reason) => {
+    delete window.__loginChoices[requestId]
+    if (query.get('loginclose') !== 'silent') emit('saved-login-selection-closed', { requestId, reason })
+  }
+  window.__loginChoiceExpire = () => { for (const requestId of Object.keys(window.__loginChoices)) closeChoice(requestId, 'timeout') }
+  window.__loginChoiceStop = (requestId) => { if (window.__loginChoices[requestId]) closeChoice(requestId, 'cancelled') }
+  function savedLoginCommand(command, args) {
+    const store = window.__savedLogins
+    window.__savedLoginCalls.push([command, command === 'saved_login_set' ? { ...args.input, password: undefined, hasPassword: typeof args.input.password === 'string' } : args])
+    if (query.get('logins') === 'store' && command !== 'saved_login_select' && command !== 'saved_login_cancel') throw 'credential_store_unavailable'
+    const view = ({ password, ...rest }) => rest
+    if (command === 'saved_login_list') return store.map(view)
+    if (command === 'saved_login_delete') {
+      const at = store.findIndex((e) => e.id === args.id)
+      if (at < 0) throw 'not_found'
+      store.splice(at, 1)
+      return null
+    }
+    if (command === 'saved_login_select') {
+      const pending = window.__loginChoices[args.requestId]
+      if (!pending || !pending.ids.includes(args.loginId)) throw 'unavailable'
+      window.__loginChosen = args.loginId
+      // 닫힘 이벤트가 명령 답보다 먼저 오는 순서.
+      closeChoice(args.requestId, 'selected')
+      return null
+    }
+    if (command === 'saved_login_cancel') {
+      if (!window.__loginChoices[args.requestId]) throw 'unavailable'
+      if (query.get('loginclose') === 'cancelfail') throw 'credential_store_unavailable'
+      delete window.__loginChoices[args.requestId]
+      // 명령 답이 먼저, 닫힘 이벤트가 뒤에 오는 순서.
+      setTimeout(() => { if (query.get('loginclose') !== 'silent') emit('saved-login-selection-closed', { requestId: args.requestId, reason: 'cancelled' }) }, 50)
+      return null
+    }
+    // saved_login_set: 뒤쪽 prepare_set 을 줄여 흉내.
+    const input = args.input
+    let origin
+    try {
+      const url = new URL(input.origin)
+      if (url.protocol !== 'https:' || url.pathname !== '/' || url.search || url.hash || url.username) throw 0
+      origin = url.origin
+    } catch { throw 'invalid_origin' }
+    if (input.loginPath && (!input.loginPath.startsWith('/') || input.loginPath.startsWith('//'))) throw 'invalid_input'
+    if (!String(input.label || '').trim() || !String(input.username || '').trim() || String(input.label).length > 100) throw 'invalid_input'
+    if (store.some((e) => e.origin === origin && e.label === input.label && e.id !== input.id)) throw 'duplicate_label'
+    const next = store.map((e) => ({ ...e }))
+    let entry
+    if (input.id) {
+      entry = next.find((e) => e.id === input.id)
+      if (!entry) throw 'not_found'
+      if (entry.origin !== origin) throw 'origin_change_requires_new_login'
+      Object.assign(entry, { label: input.label, username: input.username })
+      if (input.askBeforeUse !== undefined) entry.askBeforeUse = input.askBeforeUse
+      if (input.loginPath !== undefined) entry.loginPath = input.loginPath || null
+      if (input.defaultForPath !== undefined) entry.defaultForPath = input.defaultForPath
+      if (input.password !== undefined) entry.password = input.password
+    } else {
+      if (!input.password) throw 'invalid_input'
+      loginSeq += 1
+      entry = { id: `login-${loginSeq}-new`, origin, label: input.label, username: input.username, password: input.password, askBeforeUse: input.askBeforeUse ?? false, loginPath: input.loginPath || null, defaultForPath: input.defaultForPath ?? false }
+      next.push(entry)
+    }
+    if (entry.defaultForPath) {
+      const others = next.filter((e) => e.id !== entry.id && e.origin === entry.origin && e.loginPath === entry.loginPath && e.defaultForPath)
+      if (others.length && input.defaultForPath !== true) throw 'default_conflict'
+      for (const e of others) e.defaultForPath = false
+    }
+    if (JSON.stringify(next).length > 2200) throw 'capacity_exceeded'
+    store.splice(0, store.length, ...next)
+    return view(entry)
+  }
+  // 사이트 승인(가짜, 3c76dcf): window.__approveSite('https://www.google.com') — 이 채팅방에서 그 호스트의 누르기·입력.
+  window.__approveSite = (origin = 'https://www.google.com', chatId) => window.__approve('browser_action', ['allow_once', 'deny', 'cancel'], {
+    description: '이 사이트에서 누르고 입력해도 될까요', reason: 'site_access', targets: [{ path: origin, change: 'edit' }], change: 'edit', ...(chatId ? { chatId } : {}),
+  })
+  // 다운로드(새 꼴): window.__panelDownload('started'|'finished'|'blocked'|'failed', name, chatId) — chatId 를 빼면 지금 고른 방(50cf562 부터 방이 붙는다).
+  window.__panelDownload = (state = 'finished', name = 'class-plan.pdf', chatId) => emit('panel-browser-download', { chatId: chatId === undefined ? window.__panelState.active : chatId, state, name, path: state === 'finished' ? 'D:/Downloads/' + name : null, size: state === 'finished' ? 182400 : null })
   // AI 가 패널을 쓸 때(가짜): window.__panelAgentOpen(chatId), window.__panelAgent(chatId, 'started'|'ended'|'human'|'available'|'login', reason, chatTitle)
   //   panel_agent_resume 은 ?agentlogin=notyet 이면 human_required, 아니면 login 뒤에는 started.
   // 팝업(가짜): window.__panelPopup('opened'|'closed', host, openerHost, title)
-  window.__panelPopup = (state, host, openerHost, title) => emit('panel-browser-popup', { state, host, openerHost: openerHost ?? null, title: title ?? null, reason: state === 'closed' ? 'user' : null })
+  window.__panelPopup = (state, host, openerHost, title, chatId) => emit('panel-browser-popup', { chatId: chatId === undefined ? window.__panelState.active : chatId, state, host, openerHost: openerHost ?? null, title: title ?? null, reason: state === 'closed' ? 'user' : null })
   window.__panelAgentOpen = (chatId) => emit('panel-agent-open-request', { chatId })
   // 로그인 코드(가짜, 2026-11-18 넷째 줄 계약): 장치 코드 · 닫힘 · 클로드 기본 브라우저 안내.
   window.__deviceLogin = (provider = 'codex', seconds = 900) => emit('provider-login-device', { provider, url: provider === 'github' ? 'https://github.com/login/device' : 'https://auth.openai.com/codex/device', code: provider === 'github' ? 'A1B2-C3D4' : 'KQ7M-2XWP', expiresInSeconds: seconds })
@@ -779,7 +936,7 @@
     window.__panelState.agentLogin = state === 'login'
     emit('panel-agent-control-changed', { chatId, state, reason: reason ?? null, provider: 'codex', chatTitle: chatTitle ?? null, ...(loginUrl ? { loginUrl, siteUrl: 'https://smartplace.naver.com/' } : {}) })
   }
-  window.__panelGoogle = (siteUrl) => emit('panel-browser-google-login', { host: 'accounts.google.com', siteUrl: siteUrl ?? null })
+  window.__panelGoogle = (siteUrl, chatId) => emit('panel-browser-google-login', { chatId: chatId === undefined ? window.__panelState.active : chatId, host: 'accounts.google.com', siteUrl: siteUrl ?? null })
   window.__closeSecret = (requestId, reason) => emit('agent-setup-secret-closed', reason ? { requestId, chatId: null, reason } : { requestId, chatId: null })
 
   // ---- 미디어(화면 확인용 가짜). ?media=ok(기본) / none(명령 없음). 그림은 색 띠 SVG. ----
@@ -1443,7 +1600,8 @@
         return mediaList()
       case 'source_asset_open': case 'source_asset_delete_preview': case 'source_asset_trash': case 'source_asset_restore_trashed': case 'source_asset_purge': case 'source_asset_deleted_list':
         return sourceCommand(command, args)
-      case 'panel_browser_open': case 'panel_browser_close': case 'panel_browser_visibility': case 'panel_browser_bounds': case 'panel_browser_navigate': case 'panel_browser_action': case 'panel_browser_open_human': case 'panel_browser_download_select': case 'panel_download_reveal': case 'panel_browser_open_agent': case 'panel_agent_status': case 'panel_agent_take_over': case 'panel_agent_resume': case 'panel_agent_external_login_open':
+      case 'panel_browser_create_draft': case 'panel_browser_adopt_draft':
+      case 'panel_browser_select_chat': case 'panel_browser_open': case 'panel_browser_close': case 'panel_browser_visibility': case 'panel_browser_bounds': case 'panel_browser_navigate': case 'panel_browser_action': case 'panel_browser_open_human': case 'panel_browser_download_select': case 'panel_download_reveal': case 'panel_browser_open_agent': case 'panel_agent_status': case 'panel_agent_take_over': case 'panel_agent_resume': case 'panel_agent_external_login_open':
         return panelCommand(command, args)
       case 'chat_items':
         return chatItems(args.chatId)
@@ -1483,6 +1641,8 @@
         if (query.get('importfail')) throw query.get('importfail')
         return new Promise((done) => setTimeout(() => done({ imported: 2, duplicate: 1, skipped: 0, omittedNonTextMessages: 0, omittedAttachments: 0, updated: 0, addedMessages: 0, conflicts: 0 }), 900))
       }
+      case 'saved_login_list': case 'saved_login_set': case 'saved_login_delete': case 'saved_login_select': case 'saved_login_cancel':
+        return savedLoginCommand(command, args)
       case 'yoga_terms_list': {
         // 용어 사전(가짜). ?big=1 이면 용어 1,000개·사람 이름 300개, 아니면 용어 몇 개. ?dict=fail 이면 읽기 실패, ?dict=slow 면 3초 뒤.
         if (query.get('dict') === 'fail') throw 'dictionary_unavailable'
@@ -1558,6 +1718,7 @@
       case 'permission_modes_available':
         return permissionModes(args.provider)
       case 'chat_send':
+        window.__panelState.calls.push(['chat_send', JSON.stringify({ chatId: args.chatId })])
         return chatSend(args)
       case 'chat_cancel':
         if (sendMode === 'old') throw 'Command chat_cancel not found'
@@ -1589,6 +1750,8 @@
       case 'chat_create_with_message': {
         // 1b3ef51: 스킬이 있으면 빈 글도 받는다(제목은 빈 글). 글과 스킬이 모두 비면 empty_message.
         if (!String(args.text || '').trim() && !String(args.skill || '').trim()) throw 'empty_message'
+        window.__panelState.calls.push(['chat_create_with_message', JSON.stringify({ text: args.text })])
+        if (query.get('createfail') === '1') throw 'database_unavailable'
         window.__createWithMessage = (window.__createWithMessage || 0) + 1
         const createdAt = nextStamp()
         const id = chatIdFor(createdAt)

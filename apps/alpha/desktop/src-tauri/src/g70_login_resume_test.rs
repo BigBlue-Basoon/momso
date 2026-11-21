@@ -169,9 +169,8 @@ fn main() {
             chat::rename(&db, &id, "fixture").unwrap();
             (id, None)
         };
-        let policy = browser_gateway::Policy::from_skill(&archive_root, skill)
-            .unwrap()
-            .unwrap();
+        crate::panel_chat::select(&id).unwrap();
+        let policy = browser_gateway::Policy::general();
         let completed = Arc::new(AtomicBool::new(false));
         browser
             .install_fake_login_panel(&id, skill, policy, completed.clone())

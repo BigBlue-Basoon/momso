@@ -5,6 +5,115 @@ use tauri::{
 };
 
 pub(crate) const LABEL: &str = "panel-browser";
+static PANEL_SWITCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) fn switch_lock() -> &'static tokio::sync::Mutex<()> {
+    &PANEL_SWITCH
+}
+
+fn ensure_chat(chat_id: &str) -> Result<(), String> {
+    let active = crate::panel_chat::active_chat();
+    if chat_is_active(active.as_deref(), chat_id) {
+        Ok(())
+    } else {
+        Err("panel_not_active".into())
+    }
+}
+
+fn chat_is_active(active: Option<&str>, chat_id: &str) -> bool {
+    active == Some(chat_id) || (cfg!(test) && active.is_none() && chat_id.is_empty())
+}
+
+pub(crate) fn current_panel(app: &tauri::AppHandle) -> Option<tauri::Webview> {
+    let label = crate::panel_chat::active_label().or_else(|| {
+        if cfg!(test) {
+            Some(LABEL.to_owned())
+        } else {
+            None
+        }
+    })?;
+    app.get_webview(&label)
+}
+
+/// The frontend calls this on every chat switch, before exposing its panel.
+#[tauri::command]
+pub(crate) async fn panel_browser_select_chat(
+    app: tauri::AppHandle,
+    chat_id: String,
+) -> Result<serde_json::Value, String> {
+    let _switch = PANEL_SWITCH.lock().await;
+    crate::panel_chat::validate(&chat_id)?;
+    let previous = crate::panel_chat::active_chat();
+    if let Some(old) = previous.as_deref().filter(|old| *old != chat_id) {
+        if let Some(state) = app.try_state::<crate::AppState>() {
+            state.browser.panel_ownership.take_over_chat(old)?;
+            let event_app = app.clone();
+            let notify: crate::browser_runtime::Notify =
+                std::sync::Arc::new(move |name, payload| {
+                    let _ = event_app.emit(name, payload);
+                });
+            state.browser.close(old, &notify).await;
+        }
+        if let Some(view) = current_panel(&app) {
+            view.hide().map_err(|_| "unavailable")?;
+        }
+    }
+    let (old, label) = crate::panel_chat::select(&chat_id).map_err(str::to_owned)?;
+    for candidate in crate::panel_chat::labels() {
+        if let Some(view) = app.get_webview(&candidate) {
+            if candidate == label {
+                view.show().map_err(|_| "unavailable")?;
+            } else {
+                view.hide().map_err(|_| "unavailable")?;
+            }
+        }
+    }
+    let main_visible = app
+        .get_window("main")
+        .is_some_and(|window| window.is_visible().unwrap_or(false));
+    for (popup_label, popup) in app.webview_windows() {
+        if popup_label.starts_with(POPUP_PREFIX) {
+            if main_visible && popup_belongs_to_active_chat(&popup_label) {
+                let _ = popup.show();
+            } else {
+                let _ = popup.hide();
+            }
+        }
+    }
+    if let (Some(old), Some(state)) = (
+        old.filter(|old| old != &chat_id),
+        app.try_state::<crate::AppState>(),
+    ) {
+        state.browser.panel_ownership.resume(&old)?;
+    }
+    Ok(serde_json::json!({"chatId":chat_id,"hasPanel":app.get_webview(&label).is_some()}))
+}
+
+#[tauri::command]
+pub(crate) async fn panel_browser_create_draft(
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    let id = format!("draft-{}", uuid::Uuid::new_v4());
+    panel_browser_select_chat(app, id).await
+}
+
+#[tauri::command]
+pub(crate) async fn panel_browser_adopt_draft(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    draft_id: String,
+    chat_id: String,
+) -> Result<serde_json::Value, String> {
+    let db = state.paths.database_path.clone();
+    let target = chat_id.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::chat::read(&db, &target))
+        .await
+        .map_err(|_| "unavailable")?
+        .map_err(|_| "chat_not_found")?;
+    let _switch = PANEL_SWITCH.lock().await;
+    crate::panel_chat::adopt(&draft_id, &chat_id).map_err(str::to_owned)?;
+    Ok(serde_json::json!({"chatId":chat_id,"hasPanel":current_panel(&app).is_some()}))
+}
 
 pub(crate) fn navigation_gate() -> &'static crate::panel_navigation::PanelNavigation {
     static GATE: std::sync::OnceLock<crate::panel_navigation::PanelNavigation> =
@@ -126,6 +235,19 @@ fn valid_device_login_url(url: &reqwest::Url) -> bool {
         && url.password().is_none()
 }
 
+fn login_panel_chat(
+    active: Option<String>,
+    requested: &str,
+) -> Result<Option<String>, &'static str> {
+    let Some(selected) = active else {
+        return Ok(None);
+    };
+    if !requested.is_empty() && requested != selected {
+        return Err("panel_not_active");
+    }
+    Ok(Some(selected))
+}
+
 async fn open_login_panel(
     app: tauri::AppHandle,
     chat_id: &str,
@@ -154,15 +276,40 @@ async fn open_login_panel(
         });
     }
     let guard = OAuthPanelGuard(id);
+    if cancel.is_cancelled() || revoked.is_cancelled() {
+        return Err("cancelled");
+    }
+    // Settings and first-run login can start before any chat has a panel.
+    let selected_chat = login_panel_chat(crate::panel_chat::active_chat(), chat_id)?;
+    if selected_chat.is_none() {
+        panel_browser_open_human(app, url.to_string())
+            .await
+            .map_err(|_| "panel_unavailable")?;
+        let fallback = tokio::spawn(async move {
+            tokio::select! {
+                _ = revoked.cancelled() => cancel.cancel(),
+                _ = cancel.cancelled() => {},
+            }
+        });
+        return Ok(OAuthPanel {
+            _guard: guard,
+            _lease: lease,
+            fallback,
+        });
+    }
+    let selected_chat = selected_chat.ok_or("panel_unavailable")?;
     app.emit_to(
         "main",
         "panel-agent-open-request",
-        serde_json::json!({"chatId": chat_id}),
+        serde_json::json!({"chatId": selected_chat}),
     )
     .map_err(|_| "unavailable")?;
     let panel = async {
         loop {
-            if app.get_webview(LABEL).is_some() {
+            if crate::panel_chat::active_chat().as_deref() != Some(selected_chat.as_str()) {
+                break Err("panel_not_active");
+            }
+            if current_panel(&app).is_some() {
                 break Ok::<(), &'static str>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -176,7 +323,7 @@ async fn open_login_panel(
     if !navigation_gate().permits_navigation(url.as_str()) {
         return Err("panel_busy");
     }
-    panel_browser_navigate(app.clone(), url.to_string())
+    panel_browser_navigate(app.clone(), selected_chat, url.to_string())
         .await
         .map_err(|_| "panel_unavailable")?;
     let fallback = tokio::spawn(async move {
@@ -199,6 +346,7 @@ async fn open_login_panel(
 
 #[cfg(windows)]
 struct PopupInfo {
+    chat_id: Option<String>,
     host: Option<String>,
     opener_host: Option<String>,
     title: Option<String>,
@@ -220,15 +368,38 @@ fn popup_event(
     reason: Option<&str>,
 ) {
     if let Ok(info) = info.lock() {
+        if crate::panel_chat::resolve(info.chat_id.clone()) != crate::panel_chat::active_chat() {
+            return;
+        }
         let _ = app.emit_to(
             "main",
             "panel-browser-popup",
             serde_json::json!({
-                "id": id, "state": state, "host": info.host, "openerHost": info.opener_host,
+                "chatId": crate::panel_chat::resolve(info.chat_id.clone()), "id": id, "state": state, "host": info.host, "openerHost": info.opener_host,
                 "title": info.title, "reason": reason
             }),
         );
     }
+}
+
+#[cfg(windows)]
+fn popup_belongs_to_active_chat(label: &str) -> bool {
+    POPUPS
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|popups| popups.get(label).cloned())
+        .and_then(|info| {
+            info.lock()
+                .ok()
+                .map(|info| crate::panel_chat::resolve(info.chat_id.clone()))
+        })
+        == Some(crate::panel_chat::active_chat())
+}
+
+#[cfg(not(windows))]
+fn popup_belongs_to_active_chat(_label: &str) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -335,13 +506,18 @@ pub(crate) fn deny_agent_popup(url: &reqwest::Url) -> bool {
 }
 
 pub(crate) fn current_site_url(app: &tauri::AppHandle) -> Option<String> {
-    app.get_webview(LABEL)
+    current_panel(app)
         .and_then(|view| view.url().ok())
         .filter(|url| allowed_address(url.as_str()).is_ok() && !is_google_login(url))
         .map(|url| url.to_string())
 }
 
-fn google_notice(app: &tauri::AppHandle, url: &reqwest::Url, site: Option<String>) -> bool {
+fn google_notice(
+    app: &tauri::AppHandle,
+    url: &reqwest::Url,
+    site: Option<String>,
+    chat_id: Option<String>,
+) -> bool {
     if !is_google_login(url) {
         return false;
     }
@@ -351,7 +527,7 @@ fn google_notice(app: &tauri::AppHandle, url: &reqwest::Url, site: Option<String
     let _ = app.emit_to(
         "main",
         "panel-browser-google-login",
-        serde_json::json!({"host": "accounts.google.com", "siteUrl": site}),
+        serde_json::json!({"chatId": crate::panel_chat::resolve(chat_id), "host": "accounts.google.com", "siteUrl": site}),
     );
     true
 }
@@ -410,30 +586,30 @@ pub(crate) async fn panel_browser_open_human(
 #[tauri::command]
 pub(crate) async fn panel_browser_open(
     app: tauri::AppHandle,
+    chat_id: String,
     url: String,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
 ) -> Result<(), String> {
+    ensure_chat(&chat_id)?;
     let url = allowed_address(&url).map_err(str::to_owned)?;
-    if google_notice(&app, &url, None) {
-        return Err("google_login_required".into());
-    }
-    open_panel(app, url, x, y, width, height, true).await
+    open_panel(app, &chat_id, url, (x, y, width, height), true).await
 }
 
 /// Open an empty panel for an already-approved agent session; no site loads yet.
 #[tauri::command]
 pub(crate) async fn panel_browser_open_agent(
     app: tauri::AppHandle,
+    chat_id: String,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
 ) -> Result<(), String> {
     let url = reqwest::Url::parse("about:blank").map_err(|_| "unavailable")?;
-    open_panel(app, url, x, y, width, height, false).await
+    open_panel(app, &chat_id, url, (x, y, width, height), false).await
 }
 
 #[cfg(any(windows, test))]
@@ -443,38 +619,57 @@ fn human_panel_may_focus(main: usize, foreground: usize, root: usize) -> bool {
 
 async fn open_panel(
     app: tauri::AppHandle,
+    chat_id: &str,
     url: reqwest::Url,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+    bounds: (f64, f64, f64, f64),
     human_requested: bool,
 ) -> Result<(), String> {
+    let _switch = PANEL_SWITCH.lock().await;
+    ensure_chat(chat_id)?;
+    if human_requested && google_notice(&app, &url, None, Some(chat_id.to_owned())) {
+        return Err("google_login_required".into());
+    }
+    let (x, y, width, height) = bounds;
     if ![x, y, width, height].iter().all(|v| v.is_finite()) || width <= 0.0 || height <= 0.0 {
         return Err("invalid_bounds".into());
     }
-    if app.get_webview(LABEL).is_some() {
+    let label = crate::panel_chat::active_label()
+        .or_else(|| {
+            if cfg!(test) {
+                Some(LABEL.to_owned())
+            } else {
+                None
+            }
+        })
+        .ok_or("chat_required")?;
+    if app.get_webview(&label).is_some() {
         return Err("already_open".into());
     }
+    #[cfg(test)]
+    let fixture_profile =
+        std::env::var_os("MOMSO_CHAT_PANEL_PROFILE").map(std::path::PathBuf::from);
+    #[cfg(not(test))]
+    let fixture_profile: Option<std::path::PathBuf> = None;
     #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
-    let profile = if let Some(root) = std::env::var_os("MOMSO_S5B_ROOT") {
+    let fixture_profile = if fixture_profile.is_some() {
+        fixture_profile
+    } else if let Some(root) = std::env::var_os("MOMSO_S5B_ROOT") {
         let root = std::path::PathBuf::from(root);
         if !root.is_absolute() || !root.starts_with(std::env::temp_dir()) {
             return Err("unavailable".into());
         }
-        root.join("panel-browser-profile")
+        Some(root.join("panel-browser-profile"))
     } else {
-        app.path()
+        None
+    };
+    let profile = match fixture_profile {
+        Some(path) => path,
+        None => app
+            .path()
             .app_data_dir()
             .map_err(|_| "unavailable")?
-            .join("panel-browser-profile")
+            .join("panel-browser-profile"),
     };
-    #[cfg(not(all(windows, debug_assertions, feature = "g61-test-probe")))]
-    let profile = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| "unavailable")?
-        .join("panel-browser-profile");
     std::fs::create_dir_all(&profile).map_err(|_| "unavailable")?;
     let window = app.get_window("main").ok_or("unavailable")?;
     let nav_app = app.clone();
@@ -483,21 +678,31 @@ async fn open_panel(
     let nav_site = current_site.clone();
     let popup_site = current_site.clone();
     let loaded_site = current_site;
+    let owner = crate::panel_chat::active_chat();
+    let navigation_owner = owner.clone();
+    let download_owner = owner.clone();
+    let popup_chat_owner = owner.clone();
+    let title_owner = owner.clone();
+    let page_owner = owner;
     let panel_view = window
         .add_child(
-            WebviewBuilder::new(LABEL, WebviewUrl::External(url))
+            WebviewBuilder::new(label, WebviewUrl::External(url))
                 .data_directory(profile)
                 // Creating an agent panel must not activate a background window.
                 .focused(false)
-                .on_navigation(move |url| navigation_gate().permits_navigation(url.as_str()) && (allowed_address(url.as_str()).is_ok() || oauth_callback_allowed(url)) && !google_notice(&nav_app, url, nav_site.lock().ok().and_then(|v| v.clone())))
+                .on_navigation(move |url| crate::panel_chat::resolve(navigation_owner.clone()) == crate::panel_chat::active_chat() && navigation_gate().permits_navigation(url.as_str()) && (allowed_address(url.as_str()).is_ok() || oauth_callback_allowed(url)) && !google_notice(&nav_app, url, nav_site.lock().ok().and_then(|v| v.clone()), navigation_owner.clone()))
                 .on_new_window(move |url, features| {
-                    if deny_agent_popup(&url) || allowed_address(url.as_str()).is_err() || google_notice(&popup_app, &url, popup_site.lock().ok().and_then(|v| v.clone())) {
+                    if crate::panel_chat::resolve(popup_chat_owner.clone()) != crate::panel_chat::active_chat() {
+                        return NewWindowResponse::Deny;
+                    }
+                    if deny_agent_popup(&url) || allowed_address(url.as_str()).is_err() || google_notice(&popup_app, &url, popup_site.lock().ok().and_then(|v| v.clone()), popup_chat_owner.clone()) {
                         return NewWindowResponse::Deny;
                     }
                     #[cfg(windows)]
                     {
                         let Some(owner) = popup_app.get_window("main").and_then(|window| window.hwnd().ok()) else { return NewWindowResponse::Deny };
                         let info = std::sync::Arc::new(std::sync::Mutex::new(PopupInfo {
+                            chat_id: popup_chat_owner.clone(),
                             host: url.host_str().map(str::to_owned),
                             opener_host: popup_site.lock().ok().and_then(|site| site.as_ref().and_then(|s| reqwest::Url::parse(s).ok()).and_then(|u| u.host_str().map(str::to_owned))),
                             title: None,
@@ -506,20 +711,22 @@ async fn open_panel(
                         let title_info = info.clone();
                         let popup_nav_app = popup_app.clone();
                         let popup_nav_site = popup_site.clone();
+                        let popup_nav_owner = popup_chat_owner.clone();
+                        let popup_download_owner = popup_chat_owner.clone();
                         let builder = WebviewWindowBuilder::new(&popup_app, format!("{POPUP_PREFIX}{}", uuid::Uuid::new_v4()), WebviewUrl::External("about:blank".parse().expect("static URL")))
                             .window_features(features)
                             .owner_raw(owner)
                             .title(url.origin().ascii_serialization())
-                            .on_navigation(move |url| allowed_address(url.as_str()).is_ok() && !google_notice(&popup_nav_app, url, popup_nav_site.lock().ok().and_then(|v| v.clone())))
+                            .on_navigation(move |url| crate::panel_chat::resolve(popup_nav_owner.clone()) == crate::panel_chat::active_chat() && allowed_address(url.as_str()).is_ok() && !google_notice(&popup_nav_app, url, popup_nav_site.lock().ok().and_then(|v| v.clone()), popup_nav_owner.clone()))
                             .on_page_load(move |window, payload| {
                                 if let Ok(mut info) = page_info.lock() { info.host = payload.url().host_str().map(str::to_owned); }
                                 let _ = window.set_title(&payload.url().origin().ascii_serialization());
                             })
                             .on_document_title_changed(move |_, title| { if let Ok(mut info) = title_info.lock() { info.title = Some(title); } })
                             .on_new_window(|_, _| NewWindowResponse::Deny)
-                            .on_download(|webview, event| match event {
-                                DownloadEvent::Requested { url, destination } => crate::panel_download::start(webview.app_handle(), url.as_str(), destination),
-                                DownloadEvent::Finished { url, path, success } => { crate::panel_download::finish(webview.app_handle().clone(), url.to_string(), path, success); true }
+                            .on_download(move |webview, event| match event {
+                                DownloadEvent::Requested { url, destination } => crate::panel_download::start(webview.app_handle(), url.as_str(), destination, popup_download_owner.clone()),
+                                DownloadEvent::Finished { url, path, success } => { crate::panel_download::finish(webview.app_handle().clone(), url.to_string(), path, success, popup_download_owner.clone()); true }
                                 _ => false,
                             });
                         #[cfg(debug_assertions)]
@@ -568,33 +775,37 @@ async fn open_panel(
                     #[cfg(not(windows))]
                     { let _ = features; NewWindowResponse::Deny }
                 })
-                .on_download(|webview, event| {
+                .on_download(move |webview, event| {
                     match event {
-                        DownloadEvent::Requested { url, destination } => crate::panel_download::start(webview.app_handle(), url.as_str(), destination),
+                        DownloadEvent::Requested { url, destination } => crate::panel_chat::resolve(download_owner.clone()) == crate::panel_chat::active_chat() && crate::panel_download::start(webview.app_handle(), url.as_str(), destination, download_owner.clone()),
                         DownloadEvent::Finished { url, path, success } => {
-                            crate::panel_download::finish(webview.app_handle().clone(), url.to_string(), path, success);
+                            crate::panel_download::finish(webview.app_handle().clone(), url.to_string(), path, success, download_owner.clone());
                             true
                         }
                         _ => false,
                     }
                 })
-                .on_document_title_changed(|webview, title| {
-                    let _ = webview.app_handle().emit_to("main", "panel-browser-title", serde_json::json!({"title": title}));
+                .on_document_title_changed(move |webview, title| {
+                    if crate::panel_chat::resolve(title_owner.clone()) == crate::panel_chat::active_chat() {
+                        let _ = webview.app_handle().emit_to("main", "panel-browser-title", serde_json::json!({"chatId":crate::panel_chat::resolve(title_owner.clone()),"title": title}));
+                    }
                 })
                 .on_page_load(move |webview, payload| {
                     let url = payload.url();
                     if url.scheme() == "http" && url.host_str() == Some("localhost") && url.port() == Some(8976) && url.path() == "/oauth/callback" { return; }
                     if let Ok(mut site) = loaded_site.lock() { *site = Some(url.to_string()); }
-                    let _ = webview.app_handle().emit_to("main", "panel-browser-page", serde_json::json!({
-                        "url": url.as_str(), "host": url.host_str(), "secure": url.scheme() == "https",
-                        "loading": matches!(payload.event(), PageLoadEvent::Started)
-                    }));
-                    emit_history(&webview);
+                    if crate::panel_chat::resolve(page_owner.clone()) == crate::panel_chat::active_chat() {
+                        let _ = webview.app_handle().emit_to("main", "panel-browser-page", serde_json::json!({
+                            "chatId":crate::panel_chat::resolve(page_owner.clone()),"url": url.as_str(), "host": url.host_str(), "secure": url.scheme() == "https",
+                            "loading": matches!(payload.event(), PageLoadEvent::Started)
+                        }));
+                        emit_history(&webview, page_owner.clone());
+                    }
                 }),
             LogicalPosition::new(x, y),
             LogicalSize::new(width, height),
         )
-        .map_err(|_| "unavailable".to_owned())?;
+        .map_err(|_| if cfg!(test) { "test_webview_unavailable".to_owned() } else { "unavailable".to_owned() })?;
     crate::app_lifecycle::observe_webview(&panel_view);
     #[cfg(windows)]
     if human_requested {
@@ -619,11 +830,16 @@ async fn open_panel(
 }
 
 fn panel(app: &tauri::AppHandle) -> Result<tauri::Webview, String> {
-    app.get_webview(LABEL).ok_or_else(|| "unavailable".into())
+    current_panel(app).ok_or_else(|| "unavailable".into())
 }
 
 #[tauri::command]
-pub(crate) async fn panel_browser_close(app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) async fn panel_browser_close(
+    app: tauri::AppHandle,
+    chat_id: String,
+) -> Result<(), String> {
+    let _switch = PANEL_SWITCH.lock().await;
+    ensure_chat(&chat_id)?;
     if let Some(state) = app.try_state::<crate::AppState>() {
         if let Ok(Some(chat_id)) = state.browser.panel_ownership.panel_closed() {
             if let Some(token) = state.chat_active.lock().await.get(&chat_id).cloned() {
@@ -638,7 +854,7 @@ pub(crate) async fn panel_browser_close(app: tauri::AppHandle) -> Result<(), Str
         }
     }
     for (label, popup) in app.webview_windows() {
-        if label.starts_with(POPUP_PREFIX) {
+        if label.starts_with(POPUP_PREFIX) && popup_belongs_to_active_chat(&label) {
             #[cfg(windows)]
             close_popup_event(&app, &label, "panel_closed");
             let _ = popup.destroy();
@@ -658,7 +874,7 @@ async fn clear_profile_data(
     app: tauri::AppHandle,
     disk_cache_only: bool,
 ) -> Result<&'static str, String> {
-    let (view, temporary) = if let Some(view) = app.get_webview(LABEL) {
+    let (view, temporary) = if let Some(view) = current_panel(&app) {
         (view, false)
     } else {
         let profile = app
@@ -757,13 +973,16 @@ async fn clear_profile_data(
 #[tauri::command]
 pub(crate) async fn panel_browser_visibility(
     app: tauri::AppHandle,
+    chat_id: String,
     visible: bool,
 ) -> Result<(), String> {
+    let _switch = PANEL_SWITCH.lock().await;
+    ensure_chat(&chat_id)?;
     let main_visible = app
         .get_window("main")
         .is_some_and(|window| window.is_visible().unwrap_or(false));
     for (label, popup) in app.webview_windows() {
-        if label.starts_with(POPUP_PREFIX) {
+        if label.starts_with(POPUP_PREFIX) && popup_belongs_to_active_chat(&label) {
             #[cfg(windows)]
             if visible && main_visible {
                 if let Ok(hwnd) = popup.hwnd() {
@@ -819,11 +1038,14 @@ pub(crate) async fn panel_browser_visibility(
 #[tauri::command]
 pub(crate) async fn panel_browser_bounds(
     app: tauri::AppHandle,
+    chat_id: String,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
 ) -> Result<(), String> {
+    let _switch = PANEL_SWITCH.lock().await;
+    ensure_chat(&chat_id)?;
     if ![x, y, width, height].iter().all(|v| v.is_finite()) || width <= 0.0 || height <= 0.0 {
         return Err("invalid_bounds".into());
     }
@@ -837,21 +1059,23 @@ pub(crate) async fn panel_browser_bounds(
 #[tauri::command]
 pub(crate) async fn panel_browser_navigate(
     app: tauri::AppHandle,
+    chat_id: String,
     url: String,
 ) -> Result<(), String> {
+    let _switch = PANEL_SWITCH.lock().await;
+    ensure_chat(&chat_id)?;
     let url = allowed_address(&url).map_err(str::to_owned)?;
-    let site = app
-        .get_webview(LABEL)
+    let site = current_panel(&app)
         .and_then(|view| view.url().ok())
         .filter(|current| allowed_address(current.as_str()).is_ok() && !is_google_login(current))
         .map(|current| current.to_string());
-    if google_notice(&app, &url, site) {
+    if google_notice(&app, &url, site, Some(chat_id.clone())) {
         return Err("google_login_required".into());
     }
     panel(&app)?.navigate(url).map_err(|_| "unavailable".into())
 }
 
-fn emit_history(view: &tauri::Webview) {
+fn emit_history(view: &tauri::Webview, owner: Option<String>) {
     let app = view.app_handle().clone();
     let _ = view.with_webview(move |platform| {
         #[cfg(windows)]
@@ -859,21 +1083,24 @@ fn emit_history(view: &tauri::Webview) {
             if let Ok(core) = platform.controller().CoreWebView2() {
                 let mut back = Default::default();
                 let mut forward = Default::default();
-                if core.CanGoBack(&mut back).is_ok() && core.CanGoForward(&mut forward).is_ok() {
-                    let _ = app.emit_to("main", "panel-browser-history", serde_json::json!({"canGoBack": back.as_bool(), "canGoForward": forward.as_bool()}));
+                if crate::panel_chat::resolve(owner.clone()) == crate::panel_chat::active_chat() && core.CanGoBack(&mut back).is_ok() && core.CanGoForward(&mut forward).is_ok() {
+                    let _ = app.emit_to("main", "panel-browser-history", serde_json::json!({"chatId":crate::panel_chat::resolve(owner),"canGoBack": back.as_bool(), "canGoForward": forward.as_bool()}));
                 }
             }
         }
         #[cfg(not(windows))]
-        let _ = (platform, app);
+        let _ = (platform, app, owner);
     });
 }
 
 #[tauri::command]
 pub(crate) async fn panel_browser_action(
     app: tauri::AppHandle,
+    chat_id: String,
     action: String,
 ) -> Result<(), String> {
+    let _switch = PANEL_SWITCH.lock().await;
+    ensure_chat(&chat_id)?;
     let view = panel(&app)?;
     if action == "reload" {
         return view.reload().map_err(|_| "unavailable".into());
@@ -910,6 +1137,383 @@ pub(crate) async fn panel_browser_action(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires WebView2 and an interactive Windows desktop"]
+    fn ai_panel_navigation_click_then_read_real_webview() {
+        use std::{
+            io::{Read, Write},
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            time::Duration,
+        };
+        if std::env::var_os("MOMSO_CLICK_PROBE").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let local = temp.path().join("local");
+            let roaming = temp.path().join("roaming");
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::create_dir_all(&roaming).unwrap();
+            let output = crate::hidden_process::hidden_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "panel_browser::tests::ai_panel_navigation_click_then_read_real_webview",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("MOMSO_CLICK_PROBE", "1")
+                .env("MOMSO_CLICK_ROOT", temp.path())
+                .env(
+                    "MOMSO_CHAT_PANEL_PROFILE",
+                    temp.path().join("panel-profile"),
+                )
+                .env("MOMSO_PANEL_ALLOW_LOOPBACK", "1")
+                .env("MOMSO_TEST_FAKE_CREDENTIAL_STORE", "1")
+                .env("USERPROFILE", temp.path())
+                .env("LOCALAPPDATA", local)
+                .env("APPDATA", roaming)
+                .output()
+                .unwrap();
+            let result = std::fs::read_to_string(temp.path().join("result.txt"))
+                .unwrap_or_else(|_| "result missing".into());
+            if let Ok(detail) = std::fs::read_to_string(temp.path().join("public-observation.txt"))
+            {
+                println!("{detail}");
+            }
+            assert!(
+                output.status.success() && result == "ok",
+                "result={result}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        struct FixtureLogger;
+        impl log::Log for FixtureLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Warn
+                    && (metadata.target().ends_with("panel_worker")
+                        || metadata.target().ends_with("panel_cdp")
+                        || metadata.target().ends_with("browser_runtime"))
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    eprintln!("{}", record.args());
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: FixtureLogger = FixtureLogger;
+        let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+        let public_site = std::env::var_os("MOMSO_CLICK_PUBLIC_SITE").is_some();
+        let root = std::path::PathBuf::from(std::env::var_os("MOMSO_CLICK_ROOT").unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(40) {
+                let Ok(mut stream) = stream else { break };
+                let mut input = [0; 8192];
+                if let Ok(n) = stream.read(&mut input) {
+                    let request = String::from_utf8_lossy(&input[..n]);
+                    let body = if request.starts_with("GET /next ") {
+                        "<html><title>next page</title><body>next content</body></html>"
+                    } else {
+                        "<html><title>start page</title><body><button onclick=\"location.href='/next'\">pricing</button></body></html>"
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+        let db = root.join("momso.db");
+        crate::storage::initialize(&db, &root.join("backups"), "fixture").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut context = tauri::generate_context!();
+        context.config_mut().identifier = "app.momso.click.fixture".into();
+        context.config_mut().app.windows.clear();
+        let app = tauri::Builder::<tauri::Wry>::default().any_thread().setup(move |app| {
+            tauri::window::WindowBuilder::new(app, "main").visible(false).skip_taskbar(true).position(-20000.0, -20000.0).build()?;
+            let app = app.handle().clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let result: Result<(), String> = runtime.block_on(async {
+                    let chat = "click-fixture";
+                    super::panel_browser_select_chat(app.clone(), chat.into()).await?;
+                    super::panel_browser_open_agent(app.clone(), chat.into(), 0.0, 0.0, 300.0, 200.0).await?;
+                    let manager = crate::browser_runtime::BrowserManager::default();
+                    manager.bind_app(app.clone());
+                    let policy = Ok(Some(crate::browser_gateway::Policy::general()));
+                    let asks = Arc::new(AtomicUsize::new(0));
+                    let count = asks.clone();
+                    let ask: crate::browser_runtime::Ask = Arc::new(move |_, _| { count.fetch_add(1, Ordering::SeqCst); Box::pin(async { true }) });
+                    let notify: crate::browser_runtime::Notify = Arc::new(|_, _| {});
+                    let call = |input| manager.dispatch(crate::browser_runtime::RequestContext { chat_id: chat, provider: "fixture", skill: None, selected: &policy, root: root.clone(), visible: false, cancel: tokio_util::sync::CancellationToken::new(), notify: notify.clone(), ask: ask.clone() }, input);
+                    let opened = call(serde_json::json!({"method":"browser_open","arguments":{}})).await;
+                    if opened["status"] != "ok" { return Err(format!("open: {}", opened["status"])); }
+                    let start_url = if public_site { "https://bodycodi.com/".to_owned() } else { format!("{base}/first") };
+                    let page = call(serde_json::json!({"method":"browser_navigate","arguments":{"url":start_url}})).await;
+                    if page["status"] != "page" { return Err(format!("navigate: {}", page["status"])); }
+                    let previous_title = page["title"].clone();
+                    let previous_text = page["text"].clone();
+                    let id = page["elements"].as_array().and_then(|items| items.iter().find(|item| if public_site { item["name"].as_str().is_some_and(|name| name.contains("요금")) } else { item["name"] == "pricing" })).and_then(|item| item["id"].as_str()).ok_or("missing pricing menu")?.to_owned();
+                    if public_site {
+                        let transport = crate::panel_cdp::PanelTransport::bind(&app).map_err(str::to_owned)?;
+                        let tree = transport.call("Page.getFrameTree", serde_json::json!({})).await.map_err(str::to_owned)?;
+                        let frame = tree.pointer("/frameTree/frame/id").and_then(serde_json::Value::as_str).ok_or("frame unavailable")?;
+                        let world = transport.call("Page.createIsolatedWorld", serde_json::json!({"frameId":frame,"worldName":"momso-browser-driver"})).await.map_err(str::to_owned)?;
+                        let context = world["executionContextId"].as_i64().ok_or("world unavailable")?;
+                        let quoted = serde_json::to_string(&id).map_err(|_| "id unavailable")?;
+                        let expression = format!("(()=>{{const e=window.__momso_driver_state?.byId.get({quoted});if(!e)return 'unknown';if(e.tagName!=='A')return 'button';const t=e.getAttribute('target');return t==='_blank'?'link_blank':t?'link_other':'link_same'}})()");
+                        let observation = transport.call("Runtime.evaluate", serde_json::json!({"expression":expression,"contextId":context,"returnByValue":true})).await.map_err(str::to_owned)?;
+                        let target = observation.pointer("/result/value").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+                        std::fs::write(root.join("public-observation.txt"), format!("public_target={target}")).map_err(|_| "observation unavailable")?;
+                    }
+                    let clicked = call(serde_json::json!({"method":"browser_click","arguments":{"elementId":id}})).await;
+                    if clicked["status"] != "ok" && clicked["status"] != "page" { return Err(format!("click: {}", clicked["status"])); }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let page = call(serde_json::json!({"method":"browser_read","arguments":{}})).await;
+                    if page["status"] != "page" || (!public_site && page["title"] != "next page") { return Err(format!("read: {}", page["status"])); }
+                    if public_site && page["title"] == previous_title && page["text"] == previous_text { return Err("pricing view did not change".into()); }
+                    if asks.load(Ordering::SeqCst) != 1 { return Err("approval count".into()); }
+                    if super::current_panel(&app).is_none() { return Err("panel closed".into()); }
+                    if !public_site {
+                        crate::panel_worker::fail_next_guard_for_test();
+                        for _ in 0..100 {
+                            if !manager.is_open(chat).await { break; }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        if manager.is_open(chat).await { return Err("guard did not stop".into()); }
+                        if super::current_panel(&app).is_none() { return Err("guard failure closed panel".into()); }
+                        super::panel_browser_navigate(app.clone(), chat.into(), format!("{base}/after-guard")).await?;
+                    }
+                    Ok(())
+                });
+                let text = match result { Ok(()) => "ok".to_owned(), Err(error) => format!("error: {error}") };
+                let _ = std::fs::write(std::env::var_os("MOMSO_CLICK_ROOT").unwrap().to_string_lossy().to_string() + "\\result.txt", text);
+                let _ = tx.send(());
+                app.exit(0);
+            });
+            Ok(())
+        }).build(context).unwrap();
+        app.run(|_, _| {});
+        rx.recv_timeout(Duration::from_secs(90)).unwrap();
+    }
+
+    #[test]
+    fn login_routes_without_chat_and_respects_selected_chat() {
+        assert_eq!(super::login_panel_chat(None, "").unwrap(), None);
+        assert_eq!(
+            super::login_panel_chat(Some("draft".into()), "")
+                .unwrap()
+                .as_deref(),
+            Some("draft")
+        );
+        assert_eq!(
+            super::login_panel_chat(Some("chat".into()), "other"),
+            Err("panel_not_active")
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires WebView2 and an interactive Windows desktop"]
+    fn isolated_chat_panels_keep_pages_and_share_cookies() {
+        use std::{
+            io::{Read, Write},
+            sync::{Arc, Mutex},
+            time::{Duration, Instant},
+        };
+        if std::env::var_os("MOMSO_CHAT_PANEL_PROBE").is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let local = temp.path().join("local");
+            let roaming = temp.path().join("roaming");
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::create_dir_all(&roaming).unwrap();
+            let output = crate::hidden_process::hidden_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "panel_browser::tests::isolated_chat_panels_keep_pages_and_share_cookies",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("MOMSO_CHAT_PANEL_PROBE", "1")
+                .env("MOMSO_CHAT_PANEL_RESULT", temp.path().join("result.txt"))
+                .env(
+                    "MOMSO_CHAT_PANEL_PROFILE",
+                    temp.path().join("panel-profile"),
+                )
+                .env("MOMSO_PANEL_ALLOW_LOOPBACK", "1")
+                .env("USERPROFILE", temp.path())
+                .env("LOCALAPPDATA", local)
+                .env("APPDATA", roaming)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("result.txt")).unwrap(),
+                "ok"
+            );
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_seen = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8) {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0; 8192];
+                if let Ok(n) = stream.read(&mut buf) {
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    server_seen.lock().unwrap().push(request);
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nSet-Cookie: fixture_chat=shared; Path=/\r\nConnection: close\r\n\r\nok");
+                }
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut context = tauri::generate_context!();
+        context.config_mut().identifier = "app.momso.panel.fixture".into();
+        context.config_mut().app.windows.clear();
+        let app = tauri::Builder::<tauri::Wry>::default()
+            .any_thread()
+            .setup(move |app| {
+                tauri::window::WindowBuilder::new(app, "main")
+                    .visible(false)
+                    .skip_taskbar(true)
+                    .position(-20000.0, -20000.0)
+                    .build()?;
+                let app = app.handle().clone();
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    let result: Result<(), String> = runtime.block_on(async {
+                        let draft = super::panel_browser_create_draft(app.clone()).await?["chatId"]
+                            .as_str()
+                            .ok_or("draft id missing")?
+                            .to_owned();
+                        super::panel_browser_open(
+                            app.clone(),
+                            draft.clone(),
+                            format!("{base}/first"),
+                            0.0,
+                            0.0,
+                            300.0,
+                            200.0,
+                        )
+                        .await
+                        .map_err(|e| format!("open first: {e}"))?;
+                        let deadline = Instant::now() + Duration::from_secs(15);
+                        while !seen
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|r| r.starts_with("GET /first "))
+                        {
+                            if Instant::now() > deadline {
+                                return Err("first page did not load".into());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        crate::panel_chat::adopt(&draft, "first").map_err(str::to_owned)?;
+                        super::panel_browser_navigate(
+                            app.clone(),
+                            "first".into(),
+                            format!("{base}/first-again"),
+                        )
+                        .await?;
+                        let deadline = Instant::now() + Duration::from_secs(15);
+                        while !seen
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|r| r.starts_with("GET /first-again "))
+                        {
+                            if Instant::now() > deadline {
+                                return Err("adopted page did not load".into());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        super::panel_browser_select_chat(app.clone(), "second".into())
+                            .await
+                            .map_err(|e| format!("select second: {e}"))?;
+                        super::panel_browser_open(
+                            app.clone(),
+                            "second".into(),
+                            format!("{base}/second"),
+                            0.0,
+                            0.0,
+                            300.0,
+                            200.0,
+                        )
+                        .await
+                        .map_err(|e| format!("open second: {e}"))?;
+                        let deadline = Instant::now() + Duration::from_secs(15);
+                        loop {
+                            let second = seen
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .find(|r| r.starts_with("GET /second "))
+                                .cloned();
+                            if let Some(request) = second {
+                                if !request.to_lowercase().contains("fixture_chat=shared") {
+                                    return Err("shared cookie missing".into());
+                                }
+                                break;
+                            }
+                            if Instant::now() > deadline {
+                                return Err("second page did not load".into());
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        super::panel_browser_select_chat(app.clone(), "first".into())
+                            .await
+                            .map_err(|e| format!("return first: {e}"))?;
+                        let first = super::current_panel(&app).ok_or("first panel missing")?;
+                        if first.url().map_err(|e| e.to_string())?.path() != "/first-again" {
+                            return Err("first page changed".into());
+                        }
+                        if super::panel_browser_navigate(
+                            app.clone(),
+                            "second".into(),
+                            format!("{base}/wrong"),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            return Err("inactive chat controlled active panel".into());
+                        }
+                        Ok(())
+                    });
+                    let text = match &result {
+                        Ok(()) => "ok".to_owned(),
+                        Err(error) => format!("error: {error}"),
+                    };
+                    let _ =
+                        std::fs::write(std::env::var_os("MOMSO_CHAT_PANEL_RESULT").unwrap(), text);
+                    let _ = tx.send(result);
+                    app.exit(0);
+                });
+                Ok(())
+            })
+            .build(context)
+            .unwrap();
+        app.run(|_, _| {});
+        rx.recv_timeout(Duration::from_secs(45)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn commands_from_inactive_chat_cannot_target_visible_panel() {
+        assert!(super::chat_is_active(Some("chat_a"), "chat_a"));
+        assert!(!super::chat_is_active(Some("chat_b"), "chat_a"));
+        assert!(!super::chat_is_active(None, "chat_a"));
+    }
+
     #[test]
     fn human_panel_focus_requires_own_foreground_window() {
         assert!(super::human_panel_may_focus(10, 10, 10));
@@ -976,17 +1580,17 @@ mod tests {
                             }).map_err(|e| e.to_string())?;
                             shown_rx.await.map_err(|e| e.to_string())?;
                         }
-                        super::panel_browser_open_agent(app.clone(), 0.0, 0.0, 100.0, 100.0).await?;
-                        super::panel_browser_bounds(app.clone(), 5.0, 5.0, 120.0, 120.0).await?;
-                        super::panel_browser_visibility(app.clone(), false).await?;
-                        super::panel_browser_visibility(app.clone(), true).await?;
-                        super::panel_browser_navigate(app.clone(), local_url.clone()).await?;
+                        super::panel_browser_open_agent(app.clone(), String::new(), 0.0, 0.0, 100.0, 100.0).await?;
+                        super::panel_browser_bounds(app.clone(), String::new(), 5.0, 5.0, 120.0, 120.0).await?;
+                        super::panel_browser_visibility(app.clone(), String::new(), false).await?;
+                        super::panel_browser_visibility(app.clone(), String::new(), true).await?;
+                        super::panel_browser_navigate(app.clone(), String::new(), local_url.clone()).await?;
                         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                         if unsafe { GetForegroundWindow() } as usize != foreground {
                             return Err(format!("foreground changed: background_visible={background_visible}"));
                         }
                         if focus()? != original_focus { return Err(format!("keyboard focus changed: background_visible={background_visible}")); }
-                        super::panel_browser_close(app.clone()).await?;
+                        super::panel_browser_close(app.clone(), String::new()).await?;
                     }
                     Ok(())
                 });

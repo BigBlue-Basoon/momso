@@ -30,13 +30,16 @@ fn load_with(
 }
 
 pub(crate) fn protects(name: &str) -> bool {
-    (name.starts_with("ai:") && name.ends_with(":api-key"))
+    name == crate::saved_logins::VAULT
+        || (name.starts_with("ai:") && name.ends_with(":api-key"))
         || name.starts_with("object-store:")
         || (name.starts_with("backup:") && name.ends_with(":age-identity"))
 }
 
 fn kind(name: &str) -> &'static str {
-    if name.starts_with("object-store:") {
+    if name == crate::saved_logins::VAULT {
+        "savedLogins"
+    } else if name.starts_with("object-store:") {
         "objectStore"
     } else if name.starts_with("backup:") {
         "backup"
@@ -104,7 +107,12 @@ fn watched_values_with(
     let mut values = Vec::new();
     for name in queue.watched_names {
         if let Some(value) = get(&name)? {
-            if name.starts_with("object-store:") {
+            if name == crate::saved_logins::VAULT {
+                values.extend(
+                    crate::saved_logins::passwords_from_serialized(&value)
+                        .map_err(|_| CredentialError::ReadFailed)?,
+                );
+            } else if name.starts_with("object-store:") {
                 let object: serde_json::Value =
                     serde_json::from_str(&value).map_err(|_| CredentialError::ReadFailed)?;
                 for field in ["accessKeyId", "secretAccessKey"] {
@@ -197,7 +205,12 @@ pub(crate) fn material_with(
     let queue = load_with(get)?;
     let mut values = Vec::new();
     for entry in queue.entries {
-        if entry.kind == "objectStore" {
+        if entry.kind == "savedLogins" {
+            values.extend(
+                crate::saved_logins::passwords_from_serialized(&entry.value)
+                    .map_err(|_| CredentialError::ReadFailed)?,
+            );
+        } else if entry.kind == "objectStore" {
             let object: serde_json::Value =
                 serde_json::from_str(&entry.value).map_err(|_| CredentialError::ReadFailed)?;
             for field in ["accessKeyId", "secretAccessKey"] {
@@ -269,6 +282,27 @@ pub(crate) fn expire_unlocked(_now: i64) -> Result<(), CredentialError> {
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashMap};
+    #[test]
+    fn retired_saved_login_values_remain_available_for_redaction() {
+        let store = RefCell::new(HashMap::<String, String>::new());
+        let get = |name: &str| Ok(store.borrow().get(name).cloned());
+        let mut put = |name: &str, value: &str| {
+            store.borrow_mut().insert(name.into(), value.into());
+            Ok(())
+        };
+        let secret = uuid::Uuid::new_v4().to_string();
+        let vault = serde_json::json!([{"id":"id","origin":"https://example.test","label":"label","username":"user","password":secret}]).to_string();
+        put(crate::saved_logins::VAULT, &vault).unwrap();
+        watch_new_with(crate::saved_logins::VAULT, &get, &mut put).unwrap();
+        let watched = watched_values_with(&get).unwrap();
+        enqueue_with(crate::saved_logins::VAULT, &vault, 100, &get, &mut put).unwrap();
+        let expected = serde_json::from_str::<serde_json::Value>(&vault).unwrap()[0]["password"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(watched, vec![expected.clone()]);
+        assert_eq!(material_with(&get).unwrap(), vec![expected]);
+    }
     #[test]
     fn multiple_retired_keys_live_only_in_waiting_credential_and_expire() {
         let store = RefCell::new(HashMap::<String, String>::new());

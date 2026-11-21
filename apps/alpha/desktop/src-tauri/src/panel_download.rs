@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager};
 
 struct Pending {
     name: String,
+    chat_id: Option<String>,
     staging: PathBuf,
     _marker: std::fs::File,
 }
@@ -267,14 +268,29 @@ fn publish_no_overwrite(
     Err(io::ErrorKind::AlreadyExists.into())
 }
 
+fn event_payload(
+    state: &str,
+    name: Option<&str>,
+    path: Option<&Path>,
+    size: Option<u64>,
+    chat_id: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({"chatId": crate::panel_chat::resolve(chat_id), "state": state, "name": name, "path": path.map(|v| v.to_string_lossy().into_owned()), "size": size})
+}
+
 fn emit(
     app: &tauri::AppHandle,
     state: &str,
     name: Option<&str>,
     path: Option<&Path>,
     size: Option<u64>,
+    chat_id: Option<String>,
 ) {
-    let _ = app.emit_to("main", "panel-browser-download", serde_json::json!({"state": state, "name": name, "path": path.map(|v| v.to_string_lossy().into_owned()), "size": size}));
+    let _ = app.emit_to(
+        "main",
+        "panel-browser-download",
+        event_payload(state, name, path, size, chat_id),
+    );
 }
 
 fn downloads_dir(app: &tauri::AppHandle) -> io::Result<PathBuf> {
@@ -293,28 +309,33 @@ fn downloads_dir(app: &tauri::AppHandle) -> io::Result<PathBuf> {
     app.path().download_dir().map_err(io::Error::other)
 }
 
-pub(crate) fn start(app: &tauri::AppHandle, url: &str, destination: &mut PathBuf) -> bool {
+pub(crate) fn start(
+    app: &tauri::AppHandle,
+    url: &str,
+    destination: &mut PathBuf,
+    chat_id: Option<String>,
+) -> bool {
     let Some(name) = destination
         .file_name()
         .and_then(|v| v.to_str())
         .map(str::to_owned)
     else {
-        emit(app, "failed", None, None, None);
+        emit(app, "failed", None, None, None, chat_id.clone());
         return false;
     };
     if !safe_name(&name) || name == MARKER {
-        emit(app, "blocked", Some(&name), None, None);
+        emit(app, "blocked", Some(&name), None, None, chat_id.clone());
         return false;
     }
     let Ok(root) = app.path().app_data_dir() else {
-        emit(app, "failed", Some(&name), None, None);
+        emit(app, "failed", Some(&name), None, None, chat_id.clone());
         return false;
     };
     let stage = root
         .join("panel-download-staging")
         .join(uuid::Uuid::new_v4().to_string());
     if std::fs::create_dir_all(&stage).is_err() {
-        emit(app, "failed", Some(&name), None, None);
+        emit(app, "failed", Some(&name), None, None, chat_id.clone());
         return false;
     }
     let marker_path = stage.join(MARKER);
@@ -329,7 +350,7 @@ pub(crate) fn start(app: &tauri::AppHandle, url: &str, destination: &mut PathBuf
     let Ok(marker) = marker else {
         let _ = std::fs::remove_file(marker_path);
         let _ = std::fs::remove_dir(&stage);
-        emit(app, "failed", Some(&name), None, None);
+        emit(app, "failed", Some(&name), None, None, chat_id.clone());
         return false;
     };
     let staging = stage.join(&name);
@@ -337,20 +358,27 @@ pub(crate) fn start(app: &tauri::AppHandle, url: &str, destination: &mut PathBuf
         drop(marker);
         let _ = std::fs::remove_file(stage.join(MARKER));
         let _ = std::fs::remove_dir(&stage);
-        emit(app, "failed", Some(&name), None, None);
+        emit(app, "failed", Some(&name), None, None, chat_id.clone());
         return false;
     };
     pending.entry(url.to_owned()).or_default().push(Pending {
         name: name.clone(),
+        chat_id: chat_id.clone(),
         staging: staging.clone(),
         _marker: marker,
     });
     *destination = staging;
-    emit(app, "started", Some(&name), None, None);
+    emit(app, "started", Some(&name), None, None, chat_id.clone());
     true
 }
 
-pub(crate) fn finish(app: tauri::AppHandle, url: String, path: Option<PathBuf>, success: bool) {
+pub(crate) fn finish(
+    app: tauri::AppHandle,
+    url: String,
+    path: Option<PathBuf>,
+    success: bool,
+    chat_id: Option<String>,
+) {
     std::thread::spawn(move || {
         // WebView2 supplies no path on failure. Two downloads may share a URL,
         // so do not guess which staging file belongs to a failure.
@@ -362,7 +390,7 @@ pub(crate) fn finish(app: tauri::AppHandle, url: String, path: Option<PathBuf>, 
                 .and_then(|all| all.get(&url).map(|items| !items.is_empty()))
                 .unwrap_or(false);
             if active {
-                emit(&app, "failed", None, None, None);
+                emit(&app, "failed", None, None, None, chat_id.clone());
             }
             return;
         }
@@ -383,7 +411,7 @@ pub(crate) fn finish(app: tauri::AppHandle, url: String, path: Option<PathBuf>, 
             });
         let Some(item) = item else {
             if success {
-                emit(&app, "failed", None, None, None);
+                emit(&app, "failed", None, None, None, chat_id.clone());
             }
             return;
         };
@@ -407,9 +435,23 @@ pub(crate) fn finish(app: tauri::AppHandle, url: String, path: Option<PathBuf>, 
                     .file_name()
                     .and_then(|name| name.to_str())
                     .unwrap_or(&item.name);
-                emit(&app, "finished", Some(saved_name), Some(&path), Some(size));
+                emit(
+                    &app,
+                    "finished",
+                    Some(saved_name),
+                    Some(&path),
+                    Some(size),
+                    item.chat_id.clone(),
+                );
             }
-            Err(_) => emit(&app, "failed", Some(&item.name), None, None),
+            Err(_) => emit(
+                &app,
+                "failed",
+                Some(&item.name),
+                None,
+                None,
+                item.chat_id.clone(),
+            ),
         }
         let removed = match std::fs::remove_file(&item.staging) {
             Ok(()) => true,
@@ -442,6 +484,18 @@ pub(crate) fn take_completed(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn download_event_includes_its_chat() {
+        let event = event_payload(
+            "finished",
+            Some("example.txt"),
+            None,
+            Some(5),
+            Some("chat-fixture".into()),
+        );
+        assert_eq!(event["chatId"], "chat-fixture");
+        assert_eq!(event["state"], "finished");
+    }
     #[test]
     fn reveal_accepts_only_unchanged_recorded_paths() {
         let temp = tempfile::tempdir().unwrap();

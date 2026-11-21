@@ -7,6 +7,7 @@ struct State {
     generation: u64,
     origins: Option<BTreeSet<String>>,
     blocked: Option<String>,
+    credential_origin: Option<String>,
 }
 
 /// Inactive means ordinary human navigation. Active means exact origin checks.
@@ -15,6 +16,12 @@ pub struct PanelNavigation(Arc<Mutex<State>>);
 
 /// Clears only its own generation; an obsolete lease cannot release a newer policy.
 pub struct NavigationLease {
+    gate: PanelNavigation,
+    generation: u64,
+}
+
+/// A credential operation cannot broaden its parent navigation lease.
+pub struct CredentialFence {
     gate: PanelNavigation,
     generation: u64,
 }
@@ -44,11 +51,26 @@ fn validated_origin(input: &str) -> Result<String, &'static str> {
     origin(input).ok_or("invalid_origin")
 }
 
+fn general_address_allowed(target: &str) -> bool {
+    let test_loopback = cfg!(test)
+        && reqwest::Url::parse(target).is_ok_and(|url| {
+            url.scheme() == "http"
+                && url.host_str() == Some("127.0.0.1")
+                && url.username().is_empty()
+                && url.password().is_none()
+        });
+    test_loopback || crate::external_url::validate(target).is_ok()
+}
+
 impl PanelNavigation {
     pub fn activate(&self, origins: &[String]) -> Result<NavigationLease, &'static str> {
         let mut allowed = BTreeSet::new();
         for input in origins {
-            allowed.insert(validated_origin(input)?);
+            allowed.insert(if input == "*" {
+                "*".to_owned()
+            } else {
+                validated_origin(input)?
+            });
         }
         if allowed.is_empty() {
             return Err("invalid_origin");
@@ -60,6 +82,7 @@ impl PanelNavigation {
         state.generation = state.generation.checked_add(1).ok_or("unavailable")?;
         state.origins = Some(allowed);
         state.blocked = None;
+        state.credential_origin = None;
         Ok(NavigationLease {
             gate: self.clone(),
             generation: state.generation,
@@ -73,10 +96,17 @@ impl PanelNavigation {
         };
         let candidate = origin(target);
         let allowed = state.origins.as_ref().is_none_or(|allowed| {
-            candidate
-                .as_ref()
-                .is_some_and(|value| allowed.contains(value))
-        });
+            if allowed.contains("*") {
+                general_address_allowed(target)
+            } else {
+                candidate
+                    .as_ref()
+                    .is_some_and(|value| allowed.contains(value))
+            }
+        }) && state
+            .credential_origin
+            .as_ref()
+            .is_none_or(|expected| candidate.as_ref() == Some(expected));
         if !allowed {
             state.blocked = Some(if crate::browser_runtime::google_login_target(target) {
                 target.to_owned()
@@ -92,15 +122,36 @@ impl PanelNavigation {
         let Ok(state) = self.0.lock() else {
             return false;
         };
+        let candidate = origin(target);
         state.origins.as_ref().is_none_or(|allowed| {
-            origin(target).is_some_and(|candidate| allowed.contains(&candidate))
+            if allowed.contains("*") {
+                general_address_allowed(target)
+            } else {
+                origin(target).is_some_and(|candidate| allowed.contains(&candidate))
+            }
+        }) && state
+            .credential_origin
+            .as_ref()
+            .is_none_or(|expected| candidate.as_ref() == Some(expected))
+    }
+
+    pub fn general_active(&self) -> bool {
+        self.0.lock().is_ok_and(|state| {
+            state
+                .origins
+                .as_ref()
+                .is_some_and(|origins| origins.contains("*"))
         })
     }
 
-    /// AI-controlled sessions deny new windows; the human panel keeps its old behavior.
+    /// General browsing uses the human panel's popup rules.
     pub fn permits_popup(&self) -> bool {
         self.0.lock().is_ok_and(|mut state| {
-            if state.origins.is_some() {
+            if state
+                .origins
+                .as_ref()
+                .is_some_and(|origins| !origins.contains("*"))
+            {
                 state.blocked = Some("new_window".into());
                 false
             } else {
@@ -128,6 +179,27 @@ impl PanelNavigation {
 }
 
 impl NavigationLease {
+    /// Hold this fence across the complete credential submission and redirects.
+    pub fn restrict_credentials(&self, input: &str) -> Result<CredentialFence, &'static str> {
+        let value = validated_origin(input)?;
+        let mut state = self.gate.0.lock().map_err(|_| "unavailable")?;
+        if state.generation != self.generation {
+            return Err("panel_closed");
+        }
+        if state.credential_origin.is_some()
+            || !state.origins.as_ref().is_some_and(|origins| {
+                origins.contains(&value)
+                    || (origins.contains("*") && general_address_allowed(&value))
+            })
+        {
+            return Err("unavailable");
+        }
+        state.credential_origin = Some(value);
+        Ok(CredentialFence {
+            gate: self.gate.clone(),
+            generation: self.generation,
+        })
+    }
     /// Only the host's already-approved session may extend this lease.
     pub fn allow_origin(&self, input: &str) -> Result<(), &'static str> {
         let value = validated_origin(input)?;
@@ -145,6 +217,17 @@ impl Drop for NavigationLease {
         if let Ok(mut state) = self.gate.0.lock() {
             if state.generation == self.generation {
                 state.origins = None;
+                state.credential_origin = None;
+            }
+        }
+    }
+}
+
+impl Drop for CredentialFence {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.0.lock() {
+            if state.generation == self.generation {
+                state.credential_origin = None;
             }
         }
     }
@@ -153,6 +236,57 @@ impl Drop for NavigationLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_fence_restricts_even_previously_approved_origins() {
+        let gate = PanelNavigation::default();
+        let lease = gate
+            .activate(&[
+                "https://site.example".into(),
+                "https://login.example".into(),
+            ])
+            .unwrap();
+        assert!(lease
+            .restrict_credentials("https://outside.example")
+            .is_err());
+        let fence = lease.restrict_credentials("https://login.example").unwrap();
+        assert!(gate.permits_request("https://login.example/auth"));
+        assert!(!gate.permits_request("https://site.example/redirect"));
+        lease.allow_origin("https://third.example").unwrap();
+        assert!(!gate.permits_request("https://third.example/"));
+        assert!(!gate.permits_navigation("https://login.example.attacker.test/"));
+        assert!(lease.restrict_credentials("https://site.example").is_err());
+        drop(fence);
+        assert!(gate.permits_request("https://site.example/"));
+    }
+
+    #[test]
+    fn general_browser_accepts_public_sites_but_rejects_private_targets() {
+        let gate = PanelNavigation::default();
+        let _lease = gate.activate(&["*".into()]).unwrap();
+        assert!(gate.permits_navigation("https://first.example/path"));
+        assert!(gate.permits_navigation("http://another.example/"));
+        for target in [
+            "file:///C:/private.txt",
+            "http://localhost:1234/",
+            "http://192.168.1.1/",
+            "https://user:pass@example.com/",
+        ] {
+            assert!(!gate.permits_navigation(target), "{target}");
+        }
+    }
+
+    #[test]
+    fn general_browser_credential_fence_still_requires_exact_origin() {
+        let gate = PanelNavigation::default();
+        let lease = gate.activate(&["*".into()]).unwrap();
+        assert!(gate.permits_request("https://other.example/"));
+        let _fence = lease.restrict_credentials("https://site.example").unwrap();
+        assert!(gate.permits_request("https://site.example/login"));
+        assert!(!gate.permits_request("https://other.example/"));
+        assert!(!gate.permits_navigation("https://site.example.attacker.test/"));
+        assert!(!gate.permits_request("https://site.example:444/"));
+    }
 
     #[test]
     fn blocked_google_login_retains_exact_address_only_for_google() {
@@ -185,6 +319,17 @@ mod tests {
         assert!(!gate.permits_popup());
         drop(lease);
         assert!(gate.permits_popup());
+    }
+
+    #[test]
+    fn general_browsing_uses_human_popup_rules() {
+        let gate = PanelNavigation::default();
+        let lease = gate.activate(&["*".into()]).unwrap();
+        assert!(gate.general_active());
+        assert!(gate.permits_popup());
+        assert!(!gate.permits_navigation("http://127.0.0.2/private"));
+        drop(lease);
+        assert!(!gate.general_active());
     }
 
     #[test]

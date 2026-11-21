@@ -7,6 +7,7 @@ import { PROVIDER_NAME, type AiProvider } from '../ai-models'
 import type { ApprovalChoice } from '../approvals'
 import { ApprovalCard, type ApprovalItem } from './ApprovalCard'
 import { SecretRequestCard, type SecretItem } from './SecretRequestCard'
+import { SavedLoginChoiceCard, type LoginChoiceItem } from './SavedLoginChoiceCard'
 import { MessageRail } from './MessageRail'
 import { ZetMarkdown } from './ZetMarkdown'
 import { requestPanelBrowser } from '../panel-browser'
@@ -80,6 +81,10 @@ type AssistantPanelProps = {
   onSubmitSecret?: (requestId: string, values: Record<string, string>) => void
   /** 키 넣기를 그만두기(agent_setup_secret_cancel). 넘기지 않으면 "그만두기" 단추를 두지 않는다. */
   onCancelSecret?: (requestId: string) => void
+  /** 저장된 로그인 중 어느 것을 쓸지 고르는 물음(saved-login-selection-request). 고른 것은 한 줄로 남는다. */
+  loginChoices?: LoginChoiceItem[]
+  onChooseLogin?: (requestId: string, loginId: string) => void
+  onCancelLogin?: (requestId: string) => void
   /** 답이 오지 않았을 때 채팅방 끝의 한 줄과 지금 할 수 있는 일(G18). 다음에 보내면 사라진다. */
   failure?: { text: string; actions: Array<{ id: string; label: string; run: () => void }> } | null
   /** 회사가 스스로 다시 시도하는 중일 때 답 아래 조용한 한 줄(chat-provider-retrying). */
@@ -112,6 +117,9 @@ export function AssistantPanel({
   secretRequests = [],
   onSubmitSecret,
   onCancelSecret,
+  loginChoices = [],
+  onChooseLogin,
+  onCancelLogin,
   failure = null,
   retrying = null,
   chatKey = null,
@@ -181,6 +189,17 @@ export function AssistantPanel({
   // 키 넣기: 끝난 것은 물음이 온 자리에 한 줄로, 기다리는 것은 대화 끝에.
   const secretsDoneAt = (index: number) => secretRequests.filter((item) => (item.status === 'saved' || item.status === 'cancelled' || item.status === 'closed') && Math.min(item.at, messages.length) === index)
   const pendingSecrets = secretRequests.filter((item) => item.status === 'pending' || item.status === 'sending')
+  // 로그인 고르기: 키 넣기와 같이 끝난 것은 물음이 온 자리에, 기다리는 것은 대화 끝에.
+  const choicesDoneAt = (index: number) => loginChoices.filter((item) => (item.status === 'chosen' || item.status === 'cancelled' || item.status === 'closed') && Math.min(item.at, messages.length) === index)
+  const pendingChoices = loginChoices.filter((item) => item.status === 'pending' || item.status === 'sending')
+  const renderChoice = (item: LoginChoiceItem) => (
+    <SavedLoginChoiceCard
+      key={item.request.requestId}
+      item={item}
+      onChoose={(loginId) => onChooseLogin?.(item.request.requestId, loginId)}
+      onCancel={onCancelLogin && (() => onCancelLogin(item.request.requestId))}
+    />
+  )
   const renderSecret = (item: SecretItem) => (
     <SecretRequestCard
       key={item.request.requestId}
@@ -195,7 +214,7 @@ export function AssistantPanel({
   useEffect(() => {
     const stream = streamRef.current
     if (stream) stream.scrollTo({ top: stream.scrollHeight, behavior: 'smooth' })
-  }, [lastId, isGenerating, pendingApprovals.length, pendingSecrets.length])
+  }, [lastId, isGenerating, pendingApprovals.length, pendingSecrets.length, pendingChoices.length])
 
   // 입력 칸이 자라면 대화의 마지막 말이 그 뒤에 가리지 않게 아래 여백을 함께 늘린다.
   useEffect(() => {
@@ -232,7 +251,7 @@ export function AssistantPanel({
         {/* 아직 말이 없는 채팅방(홈): 한가운데에 몸소 CI 와 한 줄(2026-11-16 그의 말, Codex 앱의 빈 화면처럼). 첫 말을 보내면 사라진다.
             CI 는 docs/brand 의 메인 로고 agar yoga(인앱 로고) 심볼만, Codex 앱처럼 무채색으로(2026-11-16 그의 말 "심볼 넣을 떄 무채색으로").
             public/brand/agar-yoga-mono-mask.png 는 원본(agar-yoga.png = agar-yoga-mark-transparent.png)에서 만든 한 색 가림판 사본이다. */}
-        {messages.length === 0 && !isGenerating && pendingApprovals.length === 0 && pendingSecrets.length === 0 && notices.length === 0 && (
+        {messages.length === 0 && !isGenerating && pendingApprovals.length === 0 && pendingSecrets.length === 0 && pendingChoices.length === 0 && notices.length === 0 && (
           <div className="chat-empty-hero">
             <span className="chat-empty-mark" aria-hidden="true" />
             <p className="chat-empty-title">{W.assistantPanel.emptyTitle}</p>
@@ -244,6 +263,7 @@ export function AssistantPanel({
           <Fragment key={message.id}>
             {answeredAt(index).map(renderApproval)}
             {secretsDoneAt(index).map(renderSecret)}
+            {choicesDoneAt(index).map(renderChoice)}
             {noticesAt(index).map(renderNotice)}
             <MessageItem
               message={message}
@@ -257,6 +277,7 @@ export function AssistantPanel({
         })}
         {answeredAt(messages.length).map(renderApproval)}
         {secretsDoneAt(messages.length).map(renderSecret)}
+        {choicesDoneAt(messages.length).map(renderChoice)}
         {noticesAt(messages.length).map(renderNotice)}
         {isGenerating && (
           <div className="message assistant generating">
@@ -285,6 +306,7 @@ export function AssistantPanel({
         )}
         {pendingApprovals.map(renderApproval)}
         {pendingSecrets.map(renderSecret)}
+        {pendingChoices.map(renderChoice)}
       </div>
 
       {composer}

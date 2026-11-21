@@ -1,10 +1,13 @@
 //! In-process transport for the dedicated panel WebView2; no listener or debug port.
 //! This transport is not an MCP tool and does not grant browser access to AI.
 use serde_json::Value;
+#[cfg(test)]
 use tauri::Manager;
 
+#[cfg(test)]
 const PANEL_LABEL: &str = crate::panel_browser::LABEL;
 
+#[cfg(test)]
 fn lookup_panel<T>(get: impl FnOnce(&str) -> Option<T>) -> Result<T, &'static str> {
     get(PANEL_LABEL).ok_or("unavailable")
 }
@@ -62,8 +65,45 @@ impl Drop for PanelEvents {
 impl PanelTransport {
     /// Bind only the app-owned panel, and fail if it is not open.
     pub fn bind(app: &tauri::AppHandle) -> Result<Self, &'static str> {
-        let view = lookup_panel(|label| app.get_webview(label))?;
+        let view = crate::panel_browser::current_panel(app).ok_or("unavailable")?;
         Ok(Self { view })
+    }
+
+    /// Turn off the WebView2 password autosave feature before filling.
+    pub async fn disable_password_autosave(&self) -> Result<(), &'static str> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.view
+            .with_webview(move |platform| {
+                #[cfg(windows)]
+                {
+                    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings4;
+                    use windows_core::{Interface, BOOL};
+                    let result = unsafe {
+                        platform.controller().CoreWebView2().and_then(|core| {
+                            let settings = core.Settings()?.cast::<ICoreWebView2Settings4>()?;
+                            settings.SetIsPasswordAutosaveEnabled(false)?;
+                            let mut enabled = BOOL::default();
+                            settings.IsPasswordAutosaveEnabled(&mut enabled)?;
+                            Ok(!enabled.as_bool())
+                        })
+                    };
+                    let _ = tx.send(matches!(result, Ok(true)));
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = platform;
+                    let _ = tx.send(false);
+                }
+            })
+            .map_err(|_| "unavailable")?;
+        match rx.await {
+            Ok(true) => Ok(()),
+            _ => Err("unavailable"),
+        }
+    }
+
+    pub(crate) fn close_view(&self) {
+        let _ = self.view.close();
     }
 
     /// Dispatch on the WebView UI thread and receive the asynchronous CDP result.
@@ -148,6 +188,7 @@ impl PanelTransport {
     pub async fn subscribe(&self, event: &str) -> Result<PanelEvents, &'static str> {
         let event_name = event.to_owned();
         let requested = event_name.clone();
+        let callback_event = event_name.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(256);
         let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_overflow = overflow.clone();
@@ -176,6 +217,7 @@ impl PanelTransport {
                         }
                     }
                     if !delivered {
+                        log::warn!("panel_cdp stage=event_decode_or_queue event={} status=unavailable", callback_event);
                         callback_overflow.store(true, std::sync::atomic::Ordering::Release);
                         let _ = sender.try_send(Value::Null);
                     }
@@ -191,7 +233,7 @@ impl PanelTransport {
                 }
             }
             #[cfg(not(windows))]
-            { let _ = (platform, requested, sender, callback_overflow); let _ = tx.send(Err("unavailable")); }
+            { let _ = (platform, requested, sender, callback_overflow, callback_event); let _ = tx.send(Err("unavailable")); }
         }).map_err(|_| "unavailable")?;
         let token = tokio::time::timeout(std::time::Duration::from_secs(15), rx)
             .await
@@ -269,32 +311,54 @@ pub(crate) mod tests {
     #[test]
     #[ignore = "requires the real WebView2 runtime and an interactive Windows desktop"]
     fn hidden_webview2_can_use_portless_cdp_against_local_fixture() {
-        run_local_fixture(false, false, false);
+        run_local_fixture(false, false, false, false, false);
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "requires the real WebView2 runtime and an interactive Windows desktop"]
     fn blocked_origin_receives_no_request_content() {
-        run_local_fixture(true, false, false);
+        run_local_fixture(true, false, false, false, false);
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "requires the real WebView2 runtime and an interactive Windows desktop"]
     fn panel_mcp_scope_login_and_close_through_product_path() {
-        run_local_fixture(true, true, false);
+        run_local_fixture(true, true, false, false, false);
     }
 
     #[cfg(windows)]
     #[test]
     #[ignore = "requires the real WebView2 runtime and an interactive Windows desktop"]
     fn panel_takeover_cancels_approval_and_requires_new_request() {
-        run_local_fixture(true, true, true);
+        run_local_fixture(true, true, true, false, false);
     }
 
     #[cfg(windows)]
-    fn run_local_fixture(allow_tcp_without_data: bool, run_mcp: bool, takeover: bool) {
+    #[test]
+    #[ignore = "requires the real WebView2 runtime and an isolated Windows desktop"]
+    fn saved_login_auto_through_mcp_and_local_site() {
+        assert!(std::env::var_os("MOMSO_TEST_FAKE_CREDENTIAL_STORE").is_some());
+        run_local_fixture(true, true, false, true, false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the real WebView2 runtime and an isolated Windows desktop"]
+    fn saved_login_ask_through_mcp_and_local_site() {
+        assert!(std::env::var_os("MOMSO_TEST_FAKE_CREDENTIAL_STORE").is_some());
+        run_local_fixture(true, true, false, true, true);
+    }
+
+    #[cfg(windows)]
+    fn run_local_fixture(
+        allow_tcp_without_data: bool,
+        run_mcp: bool,
+        takeover: bool,
+        saved: bool,
+        ask_login: bool,
+    ) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use tauri::{LogicalPosition, LogicalSize, WebviewUrl};
@@ -305,6 +369,16 @@ pub(crate) mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let secret = if saved {
+            std::env::var("MOMSO_S7_TEST_SECRET").expect("isolated runner supplies test secret")
+        } else {
+            uuid::Uuid::new_v4().to_string()
+        };
+        let server_secret = secret.clone();
+        let posted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_posted = posted.clone();
+        let secret_in_get = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_secret_in_get = secret_in_get.clone();
         let stop_server = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server_stopped = stop_server.clone();
         let server = std::thread::spawn(move || {
@@ -316,9 +390,56 @@ pub(crate) mod tests {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
-                    let mut input = [0; 4096];
-                    if matches!(stream.read(&mut input), Ok(count) if count > 0)
-                        && write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).is_ok() { continue; }
+                    let mut input = Vec::new();
+                    let mut buffer = [0; 4096];
+                    while input.len() < 16384 {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => input.extend_from_slice(&buffer[..count]),
+                        }
+                        if let Some(end) = input.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&input[..end]);
+                            let length = head
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if input.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    if !input.is_empty() {
+                        let request = String::from_utf8_lossy(&input);
+                        if saved && request.starts_with("GET ") && request.contains(&server_secret)
+                        {
+                            server_secret_in_get.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if saved && request.starts_with("POST /auth ") {
+                            if request.contains(&server_secret) {
+                                server_posted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            let _ = write!(stream, "HTTP/1.1 303 See Other\r\nLocation: /dashboard\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            continue;
+                        }
+                        let response = if saved && request.starts_with("GET /saved ") && !ask_login
+                        {
+                            r#"<html><title>Login</title><form id='login'><input name='user' type='text'><input name='pw' type='password'><label><input type='checkbox' name='remember'>remember</label><button type='button' onclick="fetch('/auth',{method:'POST',body:new URLSearchParams(new FormData(document.getElementById('login')))}).then(()=>location.href='/dashboard')">login</button></form></html>"#
+                        } else if saved && request.starts_with("GET /saved ") {
+                            "<html><title>Login</title><form method='post' action='/auth'><input name='user' type='text'><input name='pw' type='password'><button type='submit'>login</button></form></html>"
+                        } else if saved && request.starts_with("GET /frame ") {
+                            "<html><title>Frame</title><iframe src='http://127.0.0.1:1/login'></iframe><form method='post' action='/auth'><input name='user' type='text'><input name='pw' type='password'><button type='submit'>login</button></form></html>"
+                        } else if saved && request.starts_with("GET /dashboard ") {
+                            "<html><title>Done</title><body>signed in</body></html>"
+                        } else {
+                            body
+                        };
+                        if write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).is_ok() { continue; }
+                    }
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
@@ -539,7 +660,7 @@ pub(crate) mod tests {
                     }) { return Err("unexpected_listener"); }
                     println!("controlled process tree: processes={}, listening_tcp=0 (fixture listeners excluded)", processes.len());
                     if run_mcp {
-                        run_product_mcp(&handle, data_root.clone(), format!("http://{address}"), takeover).await?;
+                        run_product_mcp(&handle, data_root.clone(), format!("http://{address}"), takeover, saved, ask_login, secret).await?;
                     }
                     Ok(())
                 });
@@ -549,13 +670,24 @@ pub(crate) mod tests {
             Ok(())
         }).build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap();
         app.run_return(|_, _| {});
-        assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(120))
-                .unwrap(),
-            Ok(())
-        );
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .unwrap();
+        if saved && outcome.is_err() {
+            println!(
+                "saved login fixture submitted={}",
+                posted.load(std::sync::atomic::Ordering::SeqCst)
+            );
+        }
+        assert_eq!(outcome, Ok(()));
         stop_server.store(true, std::sync::atomic::Ordering::Release);
         server.join().unwrap();
+        if saved {
+            assert!(posted.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!secret_in_get.load(std::sync::atomic::Ordering::SeqCst));
+            // Keep this isolated profile until the parent verifies it after process exit.
+            let _ = temp.keep();
+        }
     }
 
     #[cfg(windows)]
@@ -564,6 +696,9 @@ pub(crate) mod tests {
         root: std::path::PathBuf,
         site: String,
         takeover: bool,
+        saved: bool,
+        ask_login: bool,
+        secret: String,
     ) -> Result<(), &'static str> {
         use crate::approval::ApprovalChoice;
         use tauri::{Emitter, Listener, Manager};
@@ -612,6 +747,14 @@ pub(crate) mod tests {
                     }
                 });
             });
+        });
+        let event_secret = secret.clone();
+        let saved_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_saved_events = saved_events.clone();
+        let saved_listener = app.listen("saved-login-used", move |event| {
+            if let Ok(mut events) = captured_saved_events.lock() {
+                events.push(event.payload().to_owned());
+            }
         });
         let state = app.state::<crate::AppState>();
         let manager = state.browser.clone();
@@ -678,6 +821,12 @@ pub(crate) mod tests {
         });
         let mut fixture_policy = crate::browser_gateway::Policy::test_loopback(site.clone());
         fixture_policy.add_test_login_path(format!("{site}/account"));
+        if saved {
+            crate::saved_logins::fixture_save_login(&site, &secret, ask_login)?;
+            if !crate::saved_logins::for_origin("http://127.0.0.1:1")?.is_empty() {
+                return Err("saved_login_wrong_origin_exposed");
+            }
+        }
         let policy = Ok(Some(fixture_policy));
         let handler_app = app.clone();
         let resume_site = site.clone();
@@ -768,7 +917,7 @@ pub(crate) mod tests {
                     )
                     .await;
                     human_login_phase.store(2, std::sync::atomic::Ordering::SeqCst);
-                } else if result["status"] == "human_required" {
+                } else if result["status"] == "human_required" && !saved {
                     if let Ok(transport) = PanelTransport::bind(&app) {
                         let _ = transport
                             .call(
@@ -790,7 +939,7 @@ pub(crate) mod tests {
                             }
                         }
                     }
-                    let _ = crate::panel_browser::panel_browser_close(app).await;
+                    let _ = crate::panel_browser::panel_browser_close(app, String::new()).await;
                 } else if takeover && reading && result["status"] == "human_takeover" {
                     let _ = crate::panel_agent_resume(
                         app.clone(),
@@ -820,9 +969,29 @@ pub(crate) mod tests {
             let mut call = |name: &str, args: Value| -> Result<Value, &'static str> {
                 let result = crate::momso_mcp::test_response(&serde_json::json!({"id":1,"method":"tools/call","params":{"name":name,"arguments":args}}), &mut ready, &mut client).ok_or("mcp_response_missing")?;
                 let text = result.pointer("/result/content/0/text").and_then(Value::as_str).ok_or("mcp_response_invalid")?;
+                if saved && text.contains(&secret) { return Err("saved_login_secret_in_ai_response"); }
                 serde_json::from_str(text).map_err(|_| "mcp_response_invalid")
             };
             if call("browser_open", serde_json::json!({}))?["status"] != "ok" { return Err("mcp_open_failed"); }
+            if saved {
+                if call("browser_navigate", serde_json::json!({"url":format!("{site}/saved")}))?["status"] != "human_required" { return Err("saved_login_page_not_detected"); }
+                let login = call("browser_request_saved_login", serde_json::json!({}))?;
+                if login["status"] != "logged_in" {
+                    return Err(match login["status"].as_str() {
+                        Some("human_required") => "saved_login_human_required",
+                        Some("target_changed") => "saved_login_target_changed",
+                        Some("not_found") => "saved_login_not_found",
+                        Some("denied") => "saved_login_denied",
+                        Some("credential_store_unavailable") => "saved_login_store_unavailable",
+                        Some("unavailable") => "saved_login_unavailable",
+                        _ => "saved_login_other_status",
+                    });
+                }
+                if call("browser_read", serde_json::json!({}))?["status"] != "page" { return Err("saved_login_read_failed"); }
+                if call("browser_navigate", serde_json::json!({"url":format!("{site}/frame")}))?["status"] != "human_required" { return Err("saved_login_frame_guard_missing"); }
+                if call("browser_request_saved_login", serde_json::json!({}))?["status"] != "human_required" { return Err("saved_login_frame_not_refused"); }
+                return Ok(());
+            }
             if call("browser_navigate", serde_json::json!({"url":format!("{site}/")}))?["status"] != "page" { return Err("mcp_navigate_failed"); }
             if call("browser_request_human_login", serde_json::json!({"reason":"login"}))?["status"] != "human_required" { return Err("mcp_login_request_failed"); }
             if call("browser_read", serde_json::json!({}))?["status"] != "human_required" { return Err("mcp_login_not_paused"); }
@@ -856,6 +1025,24 @@ pub(crate) mod tests {
         app.unlisten(open_listener);
         responder.abort();
         result?;
+        if saved {
+            // This baseline branch requests a site-scope card on browser_open.
+            // The saved-login card is the additional one only in ask mode.
+            if cards_count.load(std::sync::atomic::Ordering::SeqCst)
+                != if ask_login { 2 } else { 1 }
+            {
+                return Err("saved_login_approval_policy_mismatch");
+            }
+            let events = saved_events.lock().map_err(|_| "saved_event_lock_failed")?;
+            if events.len() != 1 || events.iter().any(|event| event.contains(&event_secret)) {
+                return Err("saved_event_invalid");
+            }
+            app.unlisten(saved_listener);
+            app.unlisten(closed_listener);
+            app.unlisten(panel_listener);
+            return Ok(());
+        }
+        app.unlisten(saved_listener);
         if !turn.is_cancelled() {
             return Err("mcp_turn_not_cancelled");
         }

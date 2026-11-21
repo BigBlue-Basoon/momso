@@ -43,6 +43,10 @@ pub(crate) const BUNDLED_SKILLS: &[(&str, &str)] = &[
         "object-store-connect",
         include_str!("../bundled-skills/object-store-connect/SKILL.md"),
     ),
+    (
+        "bodycodi-operations",
+        include_str!("../bundled-skills/bodycodi-operations/SKILL.md"),
+    ),
 ];
 
 pub(crate) fn install_bundled(root: &Path, resources: &Path) -> Result<(), &'static str> {
@@ -163,7 +167,7 @@ pub(crate) fn skill_path(
 }
 
 fn unavailable_reason(
-    root: &Path,
+    _root: &Path,
     name: &str,
     enabled: bool,
     conflict: bool,
@@ -173,13 +177,8 @@ fn unavailable_reason(
         Some("skill_conflict")
     } else if !enabled {
         Some("disabled")
-    } else if crate::browser_gateway::builtin_browser_name(name) {
-        match crate::browser_gateway::Policy::from_skill(root, name) {
-            Err("browser_policy_modified") => Some("policy_modified"),
-            Err(_) | Ok(None) => Some("policy_unavailable"),
-            Ok(Some(_)) if !browser_available => Some("browser_unavailable"),
-            Ok(Some(_)) => None,
-        }
+    } else if crate::browser_gateway::builtin_browser_name(name) && !browser_available {
+        Some("browser_unavailable")
     } else {
         None
     }
@@ -339,7 +338,7 @@ pub(crate) fn is_builtin(name: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn browser_skill_availability_tracks_tool_and_policy_without_changing_enabled() {
+    fn browser_skill_availability_tracks_tool_not_guide_content() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let name = "naver-smartplace";
@@ -353,10 +352,7 @@ mod tests {
         );
         assert_eq!(unavailable_reason(root, name, true, false, true), None);
         std::fs::write(path.join("SKILL.md"), format!("{content}\nmodified")).unwrap();
-        assert_eq!(
-            unavailable_reason(root, name, true, false, true),
-            Some("policy_modified")
-        );
+        assert_eq!(unavailable_reason(root, name, true, false, true), None);
         assert_eq!(
             unavailable_reason(root, name, false, false, true),
             Some("disabled")

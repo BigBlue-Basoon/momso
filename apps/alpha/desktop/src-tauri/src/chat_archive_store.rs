@@ -434,6 +434,9 @@ fn known_values_with(
             known.push(value);
         }
     }
+    if let Some(value) = get_secret(crate::saved_logins::VAULT)? {
+        known.extend(crate::saved_logins::passwords_from_serialized(&value)?);
+    }
     if let Some(config) = crate::object_store::load_config(data_root)? {
         let (access, secret) = get_object_keys(&config)?;
         known.push(access);
@@ -1339,6 +1342,30 @@ mod tests {
         crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
         let result = known_values_with(temp.path(), &db, |_| Ok(None), |_| Err("unavailable"));
         assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn saved_login_password_is_included_in_archive_redaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let secret = uuid::Uuid::new_v4().to_string();
+        let vault = serde_json::json!([{"id":"id","origin":"https://example.test","label":"label","username":"user","password":secret}]).to_string();
+        let known = known_values_with(
+            temp.path(),
+            &db,
+            |name| Ok((name == crate::saved_logins::VAULT).then(|| vault.clone())),
+            |_| Err("unavailable"),
+        )
+        .unwrap();
+        let refs: Vec<&str> = known.iter().map(String::as_str).collect();
+        let value: serde_json::Value = serde_json::from_str(&vault).unwrap();
+        let password = value[0]["password"].as_str().unwrap();
+        assert!(
+            !crate::chat_archive_redact::redact_with_known(password, &refs)
+                .text
+                .contains(password)
+        );
     }
 
     #[test]

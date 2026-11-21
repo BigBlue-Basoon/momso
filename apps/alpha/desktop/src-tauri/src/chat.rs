@@ -444,6 +444,10 @@ pub(crate) fn create_with_message(
     if text.trim().is_empty() && skill.is_none() {
         return Err("empty_message".into());
     }
+    let known = crate::saved_logins::known_passwords()
+        .map_err(|_| "저장된 로그인 보관함을 확인하지 못했습니다".to_string())?;
+    let safe_text = crate::saved_logins::redact_text(text, &known);
+    let text = safe_text.as_str();
     let mut c = db(path)?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -826,6 +830,10 @@ fn append_internal(
     finish_reason: Option<FinishReason>,
     claim_attachments: bool,
 ) -> Result<ChatMessage, String> {
+    let known = crate::saved_logins::known_passwords()
+        .map_err(|_| "저장된 로그인 보관함을 확인하지 못했습니다".to_string())?;
+    let safe_text = crate::saved_logins::redact_text(text, &known);
+    let text = safe_text.as_str();
     let mut c = db(path)?;
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
