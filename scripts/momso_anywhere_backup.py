@@ -80,6 +80,56 @@ def _snapshot(data_dir, temp_dir, names):
     return result
 
 
+def stage_live_snapshot(data_dir, target):
+    """Freeze the local backup inputs before releasing server admission."""
+    data_dir, target = Path(data_dir), Path(target)
+    memory_files = {}
+    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for name in DATABASE_AND_VAULT:
+        source = _safe_path(data_dir, name)
+        if not source.exists():
+            continue
+        if name == "codex/auth.json":
+            memory_files[name] = source.read_bytes()
+            continue
+        destination = _safe_path(target, name, create_parents=True)
+        if name.endswith((".sqlite", ".sqlite3", ".db")):
+            with closing(sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True)) as src:
+                with closing(sqlite3.connect(destination)) as dst:
+                    src.backup(dst)
+        else:
+            shutil.copyfile(source, destination, follow_symlinks=False)
+    for name in ("archive/objects/sha256", "attachments/upload-staging"):
+        source = _safe_path(data_dir, name)
+        if not source.exists():
+            continue
+        if source.is_symlink() or not source.is_dir():
+            raise ValueError("unsafe backup input")
+        destination = _safe_path(target, name, create_parents=True)
+        destination.mkdir(mode=0o700, exist_ok=True)
+        for root, directories, files in os.walk(source, followlinks=False):
+            root = Path(root)
+            for item in directories:
+                if (root / item).is_symlink():
+                    raise ValueError("unsafe backup input")
+                (destination / (root / item).relative_to(source)).mkdir(mode=0o700, exist_ok=True)
+            for item in files:
+                src = root / item
+                if src.is_symlink() or not src.is_file():
+                    raise ValueError("unsafe backup input")
+                dst = destination / src.relative_to(source)
+                if name.startswith("archive/"):
+                    try:
+                        os.link(src, dst, follow_symlinks=False)
+                    except OSError as error:
+                        if error.errno != errno.EXDEV:
+                            raise
+                        shutil.copyfile(src, dst, follow_symlinks=False)
+                else:
+                    shutil.copyfile(src, dst, follow_symlinks=False)
+    return memory_files
+
+
 def _pack(files):
     out = io.BytesIO()
     with tarfile.open(fileobj=out, mode="w") as tar:
@@ -154,7 +204,7 @@ def _hash_file(path):
 
 def _backup_path(path, expected_hash, store, key_service, old=None):
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(path, flags)
+    descriptor = os.dup(path) if isinstance(path, int) else os.open(path, flags)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ValueError("backup source is not a file")
@@ -299,7 +349,7 @@ def _snapshot_paths(data_dir, temporary, names):
     return result
 
 
-def _backup_v3(data_dir, archive, store, key_service, names, vault_identity):
+def _backup_v3(data_dir, archive, store, key_service, names, vault_identity, memory_files=None):
     purged = read_purged_ledger(store, key_service)
     latest = _latest(store)
     previous_payload = _decrypt(store.read(latest[1]), key_service) if latest else None
@@ -330,6 +380,20 @@ def _backup_v3(data_dir, archive, store, key_service, names, vault_identity):
 
         for name, path in paths.items():
             files[name] = add_path(path)
+        for name, content in (memory_files or {}).items():
+            if name != "codex/auth.json" or not isinstance(content, bytes):
+                raise ValueError("invalid in-memory backup input")
+            digest = hashlib.sha256(content).hexdigest()
+            descriptor = os.memfd_create("momso-backup-private", os.MFD_CLOEXEC)
+            try:
+                with os.fdopen(os.dup(descriptor), "wb") as output:
+                    output.write(content)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                existing = by_hash.get(digest) or previous_by_hash.get(digest)
+                by_hash[digest] = _backup_path(descriptor, digest, store, key_service, existing)
+                files[name] = digest
+            finally:
+                os.close(descriptor)
         stage = _safe_path(data_dir, "attachments/upload-staging")
         if stage.exists():
             if not stage.is_dir():
@@ -984,13 +1048,13 @@ def _latest_retention_time(items):
         raise ValueError("invalid retention time") from None
 
 
-def backup(data_dir, store, key_service, names, temp_root=None, vault_identity=None, archive=None, quiescent=False):
+def backup(data_dir, store, key_service, names, temp_root=None, vault_identity=None, archive=None, quiescent=False, memory_files=None):
     """Backup changed data, rotating fixed slots. The caller schedules daily."""
     data_dir = Path(data_dir)
     if archive is not None and not quiescent:
         raise ValueError("quiescence_required")
     if archive is not None:
-        return _backup_v3(data_dir, Path(archive), store, key_service, names, vault_identity)
+        return _backup_v3(data_dir, Path(archive), store, key_service, names, vault_identity, memory_files)
     with tempfile.TemporaryDirectory(prefix="momso-backup-", dir=temp_root) as tmp:
         files = _snapshot(data_dir, Path(tmp), names)
         latest = _latest(store)

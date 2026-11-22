@@ -1,0 +1,18 @@
+[package]
+name = "momso-server-attachments"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fs2 = "0.4"
+chrono = "0.4"
+hex = "0.4"
+libc = "0.2"
+momso-core = { path = "../desktop/src-tauri/momso-core" }
+rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]

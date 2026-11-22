@@ -21,7 +21,7 @@ def make_poller(config):
     gateway = CloudRunGateway(config["project"], config["region"], config["gatewayService"])
     host = SystemdHost(root, config["dataDir"], config["serverUnit"],
                        "http://127.0.0.1:8765/health", admission, gateway, progress,
-                       proxy_unit=config["proxyUnit"])
+                       proxy_unit=config["proxyUnit"], idle_unit=config.get("idleUnit", "momso-idle-stop.service"))
     updater = Updater(root, config["publicKey"], host, channel=channel)
     return ReleasePoller(GitHubReleases(channel), updater)
 

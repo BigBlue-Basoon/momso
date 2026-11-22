@@ -1,0 +1,23 @@
+[package]
+name = "momso-server-browser"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+fixture-loopback = []
+fixture-sites = ["fixture-loopback"]
+
+[dependencies]
+libc = "0.2"
+serde_json = "1"
+sha2 = "0.10"
+url = "2"
+zeroize = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+momso-saved-login-core = { path = "../desktop/src-tauri/saved-login-core" }
+
+[dev-dependencies]
+tempfile = "3"
+age = "0.12.1"
+momso-server-crm = { path = "../server-crm" }

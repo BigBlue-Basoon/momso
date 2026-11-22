@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from unittest.mock import patch
 from server_admission import ServerAdmission
 
 
@@ -62,6 +63,21 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse(competing.acquire_offline_for_recovery())
         self.admission.release()
         self.assertFalse(self.server.maintenance)
+
+    def test_recovery_reuses_own_lock_after_release_failure(self):
+        self.assertTrue(self.admission.acquire())
+        with patch.object(self.admission, '_request', side_effect=OSError('fixture')):
+            with self.assertRaises(OSError): self.admission.release()
+        self.assertTrue(self.admission.reacquire_for_recovery())
+        self.admission.release()
+        self.assertFalse(self.server.maintenance)
+
+    def test_recovery_reacquires_if_release_response_was_lost(self):
+        self.assertTrue(self.admission.acquire())
+        self.server.maintenance = False
+        self.assertTrue(self.admission.reacquire_for_recovery())
+        self.assertTrue(self.server.maintenance)
+        self.admission.release()
 
 
 if __name__ == "__main__": unittest.main()

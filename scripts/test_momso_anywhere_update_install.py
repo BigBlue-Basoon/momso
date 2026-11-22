@@ -16,6 +16,50 @@ from momso_server_install import InstallError
 
 
 class InstallTests(unittest.TestCase):
+    def test_repair_rejects_different_account_before_contacting_vm(self):
+        import momso_anywhere_repair_updater as repair
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps({'version': 1, 'id': '0123456789ab', 'account': 'other@example.invalid', 'project': 'fixture-project'}))
+            argv = ['repair', '--account', 'owner@example.invalid', '--project', 'fixture-project', '--state', str(state)]
+            with patch('sys.argv', argv), patch.object(repair, 'refresh_worker') as refresh:
+                with self.assertRaises(SystemExit): repair.main()
+                refresh.assert_not_called()
+
+    @unittest.skipIf(os.name == 'nt', 'VM payload requires Linux filesystem operations')
+    def test_worker_refresh_preserves_recovery_journal_and_restarts_even_on_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); worker = root / 'worker'; worker.mkdir(mode=0o700)
+            etc = root / 'etc'; etc.mkdir(mode=0o700); (etc / 'momso-private').mkdir(mode=0o700)
+            (etc / 'momso-update.json').write_text('{}')
+            unit = etc / 'systemd/system/momso-update.service'; unit.parent.mkdir(parents=True)
+            unit.write_text(f'ExecStart=/usr/bin/python3 {worker}/worker.py --config {etc}/momso-update.json\n')
+            recovery = root / 'update-state.json'; recovery.write_text('{"phase":"switching"}')
+            provider = Mock(install_id='0123456789ab')
+            install.refresh_worker(provider)
+            wrapper, payload = provider.ssh.call_args.args
+            node = ast.parse(wrapper)
+            encoded = next(n.args[0].value for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'b64decode')
+            code = base64.b64decode(encoded).decode().replace('/opt/momso-updater', str(worker)).replace('/etc/', str(etc) + '/')
+            calls = []
+            with patch('sys.stdin', io.TextIOWrapper(io.BytesIO(payload))), patch('subprocess.run', side_effect=lambda args, **kwargs: calls.append(args)):
+                exec(compile(code, '<vm fixture>', 'exec'), {})
+            self.assertEqual(calls, [['systemctl', 'stop', 'momso-update.service'], ['systemctl', 'start', 'momso-update.service']])
+            self.assertEqual(json.loads(recovery.read_text())['phase'], 'switching')
+            calls.clear()
+            def failed_stop(args, **kwargs):
+                calls.append(args)
+                if args[1] == 'stop': raise RuntimeError('stop failed')
+            with patch('sys.stdin', io.TextIOWrapper(io.BytesIO(payload))), patch('subprocess.run', side_effect=failed_stop):
+                with self.assertRaisesRegex(RuntimeError, 'stop failed'): exec(compile(code, '<vm fixture>', 'exec'), {})
+            self.assertEqual(calls[-1], ['systemctl', 'start', 'momso-update.service'])
+            (worker / 'worker.py').write_bytes(b'unknown worker')
+            calls.clear()
+            with patch('sys.stdin', io.TextIOWrapper(io.BytesIO(payload))), patch('subprocess.run', side_effect=lambda args, **kwargs: calls.append(args)):
+                with self.assertRaises(Exception): exec(compile(code, '<vm fixture>', 'exec'), {})
+            self.assertEqual(calls[-1], ['systemctl', 'start', 'momso-update.service'])
+            self.assertEqual((worker / 'worker.py').read_bytes(), b'unknown worker')
+
     @unittest.skipIf(os.name == 'nt', 'VM payload requires Linux filesystem operations')
     def test_worker_upgrade_restores_old_files_when_install_fails(self):
         with tempfile.TemporaryDirectory() as directory:

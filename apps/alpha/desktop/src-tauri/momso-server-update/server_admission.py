@@ -69,18 +69,20 @@ class ServerAdmission:
     def reacquire_for_recovery(self):
         """Only an updater with its durable switching record may call this."""
         if self.lock is not None:
-            return False
-        lock = (self.directory / "lifecycle.lock").open("a+b")
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock.close(); return False
-        self.lock = lock
+            if not self.held: return False
+        else:
+            lock = (self.directory / "lifecycle.lock").open("a+b")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close(); return False
+            self.lock = lock
         try:
             if (self.directory / "idle-stop.pending").exists():
                 self._unlock(); return False
             state = self._request("/activity")
             if state.get("maintenance") is False:
+                self.held = False
                 self._unlock()
                 return self.acquire()
             if state.get("maintenance") is not True:

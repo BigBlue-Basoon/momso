@@ -16,6 +16,7 @@ import uuid
 from systemd_host import SystemdHost
 from github_releases import GitHubReleases, ReleasePoller
 from update import Updater, UpdateError, _atomic_json
+from cloud_run_gateway import GatewayError
 
 
 class Gate:
@@ -83,11 +84,17 @@ class SystemdIntegration(unittest.TestCase):
                 self.assertEqual(poller.poll(), "completed")
                 good = host.current_release(); self.assertNotEqual(good, str(old)); self.assertTrue(host.server_healthy())
                 publish(3, False)
-                with self.assertRaisesRegex(UpdateError, "update_failed_rolled_back"):
+                with self.assertRaisesRegex(UpdateError, "server_unhealthy"):
                     poller.poll()
                 self.assertEqual(host.current_release(), good); self.assertEqual(host.current_sequence(), 2)
                 self.assertTrue(host.server_healthy()); self.assertEqual((data / "database").read_text(), "fixture")
                 self.assertFalse(gate.held)
+                publish(4, True)
+                gateway.activate = lambda _: (_ for _ in ()).throw(GatewayError("gateway_image_permission"))
+                with self.assertRaisesRegex(UpdateError, "gateway_image_permission"):
+                    poller.poll()
+                self.assertEqual(host.current_release(), good)
+                self.assertTrue(host.server_healthy())
             finally:
                 subprocess.run(["systemctl", "stop", unit], check=False, capture_output=True)
                 subprocess.run(["systemctl", "disable", "--runtime", unit], check=False, capture_output=True)
