@@ -7,8 +7,10 @@
 //     { kind: 'ai', provider, model }·'created' | 'edited'·그때. 알 수 없으면 null(화면은 그 칸을 비운다. by 가 null 이면 누가 했다고 적지 않는다).
 //   - evidence: 'tool'(도구가 성공을 알림) | 'diff'(파일 전후 비교로 확인) | null(옛 기록). 값만 받고 화면에는 보이지 않는다(보일지는 그가 정하지 않음).
 //   - 겹쳐 답한 채팅방이 있어 누가 했는지 가를 수 없으면 by 가 null 이다.
-import { convertFileSrc, invoke } from '@tauri-apps/api/core'
-import { isDesktopRuntime } from './runtime'
+import { convertFileSrc } from '@tauri-apps/api/core'
+import { invoke } from './host'
+import { hasAppBackend, isNetworkRuntime } from './runtime'
+import { serverMediaDownloadPath } from './server-client'
 
 export type MediaItem = {
   id: string
@@ -61,7 +63,8 @@ function withMaker(item: MediaItem): MediaItem {
 }
 
 export async function listMedia() {
-  if (!isDesktopRuntime()) throw new Error('media_list needs the desktop runtime')
+  // 휴대폰 몸소도(S75 셋째, server GET /media). 그곳의 path 는 같은 출처의 내려받기 주소다.
+  if (!hasAppBackend()) throw new Error('media_list needs the desktop runtime')
   return (await invoke<MediaItem[]>('media_list')).map(withMaker)
 }
 
@@ -70,7 +73,7 @@ export async function listMedia() {
  * 판 항목에는 크기·첫 장면 그림·작업 기록이 없어, 목록에서 받은 그 생성물(cover)의 값을 이어 쓴다.
  */
 export async function listMediaVersions(cover: MediaItem): Promise<MediaItem[]> {
-  if (!isDesktopRuntime() || !cover.lineageId) return [cover]
+  if (!hasAppBackend() || !cover.lineageId) return [cover]
   const list = await invoke<Array<{ assetId: string; kind?: MediaItem['kind']; prompt?: string | null; provider?: string | null; model?: string | null; createdAt?: string | null; chatId?: string | null; version?: number | null; path?: string | null; lineageId?: string | null; versionOf?: string | null; versionHow?: 'regenerated' | 'edited' | null }>>('media_versions', { versionGroupId: cover.lineageId })
   return list.map((version) => {
     if (version.assetId === cover.id) return { ...cover, version: version.version ?? cover.version, versionOf: version.versionOf ?? null, versionHow: version.versionHow ?? null }
@@ -97,7 +100,15 @@ export async function listMediaVersions(cover: MediaItem): Promise<MediaItem[]> 
 }
 
 /** Windows 저장 창으로 내려받기(media_save_as). 취소하면 'cancelled', 저장하면 'saved'. 오류는 이름 그대로 던진다. */
-export async function saveMediaAs(assetId: string) {
+export async function saveMediaAs(assetId: string): Promise<'saved' | 'cancelled' | 'downloading'> {
+  // 휴대폰 몸소: 저장 창이 없어 브라우저가 내려받는다(저장했는지는 알 수 없어 'downloading', 알림 없음).
+  if (isNetworkRuntime()) {
+    const link = document.createElement('a')
+    link.href = serverMediaDownloadPath(assetId)
+    link.download = ''
+    link.click()
+    return 'downloading'
+  }
   const result = await invoke<{ status?: string } | null>('media_save_as', { assetId })
   return result?.status === 'saved' ? 'saved' : 'cancelled'
 }
@@ -105,5 +116,7 @@ export async function saveMediaAs(assetId: string) {
 /** 화면에 보일 주소. 로컬 경로는 Tauri 의 주소로 바꾸고, 이미 주소(data:, http:)면 그대로. */
 export function mediaSrc(path: string | null) {
   if (!path) return null
+  // 휴대폰 몸소: server 의 같은 출처 주소(/media/…/download)는 그대로.
+  if (isNetworkRuntime() && path.startsWith('/')) return path
   return /^(data:|https?:|blob:)/.test(path) ? path : convertFileSrc(path)
 }

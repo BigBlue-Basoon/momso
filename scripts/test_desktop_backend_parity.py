@@ -57,7 +57,7 @@ class ParityTest(unittest.TestCase):
                 package = directory / 'apps/alpha/desktop/package.json'
                 package.parent.mkdir(parents=True)
                 package.write_text(json.dumps({'scripts': {'build:bundle': 'node scripts/prepare-node.mjs && npm run build'}}), encoding='utf-8')
-            for name in ('.github/ISSUE_TEMPLATE/private.md', '.github/pull_request_template.md', 'docs/development/private.md'):
+            for name in ('.github/ISSUE_TEMPLATE/private.md', '.github/pull_request_template.md', '.github/workflows/momso-server-linux.yml', 'docs/development/private.md'):
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('private', encoding='utf-8')

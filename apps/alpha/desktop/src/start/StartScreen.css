@@ -1,0 +1,61 @@
+/* 휴대폰에서 시작하기(StartScreen.tsx). 첫 실행(FirstRun.css)의 바탕·글 크기를 잇는다. 휴대폰이 먼저: 한 줄 칸, 안전 영역, 단추는 엄지가 닿는 가득 너비. */
+/* 시작 페이지로 빌드했을 때만(main.tsx 가 html 에 is-start-page). 데스크톱·휴대폰 채팅 앱에는 닿지 않는다. */
+html.is-start-page, html.is-start-page body, html.is-start-page #root { height: auto; min-height: 100%; }
+.start-page { min-height: 100dvh; box-sizing: border-box; display: flex; justify-content: center; padding: max(32px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); background: #f8f9f7; color: var(--ink); }
+.start-column { width: min(440px, 100%); display: flex; flex-direction: column; gap: 18px; margin: auto 0; animation: start-in 320ms var(--material-ease, ease); }
+.start-head { display: grid; gap: 8px; }
+.start-head h1 { margin: 0; font-size: 22px; font-weight: 700; line-height: 1.35; letter-spacing: 0; word-break: keep-all; }
+.start-head h1:focus { outline: none; }
+.start-head p { margin: 0; color: var(--muted); font-size: 13.5px; line-height: 1.65; word-break: keep-all; }
+.start-mark { width: 56px; height: 56px; border-radius: 14px; margin-bottom: 6px; }
+.start-done-mark { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; margin-bottom: 4px; background: var(--ink); color: var(--surface); }
+.start-what { padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.start-what h2, .start-home h2 { margin: 0 0 8px; font-size: 13px; font-weight: 700; }
+.start-what ol, .start-home ol { margin: 0; padding-left: 20px; display: grid; gap: 6px; font-size: 13.5px; line-height: 1.6; color: var(--ink-soft); word-break: keep-all; }
+.start-cost, .start-small { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.6; word-break: keep-all; }
+.start-actions { display: flex; flex-direction: column; gap: 10px; padding-top: 4px; }
+.start-primary, .start-secondary { min-height: 46px; box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; gap: 10px; padding: 0 18px; border-radius: 10px; font: inherit; font-size: 14.5px; font-weight: 600; text-decoration: none; cursor: pointer; }
+.start-primary { border: 0; background: var(--ink); color: var(--surface); }
+.start-primary img { width: 18px; height: 18px; padding: 3px; border-radius: 50%; background: #fff; }
+.start-secondary { border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); }
+.start-link { align-self: center; min-height: 40px; padding: 0 8px; border: 0; background: none; color: var(--ink-soft); font: inherit; font-size: 13.5px; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.start-status { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--muted); font-size: 13px; }
+.start-problem { margin: 0; padding: 12px 14px; border-radius: 10px; background: color-mix(in srgb, var(--coral) 9%, var(--surface)); color: var(--ink); font-size: 13.5px; line-height: 1.6; word-break: keep-all; }
+.start-steps { margin: 0; padding: 4px 16px; list-style: none; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.start-steps li { display: flex; align-items: center; gap: 12px; min-height: 44px; font-size: 14px; color: var(--ink); }
+.start-steps li + li { border-top: 1px solid var(--line); }
+.start-steps li.is-waiting { color: var(--muted); }
+.start-steps li.is-failed { color: var(--coral); }
+.start-step-mark { width: 22px; height: 22px; flex: none; display: grid; place-items: center; border-radius: 50%; border: 1.5px solid var(--line-strong); box-sizing: border-box; }
+.is-working .start-step-mark { border-color: transparent; }
+.is-done .start-step-mark { border-color: var(--ink); background: var(--ink); color: var(--surface); }
+.start-steps li.is-pending { color: var(--ink-soft); }
+.is-pending .start-step-mark { border-style: dashed; color: var(--ink-soft); }
+.start-remaining { margin: 0; padding: 4px 16px; list-style: none; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.start-remaining li { display: flex; align-items: center; min-height: 40px; font-size: 14px; color: var(--ink); }
+.start-remaining li + li { border-top: 1px solid var(--line); }
+.is-failed .start-step-mark { border-color: var(--coral); background: var(--coral); color: var(--surface); }
+.start-address { display: grid; gap: 6px; }
+.start-address-label { font-size: 12.5px; color: var(--muted); }
+.start-address-row { display: flex; align-items: center; gap: 6px; padding: 6px 6px 6px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.start-address-row code, .start-found code { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; line-height: 1.5; }
+.start-note { margin: 0; color: var(--muted); font-size: 12.5px; }
+.start-home { display: grid; gap: 10px; padding-top: 6px; border-top: 1px solid var(--line); }
+.start-home h2 { margin: 8px 0 0; }
+.start-home > p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; word-break: keep-all; }
+.start-home-guide { padding: 12px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.start-home-guide h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+.start-found { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+.start-found li { display: flex; align-items: center; gap: 10px; padding: 10px 10px 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.start-found .start-secondary { min-height: 38px; font-size: 13.5px; }
+/* S64 고르기: 앱 설정의 고르기 칸(App.css .setting-field)을 그대로 쓰고, 휴대폰 한 줄 칸에 맞게 이름을 위로. 16px 는 아이폰이 칸을 누를 때 확대하지 않는 크기. */
+.start-choose { margin: 0; padding: 2px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.start-page .setting-field { grid-template-columns: minmax(0, 1fr); gap: 6px; padding: 12px 0; font-size: 13px; }
+.start-page .setting-field + .setting-field { border-top: 1px solid var(--line); }
+.start-page .setting-field > span { padding-top: 0; color: var(--ink); }
+.start-page .setting-field select { height: 44px; border-radius: 8px; font-size: 16px; }
+.start-page .setting-field small { grid-column: 1; color: var(--muted); font-size: 12.5px; line-height: 1.5; word-break: keep-all; }
+.start-primary:disabled { opacity: 0.45; cursor: default; }
+.start-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@keyframes start-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .start-column { animation: none; } }

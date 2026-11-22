@@ -1,0 +1,69 @@
+/* 확장 프로그램(퍼즐 단추·메뉴·관리 화면·고정 단추). 어사이드 aside-2·3·4 꼴을 몸소 색으로. */
+.ext-icon { width: 20px; height: 20px; flex: none; display: grid; place-items: center; border-radius: 5px; background: var(--surface-muted, #eef1ee); color: var(--ink-soft); font-size: 9.5px; font-weight: 700; letter-spacing: 0; }
+.ext-icon.is-large { width: 36px; height: 36px; border-radius: 9px; font-size: 13px; }
+.ext-icon svg { color: var(--muted); }
+/* 확장의 진짜 그림이 있으면 회색 칸 없이 같은 자리·크기에 그림만(S41). */
+.ext-icon.has-image { background: none; }
+.ext-icon img { width: 100%; height: 100%; display: block; object-fit: contain; }
+
+/* 퍼즐 메뉴 */
+.ext-menu { display: flex; flex-direction: column; padding: 6px; }
+.ext-menu-item { display: flex; align-items: center; gap: 9px; min-height: 32px; padding: 0 10px; border: 0; border-radius: 7px; background: none; color: var(--ink); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.ext-menu-item:hover, .ext-menu-item:focus-visible { background: var(--hover, rgba(40, 43, 42, 0.06)); outline: none; }
+.ext-menu-item svg { color: var(--muted); }
+.ext-menu-rule { width: 100%; margin: 5px 0; border: 0; border-top: 1px solid var(--line); }
+.ext-menu-label { margin: 4px 10px 4px; color: var(--muted); font-size: 11.5px; }
+.ext-menu-note { display: flex; align-items: center; gap: 7px; margin: 4px 10px 8px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.ext-menu-row { display: flex; align-items: center; gap: 9px; min-height: 34px; padding: 0 4px 0 10px; border-radius: 7px; font-size: 13px; }
+.ext-menu-row:hover, .ext-menu-row:focus-within { background: var(--hover, rgba(40, 43, 42, 0.06)); }
+.ext-menu-name { flex: 1; min-width: 0; overflow: hidden; color: var(--ink); text-overflow: ellipsis; white-space: nowrap; }
+.ext-menu-row.is-off .ext-menu-name { color: var(--muted); }
+.ext-off { color: var(--muted); font-size: 11.5px; }
+.ext-pin { width: 26px; height: 26px; opacity: 0; }
+.ext-pin.is-pinned, .ext-menu-row:hover .ext-pin, .ext-menu-row:focus-within .ext-pin, .ext-card .ext-pin { opacity: 1; }
+.ext-pin.is-pinned { color: var(--accent, #2f6fd6); }
+.ext-row-menu-name { margin: 2px 10px 4px; color: var(--muted); font-size: 11.5px; }
+
+/* 떠 있는 창 안의 메뉴 카드(창 = 카드 + 그림자 자리) / 떠 있는 창이 없을 때 화면 안 */
+.ext-menu-card { position: absolute; overflow: auto; border: 1px solid var(--line); border-radius: 12px; outline: 0; background: var(--surface-soft); box-shadow: 0 12px 32px rgba(35, 42, 38, 0.18), 0 3px 10px rgba(35, 42, 38, 0.08); }
+.ext-menu-card.is-inline { position: fixed; z-index: 30; }
+
+/* 주소 줄의 고정한 확장 단추 */
+.ext-bar-button { width: 28px; height: 28px; padding: 0; }
+.ext-bar-button .ext-icon { width: 18px; height: 18px; font-size: 8.5px; }
+.ext-bar-button[aria-expanded='true'] { background: var(--hover, rgba(40, 43, 42, 0.08)); }
+
+/* 관리 화면(패널 브라우저 자리) */
+.ext-page { position: absolute; inset: 0; overflow: auto; display: flex; flex-direction: column; gap: 14px; padding: 22px 24px 32px; background: var(--surface); color: var(--ink); }
+.ext-page-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.ext-page-head h2 { display: inline-flex; align-items: center; gap: 8px; margin: 0; font-size: 18px; font-weight: 700; }
+.ext-page-count { color: var(--muted); font-size: 12.5px; }
+.ext-store { display: flex; align-items: flex-end; gap: 8px; }
+.ext-field { flex: 1; min-width: 0; display: grid; gap: 6px; font-size: 12.5px; color: var(--ink-soft); }
+.ext-field input { height: 36px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font: inherit; font-size: 13px; }
+.ext-field input:focus { outline: none; border-color: var(--ink-soft); }
+.ext-primary { height: 36px; }
+.ext-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ext-actions .secondary-button, .ext-primary { display: inline-flex; align-items: center; gap: 6px; }
+.ext-note { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.6; word-break: keep-all; }
+.ext-message { margin: 0; color: var(--ink-soft); font-size: 12.5px; }
+.ext-message.is-alert { color: var(--coral); }
+.ext-import { display: grid; gap: 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-soft); }
+.ext-import h3, .ext-list-title { margin: 0; font-size: 13px; font-weight: 700; }
+.ext-candidates { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.ext-candidates li { display: flex; align-items: center; gap: 10px; min-height: 40px; }
+.ext-candidate-text { flex: 1; min-width: 0; display: grid; font-size: 12.5px; }
+.ext-candidate-text strong { overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ext-candidate-text span { color: var(--muted); }
+.ext-cards { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+.ext-card { display: flex; align-items: center; gap: 12px; padding: 14px 14px 14px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 1px 2px rgba(35, 42, 38, 0.04); }
+.ext-card.is-off .ext-card-text strong { color: var(--muted); }
+.ext-card-text { flex: 1; min-width: 0; display: grid; gap: 3px; }
+.ext-card-text strong { overflow: hidden; font-size: 13.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.ext-card-id { overflow: hidden; color: var(--muted); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; }
+.ext-card-actions { display: flex; align-items: center; gap: 4px; }
+.ext-switch { position: relative; width: 34px; height: 20px; margin-left: 6px; padding: 0; border: 0; border-radius: 999px; background: var(--line-strong); cursor: pointer; transition: background 160ms; }
+.ext-switch span { position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: transform 160ms; }
+.ext-switch.is-on { background: var(--ink); }
+.ext-switch.is-on span { transform: translateX(14px); }
+.ext-switch:disabled { opacity: 0.5; cursor: default; }

@@ -1,0 +1,396 @@
+/* 네트워크 길(momso server)로 연 화면(2026-11-21 momso mobile 첫 걸음). 데스크톱(Tauri)에는 data-host 가 붙지 않아 이 파일의 칸 꼴이 닿지 않는다. */
+
+/* ---- 휴대폰 홈 화면 앱(2026-11-21): 화면 높이는 키보드를 뺀 보이는 높이(--app-height, main.tsx 가 visualViewport 로 잰다),
+   노치·상태 줄·홈 막대 자리는 안전 영역(env)만큼 비운다. 데스크톱(Tauri)은 html 에 is-network-app 이 붙지 않아 닿지 않는다. ---- */
+html.is-network-app,
+html.is-network-app body,
+html.is-network-app #root {
+  height: var(--app-height, 100dvh);
+  min-height: 0;
+}
+
+html.is-network-app .desktop-shell[data-host='network'],
+html.is-network-app .server-gate {
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top);
+  padding-right: env(safe-area-inset-right);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+}
+
+html.is-network-app .server-gate {
+  padding-top: max(24px, env(safe-area-inset-top));
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
+}
+
+/* ---- 문: 처음 확인하는 동안 / 로그인이 풀림 / 닿지 못함 (ServerGate) ---- */
+.server-gate {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  padding: 24px 16px;
+  background: var(--surface-soft);
+}
+
+/* 쓰는 중에 로그인이 풀리면 채팅 화면 위를 덮는다. */
+.server-gate.server-gate-cover {
+  position: fixed;
+  z-index: 90;
+  inset: 0;
+  background: rgba(26, 30, 28, 0.34);
+}
+
+.server-gate-checking {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.server-gate-card {
+  display: grid;
+  width: min(100%, 380px);
+  gap: 12px;
+  padding: 28px 24px 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.server-gate-card h1 {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.server-gate-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.server-gate-button {
+  display: inline-flex;
+  height: 40px;
+  align-items: center;
+  justify-content: center;
+  margin-top: 4px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--ink);
+  color: #ffffff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* ---- AI 연결(ServerAiConnect): 같은 카드 안에 회사 한 줄과 로그인 코드 카드(화면 안 꼴). 휴대폰 한 손으로 누르게 단추는 가로 가득. ---- */
+.server-ai {
+  width: min(100%, 400px);
+}
+
+.server-ai-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.server-ai-row strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.server-ai-row .provider-state {
+  margin-left: auto;
+}
+
+.server-ai-mark {
+  width: 28px;
+  height: 28px;
+}
+
+/* 클로드·제미나이 줄(S55): 같은 줄 꼴에 데스크톱의 API 키 칸을 아래로 한 줄 가득. */
+.server-ai-row.is-key {
+  flex-wrap: wrap;
+}
+
+.server-ai-row.is-key .provider-key,
+.server-ai-row.is-key .provider-error {
+  flex-basis: 100%;
+}
+
+.server-ai-row.is-key .provider-key-form {
+  min-width: 0;
+}
+
+.server-ai .server-gate-button {
+  min-height: 44px;
+}
+
+.server-gate-card .server-ai-hint,
+.server-gate-card .server-ai-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.server-gate-card .server-ai-problem {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--coral);
+  font-size: 12.5px;
+}
+
+/* ---- 네트워크 길의 칸 꼴: 아이콘 띠(문서·사진과 동영상·설정)는 server 에 없어 그리지 않는다. 목록과 대화 두 칸. ---- */
+.desktop-shell[data-host='network'] .activity-rail {
+  display: none;
+}
+
+.desktop-shell[data-host='network'] .workbench-body > .workbench-grid {
+  grid-template-columns: clamp(220px, 20vw, 282px) minmax(0, 1fr);
+}
+
+.desktop-shell[data-host='network'] .workbench-body[data-list-hidden='true'] > .workbench-grid {
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+
+/* ---- 휴대폰 몸소의 문서(S34, NetworkDocuments): 데스크톱의 문서 화면(목록·대화 칸을 숨기고 패널을 넓힘) 대신 대화 칸 자리에 읽기 화면.
+   사진과 동영상(S75 셋째)도 같은 자리. ---- */
+.desktop-shell[data-host='network'] .workbench-body[data-screen='documents'] > .workbench-grid,
+.desktop-shell[data-host='network'] .workbench-body[data-screen='media'] > .workbench-grid {
+  flex: 1 1 auto;
+  grid-template-columns: clamp(220px, 20vw, 282px) minmax(0, 1fr);
+}
+
+.network-docs { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--surface); }
+.network-docs-head { display: flex; align-items: center; gap: 8px; min-height: 56px; padding: 0 16px; border-bottom: 1px solid var(--line); }
+.network-docs-head h1 { margin: 0; min-width: 0; overflow: hidden; font-size: 15px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.network-docs-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 16px calc(24px + env(safe-area-inset-bottom)); }
+.network-docs-note { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px 0; color: var(--muted); font-size: 13px; }
+.network-docs-folder + .network-docs-folder { margin-top: 14px; }
+.network-docs-folder h2 { margin: 6px 4px 6px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.network-docs-folder ul { margin: 0; padding: 0; list-style: none; }
+.network-docs-row { width: 100%; min-height: 48px; display: flex; align-items: center; gap: 10px; padding: 0 10px; border: 0; border-radius: 10px; background: none; color: var(--ink); font: inherit; text-align: left; cursor: pointer; }
+.network-docs-row:hover, .network-docs-row:focus-visible { background: var(--surface-muted, #f1f3f1); outline: none; }
+.network-docs-row svg { flex: none; color: var(--muted); }
+.network-docs-title { flex: 1; min-width: 0; overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.network-docs-day { flex: none; color: var(--muted); font-size: 12px; }
+.network-doc { max-width: 720px; margin: 0 auto; font-size: 15px; line-height: 1.7; }
+.network-doc-meta { margin: 4px 0 12px; color: var(--muted); font-size: 12.5px; }
+/* 고치기(S75): 데스크톱 문서의 고치기 칸을 그대로(제목·요약 머리, 취소·저장 줄, 본문 칸). 머리 줄 오른쪽 끝에 "수정"·"새 폴더". */
+.network-docs-body.is-editing { padding: 0 0 env(safe-area-inset-bottom); }
+.network-docs-head .zet-edit-start,
+.network-docs-tool { display: inline-flex; flex: none; align-items: center; gap: 6px; margin-left: auto; }
+.network-docs-naming { margin-bottom: 6px; border-radius: 10px; }
+.network-docs-folder > .network-docs-note { margin: 2px 4px 6px; }
+/* 폴더 머리의 … 메뉴(이름 바꾸기)와 본문·이전 버전 두 보기(데스크톱 보기 줄은 세 칸이라 두 칸으로). S75 둘째. */
+.network-docs-folder-head { position: relative; }
+.network-docs-folder-head h2 { padding-right: 32px; }
+.network-doc-views { max-width: 240px; margin: 2px 0 14px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.network-doc-views .glass-slider { width: calc((100% - 8px) / 2); }
+.network-doc-views[data-active='history'] .glass-slider { transform: translateX(calc(100% + 2px)); }
+
+/* ---- 휴대폰 몸소의 설정(S75: 보관된 채팅방·스킬·용어 사전): 왼쪽 목록이 없는 화면이라 설정이 한 칸 전체. ---- */
+.desktop-shell[data-host='network'] .workbench-body[data-screen='settings'] > .workbench-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* 데스크톱의 설정은 아이콘 띠 다음 칸부터(grid-column 2). 휴대폰 몸소에는 띠가 없어 첫 칸부터. */
+.desktop-shell[data-host='network'] .settings-workspace {
+  grid-column: 1 / -1;
+}
+
+/* 목록 단추와 뒤 가림은 휴대폰 너비에서만. */
+.network-menu,
+.network-backdrop {
+  display: none;
+}
+
+/* ---- 휴대폰 너비(640 아래): ChatGPT·Gemini 휴대폰 화면처럼 대화가 화면 가득, 맨 위 줄 왼쪽 단추로 채팅방 목록이 왼쪽에서 밀려 들어온다
+   (화면을 옅게 가리고, 바깥을 누르거나 방을 고르면 닫힘). 입력 칸은 아래. 오른쪽 패널(문서·브라우저)은 휴대폰에서 다루지 않는다. ---- */
+@media (max-width: 640px) {
+  .desktop-shell[data-host='network'] .workbench-body > .workbench-grid,
+  .desktop-shell[data-host='network'] .workbench-body[data-list-hidden='true'] > .workbench-grid,
+  .desktop-shell[data-host='network'] .workbench-body[data-screen='documents'] > .workbench-grid,
+  .desktop-shell[data-host='network'] .workbench-body[data-screen='media'] > .workbench-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 데스크톱의 사진과 동영상은 아이콘 띠 다음 칸부터. 휴대폰에서는 목록이 밀려 들어오는 칸이라 첫 칸부터. */
+  .desktop-shell[data-host='network'] .media-view {
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  /* 맨 위 줄이 좁아 제목과 거르기·찾기가 한 줄에 들어가지 않는다: 목록 단추·제목(문서 화면 머리와 같은 크기) 아래 줄에 거르기와 찾기를 폭 가득. */
+  .desktop-shell[data-host='network'] .media-header {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 8px;
+    min-height: 56px;
+    padding: 10px 16px;
+  }
+
+  .desktop-shell[data-host='network'] .media-header h1 {
+    font-size: 15px;
+    white-space: nowrap;
+  }
+
+  .desktop-shell[data-host='network'] .media-tools {
+    flex: 1 1 100%;
+  }
+
+  .desktop-shell[data-host='network'] .media-kinds button {
+    white-space: nowrap;
+  }
+
+  .desktop-shell[data-host='network'] .media-search {
+    flex: 1 1 auto;
+    width: auto;
+  }
+
+  .desktop-shell[data-host='network'] .media-scroll {
+    padding: 4px 16px calc(32px + env(safe-area-inset-bottom));
+  }
+
+  .desktop-shell[data-host='network'] .task-sidebar {
+    position: fixed;
+    z-index: 50;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    width: min(85vw, 320px);
+    border-right: 1px solid var(--line);
+    box-shadow: 0 18px 44px rgba(35, 42, 38, 0.18);
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition: transform 240ms var(--material-ease), visibility 0s linear 240ms;
+  }
+
+  .desktop-shell[data-host='network'][data-mobile-list='open'] .task-sidebar {
+    transform: none;
+    visibility: visible;
+    transition: transform 240ms var(--material-ease), visibility 0s;
+  }
+
+  .desktop-shell[data-host='network'][data-mobile-list='open'] .network-backdrop {
+    position: fixed;
+    z-index: 49;
+    display: block;
+    inset: 0;
+    border: 0;
+    background: rgba(26, 30, 28, 0.34);
+  }
+
+  .desktop-shell[data-host='network'] .network-menu {
+    display: inline-grid;
+    flex: none;
+    margin-left: -6px;
+  }
+
+  .desktop-shell[data-host='network'] .assistant-panel {
+    min-width: 0;
+  }
+
+  /* 설정(S75): 데스크톱의 왼쪽 쪽 목록(188px)이 들어가지 않아 맨 위 한 줄로 두고, 쪽은 그 아래 화면 가득. */
+  .desktop-shell[data-host='network'] .settings-header {
+    padding: calc(10px + env(safe-area-inset-top)) 12px 9px 16px;
+  }
+
+  .desktop-shell[data-host='network'] .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .desktop-shell[data-host='network'] .settings-navigation {
+    flex-direction: row;
+    overflow-x: auto;
+    padding: 8px 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .desktop-shell[data-host='network'] .settings-navigation button {
+    width: auto;
+    flex: none;
+  }
+
+  .desktop-shell[data-host='network'] .settings-page {
+    padding: 22px 16px calc(48px + env(safe-area-inset-bottom));
+  }
+
+  /* 설정의 이름·칸 두 칸(이름 150px)이 들어가지 않아 시작 화면(StartScreen.css)처럼 이름을 칸 위로. */
+  .desktop-shell[data-host='network'] .settings-page .setting-field {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .desktop-shell[data-host='network'] .settings-page .setting-field > span {
+    padding-top: 0;
+  }
+
+  .desktop-shell[data-host='network'] .settings-page .setting-field small {
+    grid-column: 1;
+  }
+
+  /* 한 번 묻는 창(QuestionDialog): 단추 셋이 한 줄에 들어가지 않으면 단추째 다음 줄로(글자가 단추 안에서 끊기지 않게). 창 밖 여백도 줄인다. */
+  html.is-network-app .zet-confirm-backdrop {
+    padding: 16px;
+  }
+
+  html.is-network-app .zet-confirm-actions {
+    flex-wrap: wrap;
+  }
+
+  html.is-network-app .zet-confirm-actions button {
+    white-space: nowrap;
+  }
+
+  /* 보관된 채팅방 줄의 되돌리기: 손가락으로는 줄에 올릴 수 없어 늘 보이게 한다. */
+  .desktop-shell[data-host='network'] .archived-actions {
+    opacity: 1;
+  }
+
+  /* 채팅방 줄의 고정·보관 단추: 손가락으로는 줄에 올릴 수 없어 늘 보이게 하고 그 자리를 비운다. */
+  .desktop-shell[data-host='network'] .chat-keep {
+    opacity: 1;
+  }
+
+  .desktop-shell[data-host='network'] .chat-row-item.has-keep .chat-row {
+    padding-right: 58px;
+  }
+
+  /* 묶음(S75 둘째): 줄과 묶음 머리의 … 메뉴도 늘 보이게 하고, 고정·보관 단추를 그 왼쪽으로. */
+  .desktop-shell[data-host='network'] .chat-more {
+    opacity: 1;
+  }
+
+  .desktop-shell[data-host='network'] .chat-row-item.has-keep.has-more .chat-row {
+    padding-right: 84px;
+  }
+
+  /* iOS 는 16px 보다 작은 글 칸에 초점이 가면 화면을 키운다. */
+  .desktop-shell[data-host='network'] textarea,
+  .desktop-shell[data-host='network'] input {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .desktop-shell[data-host='network'] .task-sidebar {
+    transition: none;
+  }
+}

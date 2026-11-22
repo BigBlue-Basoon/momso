@@ -11,21 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Element {
-    pub id: String,
-    pub role: String,
-    pub name: String,
-    pub kind: &'static str,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PageState {
-    pub origin: String,
-    pub title: String,
-    pub text: String,
-    pub elements: Vec<Element>,
-    pub data_provenance: &'static str,
-}
+pub(crate) use crate::browser_engine::{DriverError, Element, PageState};
 
 fn has_login_button(page: &PageState) -> bool {
     page.elements.iter().any(|element| {
@@ -35,14 +21,6 @@ fn has_login_button(page: &PageState) -> bool {
                 "로그인" | "sign in" | "log in"
             )
     })
-}
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DriverError {
-    Unavailable,
-    Blocked(String),
-    HumanRequired(&'static str),
-    Refused(&'static str),
-    TargetChanged,
 }
 
 /// Run the authentication check in the same JavaScript execution before an
@@ -678,6 +656,7 @@ impl Session {
         &self,
         target: &SavedLoginTarget,
         secret: crate::saved_logins::LoginSecret,
+        submit: bool,
     ) -> Result<(), DriverError> {
         if self.panel.is_none()
             || self.webauthn_pending.load(Ordering::Acquire)
@@ -714,7 +693,7 @@ impl Session {
           const set=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
           set.call(s.user,{username});s.user.dispatchEvent(new Event('input',{{bubbles:true}}));if(!valid())return 'changed';
           set.call(s.password,{password});s.password.dispatchEvent(new Event('input',{{bubbles:true}}));if(!valid())return 'changed';
-          if(s.method!=='post')s.form.addEventListener('submit',e=>e.preventDefault(),{{capture:true,once:true}});HTMLElement.prototype.click.call(s.button);return 'ok';}})()"#
+          if({submit}){{if(s.method!=='post')s.form.addEventListener('submit',e=>e.preventDefault(),{{capture:true,once:true}});HTMLElement.prototype.click.call(s.button);}}return 'ok';}})()"#
         );
         let value = self.call("Runtime.evaluate", json!({"expression":expression,"contextId":target.context,"returnByValue":true,"awaitPromise":false}))?;
         if value.get("exceptionDetails").is_some()
@@ -1437,6 +1416,48 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+impl crate::browser_engine::BrowserEngine for Session {
+    fn navigate(&mut self, url: &str) -> Result<PageState, DriverError> {
+        Session::navigate(self, url)
+    }
+    fn read(&mut self) -> Result<PageState, DriverError> {
+        Session::read(self)
+    }
+    fn scroll(&mut self, direction: &str, origin: &str) -> Result<(), DriverError> {
+        let offset = match direction {
+            "down" => 600,
+            "up" => -600,
+            _ => return Err(DriverError::Unavailable),
+        };
+        let origin = serde_json::to_string(origin).map_err(|_| DriverError::Unavailable)?;
+        let script = format!(
+            "(()=>{{if(location.origin!=={origin})return false;window.scrollBy(0,{offset});return true}})()"
+        );
+        if self.eval(&script)?.as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(DriverError::TargetChanged)
+        }
+    }
+    fn click_checked(
+        &mut self,
+        id: &str,
+        name: &str,
+        origin: Option<&str>,
+    ) -> Result<(), DriverError> {
+        Session::click_checked(self, id, name, origin)
+    }
+    fn fill_checked(
+        &mut self,
+        id: &str,
+        text: &str,
+        name: Option<&str>,
+        origin: Option<&str>,
+    ) -> Result<(), DriverError> {
+        Session::fill_checked(self, id, text, name, origin)
     }
 }
 

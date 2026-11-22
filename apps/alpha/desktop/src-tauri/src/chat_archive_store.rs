@@ -434,9 +434,7 @@ fn known_values_with(
             known.push(value);
         }
     }
-    if let Some(value) = get_secret(crate::saved_logins::VAULT)? {
-        known.extend(crate::saved_logins::passwords_from_serialized(&value)?);
-    }
+    known.extend(crate::saved_logins::passwords_with(&get_secret)?);
     if let Some(config) = crate::object_store::load_config(data_root)? {
         let (access, secret) = get_object_keys(&config)?;
         known.push(access);

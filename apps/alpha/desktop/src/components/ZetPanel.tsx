@@ -146,7 +146,7 @@ function formatDateTime(value: string) {
   return Number.isNaN(date.getTime()) ? value : dateTimeFormat.format(date)
 }
 
-function formatDateTimeSeconds(value: string) {
+export function formatDateTimeSeconds(value: string) {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : dateTimeSecondsFormat.format(date)
 }
@@ -2111,7 +2111,8 @@ function LinkedView({
   )
 }
 
-function VersionView({
+/** 지난 판 하나(데스크톱 문서의 "이전 버전"). 휴대폰 몸소의 문서 화면도 그대로 쓴다. */
+export function VersionView({
   id,
   entry,
   latestRevision,

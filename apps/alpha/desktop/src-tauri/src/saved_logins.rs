@@ -1,15 +1,15 @@
-//! Saved site logins. The single serialized vault lives only in the OS credential store.
+//! Saved site logins. Each record lives in its own OS credential-store entry.
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Mutex, OnceLock},
 };
+use tauri::Manager;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) const VAULT: &str = "browser:saved-logins:v1";
-// Windows generic credentials have a bounded blob size; reject rather than truncate.
-const MAX_VAULT_BYTES: usize = 2200;
+const SLOT_PREFIX: &str = "browser:saved-logins:v2:slot:";
 static LOCK: Mutex<()> = Mutex::new(());
 
 struct PendingSelection {
@@ -142,7 +142,7 @@ async fn select_for_person_with_timeout(
         .ok_or("unavailable")
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Entry {
     id: String,
@@ -156,6 +156,14 @@ struct Entry {
     login_path: Option<String>,
     #[serde(default)]
     default_for_path: bool,
+    #[serde(default)]
+    site_url: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    favorite: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -168,6 +176,18 @@ pub(crate) struct LoginInfo {
     pub(crate) ask_before_use: bool,
     pub(crate) login_path: Option<String>,
     pub(crate) default_for_path: bool,
+    pub(crate) site_url: Option<String>,
+    pub(crate) created_at: Option<String>,
+    pub(crate) updated_at: Option<String>,
+    pub(crate) favorite: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LoginListItem {
+    #[serde(flatten)]
+    info: LoginInfo,
+    icon_data_url: Option<String>,
 }
 
 pub(crate) struct LoginSecret {
@@ -199,8 +219,33 @@ pub(crate) fn for_origin(value: &str) -> Result<Vec<LoginInfo>, &'static str> {
             ask_before_use: entry.ask_before_use,
             login_path: entry.login_path,
             default_for_path: entry.default_for_path,
+            site_url: entry.site_url,
+            created_at: entry.created_at,
+            updated_at: entry.updated_at,
+            favorite: entry.favorite,
         })
         .collect())
+}
+
+pub(crate) fn info_for_id(id: &str) -> Result<LoginInfo, &'static str> {
+    let _guard = LOCK.lock().map_err(|_| "credential_store_unavailable")?;
+    let entry = read()?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .ok_or("not_found")?;
+    Ok(LoginInfo {
+        id: entry.id,
+        origin: entry.origin,
+        label: entry.label,
+        username: entry.username,
+        ask_before_use: entry.ask_before_use,
+        login_path: entry.login_path,
+        default_for_path: entry.default_for_path,
+        site_url: entry.site_url,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+        favorite: entry.favorite,
+    })
 }
 
 pub(crate) fn match_login_path(mut entries: Vec<LoginInfo>, path: &str) -> Vec<LoginInfo> {
@@ -372,9 +417,6 @@ fn used_passwords() -> &'static Mutex<HashSet<String>> {
 
 pub(crate) fn remember_used_password(value: &str) -> Result<(), &'static str> {
     let mut used = used_passwords().lock().map_err(|_| "unavailable")?;
-    if used.len() >= 1024 && !used.contains(value) {
-        return Err("unavailable");
-    }
     used.insert(value.to_owned());
     Ok(())
 }
@@ -393,6 +435,10 @@ pub(crate) struct LoginInput {
     login_path: Option<String>,
     #[serde(default)]
     default_for_path: Option<bool>,
+    #[serde(default)]
+    site_url: Option<String>,
+    #[serde(default)]
+    favorite: Option<bool>,
 }
 
 fn origin(value: &str) -> Result<String, &'static str> {
@@ -416,20 +462,73 @@ fn valid_text(value: &str, max: usize) -> bool {
 }
 
 fn allowed_caller(label: &str) -> Result<(), &'static str> {
-    if label == "main" {
+    if label == "main" || label == crate::panel_overlay::WEBVIEW {
         Ok(())
     } else {
         Err("unavailable")
     }
 }
 
-fn read() -> Result<Vec<Entry>, &'static str> {
-    let value =
-        crate::credentials::get_secret(VAULT).map_err(|_| "credential_store_unavailable")?;
-    match value {
-        None => Ok(Vec::new()),
-        Some(text) => serde_json::from_str(&text).map_err(|_| "credential_store_unavailable"),
+fn slot_name(index: usize) -> String {
+    format!("{SLOT_PREFIX}{index}")
+}
+
+#[path = "../saved-login-core/src/backend.rs"]
+mod credential_backend;
+use credential_backend::CredentialBackend;
+
+struct WindowsCredentialBackend;
+
+impl CredentialBackend for WindowsCredentialBackend {
+    fn get(&self, key: &str) -> Result<Option<String>, &'static str> {
+        crate::credentials::get_secret(key).map_err(|_| "credential_store_unavailable")
     }
+    fn put(&self, key: &str, value: &str) -> Result<(), &'static str> {
+        crate::credentials::put_secret_unlocked(key, value)
+            .map_err(|_| "credential_store_unavailable")
+    }
+    fn remove(&self, key: &str) -> Result<(), &'static str> {
+        crate::credentials::remove_secret_unlocked(key).map_err(|_| "credential_store_unavailable")
+    }
+}
+
+fn read_with(
+    get: &impl Fn(&str) -> Result<Option<String>, &'static str>,
+) -> Result<Vec<Entry>, &'static str> {
+    let mut entries: Vec<Entry> = match get(VAULT)? {
+        None => Vec::new(),
+        Some(text) => serde_json::from_str(&text).map_err(|_| "credential_store_unavailable")?,
+    };
+    let mut index = 0;
+    while let Some(text) = get(&slot_name(index))? {
+        let item: Option<Entry> =
+            serde_json::from_str(&text).map_err(|_| "credential_store_unavailable")?;
+        if let Some(item) = item {
+            entries.retain(|old| old.id != item.id);
+            entries.push(item);
+        }
+        index += 1;
+    }
+    Ok(entries)
+}
+
+fn read() -> Result<Vec<Entry>, &'static str> {
+    let backend = WindowsCredentialBackend;
+    let entries = read_with(&|name| backend.get(name))?;
+    // A failed migration leaves the old vault intact and does not prevent using it.
+    if backend.get(VAULT)?.is_some() {
+        let _ = write(&entries);
+    }
+    Ok(entries)
+}
+
+pub(crate) fn passwords_with(
+    get: &impl Fn(&str) -> Result<Option<String>, &'static str>,
+) -> Result<Vec<String>, &'static str> {
+    Ok(read_with(get)?
+        .into_iter()
+        .map(|entry| entry.password)
+        .collect())
 }
 
 pub(crate) fn passwords_from_serialized(value: &str) -> Result<Vec<String>, &'static str> {
@@ -445,29 +544,62 @@ fn retired_entries(old: Vec<Entry>, current: &[Entry]) -> Vec<Entry> {
 }
 
 fn write(entries: &[Entry]) -> Result<(), &'static str> {
-    let value = serde_json::to_string(entries).map_err(|_| "credential_store_unavailable")?;
-    if value.len() > MAX_VAULT_BYTES {
-        return Err("capacity_exceeded");
-    }
     let _guard =
         crate::credentials::prevent_secret_changes().map_err(|_| "credential_store_unavailable")?;
-    let previous =
-        crate::credentials::get_secret(VAULT).map_err(|_| "credential_store_unavailable")?;
-    if let Some(previous) = previous {
-        let old: Vec<Entry> =
-            serde_json::from_str(&previous).map_err(|_| "credential_store_unavailable")?;
-        let retired = retired_entries(old, entries);
-        if !retired.is_empty() {
+    let backend = WindowsCredentialBackend;
+    let get = |name: &str| backend.get(name);
+    let old = read_with(&get)?;
+    let retired = retired_entries(old.clone(), entries);
+    if !retired.is_empty() {
+        let encoded =
+            serde_json::to_string(&retired).map_err(|_| "credential_store_unavailable")?;
+        crate::redaction_wait::enqueue_unlocked(VAULT, &encoded)
+            .map_err(|_| "credential_store_unavailable")?;
+    }
+    crate::redaction_wait::watch_new_unlocked(VAULT).map_err(|_| "credential_store_unavailable")?;
+    let mut slots: Vec<Option<Entry>> = Vec::new();
+    while let Some(value) = get(&slot_name(slots.len()))? {
+        slots.push(serde_json::from_str(&value).map_err(|_| "credential_store_unavailable")?);
+    }
+    // First copy every old entry, so interrupting a legacy migration cannot lose it.
+    for entry in &old {
+        if !slots.iter().flatten().any(|saved| saved.id == entry.id) {
+            let index = slots.len();
             let encoded =
-                serde_json::to_string(&retired).map_err(|_| "credential_store_unavailable")?;
-            crate::redaction_wait::enqueue_unlocked(VAULT, &encoded)
-                .map_err(|_| "credential_store_unavailable")?;
+                serde_json::to_string(&Some(entry)).map_err(|_| "credential_store_unavailable")?;
+            backend.put(&slot_name(index), &encoded)?;
+            slots.push(Some(entry.clone()));
         }
     }
-    // Mark the new value for history checks before making it active.
-    crate::redaction_wait::watch_new_unlocked(VAULT).map_err(|_| "credential_store_unavailable")?;
-    crate::credentials::put_secret_unlocked(VAULT, &value)
-        .map_err(|_| "credential_store_unavailable")
+    backend.remove(VAULT)?;
+    for (index, slot) in slots.iter_mut().enumerate() {
+        if let Some(old) = slot.as_ref() {
+            let next = entries.iter().find(|entry| entry.id == old.id).cloned();
+            if *slot != next {
+                let encoded =
+                    serde_json::to_string(&next).map_err(|_| "credential_store_unavailable")?;
+                backend.put(&slot_name(index), &encoded)?;
+                *slot = next;
+            }
+        }
+    }
+    for entry in entries {
+        if !slots.iter().flatten().any(|saved| saved.id == entry.id) {
+            let index = slots
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or(slots.len());
+            let encoded =
+                serde_json::to_string(&Some(entry)).map_err(|_| "credential_store_unavailable")?;
+            backend.put(&slot_name(index), &encoded)?;
+            if index == slots.len() {
+                slots.push(Some(entry.clone()));
+            } else {
+                slots[index] = Some(entry.clone());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(all(test, windows))]
@@ -494,16 +626,50 @@ pub(crate) fn fixture_save_login(
             ask_before_use: Some(ask),
             login_path: None,
             default_for_path: None,
+
+            site_url: None,
+            favorite: None,
         },
     )?;
+    if std::env::var_os("MOMSO_S74_OTP").is_some() {
+        prepare_set(
+            &mut entries,
+            LoginInput {
+                id: None,
+                origin: site.into(),
+                label: "second fixture".into(),
+                username: "second-fixture".into(),
+                password: Some(password.into()),
+                ask_before_use: Some(ask),
+                login_path: None,
+                default_for_path: None,
+                site_url: None,
+                favorite: None,
+            },
+        )?;
+    }
+    write(&entries)
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn fixture_set_login_path(path: &str) -> Result<(), &'static str> {
+    if std::env::var_os("MOMSO_TEST_FAKE_CREDENTIAL_STORE").is_none() {
+        return Err("unavailable");
+    }
+    let _guard = LOCK.lock().map_err(|_| "unavailable")?;
+    let mut entries = read()?;
+    let entry = entries.first_mut().ok_or("not_found")?;
+    entry.login_path = Some(path.to_owned());
     write(&entries)
 }
 
 #[tauri::command]
-pub(crate) fn saved_login_list(webview: tauri::Webview) -> Result<Vec<LoginInfo>, &'static str> {
+pub(crate) fn saved_login_list(
+    webview: tauri::Webview,
+) -> Result<Vec<LoginListItem>, &'static str> {
     allowed_caller(webview.label())?;
     let _guard = LOCK.lock().map_err(|_| "credential_store_unavailable")?;
-    Ok(read()?
+    let entries: Vec<LoginInfo> = read()?
         .into_iter()
         .map(|entry| LoginInfo {
             id: entry.id,
@@ -513,8 +679,194 @@ pub(crate) fn saved_login_list(webview: tauri::Webview) -> Result<Vec<LoginInfo>
             ask_before_use: entry.ask_before_use,
             login_path: entry.login_path,
             default_for_path: entry.default_for_path,
+            site_url: entry.site_url,
+            created_at: entry.created_at,
+            updated_at: entry.updated_at,
+            favorite: entry.favorite,
+        })
+        .collect();
+    let icons = crate::saved_login_icons::cache_root(webview.app_handle())
+        .map(|root| {
+            crate::saved_login_icons::icons_for_origins(
+                &root,
+                entries.iter().map(|item| item.origin.as_str()),
+            )
+        })
+        .unwrap_or_default();
+    Ok(entries
+        .into_iter()
+        .map(|info| {
+            let icon_data_url = icons.get(&info.origin).cloned();
+            LoginListItem {
+                info,
+                icon_data_url,
+            }
         })
         .collect())
+}
+
+fn password_for_person(id: &str) -> Result<String, &'static str> {
+    let _guard = LOCK.lock().map_err(|_| "credential_store_unavailable")?;
+    read()?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.password)
+        .ok_or("not_found")
+}
+
+/// Only the main app webview receives a password for an explicit reveal action.
+#[tauri::command]
+pub(crate) fn saved_login_reveal(
+    webview: tauri::Webview,
+    id: String,
+) -> Result<String, &'static str> {
+    allowed_caller(webview.label())?;
+    password_for_person(&id)
+}
+
+/// Copy directly to the system clipboard without returning the value to the caller.
+#[tauri::command]
+pub(crate) fn saved_login_copy(webview: tauri::Webview, id: String) -> Result<(), &'static str> {
+    allowed_caller(webview.label())?;
+    let password = password_for_person(&id)?;
+    #[cfg(windows)]
+    {
+        let hwnd = webview
+            .window()
+            .hwnd()
+            .map_err(|_| "clipboard_unavailable")?;
+        copy_password(&password, hwnd.0 as isize)
+    }
+    #[cfg(not(windows))]
+    {
+        copy_password(&password, 0)
+    }
+}
+
+/// Open the selected site's panel and fill this specific login without submitting it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SavedLoginOpenInput {
+    chat_id: String,
+    id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[tauri::command]
+pub(crate) async fn saved_login_open_and_fill(
+    webview: tauri::Webview,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    input: SavedLoginOpenInput,
+) -> Result<serde_json::Value, String> {
+    use tauri::Emitter;
+    let SavedLoginOpenInput {
+        chat_id,
+        id,
+        x,
+        y,
+        width,
+        height,
+    } = input;
+    allowed_caller(webview.label()).map_err(str::to_owned)?;
+    if crate::panel_chat::active_chat().as_deref() != Some(chat_id.as_str()) {
+        return Err("panel_not_active".into());
+    }
+    let selected = tokio::task::spawn_blocking(move || info_for_id(&id))
+        .await
+        .map_err(|_| "unavailable")?
+        .map_err(str::to_owned)?;
+    if crate::panel_browser::current_panel(&app).is_none() {
+        crate::panel_browser::panel_browser_open_agent(
+            app.clone(),
+            chat_id.clone(),
+            x,
+            y,
+            width,
+            height,
+        )
+        .await?;
+    }
+    let event_app = app.clone();
+    let notify: crate::browser_runtime::Notify = std::sync::Arc::new(move |name, value| {
+        if let Ok(safe) = redact_tool_result(value) {
+            let _ = event_app.emit(name, safe);
+        }
+    });
+    if !state.browser.is_open(&chat_id).await {
+        let selected_policy = Ok(Some(crate::browser_gateway::Policy::general()));
+        let ask: crate::browser_runtime::Ask =
+            std::sync::Arc::new(|_, _| Box::pin(async { false }));
+        let result = state
+            .browser
+            .dispatch(
+                crate::browser_runtime::RequestContext {
+                    chat_id: &chat_id,
+                    provider: "manual",
+                    skill: None,
+                    selected: &selected_policy,
+                    root: state.paths.data_root.clone(),
+                    visible: true,
+                    cancel: CancellationToken::new(),
+                    notify: notify.clone(),
+                    ask,
+                },
+                serde_json::json!({"method":"browser_open","arguments":{}}),
+            )
+            .await;
+        if result["status"] != "ok" {
+            return Ok(result);
+        }
+    }
+    Ok(state
+        .browser
+        .fill_saved_for_person(&chat_id, selected, &notify)
+        .await)
+}
+
+#[cfg(windows)]
+fn copy_password(password: &str, owner: isize) -> Result<(), &'static str> {
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+    let words: Vec<u16> = password.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        if OpenClipboard(owner as _) == 0 {
+            return Err("clipboard_unavailable");
+        }
+        let memory = GlobalAlloc(GMEM_MOVEABLE, words.len() * std::mem::size_of::<u16>());
+        if memory.is_null() {
+            CloseClipboard();
+            return Err("clipboard_unavailable");
+        }
+        let data = GlobalLock(memory).cast::<u16>();
+        if data.is_null() {
+            GlobalFree(memory);
+            CloseClipboard();
+            return Err("clipboard_unavailable");
+        }
+        std::ptr::copy_nonoverlapping(words.as_ptr(), data, words.len());
+        GlobalUnlock(memory);
+        if EmptyClipboard() == 0 || SetClipboardData(13, memory).is_null() {
+            GlobalFree(memory);
+            CloseClipboard();
+            return Err("clipboard_unavailable");
+        }
+        CloseClipboard();
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn copy_password(_password: &str, _owner: isize) -> Result<(), &'static str> {
+    Err("unavailable")
 }
 
 #[tauri::command]
@@ -530,8 +882,27 @@ pub(crate) fn saved_login_set(
     Ok(info)
 }
 
-fn prepare_set(entries: &mut Vec<Entry>, input: LoginInput) -> Result<LoginInfo, &'static str> {
-    let origin = origin(&input.origin)?;
+fn prepare_set(entries: &mut Vec<Entry>, mut input: LoginInput) -> Result<LoginInfo, &'static str> {
+    let address = reqwest::Url::parse(&input.origin).map_err(|_| "invalid_origin")?;
+    if !address.username().is_empty() || address.password().is_some() {
+        return Err("invalid_origin");
+    }
+    let origin = origin(&address.origin().ascii_serialization())?;
+    if input.site_url.is_none()
+        && (address.path() != "/" || address.query().is_some() || address.fragment().is_some())
+    {
+        input.site_url = Some(address.to_string());
+    }
+    if let Some(value) = &input.site_url {
+        let url = reqwest::Url::parse(value).map_err(|_| "invalid_origin")?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.origin().ascii_serialization() != origin
+        {
+            return Err("invalid_origin");
+        }
+    }
     if input.login_path.as_ref().is_some_and(|path| {
         !path.is_empty()
             && (!path.starts_with('/')
@@ -550,11 +921,6 @@ fn prepare_set(entries: &mut Vec<Entry>, input: LoginInput) -> Result<LoginInfo,
     {
         return Err("invalid_input");
     }
-    if entries.iter().any(|entry| {
-        entry.origin == origin && entry.label == input.label && input.id.as_ref() != Some(&entry.id)
-    }) {
-        return Err("duplicate_label");
-    }
     let requested_default = input.default_for_path;
     let id = match input.id {
         Some(id) => {
@@ -562,9 +928,10 @@ fn prepare_set(entries: &mut Vec<Entry>, input: LoginInput) -> Result<LoginInfo,
                 .iter_mut()
                 .find(|entry| entry.id == id)
                 .ok_or("not_found")?;
-            // Changing the site creates a new authorization boundary.
+            // A site edit replaces the matching boundary; never carry an old URL to it.
             if entry.origin != origin {
-                return Err("origin_change_requires_new_login");
+                entry.origin = origin.clone();
+                entry.site_url = None;
             }
             entry.label = input.label;
             entry.username = input.username;
@@ -580,6 +947,13 @@ fn prepare_set(entries: &mut Vec<Entry>, input: LoginInput) -> Result<LoginInfo,
             if let Some(password) = input.password {
                 entry.password = password;
             }
+            if let Some(site_url) = input.site_url {
+                entry.site_url = Some(site_url);
+            }
+            if let Some(favorite) = input.favorite {
+                entry.favorite = favorite;
+            }
+            entry.updated_at = Some(chrono::Utc::now().to_rfc3339());
             id
         }
         None => {
@@ -594,6 +968,10 @@ fn prepare_set(entries: &mut Vec<Entry>, input: LoginInput) -> Result<LoginInfo,
                 ask_before_use: input.ask_before_use.unwrap_or(false),
                 login_path: input.login_path.filter(|path| !path.is_empty()),
                 default_for_path: input.default_for_path.unwrap_or(false),
+                site_url: input.site_url,
+                created_at: Some(chrono::Utc::now().to_rfc3339()),
+                updated_at: Some(chrono::Utc::now().to_rfc3339()),
+                favorite: input.favorite.unwrap_or(false),
             });
             id
         }
@@ -635,6 +1013,10 @@ fn prepare_set(entries: &mut Vec<Entry>, input: LoginInput) -> Result<LoginInfo,
         ask_before_use: entry.ask_before_use,
         login_path: entry.login_path.clone(),
         default_for_path: entry.default_for_path,
+        site_url: entry.site_url.clone(),
+        created_at: entry.created_at.clone(),
+        updated_at: entry.updated_at.clone(),
+        favorite: entry.favorite,
     })
 }
 
@@ -648,16 +1030,111 @@ pub(crate) fn saved_login_delete(webview: tauri::Webview, id: String) -> Result<
     if entries.len() == before {
         return Err("not_found");
     }
-    if entries.is_empty() {
-        crate::credentials::delete_secret(VAULT).map_err(|_| "credential_store_unavailable")
-    } else {
-        write(&entries)
-    }
+    write(&entries)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn individual_slots_scale_and_legacy_entries_remain_visible() {
+        let mut values = HashMap::new();
+        let legacy = serde_json::json!({"id":"legacy","origin":"https://example.test","label":"old","username":"person","password":uuid::Uuid::new_v4().to_string()});
+        values.insert(VAULT.to_owned(), serde_json::json!([legacy]).to_string());
+        for index in 0..100 {
+            let entry = serde_json::json!({"id":format!("id-{index}"),"origin":"https://example.test","label":format!("login-{index}"),"username":"person","password":uuid::Uuid::new_v4().to_string()});
+            values.insert(slot_name(index), entry.to_string());
+        }
+        let get = |key: &str| Ok(values.get(key).cloned());
+        let entries = read_with(&get).unwrap();
+        assert_eq!(entries.len(), 101);
+        assert_eq!(passwords_with(&get).unwrap().len(), 101);
+        let replacement = serde_json::json!({"id":"legacy","origin":"https://example.test","label":"updated","username":"person","password":uuid::Uuid::new_v4().to_string()});
+        values.insert(slot_name(100), replacement.to_string());
+        let entries = read_with(&|key| Ok(values.get(key).cloned())).unwrap();
+        assert_eq!(entries.len(), 101);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == "legacy")
+                .unwrap()
+                .label,
+            "updated"
+        );
+    }
+
+    #[test]
+    fn saved_login_metadata_preserves_site_favorite_and_times() {
+        let mut entries = Vec::new();
+        let input: LoginInput = serde_json::from_value(serde_json::json!({
+            "origin":"https://example.test", "siteUrl":"https://example.test/login",
+            "label":"studio", "username":"person", "password":uuid::Uuid::new_v4().to_string(),
+            "favorite":true
+        }))
+        .unwrap();
+        let info = prepare_set(&mut entries, input).unwrap();
+        assert_eq!(info.site_url.as_deref(), Some("https://example.test/login"));
+        assert!(info.favorite);
+        assert!(info.created_at.is_some());
+        assert!(info.updated_at.is_some());
+        let with_path: LoginInput = serde_json::from_value(serde_json::json!({
+            "origin":"https://example.test/admin/login", "label":"admin",
+            "username":"person", "password":uuid::Uuid::new_v4().to_string()
+        }))
+        .unwrap();
+        let path_info = prepare_set(&mut entries, with_path).unwrap();
+        assert_eq!(path_info.origin, "https://example.test");
+        assert_eq!(
+            path_info.site_url.as_deref(),
+            Some("https://example.test/admin/login")
+        );
+        let bad: LoginInput = serde_json::from_value(serde_json::json!({
+            "origin":"https://example.test", "siteUrl":"https://other.test/",
+            "label":"other", "username":"person", "password":uuid::Uuid::new_v4().to_string()
+        }))
+        .unwrap();
+        assert!(matches!(
+            prepare_set(&mut entries, bad),
+            Err("invalid_origin")
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires a process-local fake credential store"]
+    fn fake_vault_migrates_legacy_and_saves_many_without_losing_redaction() {
+        assert!(std::env::var_os("MOMSO_TEST_FAKE_CREDENTIAL_STORE").is_some());
+        let old_secret = uuid::Uuid::new_v4().to_string();
+        let legacy = serde_json::json!([{"id":"legacy","origin":"https://example.test","label":"old","username":"person","password":old_secret.clone()}]).to_string();
+        crate::credentials::put_secret_unlocked(VAULT, &legacy).unwrap();
+        let mut entries = read().unwrap();
+        assert!(crate::credentials::get_secret(VAULT).unwrap().is_none());
+        for index in 0..40 {
+            let input: LoginInput = serde_json::from_value(serde_json::json!({
+                "origin":"https://example.test", "label":format!("login-{index}"),
+                "username":"person", "password":uuid::Uuid::new_v4().to_string()
+            }))
+            .unwrap();
+            prepare_set(&mut entries, input).unwrap();
+        }
+        write(&entries).unwrap();
+        assert!(crate::credentials::get_secret(VAULT).unwrap().is_none());
+        assert_eq!(read().unwrap().len(), 41);
+        assert!(known_passwords().unwrap().contains(&old_secret));
+        assert_eq!(password_for_person("legacy").unwrap(), old_secret);
+        assert!(!serde_json::to_string(&info_for_id("legacy").unwrap())
+            .unwrap()
+            .contains(&old_secret));
+        entries.retain(|entry| entry.id != "legacy");
+        write(&entries).unwrap();
+        assert_eq!(read().unwrap().len(), 40);
+        assert!(known_passwords().unwrap().contains(&old_secret));
+        assert!(!serde_json::to_string(
+            &entries.iter().map(|entry| &entry.label).collect::<Vec<_>>()
+        )
+        .unwrap()
+        .contains(&old_secret));
+    }
 
     #[test]
     fn accepts_only_exact_https_origins() {
@@ -682,6 +1159,7 @@ mod tests {
     #[test]
     fn panel_and_other_webviews_cannot_manage_saved_logins() {
         assert!(allowed_caller("main").is_ok());
+        assert!(allowed_caller(crate::panel_overlay::WEBVIEW).is_ok());
         assert!(allowed_caller("panel-browser").is_err());
         assert!(allowed_caller("panel-popup-1").is_err());
     }
@@ -715,6 +1193,11 @@ mod tests {
                     ask_before_use: false,
                     login_path: None,
                     default_for_path: false,
+
+                    site_url: None,
+                    created_at: None,
+                    updated_at: None,
+                    favorite: false,
                 })
                 .collect();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -783,6 +1266,9 @@ mod tests {
             ask_before_use: None,
             login_path: path.map(str::to_owned),
             default_for_path: None,
+
+            site_url: None,
+            favorite: None,
         };
         let mut vault = Vec::new();
         let normal = prepare_set(&mut vault, make("normal", Some("/login"))).unwrap();
@@ -805,6 +1291,9 @@ mod tests {
                 ask_before_use: None,
                 login_path: None,
                 default_for_path: None,
+
+                site_url: None,
+                favorite: None,
             },
         )
         .unwrap();
@@ -827,6 +1316,9 @@ mod tests {
                 ask_before_use: None,
                 login_path: None,
                 default_for_path: Some(true),
+
+                site_url: None,
+                favorite: None,
             },
         )
         .unwrap();
@@ -848,6 +1340,11 @@ mod tests {
             ask_before_use: false,
             login_path: None,
             default_for_path: false,
+
+            site_url: None,
+            created_at: None,
+            updated_at: None,
+            favorite: false,
         };
         let info = LoginInfo {
             id: entry.id,
@@ -857,6 +1354,11 @@ mod tests {
             ask_before_use: entry.ask_before_use,
             login_path: entry.login_path,
             default_for_path: entry.default_for_path,
+
+            site_url: None,
+            created_at: None,
+            updated_at: None,
+            favorite: false,
         };
         assert!(!serde_json::to_string(&info).unwrap().contains(&secret));
     }
@@ -925,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_logins_edit_without_exposing_secret_or_changing_origin() {
+    fn multiple_logins_edit_without_exposing_secret() {
         let secret = uuid::Uuid::new_v4().to_string();
         let second = uuid::Uuid::new_v4().to_string();
         let mut entries = Vec::new();
@@ -938,12 +1440,15 @@ mod tests {
             ask_before_use: None,
             login_path: None,
             default_for_path: None,
+
+            site_url: None,
+            favorite: None,
         };
         let first = prepare_set(&mut entries, input("one", secret.clone())).unwrap();
         let other = prepare_set(&mut entries, input("two", second)).unwrap();
         assert_ne!(first.id, other.id);
         let duplicate = prepare_set(&mut entries, input("one", uuid::Uuid::new_v4().to_string()));
-        assert!(matches!(duplicate, Err("duplicate_label")));
+        assert!(duplicate.is_ok());
         assert!(!serde_json::to_string(&first).unwrap().contains(&secret));
         let updated = prepare_set(
             &mut entries,
@@ -956,6 +1461,9 @@ mod tests {
                 ask_before_use: None,
                 login_path: None,
                 default_for_path: None,
+
+                site_url: None,
+                favorite: None,
             },
         )
         .unwrap();
@@ -976,9 +1484,12 @@ mod tests {
                 ask_before_use: None,
                 login_path: None,
                 default_for_path: None,
+
+                site_url: None,
+                favorite: None,
             },
         );
-        assert!(matches!(rejected, Err("origin_change_requires_new_login")));
+        assert_eq!(rejected.unwrap().origin, "https://example.test.evil.test");
     }
 
     #[test]
@@ -992,6 +1503,9 @@ mod tests {
             ask_before_use: None,
             login_path: None,
             default_for_path: None,
+
+            site_url: None,
+            favorite: None,
         };
         let mut current = Vec::new();
         prepare_set(&mut current, make("one")).unwrap();

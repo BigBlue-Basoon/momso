@@ -735,6 +735,7 @@ fn oauth_r2_flow(with_claude: bool, automatic_upload: bool, concurrent: bool) {
                     &child_archive,
                     &chat_id,
                     "원자료 저장소 연결",
+                    &[],
                     Some("haiku"),
                     Some("low"),
                     false,

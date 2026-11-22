@@ -1,10 +1,9 @@
 // 대화(왼쪽 대화 목록, 가운데 대화 칸) 명령을 부르는 얇은 층.
 // 모양은 본부가 전한 계약을 따른다(chat_list, chat_create, chat_read, chat_append, chat_rename, chat_search).
 // 백엔드가 들어오면 momso-public-prep/archive-backend-port-notes.md 의 대화 절과 견준다.
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { isMissingCommand, type AiProvider } from './ai-models'
-import { isDesktopRuntime } from './runtime'
+import { hasAppBackend, isDesktopRuntime } from './runtime'
 
 export type ChatRole = 'user' | 'assistant'
 
@@ -63,7 +62,7 @@ export type ChatSearchResult = ChatEntry & {
 }
 
 function requireChats() {
-  if (!isDesktopRuntime()) throw new Error('chat commands need the desktop runtime')
+  if (!hasAppBackend()) throw new Error('chat commands need the desktop runtime')
 }
 
 export async function listChats() {
@@ -287,7 +286,7 @@ export async function deleteChat(chatId: string) {
 
 /** 고정·보관·되돌리기·삭제가 된 뒤(다른 곳에서 바뀐 것도). */
 export async function listenChatListUpdated(handler: () => void) {
-  if (!isDesktopRuntime()) return () => {}
+  if (!hasAppBackend()) return () => {}
   return listen('chat-list-updated', () => handler())
 }
 
@@ -308,9 +307,10 @@ export type SendResult = { status: 'started' | 'unavailable' | 'not_connected' |
 /**
  * regenerateOf(2026-11-18 화면이 가정한 꼴, 셋째 줄에 부탁함): "다시 만들기"로 붙인 생성물의 원자료 id. 뒤쪽이 아직 받지 않으면 무시된다.
  */
-export async function sendChatMessage(chatId: string, text: string, provider: AiProvider, model: string | null, effort: string | null, fast: boolean | null = null, skill: string | null = null, retryMessageId: string | null = null, regenerateOf: string | null = null) {
+/** attachments: momso anywhere(네트워크 길)에서 올린 첨부의 원자료 번호(S39). 데스크톱은 첨부를 미리 채팅방에 잇기 때문에 보내지 않는다. */
+export async function sendChatMessage(chatId: string, text: string, provider: AiProvider, model: string | null, effort: string | null, fast: boolean | null = null, skill: string | null = null, retryMessageId: string | null = null, regenerateOf: string | null = null, attachments: string[] | null = null) {
   requireChats()
-  return invoke<SendResult>('chat_send', { chatId, text, provider, model, effort, ...(fast === null ? {} : { fast }), ...(skill === null ? {} : { skill }), ...(retryMessageId === null ? {} : { retryMessageId }), ...(regenerateOf === null ? {} : { regenerateOf }) })
+  return invoke<SendResult>('chat_send', { chatId, text, provider, model, effort, ...(fast === null ? {} : { fast }), ...(skill === null ? {} : { skill }), ...(retryMessageId === null ? {} : { retryMessageId }), ...(regenerateOf === null ? {} : { regenerateOf }), ...(attachments && attachments.length > 0 ? { attachments } : {}) })
 }
 
 /**
@@ -319,7 +319,7 @@ export async function sendChatMessage(chatId: string, text: string, provider: Ai
  * chat_send 가 아예 없으면 null.
  */
 export async function probeSendableProviders(providers: AiProvider[]): Promise<AiProvider[] | null> {
-  if (!isDesktopRuntime()) return null
+  if (!hasAppBackend()) return null
   const sendable: AiProvider[] = []
   for (const provider of providers) {
     try {
@@ -379,6 +379,8 @@ export type ChatEventHandlers = {
    * 끝내 실패하면 chat-error 가 따로 온다.
    */
   onRetrying?: (event: ChatRetrying) => void
+  /** 휴대폰 몸소: 화면을 다시 불러온 뒤 진행 중인 답을 다시 따라가기 시작함(chat-resumed { chatId }, server-client.ts). 그 채팅방을 답을 쓰는 중으로 둔다. */
+  onResumed?: (event: { chatId: string }) => void
   /**
    * "다시 만들기"의 결과(2026-11-18 뒤쪽 6b21644 media_generation.rs, 계약 C52): chat-media-regeneration { chatId, userMessageId, status }.
    * status: recorded(새 판을 기록함) | not_detected(자동으로 찾지 못함, 생성물이 없다는 확정은 아님) | unavailable.
@@ -388,10 +390,11 @@ export type ChatEventHandlers = {
 export type ChatRetrying = { chatId: string; provider: string | null; attempt: number | null; kind: string | null; retryAfterSeconds: number | null }
 
 export async function listenChatEvents(handlers: ChatEventHandlers) {
-  if (!isDesktopRuntime()) return () => {}
+  if (!hasAppBackend()) return () => {}
   const stops = await Promise.all([
     listen<ChatStreamEvent>('chat-stream', (event) => handlers.onStream(event.payload)),
     listen<ChatDoneEvent>('chat-done', (event) => handlers.onDone(event.payload)),
+    listen<{ chatId?: unknown }>('chat-resumed', (event) => { if (typeof event.payload?.chatId === 'string') handlers.onResumed?.({ chatId: event.payload.chatId }) }),
     listen<ChatErrorEvent>('chat-error', (event) => handlers.onError(event.payload)),
     listen<{ chatId: string; context?: ChatContext | null }>('chat-context-updated', (event) => handlers.onContext?.(event.payload)),
     listen<{ chatId: string }>('chat-compacted', (event) => handlers.onCompacted?.(event.payload)),

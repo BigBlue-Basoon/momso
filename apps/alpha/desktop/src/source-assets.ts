@@ -8,8 +8,8 @@
 //   source_asset_purge({ assetId, planDigest, confirmed: true }) → { state: 'partial'…, localRemaining, remoteRemaining, removedRemoteKeys }
 //     지금은 확인할 수 없는 사본 때문에 늘 partial 이다(원격·이전 버전·외부 사본은 완전 삭제를 보장하지 않는다).
 //   오류: references_changed(쓰는 곳이 바뀜, 다시 미리 본다), chat_active(답하는 중), 그 밖은 지우지 못함.
-import { invoke } from '@tauri-apps/api/core'
-import { isDesktopRuntime } from './runtime'
+import { invoke } from './host'
+import { hasAppBackend, isDesktopRuntime } from './runtime'
 
 export type SourceOpen = {
   state: string
@@ -29,6 +29,8 @@ export type SourceDeletePreview = {
   chats: string[]
   recordVersions: Array<{ recordId: string; recordVersion: number }>
   planDigest: string
+  /** 사용처를 알아본 결과인가. 휴대폰 몸소의 server 는 사용처를 알려 주지 않아 false(묻는 창이 "쓰는 곳이 없습니다"라고 하지 않는다). */
+  usesKnown: boolean
 }
 
 export type SourcePurgeResult = {
@@ -41,6 +43,10 @@ export type SourcePurgeResult = {
 function need() {
   if (!isDesktopRuntime()) throw new Error('source assets need the desktop runtime')
 }
+/** 삭제(휴지통)·되돌리기·삭제한 원자료 목록은 휴대폰 몸소에서도(S75 셋째, server /assets/trash). 완전히 삭제는 server 에 없다. */
+function needAny() {
+  if (!hasAppBackend()) throw new Error('source assets need the desktop runtime')
+}
 
 export async function openSourceAsset(assetId: string) {
   need()
@@ -48,8 +54,8 @@ export async function openSourceAsset(assetId: string) {
 }
 
 export async function previewSourceDelete(assetId: string) {
-  need()
-  const value = await invoke<Partial<SourceDeletePreview> | null>('source_asset_delete_preview', { assetId })
+  needAny()
+  const value = await invoke<(Partial<SourceDeletePreview> & { usesUnknown?: boolean }) | null>('source_asset_delete_preview', { assetId })
   if (!value || typeof value.planDigest !== 'string') throw new Error('unavailable')
   return {
     assetId: value.assetId ?? assetId,
@@ -60,6 +66,7 @@ export async function previewSourceDelete(assetId: string) {
     chats: Array.isArray(value.chats) ? value.chats : [],
     recordVersions: Array.isArray(value.recordVersions) ? value.recordVersions : [],
     planDigest: value.planDigest,
+    usesKnown: value.usesUnknown !== true,
   } satisfies SourceDeletePreview
 }
 
@@ -74,13 +81,13 @@ function announce(change: SourceChange) {
 }
 
 export async function trashSource(assetId: string, planDigest: string) {
-  need()
+  needAny()
   await invoke('source_asset_trash', { assetId, planDigest })
   announce({ assetId, deleted: true })
 }
 
 export async function restoreTrashedSource(assetId: string) {
-  need()
+  needAny()
   await invoke('source_asset_restore_trashed', { assetId })
   announce({ assetId, deleted: false })
 }
@@ -115,13 +122,14 @@ export type DeletedSource = {
   deletionState: string
   canRestore: boolean
   canPurge: boolean
-  referenceCount: number
+  /** 쓰던 곳 수. 휴대폰 몸소의 server 는 알려 주지 않아 null(줄에 수를 적지 않는다). */
+  referenceCount: number | null
 }
 export type DeletedSourceCursor = { deletedAt: string; assetId: string }
 export type DeletedSourcePage = { items: DeletedSource[]; hasMore: boolean; nextCursor: DeletedSourceCursor | null }
 
 export async function listDeletedSources(before: DeletedSourceCursor | null = null): Promise<DeletedSourcePage> {
-  need()
+  needAny()
   const value = await invoke<{ items?: Array<Partial<DeletedSource>>; hasMore?: boolean; nextCursor?: DeletedSourceCursor | null } | null>(
     'source_asset_deleted_list', before ? { before } : {},
   )
@@ -132,7 +140,7 @@ export async function listDeletedSources(before: DeletedSourceCursor | null = nu
     deletionState: item.deletionState ?? '',
     canRestore: item.canRestore === true,
     canPurge: item.canPurge === true,
-    referenceCount: typeof item.referenceCount === 'number' ? item.referenceCount : 0,
+    referenceCount: typeof item.referenceCount === 'number' ? item.referenceCount : item.referenceCount === null ? null : 0,
   }))
   const nextCursor = value?.nextCursor && typeof value.nextCursor.assetId === 'string' ? value.nextCursor : null
   return { items, hasMore: value?.hasMore === true && nextCursor !== null, nextCursor }

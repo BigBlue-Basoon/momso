@@ -43,6 +43,25 @@
 .device-login-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .device-login-actions button { display: inline-flex; align-items: center; gap: 5px; }
 
+/* 화면 안에 놓는 꼴(momso anywhere 의 AI 연결 화면, 휴대폰 한 손): 제자리, 단추는 가로 가득 쌓음. */
+.device-login.is-inline {
+  position: static;
+  width: 100%;
+  padding: 14px;
+  box-shadow: none;
+  animation: none;
+}
+
+.device-login.is-inline .device-login-actions {
+  flex-direction: column-reverse;
+  align-items: stretch;
+}
+
+.device-login.is-inline .device-login-actions button {
+  justify-content: center;
+  min-height: 44px;
+}
+
 @keyframes device-login-enter {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }

@@ -402,6 +402,9 @@ pub(crate) async fn object_store_restore(
     let selected = ids
         .map(|ids| selected_hashes(&paths.database_path, ids))
         .transpose()?;
+    if selected.is_none() {
+        crate::class_student_backup::restore_if_missing(&config, &keys, &identity, &paths).await?;
+    }
     restore_selected(&config, &keys, &identity, &paths, selected).await
 }
 

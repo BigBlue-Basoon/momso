@@ -2,10 +2,10 @@
 // 권한 단계: 백엔드에 있는 명령(permission_mode_get, permission_mode_set, permission_modes_available).
 //   모양은 momso-public-prep/archive-backend-port-notes.md 의 "권한 단계" 절을 따른다.
 // 모델 목록: 본부가 전한 계약(ai_models). 백엔드가 아직 없다. 들어오면 그 절과 견준다.
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './host'
 import { latestPerFamily } from './model-families'
 import { W, modelDisplayName } from './words'
-import { isDesktopRuntime } from './runtime'
+import { hasAppBackend } from './runtime'
 
 export type AiProvider = 'codex' | 'claude' | 'gemini'
 
@@ -91,7 +91,7 @@ export function isMissingCommand(error: unknown) {
 
 /** 회사별 모델 목록. 계열마다 가장 최신 것 하나만 남긴다(model-families.ts). */
 export async function listAiModels() {
-  if (!isDesktopRuntime()) throw new Error('ai_models needs the desktop runtime')
+  if (!hasAppBackend()) throw new Error('ai_models needs the desktop runtime')
   const lists = await invoke<ProviderModels[]>('ai_models')
   return lists.map((list) => ({ ...list, models: latestPerFamily(list.models ?? []) }))
 }
@@ -193,18 +193,19 @@ export type PermissionModeOption = {
 }
 
 export async function getPermissionMode(provider: AiProvider) {
-  if (!isDesktopRuntime()) throw new Error('permission_mode_get needs the desktop runtime')
+  if (!hasAppBackend()) throw new Error('permission_mode_get needs the desktop runtime')
   return invoke<string>('permission_mode_get', { provider })
 }
 
 export async function setPermissionMode(provider: AiProvider, mode: string) {
-  if (!isDesktopRuntime()) throw new Error('permission_mode_set needs the desktop runtime')
+  if (!hasAppBackend()) throw new Error('permission_mode_set needs the desktop runtime')
   await invoke<null>('permission_mode_set', { provider, mode })
 }
 
 /** 회사의 권한 단계 목록. 예전 계약(다섯 값, 이름 없음)으로 오면 쓰지 않는다(화면이 이름을 지어 넣지 않게). */
 export async function listPermissionModes(provider: AiProvider) {
-  if (!isDesktopRuntime()) throw new Error('permission_modes_available needs the desktop runtime')
+  // 휴대폰 몸소(네트워크 길)는 server-client.ts 가 코덱스의 같은 세 단계를 준다(S23 permissionMode).
+  if (!hasAppBackend()) throw new Error('permission_modes_available needs the desktop runtime')
   const items = await invoke<Array<Partial<PermissionModeOption>>>('permission_modes_available', { provider })
   const options = items.filter((item): item is PermissionModeOption => typeof item.id === 'string' && typeof item.label === 'string')
   if (options.length === 0 || options.length !== items.length) throw new Error('permission_modes_available: old contract')

@@ -18,6 +18,8 @@ import {
 } from '../provider-auth'
 import { W } from '../words'
 import { isMissingCommand } from '../ai-models'
+import { isNetworkRuntime } from '../runtime'
+import { askServerAiConnect } from '../server-client'
 import { ProviderMark, type ProviderMarkId } from './ProviderMark'
 import { QuestionDialog } from './ZetPanel'
 
@@ -146,6 +148,8 @@ function ProviderRow({ item, onChanged }: { item: ProviderAuth; onChanged: () =>
 
   async function login() {
     setError(null)
+    // 휴대폰 몸소: 로그인 코드 카드가 있는 휴대폰의 AI 연결 화면으로(S75 셋째, server-client.ts askServerAiConnect).
+    if (isNetworkRuntime()) { askServerAiConnect(); return }
     try {
       const state = await startProviderLogin(item.provider)
       if (state === 'inProgress') setPending(true)

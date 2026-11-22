@@ -52,10 +52,11 @@ pub(crate) fn attachment_blocks(
             kind.as_str(),
             "image/png" | "image/jpeg" | "image/gif" | "image/webp"
         );
+        let pdf = kind == "application/pdf";
         let text = kind.starts_with("text/")
             || kind == "application/json"
             || matches!(ext.as_str(), "txt" | "md" | "csv" | "json");
-        if !image && !text {
+        if !image && !pdf && !text {
             continue;
         }
         let expected_hash = Path::new(&attachment.path)
@@ -108,6 +109,13 @@ pub(crate) fn attachment_blocks(
                 return Err("첨부파일 형식을 확인하지 못했습니다".into());
             }
             blocks.push(json!({"type":"image","mimeType":kind,"data":BASE64.encode(bytes)}));
+        } else if pdf {
+            if !bytes.starts_with(b"%PDF-") {
+                return Err("첨부파일 형식을 확인하지 못했습니다".into());
+            }
+            let uri =
+                reqwest::Url::from_file_path(&path).map_err(|_| "첨부파일을 읽지 못했습니다")?;
+            blocks.push(json!({"type":"resource","resource":{"uri":uri.as_str(),"mimeType":"application/pdf","blob":BASE64.encode(&bytes)},"_meta":{"momsoName":attachment.name,"momsoSize":bytes.len()}}));
         } else {
             let value = std::str::from_utf8(&bytes)
                 .ok()
@@ -118,6 +126,15 @@ pub(crate) fn attachment_blocks(
         }
     }
     Ok(blocks)
+}
+
+fn adapt_pdf_resources(blocks: Vec<Value>, supports_embedded: bool) -> Vec<Value> {
+    blocks.into_iter().map(|mut block| {
+        if block["type"] != "resource" { return block; }
+        let meta = block.as_object_mut().and_then(|object| object.remove("_meta")).unwrap_or(Value::Null);
+        if supports_embedded { return block; }
+        json!({"type":"resource_link","uri":block["resource"]["uri"],"mimeType":"application/pdf","name":meta["momsoName"],"size":meta["momsoSize"]})
+    }).collect()
 }
 
 pub(crate) fn previous(db: &Path, id: &str) -> Result<Option<String>, String> {
@@ -610,6 +627,7 @@ pub(crate) async fn run_command<F: FnMut(&str, Value) + Send>(
         let mut pending = VecDeque::new();
         let init = request(&mut input, &mut lines, &cancel, 1, "initialize", json!({"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"momso","version":env!("CARGO_PKG_VERSION")}}), &mut pending).await?;
         if blocks.iter().any(|block| block["type"] == "image") && init.pointer("/agentCapabilities/promptCapabilities/image").and_then(Value::as_bool) != Some(true) { return Err("이 AI는 이미지 첨부를 지원하지 않습니다".into()); }
+        let blocks = adapt_pdf_resources(blocks, init.pointer("/agentCapabilities/promptCapabilities/embeddedContext").and_then(Value::as_bool) == Some(true));
         request(&mut input, &mut lines, &cancel, 2, "authenticate", json!({"methodId":"gemini-api-key"}), &mut pending).await?;
         let prior = previous(db, id)?;
         if prior.is_some() && !init.pointer("/agentCapabilities/sessionCapabilities/resume").is_some_and(Value::is_object) { return Err("AI 채팅방을 이어갈 수 없습니다".into()); }
@@ -904,6 +922,45 @@ mod tests {
         std::fs::write(path, "바뀐 내용").unwrap();
         assert!(super::attachment_blocks(dir.path(), &[item]).is_err());
     }
+
+    #[test]
+    fn pdf_attachment_is_a_verified_acp_resource_link() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = include_bytes!("../tests/fixtures/s67-sample.pdf");
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let relative = format!("objects/sha256/{}/{}", &hash[..2], hash);
+        let path = dir.path().join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let item = crate::chat::MessageAttachment {
+            path: relative,
+            name: "fixture.pdf".into(),
+            media_type: Some("application/pdf".into()),
+        };
+        let blocks = super::attachment_blocks(dir.path(), std::slice::from_ref(&item)).unwrap();
+        let embedded = super::adapt_pdf_resources(blocks.clone(), true);
+        assert_eq!(embedded[0]["type"], "resource");
+        assert_eq!(embedded[0]["resource"]["mimeType"], "application/pdf");
+        assert!(embedded[0].get("_meta").is_none());
+        assert_eq!(
+            BASE64
+                .decode(embedded[0]["resource"]["blob"].as_str().unwrap())
+                .unwrap(),
+            bytes.as_slice()
+        );
+        let links = super::adapt_pdf_resources(blocks, false);
+        assert_eq!(links[0]["type"], "resource_link");
+        assert_eq!(links[0]["name"], "fixture.pdf");
+        let uri = reqwest::Url::parse(links[0]["uri"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read(uri.to_file_path().unwrap()).unwrap(),
+            bytes.as_slice()
+        );
+        std::fs::write(path, b"%PDF-modified").unwrap();
+        assert!(super::attachment_blocks(dir.path(), &[item]).is_err());
+    }
     use super::*;
 
     #[test]
@@ -1044,6 +1101,7 @@ mod tests {
         std::fs::write(&script, r#"
 if ($env:GEMINI_API_KEY -ne 'dummy-test-only') { exit 10 }
 if ($env:GOOGLE_API_KEY) { exit 19 }
+$model = 'fake'; $thought = 'low'; $mode = 'default'
 while ($line = [Console]::ReadLine()) {
   $v = $line | ConvertFrom-Json
   switch ($v.method) {
@@ -1052,9 +1110,14 @@ while ($line = [Console]::ReadLine()) {
     'session/new' { if ($v.params.mcpServers.Count -ne 1 -or $v.params.mcpServers[0].name -ne 'momso_internal_runtime_v1' -or $v.params.mcpServers[0].args[0] -ne '--momso-mcp-stdio') { exit 18 }; '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"test-session","configOptions":[{"id":"mode","currentValue":"default"},{"id":"model","currentValue":"fake"},{"id":"thought_level","currentValue":"low"}]}}' }
     'session/resume' { if ($v.params.sessionId -ne 'test-session' -or $v.params.mcpServers[0].name -ne 'momso_internal_runtime_v1') { exit 12 }; '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"default"},{"id":"model","currentValue":"fake"},{"id":"thought_level","currentValue":"low"}]}}' }
     'session/set_config_option' {
-      if ($v.params.configId -ne 'mode' -or $v.params.value -ne 'plan') { exit 17 }
+      switch ($v.params.configId) {
+        'mode' { if ($v.params.value -ne 'plan') { exit 17 }; $mode = 'plan' }
+        'model' { if ($v.params.value -ne 'fake2') { exit 17 }; $model = 'fake2' }
+        'thought_level' { if ($v.params.value -ne 'high') { exit 17 }; $thought = 'high' }
+        default { exit 17 }
+      }
       '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"test-session","update":{"sessionUpdate":"usage_update","used":64,"size":100}}}'
-      '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"mode","currentValue":"plan"},{"id":"model","currentValue":"fake"},{"id":"thought_level","currentValue":"low"}]}}'
+      @{jsonrpc='2.0';id=$v.id;result=@{configOptions=@(@{id='mode';currentValue=$mode},@{id='model';currentValue=$model},@{id='thought_level';currentValue=$thought})}} | ConvertTo-Json -Depth 8 -Compress
     }
     'session/prompt' {
       if ($env:MOMSO_EXPECT_SKILL -eq 'yes' -and -not $v.params.prompt[0].text.StartsWith('/sample ')) { exit 14 }
@@ -1147,9 +1210,9 @@ while ($line = [Console]::ReadLine()) {
                 &id,
                 "question",
                 Vec::new(),
-                Some("fake"),
+                Some(if i == 0 { "fake2" } else { "fake" }),
                 if i == 0 {
-                    None
+                    Some("high")
                 } else if i == 1 {
                     Some("  ")
                 } else {
@@ -1177,6 +1240,14 @@ while ($line = [Console]::ReadLine()) {
                 continue;
             }
             result.unwrap();
+            if i == 0 {
+                assert!(events.iter().any(
+                    |(name, value)| name == "momso-internal-observed-model" && value == "fake2"
+                ));
+                assert!(events.iter().any(|(name, value)| name
+                    == "momso-internal-observed-effort"
+                    && value == "high"));
+            }
             assert!(events.iter().any(|(name, _)| name == "chat-stream"));
             assert!(events.iter().any(|(name, _)| name == "chat-done"));
             if i >= 3 {
@@ -1209,7 +1280,7 @@ while ($line = [Console]::ReadLine()) {
                     .any(|(name, value)| name == "chat-context-updated"
                         && value["context"]["usedTokens"] == 48));
                 assert_eq!(
-                    chat_context::model_limit(&db, &id, "gemini", Some("fake")).unwrap(),
+                    chat_context::model_limit(&db, &id, "gemini", Some("fake2")).unwrap(),
                     Some((100, 48))
                 );
             }

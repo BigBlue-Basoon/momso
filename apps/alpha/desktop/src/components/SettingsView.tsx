@@ -40,6 +40,8 @@ type SettingsViewProps = {
   /** 보관된 채팅방 쪽을 그릴지(보관 명령이 있을 때만). 되돌리거나 지우면 onChatsChanged 로 왼쪽 목록을 다시 읽는다. */
   archivedChats?: boolean
   onChatsChanged?: () => void
+  /** 휴대폰 몸소(S75): server 로 할 수 있는 쪽만(그 밖의 쪽은 그리지 않는다). 없으면 모든 쪽. */
+  only?: SettingsSection[]
 }
 
 const SECTIONS: Array<{ id: SettingsSection; label: string; icon: typeof Info }> = [
@@ -72,10 +74,14 @@ export function SettingsView({
   archivedChats = false,
   onChatsChanged,
   initialSection,
+  only,
 }: SettingsViewProps) {
   // 설정의 AI 로그인: 명령이 있으면 회사 셋의 로그인 칸(undefined = 알아보는 중, null = 명령 없음).
   const providerAuth = useProviderAuth()
-  const [section, setSection] = useState<SettingsSection>(initialSection ?? 'profile')
+  const [section, setSection] = useState<SettingsSection>(() => {
+    const start = initialSection ?? 'profile'
+    return !only || only.includes(start) ? start : only[0] ?? start
+  })
   // 삭제한 원자료 목록 명령이 있는지(읽어 본다. 아무것도 바뀌지 않는다). 없거나 아직 모르면 그 쪽을 그리지 않는다.
   const [deletedSources, setDeletedSources] = useState(false)
   useEffect(() => {
@@ -105,7 +111,7 @@ export function SettingsView({
 
       <div className="settings-layout">
         <nav className="settings-navigation" aria-label={W.settingsView.aria2}>
-          {SECTIONS.filter((item) => (item.id !== 'skills' || skills || skillsFailed || skillsLoading) && (item.id !== 'archived' || archivedChats) && (item.id !== 'deletedSources' || deletedSources)).map((item) => {
+          {SECTIONS.filter((item) => (!only || only.includes(item.id)) && (item.id !== 'skills' || skills || skillsFailed || skillsLoading) && (item.id !== 'archived' || archivedChats) && (item.id !== 'deletedSources' || deletedSources)).map((item) => {
             const Icon = item.icon
             return (
               <button

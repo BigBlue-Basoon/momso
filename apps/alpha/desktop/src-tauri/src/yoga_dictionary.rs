@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::Path,
 };
 
@@ -331,7 +333,7 @@ pub(crate) fn initialize(root: &Path) -> Result<(), String> {
             }
         }
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, all(target_os = "linux", feature = "standalone")))]
     {
         let current = fs::read(dir.join(BASE)).map_err(|_| "dictionary_unavailable")?;
         if let Some(old) = PREVIOUS_BUNDLES
@@ -1091,7 +1093,54 @@ fn replace_known_base(root: &Path, old: &[u8], new: &[u8]) -> Result<bool, Strin
     Ok(true)
 }
 
-#[cfg(test)]
+#[cfg(all(target_os = "linux", feature = "standalone"))]
+fn replace_known_base(root: &Path, old: &[u8], new: &[u8]) -> Result<bool, String> {
+    use fs2::FileExt;
+    let dir = safe_directory(root)?;
+    let path = dir.join(BASE);
+    let meta = fs::symlink_metadata(&path).map_err(|_| "dictionary_unavailable")?;
+    if !meta.is_file() || crate::archive_location::is_link_or_reparse(&meta) {
+        return Err("dictionary_unsafe".into());
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|_| "dictionary_unavailable")?;
+    file.try_lock_exclusive().map_err(|_| "dictionary_busy")?;
+    let mut current = Vec::new();
+    file.read_to_end(&mut current)
+        .map_err(|_| "dictionary_unavailable")?;
+    if current != old {
+        return Ok(false);
+    }
+    if !root.join(".git").is_dir() {
+        return Ok(false);
+    }
+    let backup = root
+        .join(".git")
+        .join(format!("momso-dictionary-{}", uuid::Uuid::new_v4()));
+    let mut backup_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(backup)
+        .map_err(|_| "dictionary_unavailable")?;
+    backup_file
+        .write_all(&current)
+        .and_then(|()| backup_file.sync_all())
+        .map_err(|_| "dictionary_unavailable")?;
+    let mut temp = tempfile::NamedTempFile::new_in(&dir).map_err(|_| "dictionary_unavailable")?;
+    temp.write_all(new)
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|_| "dictionary_unavailable")?;
+    if fs::read(&path).map_err(|_| "dictionary_unavailable")? != current {
+        return Err("dictionary_changed".into());
+    }
+    temp.persist(&path).map_err(|_| "dictionary_unavailable")?;
+    Ok(true)
+}
+
+#[cfg(all(test, not(feature = "standalone")))]
 mod tests {
     use super::*;
 

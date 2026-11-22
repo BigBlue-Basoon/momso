@@ -7,8 +7,7 @@
 //     화면은 GCP 에서 버킷 이름을 그대로 받는다(원자료 버킷 자동 생성 계약, desktop-object-store-auto-bucket.md).
 //   object_store_backup, object_store_restore({ ids }), app_state_backup, app_state_restore, 이벤트 object-store-progress / done / failed
 // 키는 받아서 바로 넘기기만 한다(화면에 남기지 않는다).
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { isDesktopRuntime } from './runtime'
 
 export type RemoteStatus = {

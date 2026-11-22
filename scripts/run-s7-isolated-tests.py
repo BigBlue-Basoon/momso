@@ -72,8 +72,14 @@ def main():
         env["MOMSO_TEST_FAKE_CREDENTIAL_STORE"] = "1"
         for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GH_TOKEN", "GITHUB_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "CLOUDFLARE_API_TOKEN", "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "MOMSO_SAFE_DIAGNOSTICS"):
             env.pop(key, None)
-        block = ctypes.create_unicode_buffer("\0".join(f"{k}={v}" for k, v in sorted(env.items(), key=lambda item: item[0].upper())) + "\0\0")
         test_name = sys.argv[2] if len(sys.argv) > 2 else "saved_login_"
+        if test_name == "saved_login_open_and_fill_selected_without_submitting":
+            env["MOMSO_S14_OPEN_FILL"] = "1"
+            env["MOMSO_PANEL_ALLOW_LOOPBACK"] = "1"
+        else:
+            env.pop("MOMSO_S14_OPEN_FILL", None)
+            env.pop("MOMSO_PANEL_ALLOW_LOOPBACK", None)
+        block = ctypes.create_unicode_buffer("\0".join(f"{k}={v}" for k, v in sorted(env.items(), key=lambda item: item[0].upper())) + "\0\0")
         command = ctypes.create_unicode_buffer(subprocess.list2cmdline([executable, test_name, "--ignored", "--test-threads=1"]))
         if not kernel.CreateProcessW(executable, command, None, None, True, 0x08000400, block, None, ctypes.byref(startup), ctypes.byref(process)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -95,7 +101,7 @@ def main():
         if not kernel.GetExitCodeProcess(process.process, ctypes.byref(result)):
             raise ctypes.WinError(ctypes.get_last_error())
         reader.join(timeout=10)
-        if result.value == 0 and test_name in ("saved_login_auto_through_mcp_and_local_site", "saved_login_ask_through_mcp_and_local_site"):
+        if result.value == 0 and test_name in ("saved_login_auto_through_mcp_and_local_site", "saved_login_ask_through_mcp_and_local_site", "saved_login_open_and_fill_selected_without_submitting"):
             deadline = time.monotonic() + 30
             for folder, _, files in os.walk(owned_temp, onerror=lambda error: (_ for _ in ()).throw(error)):
                 for name in files:

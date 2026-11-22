@@ -44,6 +44,9 @@ pub(crate) async fn panel_browser_select_chat(
     let _switch = PANEL_SWITCH.lock().await;
     crate::panel_chat::validate(&chat_id)?;
     let previous = crate::panel_chat::active_chat();
+    if previous.as_deref() != Some(chat_id.as_str()) {
+        crate::panel_overlay::dismiss(app.clone(), "chat_changed", false);
+    }
     if let Some(old) = previous.as_deref().filter(|old| *old != chat_id) {
         if let Some(state) = app.try_state::<crate::AppState>() {
             state.browser.panel_ownership.take_over_chat(old)?;
@@ -688,6 +691,7 @@ async fn open_panel(
         .add_child(
             WebviewBuilder::new(label, WebviewUrl::External(url))
                 .data_directory(profile)
+                .browser_extensions_enabled(true)
                 // Creating an agent panel must not activate a background window.
                 .focused(false)
                 .on_navigation(move |url| crate::panel_chat::resolve(navigation_owner.clone()) == crate::panel_chat::active_chat() && navigation_gate().permits_navigation(url.as_str()) && (allowed_address(url.as_str()).is_ok() || oauth_callback_allowed(url)) && !google_notice(&nav_app, url, nav_site.lock().ok().and_then(|v| v.clone()), navigation_owner.clone()))
@@ -808,6 +812,8 @@ async fn open_panel(
         .map_err(|_| if cfg!(test) { "test_webview_unavailable".to_owned() } else { "unavailable".to_owned() })?;
     crate::app_lifecycle::observe_webview(&panel_view);
     #[cfg(windows)]
+    crate::saved_login_icons::observe(&panel_view);
+    #[cfg(windows)]
     if human_requested {
         if let Ok(hwnd) = window.hwnd() {
             let main = hwnd.0 as usize;
@@ -840,6 +846,7 @@ pub(crate) async fn panel_browser_close(
 ) -> Result<(), String> {
     let _switch = PANEL_SWITCH.lock().await;
     ensure_chat(&chat_id)?;
+    crate::panel_overlay::dismiss(app.clone(), "panel_hidden", false);
     if let Some(state) = app.try_state::<crate::AppState>() {
         if let Ok(Some(chat_id)) = state.browser.panel_ownership.panel_closed() {
             if let Some(token) = state.chat_active.lock().await.get(&chat_id).cloned() {
@@ -891,6 +898,7 @@ async fn clear_profile_data(
                     WebviewUrl::External("about:blank".parse().map_err(|_| "unavailable")?),
                 )
                 .data_directory(profile)
+                .browser_extensions_enabled(true)
                 .focused(false)
                 .on_navigation(|_| false),
                 LogicalPosition::new(-10000.0, -10000.0),
@@ -1006,6 +1014,7 @@ pub(crate) async fn panel_browser_visibility(
     }
     let view = panel(&app)?;
     if !visible {
+        crate::panel_overlay::dismiss(app.clone(), "panel_hidden", false);
         return view.hide().map_err(|_| "unavailable".into());
     }
     #[cfg(windows)]
@@ -1170,6 +1179,10 @@ mod tests {
                 )
                 .env("MOMSO_PANEL_ALLOW_LOOPBACK", "1")
                 .env("MOMSO_TEST_FAKE_CREDENTIAL_STORE", "1")
+                .env(
+                    "MOMSO_TEST_SAVED_LOGIN_ICON_ROOT",
+                    temp.path().join("icons"),
+                )
                 .env("USERPROFILE", temp.path())
                 .env("LOCALAPPDATA", local)
                 .env("APPDATA", roaming)
@@ -1216,10 +1229,18 @@ mod tests {
                 let mut input = [0; 8192];
                 if let Ok(n) = stream.read(&mut input) {
                     let request = String::from_utf8_lossy(&input[..n]);
+                    if request.starts_with("GET /favicon.png ") {
+                        use base64::Engine as _;
+                        let image = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAI0lEQVR4nGPUim5iIAUwkaSaYVQDcYCJSHVwMKqBGEByKAEAV0cBJzqYTqIAAAAASUVORK5CYII=").unwrap();
+                        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", image.len());
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(&image);
+                        continue;
+                    }
                     let body = if request.starts_with("GET /next ") {
                         "<html><title>next page</title><body>next content</body></html>"
                     } else {
-                        "<html><title>start page</title><body><button onclick=\"location.href='/next'\">pricing</button></body></html>"
+                        "<html><head><link rel='icon' href='/favicon.png'></head><title>start page</title><body style='height:3000px'><table><tr><th>Time</th><th>Class</th></tr><tr><td>09:00</td><td>Yoga fixture</td></tr></table><button onclick=\"location.href='/next'\">pricing</button></body></html>"
                     };
                     let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
                     let _ = stream.write_all(response.as_bytes());
@@ -1241,6 +1262,32 @@ mod tests {
                     let chat = "click-fixture";
                     super::panel_browser_select_chat(app.clone(), chat.into()).await?;
                     super::panel_browser_open_agent(app.clone(), chat.into(), 0.0, 0.0, 300.0, 200.0).await?;
+                    if !public_site {
+                        crate::panel_extension_store::install_signed_fixture(&app, &root).await.map_err(|error| format!("signed fixture: {error}"))?;
+                        if std::env::var_os("MOMSO_TEST_PUBLIC_EXTENSION").is_some() {
+                            let id = "aapbdbdomjkkjkaonfhkkikfgjllcleb";
+                            let installed = crate::panel_extension_store::panel_extensions_install_store(app.clone(), id.into()).await.map_err(|error| format!("public store: {error}"))?;
+                            if installed.first().is_none_or(|item| item.id != id) { return Err("public extension ID".into()); }
+                            crate::panel_extensions::panel_extensions_remove(app.clone(), id.into()).await.map_err(str::to_owned)?;
+                        }
+                        let old_id = "abcdefghijklmnopabcdefghijklmnop";
+                        let fixture = root.join("local/Google/Chrome/User Data/Default/Extensions").join(old_id).join("1.0_0");
+                        std::fs::create_dir_all(&fixture).map_err(|_| "fixture directory")?;
+                        std::fs::write(fixture.join("manifest.json"), r#"{"manifest_version":3,"name":"import fixture","version":"1.0","action":{"default_popup":"popup.html"}}"#).map_err(|_| "fixture manifest")?;
+                        std::fs::write(fixture.join("popup.html"), "fixture").map_err(|_| "fixture popup")?;
+                        let candidates = crate::panel_extension_catalog::panel_extensions_import_candidates().map_err(|error| format!("candidates: {error}"))?;
+                        if candidates.len() != 1 { return Err("candidate count".into()); }
+                        let installed = crate::panel_extension_catalog::panel_extensions_import(app.clone(), "chrome".into(), "Default".into(), old_id.into(), "1.0_0".into()).await.map_err(|error| format!("import: {error}"))?;
+                        let id = installed.first().ok_or("missing imported extension")?.id.clone();
+                        crate::panel_extension_catalog::panel_extensions_pin_set(app.clone(), id.clone(), true).await.map_err(|error| format!("pin: {error}"))?;
+                        if crate::panel_extension_catalog::panel_extensions_pin_get(app.clone()).map_err(str::to_owned)? != vec![id.clone()] { return Err("pin missing".into()); }
+                        let popup = crate::panel_extension_catalog::panel_extensions_popup(app.clone(), id.clone()).await.map_err(str::to_owned)?;
+                        if popup["url"] != format!("chrome-extension://{id}/popup.html") { return Err("popup address".into()); }
+                        crate::panel_extensions::panel_extensions_remove(app.clone(), id).await.map_err(str::to_owned)?;
+                        if !crate::panel_extension_catalog::panel_extensions_pin_get(app.clone()).map_err(str::to_owned)?.is_empty() { return Err("pin retained".into()); }
+                        if !fixture.join("manifest.json").exists() { return Err("source changed".into()); }
+                    }
+                    let extension = if public_site { None } else { Some(crate::panel_extensions::install_fixture(&app, &root).await.map_err(str::to_owned)?) };
                     let manager = crate::browser_runtime::BrowserManager::default();
                     manager.bind_app(app.clone());
                     let policy = Ok(Some(crate::browser_gateway::Policy::general()));
@@ -1254,6 +1301,28 @@ mod tests {
                     let start_url = if public_site { "https://bodycodi.com/".to_owned() } else { format!("{base}/first") };
                     let page = call(serde_json::json!({"method":"browser_navigate","arguments":{"url":start_url}})).await;
                     if page["status"] != "page" { return Err(format!("navigate: {}", page["status"])); }
+                    if !public_site && !page["text"].as_str().is_some_and(|text| text.contains("09:00") && text.contains("Yoga fixture")) { return Err("table text missing".into()); }
+                    let scrolled = call(serde_json::json!({"method":"browser_scroll","arguments":{"direction":"down"}})).await;
+                    if scrolled["status"] != "ok" { return Err(format!("scroll: {}", scrolled["status"])); }
+                    if !public_site {
+                        let transport = crate::panel_cdp::PanelTransport::bind(&app).map_err(str::to_owned)?;
+                        let position = transport.call("Runtime.evaluate", serde_json::json!({"expression":"window.scrollY","returnByValue":true})).await.map_err(str::to_owned)?;
+                        if position.pointer("/result/value").and_then(serde_json::Value::as_f64).unwrap_or(0.0) <= 0.0 { return Err("scroll position did not change".into()); }
+                        let mut active = false;
+                        for _ in 0..50 {
+                            let result = transport.call("Runtime.evaluate", serde_json::json!({"expression":"document.documentElement.dataset.momsoFixture === 'active'","returnByValue":true})).await.map_err(str::to_owned)?;
+                            if result.pointer("/result/value").and_then(serde_json::Value::as_bool) == Some(true) { active = true; break; }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        if !active { return Err("extension content script inactive".into()); }
+                        let cache = crate::saved_login_icons::cache_root(&app).ok_or("app data unavailable")?;
+                        let mut found = false;
+                        for _ in 0..100 {
+                            if crate::saved_login_icons::icons_for_origins(&cache, std::iter::once(base.as_str())).contains_key(&base) { found = true; break; }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        if !found { return Err("panel favicon not cached".into()); }
+                    }
                     let previous_title = page["title"].clone();
                     let previous_text = page["text"].clone();
                     let id = page["elements"].as_array().and_then(|items| items.iter().find(|item| if public_site { item["name"].as_str().is_some_and(|name| name.contains("요금")) } else { item["name"] == "pricing" })).and_then(|item| item["id"].as_str()).ok_or("missing pricing menu")?.to_owned();
@@ -1277,6 +1346,7 @@ mod tests {
                     if public_site && page["title"] == previous_title && page["text"] == previous_text { return Err("pricing view did not change".into()); }
                     if asks.load(Ordering::SeqCst) != 1 { return Err("approval count".into()); }
                     if super::current_panel(&app).is_none() { return Err("panel closed".into()); }
+                    if let Some(id) = extension { crate::panel_extensions::remove_fixture(&app, id).await.map_err(str::to_owned)?; }
                     if !public_site {
                         crate::panel_worker::fail_next_guard_for_test();
                         for _ in 0..100 {

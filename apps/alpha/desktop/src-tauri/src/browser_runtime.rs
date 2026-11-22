@@ -262,6 +262,9 @@ fn browser_known_values(data_root: &std::path::Path) -> Result<Vec<String>, &'st
     Ok(known)
 }
 fn page_value(page: PageState, known: &[&str]) -> Value {
+    page_value_at(page, known, 0)
+}
+fn page_value_at(page: PageState, known: &[&str], offset: usize) -> Value {
     let clean = |value: &str, limit| {
         limited(
             &crate::chat_archive_redact::redact_with_known(value, known).text,
@@ -269,7 +272,11 @@ fn page_value(page: PageState, known: &[&str]) -> Value {
         )
     };
     let elements: Vec<_> = page.elements.into_iter().take(40).map(|e| json!({"id":clean(&e.id,128),"role":clean(&e.role,24),"name":clean(&e.name,128),"kind":e.kind})).collect();
-    json!({"status":"page","origin":clean(&page.origin,512),"title":clean(&page.title,256),"text":clean(&page.text,4000),"elements":elements,"dataProvenance":page.data_provenance})
+    let text = crate::chat_archive_redact::redact_with_known(&page.text, known).text;
+    let length = text.chars().count();
+    let excerpt: String = text.chars().skip(offset).take(4000).collect();
+    let next = (offset.saturating_add(4000) < length).then_some(offset + 4000);
+    json!({"status":"page","origin":clean(&page.origin,512),"title":clean(&page.title,256),"text":excerpt,"nextOffset":next,"elements":elements,"dataProvenance":page.data_provenance})
 }
 fn human(reason: &'static str, chat_id: &str, notify: &Notify) -> Value {
     let reason = match reason {
@@ -366,8 +373,13 @@ fn valid(method: &str, args: &Value) -> bool {
             .is_some_and(|s| !s.is_empty() && s.len() <= 256)
     };
     match method {
-        "browser_open" | "browser_read" | "browser_close" | "browser_request_saved_login" => {
+        "browser_open" | "browser_close" | "browser_request_saved_login" => a.is_empty(),
+        "browser_read" => {
             a.is_empty()
+                || (a.len() == 1
+                    && a.get("offset")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|v| v <= 20000))
         }
         "browser_navigate" => {
             a.len() == 1
@@ -376,6 +388,13 @@ fn valid(method: &str, args: &Value) -> bool {
                     .is_some_and(|s| !s.is_empty() && s.len() <= 4096)
         }
         "browser_click" => a.len() == 1 && id(),
+        "browser_scroll" => {
+            a.len() == 1
+                && matches!(
+                    a.get("direction").and_then(Value::as_str),
+                    Some("up" | "down")
+                )
+        }
         "browser_request_host" => {
             a.len() == 1
                 && a.get("host")
@@ -405,6 +424,70 @@ fn valid(method: &str, args: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+#[cfg(test)]
+#[test]
+fn browser_scroll_only_accepts_a_bounded_direction() {
+    assert!(valid("browser_scroll", &json!({"direction":"down"})));
+    assert!(valid("browser_scroll", &json!({"direction":"up"})));
+    assert!(!valid("browser_scroll", &json!({"direction":"sideways"})));
+    assert!(!valid(
+        "browser_scroll",
+        &json!({"direction":"down","amount":999999})
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn browser_read_paginates_redacted_table_text_without_leaking_a_split_secret() {
+    let secret = "fixture-private-value";
+    let text = format!("{}{}{}", "가".repeat(3995), secret, "나".repeat(20));
+    let page = PageState {
+        origin: "https://example.test".into(),
+        title: "fixture".into(),
+        text,
+        elements: vec![],
+        data_provenance: "fixture",
+    };
+    let first = page_value_at(page.clone(), &[secret], 0);
+    let second = page_value_at(page, &[secret], 4000);
+    assert_eq!(first["nextOffset"], 4000);
+    assert!(!first.to_string().contains(secret));
+    assert!(!second.to_string().contains(secret));
+    assert!(second["text"].as_str().unwrap().contains('나'));
+    assert!(second["nextOffset"].is_null());
+    assert!(!valid("browser_read", &json!({"offset": 20001})));
+}
+
+#[cfg(test)]
+#[test]
+fn one_time_code_page_is_handed_to_the_person_without_page_text() {
+    let event = Arc::new(Mutex::new(None));
+    let recorded = event.clone();
+    let notify: Notify = Arc::new(move |name, value| {
+        *recorded.lock().unwrap() = Some((name.to_owned(), value));
+    });
+    let page = PageState {
+        origin: "https://example.test".into(),
+        title: "fixture".into(),
+        text: "fixture code must not reach the AI".into(),
+        elements: vec![crate::browser_engine::Element {
+            id: "code".into(),
+            role: "input".into(),
+            name: String::new(),
+            kind: "one_time_code",
+        }],
+        data_provenance: "fixture",
+    };
+    assert_eq!(
+        safe_page(page, "fixture-chat", &notify, &[]),
+        json!({"status":"human_required"})
+    );
+    let (name, payload) = event.lock().unwrap().clone().unwrap();
+    assert_eq!(name, "browser-human-required");
+    assert_eq!(payload["reason"], "one_time_code");
+    assert_eq!(payload["chatId"], "fixture-chat");
 }
 async fn call<T: Send + 'static>(
     entry: &Arc<Entry>,
@@ -730,6 +813,74 @@ impl BrowserManager {
             self.external_sessions.lock().await.remove(chat_id);
         }
     }
+    /// A person explicitly selected this login in the trusted app UI.
+    pub(crate) async fn fill_saved_for_person(
+        &self,
+        chat_id: &str,
+        selected: crate::saved_logins::LoginInfo,
+        notify: &Notify,
+    ) -> Value {
+        let Some(entry) = self.entries.lock().await.get(chat_id).cloned() else {
+            return json!({"status":"not_open"});
+        };
+        let _serial = entry.serial.lock().await;
+        if entry
+            .panel_lease
+            .as_ref()
+            .is_none_or(|lease| lease.check().is_err())
+        {
+            return json!({"status":"panel_closed"});
+        }
+        let url = selected.site_url.clone().unwrap_or_else(|| {
+            format!(
+                "{}{}",
+                selected.origin,
+                selected.login_path.as_deref().unwrap_or("/")
+            )
+        });
+        if !entry.allows(&url) {
+            return json!({"status":"blocked"});
+        }
+        match call(&entry, move |session| session.navigate(&url)).await {
+            Ok(_) | Err(DriverError::HumanRequired("login" | "password")) => (),
+            Err(error) => return entry.error(error, chat_id, notify),
+        }
+        let target = match call(&entry, |session| session.saved_login_target()).await {
+            Ok(target) if target.origin == selected.origin => target,
+            Ok(_) => return json!({"status":"target_changed"}),
+            Err(error) => return entry.error(error, chat_id, notify),
+        };
+        let target = match call(&entry, move |session| {
+            session.restrict_saved_login(&target)?;
+            Ok(target)
+        })
+        .await
+        {
+            Ok(target) => target,
+            Err(error) => return entry.error(error, chat_id, notify),
+        };
+        let secret = match tokio::task::spawn_blocking(move || {
+            crate::saved_logins::secret_for_origin(&selected)
+        })
+        .await
+        {
+            Ok(Ok(secret)) => secret,
+            Ok(Err("not_found")) => return json!({"status":"target_changed"}),
+            _ => return json!({"status":"credential_store_unavailable"}),
+        };
+        if crate::saved_logins::remember_used_password(&secret.password).is_err() {
+            return json!({"status":"unavailable"});
+        }
+        match call(&entry, move |session| {
+            session.fill_saved_login(&target, secret, false)
+        })
+        .await
+        {
+            Ok(()) => json!({"status":"filled"}),
+            Err(error) => entry.error(error, chat_id, notify),
+        }
+    }
+
     pub(crate) async fn dispatch(&self, context: RequestContext<'_>, input: Value) -> Value {
         let RequestContext {
             chat_id,
@@ -1183,7 +1334,7 @@ impl BrowserManager {
                 return entry.denied();
             }
             return match call(&entry, move |session| {
-                session.fill_saved_login(&target, secret)
+                session.fill_saved_login(&target, secret, true)
             })
             .await
             {
@@ -1314,13 +1465,17 @@ impl BrowserManager {
                 };
             let refs: Vec<&str> = known.iter().map(String::as_str).collect();
             let url = url.to_owned();
-            return match call(&entry, move |s| s.navigate(&url)).await {
+            return match call(&entry, move |s| {
+                crate::browser_engine::BrowserEngine::navigate(s, &url)
+            })
+            .await
+            {
                 Ok(page) if entry.allows(&page.origin) => safe_page(page, chat_id, &notify, &refs),
                 Ok(page) => entry.blocked(&page.origin),
                 Err(e) => entry.error(e, chat_id, &notify),
             };
         }
-        let page = match call(&entry, |s| s.read()).await {
+        let page = match call(&entry, crate::browser_engine::BrowserEngine::read).await {
             Ok(page) if entry.allows(&page.origin) => page,
             Ok(page) => return entry.blocked(&page.origin),
             Err(e) => return entry.error(e, chat_id, &notify),
@@ -1342,9 +1497,25 @@ impl BrowserManager {
                         _ => return json!({"status":"unavailable"}),
                     };
                 let refs: Vec<&str> = known.iter().map(String::as_str).collect();
-                page_value(page, &refs)
+                let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                page_value_at(page, &refs, offset)
             } else {
                 json!({"status":"read_only"})
+            };
+        }
+        if method == "browser_scroll" {
+            if !entry.policy.allows_read_only("browser_read") {
+                return json!({"status":"read_only"});
+            }
+            let direction = args["direction"].as_str().unwrap().to_owned();
+            let origin = page.origin.clone();
+            return match call(&entry, move |session| {
+                crate::browser_engine::BrowserEngine::scroll(session, &direction, &origin)
+            })
+            .await
+            {
+                Ok(()) => json!({"status":"ok"}),
+                Err(error) => entry.error(error, chat_id, &notify),
             };
         }
         if method == "browser_request_action" {
@@ -1526,7 +1697,12 @@ impl BrowserManager {
                 if operation_cancel.is_cancelled() {
                     Err(DriverError::Refused("cancelled"))
                 } else {
-                    s.click_checked(&id, &expected, Some(&origin))
+                    crate::browser_engine::BrowserEngine::click_checked(
+                        s,
+                        &id,
+                        &expected,
+                        Some(&origin),
+                    )
                 }
             })
             .await
@@ -1536,7 +1712,13 @@ impl BrowserManager {
                 if operation_cancel.is_cancelled() {
                     Err(DriverError::Refused("cancelled"))
                 } else {
-                    s.fill_checked(&id, &text, Some(&expected), Some(&origin))
+                    crate::browser_engine::BrowserEngine::fill_checked(
+                        s,
+                        &id,
+                        &text,
+                        Some(&expected),
+                        Some(&origin),
+                    )
                 }
             })
             .await

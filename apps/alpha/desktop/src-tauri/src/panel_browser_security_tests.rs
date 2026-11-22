@@ -39,6 +39,10 @@ fn every_registered_command_from_remote_panel_is_denied_before_dispatch() {
     let panel = tauri::WebviewWindowBuilder::new(&app, "panel-browser", Default::default())
         .build()
         .unwrap();
+    let extension =
+        tauri::WebviewWindowBuilder::new(&app, "panel-extension-popup", Default::default())
+            .build()
+            .unwrap();
     for name in &names {
         let response = get_ipc_response(
             &panel,
@@ -57,6 +61,26 @@ fn every_registered_command_from_remote_panel_is_denied_before_dispatch() {
             calls.load(Ordering::SeqCst),
             0,
             "remote command dispatched: {name}"
+        );
+        let response = get_ipc_response(
+            &extension,
+            InvokeRequest {
+                cmd: (*name).into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "chrome-extension://abcdefghijklmnopabcdefghijklmnop/popup.html"
+                    .parse()
+                    .unwrap(),
+                body: tauri::ipc::InvokeBody::Json(serde_json::json!({})),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.into(),
+            },
+        );
+        assert!(response.is_err(), "extension invocation succeeded: {name}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "extension command dispatched: {name}"
         );
     }
     let _ = get_ipc_response(
@@ -80,10 +104,13 @@ fn every_registered_command_from_remote_panel_is_denied_before_dispatch() {
 }
 
 #[test]
-fn only_main_webview_receives_capabilities() {
+fn only_app_owned_webviews_receive_capabilities() {
     let capability: serde_json::Value =
         serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
-    assert_eq!(capability["webviews"], serde_json::json!(["main"]));
+    assert_eq!(
+        capability["webviews"],
+        serde_json::json!(["main", "panel-overlay"])
+    );
     assert!(capability.get("windows").is_none());
     assert!(capability.get("remote").is_none());
 }

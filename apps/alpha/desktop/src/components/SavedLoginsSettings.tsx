@@ -14,37 +14,28 @@ import { W } from '../words'
 import { QuestionDialog } from './ZetPanel'
 
 /** 누른 단추가 사라지거나 잠겨 포커스가 화면 밖(body)으로 빠졌을 때만 다음 자리로 옮긴다(용어 사전과 같음). */
-function focusIfLost(target: () => HTMLElement | null | undefined) {
+export function focusIfLost(target: () => HTMLElement | null | undefined) {
   requestAnimationFrame(() => {
     const active = document.activeElement
     if (!active || active === document.body) target()?.focus()
   })
 }
 
-function errorText(error: unknown, plain: string) {
+export function errorText(error: unknown, plain: string) {
   const code = savedLoginErrorCode(error)
   return (code && W.savedLogins.errors[code]) || plain
 }
 
 /**
- * 설정 › 저장된 로그인(2026-11-21 본부 지시, 뒤쪽 275e017 saved-logins.ts).
- * 용어 사전의 "사람 이름" 목록과 같은 부품: 위에 제목·한 줄·"새 로그인", 줄마다 이름과 "사이트 · 아이디", 오른쪽에 수정·삭제.
- * 넣기·고치기 칸은 사이트 주소, 이름, 아이디, 비밀번호, 쓸 때마다 묻기. 로그인 화면 경로와 기본 계정은 같은 사이트(경로)에 로그인이 둘 이상일 때만 보인다
- * (이미 정해 둔 값이 있으면 늘 보인다). 비밀번호는 목록에 없고(뒤쪽도 주지 않는다) React 상태에도 담지 않는다: 칸에만 있다가 보낼 때 읽고 바로 비운다.
+ * 저장된 로그인 목록과 넣기·고치기·삭제(설정 화면과 패널 브라우저의 열쇠 카드가 함께 쓴다).
+ * save·remove 는 한 번에 하나만(working 동안은 false). 끝나면 목록을 다시 읽고 알림 줄(message)을 둔다.
  */
-export function SavedLoginsSettings() {
+export function useSavedLogins() {
   const words = W.savedLogins
   const [list, setList] = useState<SavedLogin[] | null>(null)
   const [problem, setProblem] = useState<string | null>(null)
-  const [adding, setAdding] = useState(false)
-  const [editing, setEditing] = useState<string | null>(null)
-  const [asking, setAsking] = useState<SavedLogin | null>(null)
   const [working, setWorking] = useState(false)
   const [message, setMessage] = useState<{ text: string; alert: boolean } | null>(null)
-  const addButton = useRef<HTMLButtonElement>(null)
-  const rows = useRef<HTMLUListElement>(null)
-  const focusAdd = () => focusIfLost(() => addButton.current)
-  const focusRow = (id: string, which: string) => focusIfLost(() => rows.current?.querySelector<HTMLElement>(`[data-login-id="${CSS.escape(id)}"] .${which}`))
 
   const reload = useCallback(async () => {
     try {
@@ -76,23 +67,47 @@ export function SavedLoginsSettings() {
     }
   }
 
+  /** 삭제 한 번. 지웠으면(그사이 지워진 것도) true. */
   async function remove(login: SavedLogin) {
-    if (working) return
+    if (working) return false
     setWorking(true)
     setMessage(null)
     try {
       await deleteSavedLogin(login.id)
       await reload()
       setMessage({ text: words.removed, alert: false })
+      return true
     } catch (error) {
       const code = savedLoginErrorCode(error)
       await reload()
       setMessage(code === 'not_found' ? { text: words.removed, alert: false } : { text: errorText(error, words.removeFailed), alert: true })
+      return code === 'not_found'
     } finally {
       setWorking(false)
-      focusAdd()
     }
   }
+
+  return { list, problem, working, message, setMessage, reload, save, remove }
+}
+
+/**
+ * 설정 › 저장된 로그인(2026-11-21 본부 지시, 뒤쪽 275e017 saved-logins.ts).
+ * 용어 사전의 "사람 이름" 목록과 같은 부품: 위에 제목·한 줄·"새 로그인", 줄마다 이름과 "사이트 · 아이디", 오른쪽에 수정·삭제.
+ * 넣기·고치기 칸은 사이트 주소, 이름, 아이디, 비밀번호, 쓸 때마다 묻기. 로그인 화면 경로와 기본 계정은 같은 사이트(경로)에 로그인이 둘 이상일 때만 보인다
+ * (이미 정해 둔 값이 있으면 늘 보인다). 비밀번호는 목록에 없고(뒤쪽도 주지 않는다) React 상태에도 담지 않는다: 칸에만 있다가 보낼 때 읽고 바로 비운다.
+ */
+export function SavedLoginsSettings() {
+  const words = W.savedLogins
+  const { list, problem, working, message, setMessage, reload, save, remove: removeLogin } = useSavedLogins()
+  const [adding, setAdding] = useState(false)
+  const [editing, setEditing] = useState<string | null>(null)
+  const [asking, setAsking] = useState<SavedLogin | null>(null)
+  const addButton = useRef<HTMLButtonElement>(null)
+  const rows = useRef<HTMLUListElement>(null)
+  const focusAdd = () => focusIfLost(() => addButton.current)
+  const focusRow = (id: string, which: string) => focusIfLost(() => rows.current?.querySelector<HTMLElement>(`[data-login-id="${CSS.escape(id)}"] .${which}`))
+
+  const remove = (login: SavedLogin) => { void removeLogin(login).then(focusAdd) }
 
   const stopAsking = () => { if (asking) focusRow(asking.id, 'term-person-delete'); setAsking(null) }
 
@@ -182,15 +197,13 @@ export function SavedLoginsSettings() {
  * 넣기(login 없음)와 고치기. 고칠 때 사이트 주소는 바꿀 수 없어 잠그고, 비밀번호 칸을 비워 두면 기존 것을 그대로 쓴다.
  * 로그인 화면 경로: 같은 사이트에 다른 로그인이 있거나 이미 경로를 정해 둔 로그인일 때만. 기본 계정: 그 경로에 다른 로그인이 있거나 이미 기본일 때만.
  */
-function LoginForm({ login, all, working, onCancel, onSave }: {
-  login?: SavedLogin
-  all: SavedLogin[]
-  working: boolean
-  onCancel: () => void
-  onSave: (input: SavedLoginInput) => void
-}) {
-  const words = W.savedLogins
-  const [site, setSite] = useState(login?.origin ?? '')
+/**
+ * 넣기·고치기 칸의 값과 규칙(설정의 LoginForm 과 열쇠 카드의 입력 꼴이 함께 쓴다).
+ * 로그인 화면 경로는 같은 사이트에 다른 로그인이 있거나 이미 경로를 정해 둔 로그인일 때만, 기본 계정은 그 경로에 다른 로그인이 있거나 이미 기본일 때만.
+ * 비밀번호는 password 칸(ref)에만 있다. take() 가 보낼 값을 만들며 그 칸을 바로 비운다.
+ */
+export function useLoginDraft({ login, site: startSite, all }: { login?: SavedLogin; site?: string; all: SavedLogin[] }) {
+  const [site, setSite] = useState(login?.origin ?? startSite ?? '')
   const [label, setLabel] = useState(login?.label ?? '')
   const [username, setUsername] = useState(login?.username ?? '')
   const [ask, setAsk] = useState(login?.askBeforeUse ?? false)
@@ -201,17 +214,28 @@ function LoginForm({ login, all, working, onCancel, onSave }: {
   const [hasPassword, setHasPassword] = useState(false)
 
   const origin = login ? login.origin : siteOrigin(site)
+  // 새 로그인에 경로까지 적은 주소(로그인 화면)면 siteUrl 로도 보낸다(S14: 같은 출처여야 한다).
+  const siteUrl = (() => {
+    if (login) return null
+    try {
+      const value = site.trim()
+      const url = new URL(value.includes('://') ? value : `https://${value}`)
+      return url.origin === origin && (url.pathname !== '/' || url.search) ? `${url.origin}${url.pathname}${url.search}` : null
+    } catch {
+      return null
+    }
+  })()
   const sameSite = all.filter((entry) => entry.id !== login?.id && entry.origin === origin)
   const showPath = sameSite.length > 0 || Boolean(login?.loginPath)
   const samePath = sameSite.filter((entry) => (entry.loginPath ?? '') === (showPath ? path.trim() : ''))
   const showDefault = samePath.length > 0 || Boolean(login?.defaultForPath)
   const ready = Boolean(origin && label.trim() && username.trim() && (login || hasPassword))
 
-  function submit() {
-    if (!ready || working) return
+  /** 보낼 값(준비가 안 됐으면 null). 비밀번호 칸은 여기서 비운다(저장에 실패해도 다시 적게 한다). */
+  function take(): SavedLoginInput | null {
+    if (!ready) return null
     const field = password.current
     const secret = field?.value ?? ''
-    // 보낼 값만 꺼내고 칸을 바로 비운다(저장에 실패해도 다시 적게 한다).
     if (field) field.value = ''
     setHasPassword(false)
     const input: SavedLoginInput = {
@@ -219,6 +243,7 @@ function LoginForm({ login, all, working, onCancel, onSave }: {
       origin,
       label: label.trim(),
       username: username.trim(),
+      ...(siteUrl ? { siteUrl } : {}),
       ...(secret ? { password: secret } : {}),
       askBeforeUse: ask,
       // 경로 칸이 보일 때만 보낸다(빈 값은 경로 지우기). 안 보이면 빼서 지금 값을 그대로 둔다.
@@ -226,7 +251,34 @@ function LoginForm({ login, all, working, onCancel, onSave }: {
       // 기본 계정은 늘 지금 값을 보낸다(다른 기본이 있을 때 true 면 뒤쪽이 그 기본을 해제한다).
       defaultForPath: showDefault ? isDefault : false,
     }
-    onSave(input)
+    return input
+  }
+
+  return {
+    site, setSite, label, setLabel, username, setUsername, ask, setAsk, path, setPath, isDefault, setIsDefault,
+    password, hasPassword, setHasPassword, origin, showPath, showDefault, ready, take,
+  }
+}
+
+export function LoginForm({ login, site: startSite, all, working, onCancel, onSave }: {
+  login?: SavedLogin
+  /** 새 로그인의 사이트 주소 칸에 처음 채워 둘 값. 채워 두면 이름 칸에 초점. */
+  site?: string
+  all: SavedLogin[]
+  working: boolean
+  onCancel: () => void
+  onSave: (input: SavedLoginInput) => void
+}) {
+  const words = W.savedLogins
+  const {
+    site, setSite, label, setLabel, username, setUsername, ask, setAsk, path, setPath, isDefault, setIsDefault,
+    password, setHasPassword, showPath, showDefault, ready, take,
+  } = useLoginDraft({ login, site: startSite, all })
+
+  function submit() {
+    if (!ready || working) return
+    const input = take()
+    if (input) onSave(input)
   }
 
   return (
@@ -238,12 +290,12 @@ function LoginForm({ login, all, working, onCancel, onSave }: {
     >
       <label className="setting-field">
         <span>{words.fieldSite}</span>
-        <input value={site} onChange={(event) => setSite(event.target.value)} placeholder="https://" spellCheck={false} disabled={Boolean(login)} autoFocus={!login} />
+        <input value={site} onChange={(event) => setSite(event.target.value)} placeholder="https://" spellCheck={false} disabled={Boolean(login)} autoFocus={!login && !startSite} />
         {login && <small>{words.siteFixed}</small>}
       </label>
       <label className="setting-field">
         <span>{words.fieldName}</span>
-        <input value={label} onChange={(event) => setLabel(event.target.value)} maxLength={100} autoFocus={Boolean(login)} />
+        <input value={label} onChange={(event) => setLabel(event.target.value)} maxLength={100} autoFocus={Boolean(login || startSite)} />
       </label>
       <label className="setting-field">
         <span>{words.fieldUsername}</span>

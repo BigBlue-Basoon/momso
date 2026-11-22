@@ -8,8 +8,8 @@
 //   오류 문자열: invalid_name, already_exists, not_found, invalid_format, conflict, builtin, invalid_state, io_error, save_failed, rollback_failed
 //   chat_send 의 skill(스킬 name, 고르지 않았으면 null) → 쓸 수 없는 스킬이면 말을 저장하지 않고 { status: 'skill_unavailable' }.
 // skill_list 가 없으면 입력 칸의 / 목록과 설정의 "스킬" 쪽을 그리지 않는다.
-import { invoke } from '@tauri-apps/api/core'
-import { isDesktopRuntime } from './runtime'
+import { invoke } from './host'
+import { hasAppBackend } from './runtime'
 import { W } from './words'
 
 export type SkillEntry = {
@@ -37,8 +37,9 @@ export type SkillDocument = SkillEntry & { body: string; contentHash: string }
 
 export type SkillChanges = { title?: string; description?: string; body?: string }
 
+// 데스크톱 또는 휴대폰 몸소(S75 server 의 /skills).
 function need() {
-  if (!isDesktopRuntime()) throw new Error('skills need the desktop runtime')
+  if (!hasAppBackend()) throw new Error('skills need the desktop runtime')
 }
 
 export async function listSkills() { need(); return invoke<SkillEntry[]>('skill_list') }

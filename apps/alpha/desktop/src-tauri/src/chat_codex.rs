@@ -362,8 +362,22 @@ where
     F: FnMut(&str, Value) + Send,
 {
     run_with_skill_auth(
-        db, archive, chat_id, text, model, effort, None, None, None, None, settings, approvals,
-        cancel, None, emit,
+        db,
+        archive,
+        chat_id,
+        text,
+        &[],
+        model,
+        effort,
+        None,
+        None,
+        None,
+        None,
+        settings,
+        approvals,
+        cancel,
+        None,
+        emit,
     )
     .await
 }
@@ -393,6 +407,7 @@ where
         archive,
         chat_id,
         text,
+        &[],
         model,
         effort,
         skill,
@@ -414,6 +429,7 @@ pub(crate) async fn run_with_skill_auth<F>(
     archive: &Path,
     chat_id: &str,
     text: &str,
+    attachments: &[chat::MessageAttachment],
     model: Option<&str>,
     effort: Option<&str>,
     skill: Option<&str>,
@@ -429,6 +445,7 @@ pub(crate) async fn run_with_skill_auth<F>(
 where
     F: FnMut(&str, Value) + Send,
 {
+    let images = verified_image_paths(archive, attachments)?;
     if let Some(name) = skill {
         if !crate::skills::callable(archive, name).map_err(str::to_owned)? {
             return Err("skill_unavailable".into());
@@ -464,6 +481,7 @@ where
         archive,
         chat_id,
         text,
+        &images,
         model,
         effort,
         skill,
@@ -495,6 +513,88 @@ where
     Ok(())
 }
 
+pub(crate) fn verified_image_paths(
+    archive: &Path,
+    attachments: &[chat::MessageAttachment],
+) -> Result<Vec<std::path::PathBuf>, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut result = Vec::new();
+    for attachment in attachments {
+        let kind = attachment
+            .media_type
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(
+            kind.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            continue;
+        }
+        let expected = Path::new(&attachment.path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or("첨부파일을 읽지 못했습니다")?;
+        if !attachment.path.starts_with("objects/sha256/")
+            || !crate::archive_zet::valid_asset_id(&format!("sha256:{expected}"))
+        {
+            return Err("첨부파일을 읽지 못했습니다".into());
+        }
+        let root = archive
+            .join("objects")
+            .canonicalize()
+            .map_err(|_| "첨부파일을 읽지 못했습니다")?;
+        let path = archive
+            .join(&attachment.path)
+            .canonicalize()
+            .map_err(|_| "첨부파일을 읽지 못했습니다")?;
+        if !path.starts_with(root) {
+            return Err("첨부파일을 읽지 못했습니다".into());
+        }
+        let mut file = std::fs::File::open(&path).map_err(|_| "첨부파일을 읽지 못했습니다")?;
+        #[cfg(windows)]
+        if !crate::chat_items::opened_path_matches(&file, &path) {
+            return Err("첨부파일을 읽지 못했습니다".into());
+        }
+        let mut hash = Sha256::new();
+        let mut header = [0_u8; 12];
+        let first = file
+            .read(&mut header)
+            .map_err(|_| "첨부파일을 읽지 못했습니다")?;
+        hash.update(&header[..first]);
+        let valid = match kind.as_str() {
+            "image/png" => header[..first].starts_with(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg" => header[..first].starts_with(b"\xff\xd8\xff"),
+            "image/gif" => {
+                header[..first].starts_with(b"GIF87a") || header[..first].starts_with(b"GIF89a")
+            }
+            "image/webp" => {
+                header[..first].starts_with(b"RIFF") && header.get(8..12) == Some(b"WEBP")
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err("첨부파일 형식을 확인하지 못했습니다".into());
+        }
+        let mut buffer = [0_u8; 65536];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .map_err(|_| "첨부파일을 읽지 못했습니다")?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        if format!("{:x}", hash.finalize()) != expected {
+            return Err("첨부파일이 변경되어 읽을 수 없습니다".into());
+        }
+        result.push(path);
+    }
+    Ok(result)
+}
+
 fn apply_api_key_environment(command: &mut Command, api_key: Option<&str>) {
     crate::process::remove_inherited_ai_secrets(command);
     command
@@ -513,6 +613,7 @@ pub(crate) async fn run_command<F>(
     archive: &Path,
     chat_id: &str,
     text: &str,
+    images: &[std::path::PathBuf],
     model: Option<&str>,
     effort: Option<&str>,
     skill: Option<&str>,
@@ -549,7 +650,7 @@ where
         let mut input = child.stdin.take().ok_or("AI에 요청을 보내지 못했습니다")?;
         let output = child.stdout.take().ok_or("AI의 답을 읽지 못했습니다")?;
         let mut reader = BufReader::new(output);
-        send(&mut input, json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"momso","title":"momso","version":env!("CARGO_PKG_VERSION")}}})).await?;
+        send(&mut input, crate::codex_protocol::request(1, "initialize", json!({"clientInfo":{"name":"momso","title":"momso","version":env!("CARGO_PKG_VERSION")}}))).await?;
         let mut phase = 1_u8;
         let mut answer = String::new();
         let mut actual_model: Option<String> = None;
@@ -648,11 +749,11 @@ where
                     let reads: Vec<String> = v.pointer("/params/item/commandActions").and_then(Value::as_array).into_iter().flatten().filter(|action| action.get("type").and_then(Value::as_str) == Some("read")).filter_map(|action| action.get("path").and_then(Value::as_str)).filter_map(|path| crate::chat_file_changes::reference(archive, path)).collect();
                     emit("momso-internal-file-reads", json!(reads));
                 } else if method == "item/agentMessage/delta" {
-                    if let Some(delta) = v.pointer("/params/delta").and_then(Value::as_str) {
+                    if let Some(delta) = crate::codex_protocol::message_delta(&v) {
                         answer.push_str(delta); emit("chat-stream", json!({"chatId":chat_id,"delta":delta}));
                     }
                 } else if method == "turn/completed" {
-                    if v.pointer("/params/turn/status").and_then(Value::as_str) != Some("completed") {
+                    if crate::codex_protocol::completed_turn(&v) != Some(true) {
                         if let Some(info) = v.pointer("/params/turn/error/codexErrorInfo").and_then(crate::chat_finish::codex_error) { emit("momso-internal-provider-error", info); }
                         if is_unauthorized(&v) { return Err("__momso_auth_failed".into()); }
                         if is_context_limit(&v) { emit("momso-internal-finish-reason", json!("length_limit")); }
@@ -710,7 +811,10 @@ where
                     let selected=skill.map(|name| format!("선택된 몸소 스킬은 {name}입니다. 셸 대신 momso_skill_read 도구로 이 스킬을 읽고 따르세요.\n\n")).unwrap_or_default();
                     let prompt=format!("{selected}{turn_text}");
                     let sandbox = turn_sandbox(settings.sandbox_type, archive, output_dir);
-                    let mut params=json!({"threadId":id,"cwd":archive,"approvalPolicy":settings.approval_policy,"sandboxPolicy":sandbox,"input":[{"type":"text","text":prompt}]});
+                    let mut turn_input = crate::codex_protocol::text_input(&prompt);
+                    let items = turn_input.as_array_mut().ok_or("AI에 요청을 보내지 못했습니다")?;
+                    for image in images { items.push(json!({"type":"localImage","path":image})); }
+                    let mut params=json!({"threadId":id,"cwd":archive,"approvalPolicy":settings.approval_policy,"sandboxPolicy":sandbox,"input":turn_input});
                     if let Some(m)=model.filter(|x| !x.trim().is_empty()) { params["model"]=json!(m); }
                     if let Some(e)=effort.filter(|e| !e.trim().is_empty()) { params["effort"]=json!(e); }
                     set_turn_service_tier(&mut params, fast);
@@ -797,6 +901,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_image_input_rejects_modified_originals() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let image = include_bytes!("../tests/fixtures/s67-sample.png");
+        let hash = format!("{:x}", Sha256::digest(image));
+        let relative = format!("objects/sha256/{}/{}", &hash[..2], hash);
+        let path = dir.path().join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, image).unwrap();
+        let attachment = chat::MessageAttachment {
+            path: relative,
+            name: "sample.png".into(),
+            media_type: Some("image/png".into()),
+        };
+        assert_eq!(
+            verified_image_paths(dir.path(), std::slice::from_ref(&attachment)).unwrap(),
+            vec![path.canonicalize().unwrap()]
+        );
+        std::fs::write(path, b"\x89PNG\r\n\x1a\nmodified").unwrap();
+        assert!(verified_image_paths(dir.path(), &[attachment]).is_err());
+    }
+
+    #[test]
     fn large_responses_are_limited_to_expected_thread_and_images() {
         let thread = json!({"id": 2, "result": {"thread": {"id": "test"}}});
         assert!(codex_large_response_allowed(2, &thread, false));
@@ -864,6 +991,7 @@ $null = [Console]::In.ReadLine()
             &root,
             &id,
             "continue",
+            &[],
             None,
             None,
             None,
@@ -950,6 +1078,7 @@ $event = @{method='item/completed'; params=@{threadId=$env:FIXTURE_THREAD; turnI
             &root,
             &id,
             "draw",
+            &[],
             None,
             None,
             None,
@@ -1059,6 +1188,7 @@ if (-not $text.Contains('previous-question') -or -not $text.Contains('previous-a
             d.path(),
             id,
             &handoff.prompt,
+            &[],
             None,
             None,
             None,
@@ -1132,6 +1262,7 @@ switch ($env:MOMSO_FAKE_RESULT) {
                 d.path(),
                 &id,
                 "question",
+                &[],
                 None,
                 None,
                 None,

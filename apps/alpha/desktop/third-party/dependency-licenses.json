@@ -684,6 +684,13 @@
       "source": "https://github.com/crossbeam-rs/crossbeam"
     },
     {
+      "name": "crx3",
+      "version": "2.0.1",
+      "license": "MIT OR Apache-2.0",
+      "licenseFile": null,
+      "source": "https://github.com/imputnet/omaha"
+    },
+    {
       "name": "crypto-bigint",
       "version": "0.5.5",
       "license": "Apache-2.0 OR MIT",

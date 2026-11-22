@@ -554,8 +554,22 @@ pub(crate) async fn run<F: FnMut(&str, Value) + Send>(
     emit: F,
 ) -> Result<(), String> {
     run_with_skill(
-        db, archive, id, text, model, effort, mode, fast, None, None, None, approvals, cancel,
-        None, emit,
+        db,
+        archive,
+        id,
+        text,
+        &[],
+        model,
+        effort,
+        mode,
+        fast,
+        None,
+        None,
+        None,
+        approvals,
+        cancel,
+        None,
+        emit,
     )
     .await
 }
@@ -565,6 +579,7 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
     archive: &Path,
     id: &str,
     text: &str,
+    attachments: &[chat::MessageAttachment],
     model: Option<&str>,
     effort: Option<&str>,
     mode: &str,
@@ -577,6 +592,7 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
     output_dir: Option<&Path>,
     mut emit: F,
 ) -> Result<(), String> {
+    let images = input_blocks(archive, attachments)?;
     let exe = executable().ok_or("Claude를 찾지 못했습니다")?;
     let session = previous(db, id)?;
     let mut command = crate::process::hidden_async_command(&exe);
@@ -597,6 +613,7 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
         archive,
         id,
         text,
+        &images,
         model,
         effort,
         fast,
@@ -627,8 +644,8 @@ pub(crate) async fn run_with_skill<F: FnMut(&str, Value) + Send>(
                 "mcp__momso_internal_runtime_v1__momso_version,mcp__momso_internal_runtime_v1__media_register_generated,mcp__momso_internal_runtime_v1__momso_github_connect,mcp__momso_internal_runtime_v1__momso_object_store_r2_connect,mcp__momso_internal_runtime_v1__momso_object_store_gcp_connect,mcp__momso_internal_runtime_v1__momso_object_store_aws_connect",
             ]);
             return run_command_ref(
-                command, db, archive, id, fallback, model, effort, fast, skill, None, &approvals,
-                api_key, cancel, &mut emit,
+                command, db, archive, id, fallback, &images, model, effort, fast, skill, None,
+                &approvals, api_key, cancel, &mut emit,
             )
             .await;
         }
@@ -652,10 +669,63 @@ async fn run_command<F: FnMut(&str, Value) + Send>(
     mut emit: F,
 ) -> Result<(), String> {
     run_command_ref(
-        command, db, archive, id, text, None, effort, fast, skill, None, &approvals, None, cancel,
+        command,
+        db,
+        archive,
+        id,
+        text,
+        &[],
+        None,
+        effort,
+        fast,
+        skill,
+        None,
+        &approvals,
+        None,
+        cancel,
         &mut emit,
     )
     .await
+}
+
+pub(crate) fn input_blocks(
+    archive: &Path,
+    attachments: &[chat::MessageAttachment],
+) -> Result<Vec<Value>, String> {
+    let mut images = Vec::new();
+    for attachment in attachments {
+        let media = attachment
+            .media_type
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let extension = Path::new(&attachment.name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_image = matches!(
+            media.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        );
+        let is_text = media != "application/pdf"
+            && (media.starts_with("text/")
+                || media == "application/json"
+                || matches!(extension.as_str(), "txt" | "md" | "csv" | "json"));
+        if !is_image && !is_text {
+            continue;
+        }
+        for block in
+            crate::chat_gemini::attachment_blocks(archive, std::slice::from_ref(attachment))?
+        {
+            if is_image {
+                images.push(json!({"type":"image","source":{"type":"base64","media_type":block["mimeType"],"data":block["data"]}}));
+            } else {
+                images.push(block);
+            }
+        }
+    }
+    Ok(images)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -665,6 +735,7 @@ pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
     archive: &Path,
     id: &str,
     text: &str,
+    images: &[Value],
     model: Option<&str>,
     effort: Option<&str>,
     fast: bool,
@@ -739,7 +810,8 @@ pub(crate) async fn run_command_ref<F: FnMut(&str, Value) + Send>(
                 break;
             }
         }
-        let request = json!({"type":"user","message":{"role":"user","content":prompt},"parent_tool_use_id":null,"session_id":"default"});
+        let content = if images.is_empty() { json!(prompt) } else { let mut blocks = vec![json!({"type":"text","text":prompt})]; blocks.extend_from_slice(images); json!(blocks) };
+        let request = json!({"type":"user","message":{"role":"user","content":content},"parent_tool_use_id":null,"session_id":"default"});
         input.write_all(format!("{request}\n").as_bytes()).await.map_err(|_| "AI에 요청을 보내지 못했습니다")?;
         input.flush().await.map_err(|_| "AI에 요청을 보내지 못했습니다")?;
         let mut answer = String::new();
@@ -885,6 +957,50 @@ fn format_skill_prompt(skill: Option<&str>, text: &str, now: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_attachment_becomes_anthropic_stream_content() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let image = include_bytes!("../tests/fixtures/s67-sample.png");
+        let hash = format!("{:x}", Sha256::digest(image));
+        let relative = format!("objects/sha256/{}/{}", &hash[..2], hash);
+        let path = dir.path().join(&relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, image).unwrap();
+        let item = chat::MessageAttachment {
+            path: relative,
+            name: "sample.png".into(),
+            media_type: Some("image/png".into()),
+        };
+        let blocks = input_blocks(dir.path(), std::slice::from_ref(&item)).unwrap();
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(blocks[0]["source"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, image.as_slice());
+        let text = "수업 기록".as_bytes();
+        let text_hash = format!("{:x}", Sha256::digest(text));
+        let text_relative = format!("objects/sha256/{}/{}", &text_hash[..2], text_hash);
+        let text_path = dir.path().join(&text_relative);
+        std::fs::create_dir_all(text_path.parent().unwrap()).unwrap();
+        std::fs::write(text_path, text).unwrap();
+        let text_item = chat::MessageAttachment {
+            path: text_relative,
+            name: "lesson.txt".into(),
+            media_type: Some("text/plain".into()),
+        };
+        let text_blocks = input_blocks(dir.path(), &[text_item]).unwrap();
+        assert_eq!(text_blocks[0]["type"], "text");
+        assert!(text_blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("수업 기록"));
+        std::fs::write(path, b"modified").unwrap();
+        assert!(input_blocks(dir.path(), &[item]).is_err());
+    }
     #[cfg(windows)]
     #[tokio::test]
     async fn rejected_permission_option_has_actionable_error() {
@@ -904,6 +1020,7 @@ mod tests {
             dir.path(),
             &id,
             "hello",
+            &[],
             None,
             None,
             false,
@@ -1030,6 +1147,7 @@ $null = [Console]::In.ReadLine()
             dir.path(),
             "chat",
             "user text",
+            &[],
             None,
             None,
             false,
@@ -1321,6 +1439,7 @@ $null = [Console]::In.ReadLine()
             d.path(),
             "test",
             "hello",
+            &[],
             Some("fixture-alias"),
             Some("low"),
             false,

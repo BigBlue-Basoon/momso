@@ -23,8 +23,7 @@
 //   뒤쪽은 다른 방으로 가도 임시 방의 웹뷰를 숨겨 둘 뿐 닫지 않고, 넘겨준 임시 방을 다시 고르면 draft_adopted. 그래서 화면은 넘겨주기 전까지
 //   이번 실행의 임시 방 하나를 다시 고른다(새 채팅방으로 돌아오면 보던 페이지가 그대로). 넘겨준 뒤 새 채팅방으로 가면 새 임시 방을 받는다.
 //   panel-browser-popup · panel-browser-download · panel-browser-google-login 에도 chatId 가 붙는다(다운로드 끝은 시작한 방, 넘겨준 뒤면 새 방 번호).
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { type RefObject, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from 'react'
 import { isDesktopRuntime } from './runtime'
 

@@ -3,8 +3,7 @@
 //     | pathTooLong | diskError | redactionFailed | credentialStoreUnavailable | other. 본래 명령(가져오기 등)은 성공으로 끝나고 사본 실패만 따로 온다.
 //   chat_archive_sync_status() → { state: saved | pending, pendingWrites, pendingDeletions }. 대기 중인 쓰기는 저장·업로드 전·앱 종료 때 다시 시도한다.
 // 설정 "연결과 백업"의 GitHub 까닭 줄 자리에 알린다(채팅 화면에는 띄우지 않는다). 그 화면을 열기 전에 온 실패도 놓치지 않게 앱을 켤 때부터 듣는다.
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { isDesktopRuntime } from './runtime'
 
 // 2026-11-17 뒤쪽 fdce0939: 키를 바꾸거나 지운 뒤 예전 사본을 다시 가리는 동안 state 가 redactionPending, 가린 뒤 올리기를 기다리면 redactionUploadPending.

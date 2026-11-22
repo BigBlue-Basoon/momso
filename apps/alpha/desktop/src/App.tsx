@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { ActivityRail, type AppScreen } from './components/ActivityRail'
+import { NetworkDocuments } from './components/NetworkDocuments'
 import { MediaView } from './components/MediaView'
 import { SearchDialog, type SearchAction } from './components/SearchDialog'
 import { useAppUpdate } from './components/AppUpdate'
 import { QuestionDialog } from './components/ZetPanel'
-import { restartApp } from './app-update'
+import { restartApp, restartRefusal } from './app-update'
 import { isMissingCommand as isMissingMediaCommand } from './ai-models'
 import { EMPTY_CHAT_ITEMS, attachFileToChat, chatItemCount, getChatItems, importAttachment, linkAttachment, listenChatItems, readMessageAttachments, type AttachedFile, type ChatItems } from './chat-items'
 import { listSkills, type SkillEntry } from './skills'
@@ -30,10 +31,15 @@ import { watchChatArchive } from './chat-archive-status'
 import { effortKorean } from './permission-labels'
 import { checkFirstRun, type FirstRunCheck } from './first-run'
 import './App.css'
+import './components/NetworkHost.css'
+import { serverAssetDownloadPath, uploadAttachment } from './server-client'
+import { Menu } from 'lucide-react'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import {
+  hasAppBackend,
   initializeRuntime,
   isDesktopRuntime,
+  isNetworkRuntime,
   openRuntimeDataRoot,
   isSelectionExpired,
   selectLocalPaths,
@@ -110,6 +116,8 @@ type DirectoryPickerWindow = Window & {
 
 // 모델 목록을 읽지 못했을 때 고를 수 있는 곳: 설정의 AI 연결에 있는 두 곳.
 const FALLBACK_PROVIDERS: AiProvider[] = ['codex', 'claude']
+// 휴대폰 몸소의 설정(S75): server 로 할 수 있는 쪽만. 셋째 묶음에서 사용자 정보·AI 연결(연결 해제, 다른 AI 채팅 가져오기)·삭제한 원자료를 더했다.
+const NETWORK_SETTINGS: SettingsSection[] = ['profile', 'ai', 'skills', 'dictionary', 'archived', 'deletedSources']
 
 // 뒤로·앞으로가 오가는 곳. 'new' 는 새 대화, 'settings' 는 설정, 'chat:번호' 는 그 대화.
 type Place = 'new' | 'settings' | 'documents' | 'media' | `chat:${string}`
@@ -172,6 +180,11 @@ const NEW_CHAT_KEY = 'new'
 
 function App() {
   const desktopRuntime = isDesktopRuntime()
+  // 네트워크 길(momso server, 2026-11-21): 채팅만 server 로 하고, 문서·브라우저·설정 같은 데스크톱 기능은 그리지 않는다(host.ts).
+  const networkHost = isNetworkRuntime()
+  const chatBackend = desktopRuntime || networkHost
+  // 네트워크 길의 휴대폰 너비에서 채팅방 목록(왼쪽에서 밀려 들어옴)이 열려 있는지. 넓은 화면에서는 쓰지 않는다(CSS 가 휴대폰 너비에서만 본다).
+  const [mobileList, setMobileList] = useState(false)
   // 첫 실행 화면을 보일지(설치판과 개발용 앱 모두). 'checking' 동안은 빈 창만 둔다.
   // 개발용 앱에서 작업 화면을 바로 볼 때는 VITE_MOMSO_OPEN_WORKBENCH=1 을 주고 개발 서버를 켠다.
   const skipFirstRun = !desktopRuntime || (import.meta.env.DEV && import.meta.env.VITE_MOMSO_OPEN_WORKBENCH === '1')
@@ -237,7 +250,8 @@ function App() {
   const [settingsStart, setSettingsStart] = useState<SettingsSection>('profile')
   const [models, setModels] = useState<ProviderModels[] | null>(null)
   // 모델 목록: 읽는 중 / 읽음(명령이 없을 때도) / 읽지 못함. 입력창의 모델·추론 수준 자리에 한 줄로 알린다(2026-11-17).
-  const [modelsState, setModelsState] = useState<'loading' | 'ok' | 'failed'>(desktopRuntime ? 'loading' : 'ok')
+  // momso anywhere(네트워크 길)도 server 의 모델 목록(S62)을 읽을 때까지 기다린다(고른 회사의 모델 없이 보내지 않게).
+  const [modelsState, setModelsState] = useState<'loading' | 'ok' | 'failed'>(chatBackend ? 'loading' : 'ok')
   const refreshModels = useCallback(() => {
     setModelsState('loading')
     return listAiModels()
@@ -245,7 +259,7 @@ function App() {
       .catch((error) => { setModels(null); setModelsState(isMissingCommand(error) ? 'ok' : 'failed') })
   }, [])
   // 모델 목록과 보낼 수 있는 곳을 읽었는지(앱을 연 직후 잠깐). 개발용 화면(데스크톱 밖)은 처음부터 됨.
-  const [modelsReady, setModelsReady] = useState({ models: !desktopRuntime, sendable: !desktopRuntime })
+  const [modelsReady, setModelsReady] = useState({ models: !chatBackend, sendable: !chatBackend })
   // 받은 채팅 사본을 되살리는 동안(chat-archive-restore-progress, available false)은 채팅방을 바꾸는 요청을 보내지 않는다(RESTORE-PROGRESS.md).
   const [chatRestore, setChatRestore] = useState<RestoreProgress | null>(null)
   const chatRestoreRef = useRef<RestoreProgress | null>(null)
@@ -305,7 +319,7 @@ function App() {
   const [skillsLoaded, setSkillsLoaded] = useState(false)
   const [chosenSkill, setChosenSkill] = useState<SkillEntry | null>(null)
   const refreshSkills = useCallback(() => {
-    if (!isDesktopRuntime()) return
+    if (!hasAppBackend()) return
     listSkills().then((list) => {
       setSkills(list)
       setSkillsFailed(false)
@@ -335,6 +349,8 @@ function App() {
   const [freshInPanel, setFreshInPanel] = useState<Record<string, boolean>>({})
   // 검색 창(Ctrl+K).
   const [searchOpen, setSearchOpen] = useState(false)
+  // 휴대폰 몸소: 찾기 창에서 고른 문서(문서 화면이 열면 비운다).
+  const [networkDocOpen, setNetworkDocOpen] = useState<string | null>(null)
   // 앱 버전과 업데이트. 다시 켜기 전에 물을 일이 있으면 묻는다.
   const update = useAppUpdate()
   const [askRestart, setAskRestart] = useState(false)
@@ -396,8 +412,8 @@ function App() {
   const chatsCount = useRef(0)
   const chatsLoadingMore = useRef(false)
   const refreshChats = useCallback(async () => {
-    // 설치된 앱이 아니면(브라우저로 연 개발 화면) 대화 목록을 부르지 않는다.
-    if (!isDesktopRuntime()) return null
+    // 설치된 앱도 네트워크 길도 아니면(브라우저로 연 개발 화면) 대화 목록을 부르지 않는다.
+    if (!hasAppBackend()) return null
     try {
       const want = Math.max(1, chatsCount.current)
       let page = await listChatsPage(0)
@@ -422,7 +438,7 @@ function App() {
 
   // 왼쪽 목록을 끝까지 내리면 다음 쪽을 받아 붙인다(찾기 창과 같은 방식, 새 단추 없음).
   const loadMoreChats = useCallback(async () => {
-    if (chatsNext.current === null || chatsLoadingMore.current || !isDesktopRuntime()) return
+    if (chatsNext.current === null || chatsLoadingMore.current || !hasAppBackend()) return
     chatsLoadingMore.current = true
     try {
       const page = await listChatsPage(chatsNext.current)
@@ -711,6 +727,36 @@ function App() {
     }
   }
 
+  // momso anywhere(휴대폰)의 클립(S39): 브라우저의 파일 고르기로 고른 파일을 server 에 조각으로 올린다. 올리는 동안 알림 줄에 몇 %인지.
+  // 다 올린 파일은 데스크톱처럼 모아 두었다가 보내는 말에 붙인다(chat_send 의 attachments → turns 의 attachments). 하나가 실패해도 앞서 올린 것은 남긴다.
+  const uploadInput = useRef<HTMLInputElement>(null)
+  async function uploadFiles(files: File[]) {
+    if (files.length === 0 || attachingRef.current) return
+    attachingRef.current = true
+    const key = selectedChatId ?? NEW_CHAT_KEY
+    const total = files.reduce((sum, file) => sum + file.size, 0)
+    let before = 0
+    const attached: AttachedFile[] = []
+    const show = (received: number) => showToast(W.attach.uploading(total > 0 ? Math.min(100, Math.floor(((before + received) / total) * 100)) : 100), undefined, true)
+    let failed: unknown = null
+    try {
+      show(0)
+      for (const file of files) {
+        attached.push(await uploadAttachment(file, (progress) => show(progress.received)))
+        before += file.size
+      }
+    } catch (error) {
+      failed = error
+    } finally {
+      attachingRef.current = false
+    }
+    if (attached.length > 0) {
+      setPendingAttachments((current) => ({ ...current, [key]: [...(current[key] ?? []).filter((old) => !attached.some((file) => file.assetId === old.assetId)), ...attached] }))
+    }
+    if (failed) showToast(archiveErrorMessage(failed, W.attach.failed))
+    else showToast(attached.length === 1 ? W.attach.done(attached[0].name) : W.attach.doneMany(attached.length))
+  }
+
   // 클립: 고르는 창은 뒤쪽이 연다(select_local_paths source, 여럿). 취소하면 빈 배열이라 아무 일도 없다.
   async function pickAndAttach() {
     const paths = await selectLocalPaths('source').catch(() => [] as string[])
@@ -846,9 +892,9 @@ function App() {
     refreshContext(chatId)
   }, [refreshChats, refreshContext])
 
-  // 백엔드가 보내는 답(chat-stream, chat-done, chat-error).
+  // 백엔드가 보내는 답(chat-stream, chat-done, chat-error). 네트워크 길에서는 server-client.ts 가 같은 이름으로 보낸다.
   useEffect(() => {
-    if (!desktopRuntime) return
+    if (!chatBackend) return
     let stop: (() => void) | undefined
     let disposed = false
     void listenChatEvents({
@@ -875,8 +921,19 @@ function App() {
         setRetrying((current) => ({ ...current, [event.chatId]: event }))
       },
       // 고속 모드 여부와 넘기지 못한 말의 수는 이 이벤트 전에 답에 저장된다. 다시 읽은 말(chat_read)로 보인다.
+      // 휴대폰 몸소: 화면을 다시 불러온 뒤 진행 중인 답을 다시 따라감(S32 activeTurn) → 그 채팅방을 답을 쓰는 중으로(답 조각이 실시간으로 이어 보임).
+      onResumed: ({ chatId }) => {
+        if (generatingRef.current) return
+        generatingRef.current = { chatId }
+        setGeneratingChatId(chatId)
+        setStreamText('')
+      },
       onDone: ({ chatId }) => {
         setRetrying((current) => (current[chatId] ? withoutKey(current, chatId) : current))
+        // 휴대폰 몸소: 화면을 다시 불러온 뒤 다시 따라간 답(이 화면이 보내지 않은 답)이 끝나면 보고 있는 채팅방을 다시 읽는다.
+        if (networkHost && generatingRef.current?.chatId !== chatId && selectedChatRef.current === chatId) {
+          void readChatPaged(chatId).then((document) => { if (selectedChatRef.current === chatId) setChat(document) }).catch(() => {})
+        }
         finishGenerating(chatId)
         refreshChatItems(chatId, true)
       },
@@ -936,12 +993,13 @@ function App() {
       disposed = true
       stop?.()
     }
-  }, [desktopRuntime, finishGenerating])
+  }, [chatBackend, finishGenerating])
 
   // 허락을 구하는 물음(agent-approval-request)과 거두기(agent-approval-closed).
   // 물음에는 대화 번호가 없어서(계약), 답을 쓰는 중인 대화에 둔다. 없으면 보고 있는 대화.
+  // 휴대폰 몸소(네트워크 길)도 같은 이벤트(server-client.ts 가 S23 으로 잇는다).
   useEffect(() => {
-    if (!desktopRuntime) return
+    if (!chatBackend) return
     let stop: (() => void) | undefined
     let disposed = false
     void listenApprovals({
@@ -975,11 +1033,12 @@ function App() {
       disposed = true
       stop?.()
     }
-  }, [desktopRuntime])
+  }, [chatBackend])
 
   // 몸소 브라우저 알림(browser.ts). 사람이 해야 할 일은 그 채팅방 끝에 한 줄로 두고, 그 채팅방에서 말을 보내거나 브라우저가 닫히면 거둔다.
+  // 휴대폰 몸소는 browser-human-required 만 온다(server 의 브라우저, S23).
   useEffect(() => {
-    if (!desktopRuntime) return
+    if (!chatBackend) return
     let stop: (() => void) | undefined
     let disposed = false
     void listenBrowser({
@@ -994,7 +1053,7 @@ function App() {
       // 자동 심사 단계의 브라우저는 이제 사이트별 승인으로 묻는다(2026-11-21 뒤쪽 50cf562). browser-auto-review-unavailable 줄은 없앴다.
     }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
-  }, [desktopRuntime])
+  }, [chatBackend])
 
   // 채팅방 사본에서 가린 수: 채팅방을 고를 때와 사본을 새로 쓸 때(chat-archive-changed saved) 읽는다.
   useEffect(() => {
@@ -1053,8 +1112,9 @@ function App() {
   }, [desktopRuntime, selectedChatId])
 
   // 스킬로 하는 연결에서 키를 넣어 달라는 물음(agent-setup-secret-request)과 거두기. 채팅방 번호가 없으면 답을 쓰는 중인 대화에 둔다.
+  // 휴대폰 몸소의 인증 번호·로그인 저장 물음(S32)도 같은 이벤트로 온다(kind 가 붙음).
   useEffect(() => {
-    if (!desktopRuntime) return
+    if (!chatBackend) return
     let stop: (() => void) | undefined
     let disposed = false
     void listenSecretRequests({
@@ -1079,11 +1139,12 @@ function App() {
       },
     }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
-  }, [desktopRuntime])
+  }, [chatBackend])
 
   // 저장된 로그인 고르기(saved-login-selection-request, 2026-11-21 뒤쪽 275e017). 채팅방 번호가 없으면 답을 쓰는 중인 대화에 둔다(키 넣기와 같음).
+  // 휴대폰 몸소(S32 select_saved_login)도 같은 이벤트.
   useEffect(() => {
-    if (!desktopRuntime) return
+    if (!chatBackend) return
     let stop: (() => void) | undefined
     let disposed = false
     void listenLoginChoices((request) => {
@@ -1096,12 +1157,12 @@ function App() {
       ))
     }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
-  }, [desktopRuntime])
+  }, [chatBackend])
 
   // 고르기 물음이 닫힘(saved-login-selection-closed, 뒤쪽 e8dab5e): 떠 있던 카드를 누를 때까지 기다리지 않고 한 줄로 바꾼다.
   // 이미 한 줄이 된 카드(고름·취소·닫힘)와, 답을 멈춰 거둔 카드는 그대로 둔다.
   useEffect(() => {
-    if (!desktopRuntime) return
+    if (!chatBackend) return
     let stop: (() => void) | undefined
     let disposed = false
     void listenLoginChoicesClosed((requestId, reason) => {
@@ -1113,7 +1174,7 @@ function App() {
       }))
     }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
     return () => { disposed = true; stop?.() }
-  }, [desktopRuntime])
+  }, [chatBackend])
 
   /** loginId 가 null 이면 취소(saved_login_cancel). 닫힘 이벤트가 먼저 와 한 줄이 됐으면 명령 결과로 다시 바꾸지 않는다. */
   async function answerLoginChoice(requestId: string, loginId: string | null) {
@@ -1149,8 +1210,12 @@ function App() {
       if (values) await submitSecret({ requestId, chatId: item.request.chatId }, values)
       else await cancelSecret({ requestId, chatId: item.request.chatId })
       update({ status: values ? 'saved' : 'cancelled' })
-    } catch {
-      update({ status: 'pending', error: values ? W.secretRequest.failed : W.secretRequest.cancelFailed })
+    } catch (error) {
+      // 휴대폰 몸소의 입력 물음(S32): 이미 닫힘은 그 자리에 닫힌 줄, 잘못된 입력은 그 물음의 글(물음은 남는다).
+      const code = error instanceof Error ? error.message : ''
+      const input = item.request.kind ? W.serverInput[item.request.kind] ?? null : null
+      if (input && code === 'request_closed') { update({ status: 'closed', closedReason: null, error: null }); return }
+      update({ status: 'pending', error: values ? (input ? (code === 'invalid_input' ? input.invalid : input.failed) : W.secretRequest.failed) : W.secretRequest.cancelFailed })
     }
   }
 
@@ -1284,7 +1349,7 @@ function App() {
       const targetModel = models?.find((list) => list.provider === target.provider)?.models.find((model) => model.id === target.model)
       const refused = Boolean(fastRefused[`${target.provider}:${target.model ?? ''}`])
       lastSendRef.current = { chatId: targetId, provider: target.provider, model: target.model }
-      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null, savedId, regenerateOf)
+      const result = await sendChatMessage(targetId, text, target.provider, target.model, resolveEffort(targetModel, target.effort), resolveFast(target.provider, targetModel, target.fast, refused), skill?.name ?? null, savedId, regenerateOf, networkHost ? (pendingAttachmentsRef.current[targetId] ?? []).map((file) => file.assetId) : null)
       if (result?.status === 'started' && lastSentTextRef.current?.chatId === targetId) {
         lastSentTextRef.current = { ...lastSentTextRef.current, userMessageId: result.userMessageId ?? null }
       }
@@ -1651,6 +1716,8 @@ function App() {
 
   // 문서를 연다: 문서 화면이면 그 자리에서, 아니면 대화하기 화면의 오른쪽 패널에서.
   function openDocumentAnywhere(id: string) {
+    // 휴대폰 몸소: 오른쪽 패널이 없어 문서 화면에서 그 문서를 연다.
+    if (networkHost) { setNetworkDocOpen(id); showPlace('documents'); return }
     if (screen !== 'documents') {
       if (screen !== 'home') showPlace(chatPlace)
       setZetPanelOpen(true)
@@ -1662,8 +1729,26 @@ function App() {
   function requestRestart() {
     const unsaved = Boolean(document.querySelector('.zet-tab-dirty'))
     if (unsaved || generatingChatId) setAskRestart(true)
-    else void restartApp().catch(() => showToast(W.app.text13))
+    else applyUpdateRestart()
   }
+
+  // 다시 시작해 업데이트(S69). 진행 중인 채팅이 있으면 뒤쪽이 설치하지 않고 미룬다: 알리고, 이 창에서 답하던 중이었으면 답이 끝날 때 다시 묻는다.
+  const restartDeferred = useRef(false)
+  function applyUpdateRestart() {
+    const answering = generatingChatId !== null
+    void restartApp().then((result) => {
+      const refusal = restartRefusal(result)
+      if (refusal === 'turn') { restartDeferred.current = answering; showToast(W.appUpdate.restartDeferred) }
+      else if (refusal === 'busy') showToast(W.appUpdate.restartBusy)
+      else if (refusal === 'failed') showToast(W.app.text13)
+    }).catch(() => showToast(W.app.text13))
+  }
+  useEffect(() => {
+    if (generatingChatId !== null || !restartDeferred.current) return
+    restartDeferred.current = false
+    showToast(W.appUpdate.restartAfterTurn, { label: W.app.text25, run: requestRestart }, true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generatingChatId])
 
   // 검색 창의 할 일: 지금 앱이 할 수 있는 것만.
   const searchActions: SearchAction[] = [
@@ -1761,7 +1846,22 @@ function App() {
   }
 
   return (
-    <div className={desktopRuntime ? 'desktop-shell has-window-titlebar' : 'desktop-shell'}>
+    <div
+      className={desktopRuntime ? 'desktop-shell has-window-titlebar' : 'desktop-shell'}
+      data-host={networkHost ? 'network' : undefined}
+      data-mobile-list={networkHost && mobileList ? 'open' : undefined}
+    >
+      {networkHost && (
+        <input
+          ref={uploadInput}
+          type="file"
+          multiple
+          hidden
+          tabIndex={-1}
+          aria-hidden
+          onChange={(event) => { const files = Array.from(event.target.files ?? []); event.target.value = ''; void uploadFiles(files) }}
+        />
+      )}
       {desktopRuntime && (
         <WindowTitlebar
           listHidden={listHidden}
@@ -1794,7 +1894,7 @@ function App() {
           providerAuth={providerAuth.list}
         />
 
-        {screen === 'documents' ? null : screen === 'media' ? (
+        {screen === 'documents' && !networkHost ? null : screen === 'media' && !networkHost ? (
           <ErrorBoundary name="MediaView" className="screen-error-main">
             <MediaView onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }} onNotice={showToast} onRegenerate={startRegenerate} />
           </ErrorBoundary>
@@ -1810,9 +1910,10 @@ function App() {
             skills={skills}
             onSkillsChanged={refreshSkills}
             skillsFailed={skillsFailed}
-            skillsLoading={desktopRuntime && !skillsLoaded}
-            archivedChats={chatKeep || (desktopRuntime && !chatKeepKnown)}
+            skillsLoading={chatBackend && !skillsLoaded}
+            archivedChats={chatKeep || (chatBackend && !chatKeepKnown)}
             onChatsChanged={() => void refreshChats()}
+            only={networkHost ? NETWORK_SETTINGS : undefined}
           />
           </ErrorBoundary>
         ) : (
@@ -1822,13 +1923,17 @@ function App() {
               waitingChatIds={waitingChatIds}
               selectedChatId={selectedChatId}
               error={chatsError}
-              loading={desktopRuntime && !chatsLoaded && session.mode !== 'error'}
+              loading={chatBackend && !chatsLoaded && session.mode !== 'error'}
               loadingDetail={startupDetail}
               onLoadMore={() => void loadMoreChats()}
               onRetry={() => void refreshChats()}
               restoring={chatRestore}
-              onNewChat={startNewChat}
-              onSelectChat={selectChat}
+              onNewChat={() => { setMobileList(false); if (networkHost && (screen === 'documents' || screen === 'media')) setScreen('home'); startNewChat() }}
+              onOpenDocuments={networkHost ? () => { setMobileList(false); showPlace('documents') } : undefined}
+              onOpenMedia={networkHost && mediaAvailable ? () => { setMobileList(false); showPlace('media') } : undefined}
+              onOpenSearch={networkHost ? () => { setMobileList(false); setSearchOpen(true) } : undefined}
+              onOpenSettings={networkHost ? () => { setMobileList(false); showPlace('settings') } : undefined}
+              onSelectChat={(id) => { setMobileList(false); if (networkHost && (screen === 'documents' || screen === 'media')) setScreen('home'); selectChat(id) }}
               groups={groups}
               onCreateGroup={async () => {
                 try {
@@ -1855,7 +1960,32 @@ function App() {
               onArchiveChat={chatKeep ? (chatId) => void keepChatAway(chatId) : undefined}
               busyChatId={generatingChatId}
             />
-            <AssistantPanel
+            {networkHost && screen === 'documents' ? (
+              // 휴대폰 몸소의 문서(S34, 읽기만): 대화 칸 자리에.
+              <NetworkDocuments
+                openId={networkDocOpen}
+                onOpened={() => setNetworkDocOpen(null)}
+                menu={(
+                  <button className="icon-button network-menu" type="button" aria-label={W.chatSidebar.aria1} title={W.chatSidebar.aria1} aria-expanded={mobileList} onClick={() => setMobileList(true)}>
+                    <Menu size={18} aria-hidden />
+                  </button>
+                )}
+              />
+            ) : networkHost && screen === 'media' ? (
+              // 휴대폰 몸소의 사진과 동영상(S75 셋째): 데스크톱 화면을 대화 칸 자리에, 맨 위 줄 왼쪽에 목록 단추.
+              <ErrorBoundary name="MediaView" className="screen-error-main">
+                <MediaView
+                  onOpenChat={(id) => { void openChat(id); showPlace(`chat:${id}`) }}
+                  onNotice={showToast}
+                  onRegenerate={startRegenerate}
+                  menu={(
+                    <button className="icon-button network-menu" type="button" aria-label={W.chatSidebar.aria1} title={W.chatSidebar.aria1} aria-expanded={mobileList} onClick={() => setMobileList(true)}>
+                      <Menu size={18} aria-hidden />
+                    </button>
+                  )}
+                />
+              </ErrorBoundary>
+            ) : <AssistantPanel
               failure={failureView}
               retrying={retryingText}
               chatKey={selectedChatId}
@@ -1863,6 +1993,11 @@ function App() {
               loadingOlder={Boolean(older?.loading)}
               onLoadOlder={loadOlderMessages}
               headerActions={zetPanelToggle}
+              headerStart={networkHost ? (
+                <button className="icon-button network-menu" type="button" aria-label={W.chatSidebar.aria1} title={W.chatSidebar.aria1} aria-expanded={mobileList} onClick={() => setMobileList(true)}>
+                  <Menu size={18} aria-hidden />
+                </button>
+              ) : undefined}
               title={shownChat?.title ?? ''}
               canRename={Boolean(shownChat)}
               messages={messages}
@@ -1876,7 +2011,10 @@ function App() {
                   ? [{ id: `redacted-${selectedChatId}`, at: Number.MAX_SAFE_INTEGER, text: W.app.chatRedacted(redactions[selectedChatId]) }]
                   : []),
                 ...(selectedChatId && browserHuman[selectedChatId]
-                  ? [{ id: `browser-${selectedChatId}`, at: browserHuman[selectedChatId].at, text: `${W.app.browserHuman[browserHuman[selectedChatId].reason] ?? W.app.browserHuman.verification} ${W.app.browserHumanAfter}` }]
+                  ? [{ id: `browser-${selectedChatId}`, at: browserHuman[selectedChatId].at, text: networkHost
+                    // 휴대폰 몸소: 브라우저가 server 에 있어 직접 할 수 없다. 알리기까지만(인증 번호 입력은 계약이 나오면).
+                    ? W.app.serverBrowserHuman[browserHuman[selectedChatId].reason] ?? W.app.serverBrowserHuman.verification
+                    : `${W.app.browserHuman[browserHuman[selectedChatId].reason] ?? W.app.browserHuman.verification} ${W.app.browserHumanAfter}` }]
                   : []),
               ]}
               browserOpen={Boolean(selectedChatId && browserOpen[selectedChatId])}
@@ -1903,7 +2041,8 @@ function App() {
                   onSkillChange={setChosenSkill}
                   sendReady={sendReady}
                   onStop={stopResponse}
-                  onAttach={() => void pickAndAttach()}
+                  onAttach={networkHost ? () => uploadInput.current?.click() : () => void pickAndAttach()}
+                  voice={!networkHost}
                   models={models}
                   modelsState={modelsState}
                   onRetryModels={() => void refreshModels()}
@@ -1923,10 +2062,11 @@ function App() {
                   context={selectedChatId ? chatContext : null}
                 />
               )}
-            />
+            />}
           </>
         )}
       </div>
+      {networkHost && mobileList && <button className="network-backdrop" type="button" aria-label={W.chatSidebar.aria1} tabIndex={-1} onClick={() => setMobileList(false)} />}
       {desktopRuntime && (
         <ErrorBoundary name="ZetPanel" className={screen === 'documents' ? 'screen-error-main' : panelShown ? 'screen-error-panel' : 'screen-error-hidden'}>
         <ZetPanel
@@ -1957,7 +2097,7 @@ function App() {
           text={W.app.text23}
           actions={[
             { label: W.app.text24, onSelect: () => setAskRestart(false), autoFocus: true },
-            { label: W.app.text25, primary: true, onSelect: () => { setAskRestart(false); void restartApp().catch(() => showToast(W.app.text13)) } },
+            { label: W.app.text25, primary: true, onSelect: () => { setAskRestart(false); applyUpdateRestart() } },
           ]}
           onDismiss={() => setAskRestart(false)}
         />
@@ -1971,7 +2111,14 @@ function App() {
           onClose={() => setSearchOpen(false)}
           onOpenChat={(id) => showPlace(`chat:${id}`)}
           onOpenDocument={openDocumentAnywhere}
-          onOpenMedia={() => showPlace('media')}
+          onOpenMedia={networkHost ? undefined : () => showPlace('media')}
+          // 휴대폰 몸소: 문서에 이어지지 않은 원자료는 내려받는다(S75 둘째 GET /assets/{id}/download).
+          onDownloadSource={networkHost ? (id, name) => {
+            const link = document.createElement('a')
+            link.href = serverAssetDownloadPath(id)
+            link.download = name
+            link.click()
+          } : undefined}
         />
       )}
 

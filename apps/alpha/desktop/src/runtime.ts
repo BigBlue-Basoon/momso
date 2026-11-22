@@ -1,5 +1,5 @@
 import { W } from './words'
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isNetworkRuntime } from './host'
 import { openPath } from '@tauri-apps/plugin-opener'
 
 export type RuntimeMode = 'starting' | 'ready' | 'preview' | 'error'
@@ -147,7 +147,18 @@ export function isDesktopRuntime() {
   return '__TAURI_INTERNALS__' in window
 }
 
+export { isNetworkRuntime }
+
+/** 채팅을 받는 뒤쪽이 있는가: 데스크톱(Tauri) 또는 네트워크(momso server). 문서·브라우저·설정 같은 데스크톱 기능은 그대로 isDesktopRuntime 으로 본다. */
+export function hasAppBackend() {
+  return isDesktopRuntime() || isNetworkRuntime()
+}
+
 export async function initializeRuntime(): Promise<RuntimeSession> {
+  // 네트워크 길: 연결 화면이 GET /health 를 확인한 뒤에만 이 화면이 뜬다.
+  if (isNetworkRuntime()) {
+    return { mode: 'ready', info: { ...PREVIEW_INFO, platform: 'momso server' }, error: null }
+  }
   if (!isDesktopRuntime()) {
     return { mode: 'preview', info: PREVIEW_INFO, error: null }
   }

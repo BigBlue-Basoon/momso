@@ -73,7 +73,7 @@ fn reference_parts(id: &str) -> Result<(String, PathBuf), String> {
 }
 
 pub(crate) fn valid_document_reference(id: &str) -> bool {
-    id.starts_with("document-path:") && reference_parts(id).is_ok()
+    crate::safe_path::valid_document_reference(id)
 }
 
 fn document_path(root: &Path, id: &str, create_parents: bool) -> Result<PathBuf, String> {

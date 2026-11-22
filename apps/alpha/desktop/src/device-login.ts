@@ -6,16 +6,28 @@
 //     [확인]은 provider_login_browser_ack({ provider }) — 뒤쪽은 그 뒤(또는 30초 뒤)에 로그인 창을 연다. provider-login-browser-closed { provider } 에 거둔다(2026-11-18 뒤쪽 6b21644).
 //   로그인 페이지는 뒤쪽이 panel-agent-open-request 로 오른쪽 패널에 열어 달라고 하고 20초 기다린 뒤, 안 되면 몸소 브라우저 창으로 연다.
 //   취소: provider_login_cancel({ provider }).
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
-import { isDesktopRuntime } from './runtime'
+import { invoke, listen } from './host'
+import { isDesktopRuntime, isNetworkRuntime } from './runtime'
 
 export type DeviceLogin =
   | { kind: 'device'; provider: string; url: string; code: string; expiresAt: number | null }
   | { kind: 'browser'; provider: string }
 
-export async function listenDeviceLogin(handlers: { onShow: (login: DeviceLogin) => void; onClose: (provider: string) => void }) {
+type DeviceLoginHandlers = { onShow: (login: DeviceLogin) => void; onClose: (provider: string) => void }
+
+/** 데스크톱 App 의 로그인 코드 카드. */
+export async function listenDeviceLogin(handlers: DeviceLoginHandlers) {
   if (!isDesktopRuntime()) return () => {}
+  return subscribeDeviceLogin(handlers)
+}
+
+/** momso anywhere(네트워크 길)의 AI 연결 화면(같은 이벤트를 server-client.ts 가 보낸다). */
+export async function listenDeviceLoginAnywhere(handlers: DeviceLoginHandlers) {
+  if (!isNetworkRuntime()) return () => {}
+  return subscribeDeviceLogin(handlers)
+}
+
+async function subscribeDeviceLogin(handlers: DeviceLoginHandlers) {
   const stops = await Promise.all([
     listen<{ provider?: unknown; url?: unknown; code?: unknown; expiresInSeconds?: unknown }>('provider-login-device', (event) => {
       const p = event.payload ?? {}

@@ -1,5 +1,6 @@
-import { useState } from 'react'
-import { isSelectionExpired, selectLocalPaths } from '../runtime'
+import { useRef, useState } from 'react'
+import { isNetworkRuntime, isSelectionExpired, selectLocalPaths } from '../runtime'
+import { uploadAttachment } from '../server-client'
 import { LoaderCircle } from 'lucide-react'
 import { errorState } from '../backup'
 import { cancelChatImport, importChatExportWithProgress, previewChatExport, type ChatImportPreview, type ChatImportSource } from '../chats'
@@ -37,6 +38,9 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
   const [step, setStep] = useState<Step | null>(null)
   const words = W.chatImport
   const busy = step?.kind === 'counting' || step?.kind === 'importing'
+  // 휴대폰 몸소(S75 셋째): 휴대폰의 파일 고르기로 받은 파일을 server 에 올리고, 그 원자료 번호를 데스크톱의 파일 경로 자리에 쓴다.
+  const fileInput = useRef<HTMLInputElement>(null)
+  const pickingFor = useRef<ChatImportSource | null>(null)
 
   function failure(source: ChatImportSource, error: unknown) {
     // 고른 지 5분이 지나 뒤쪽이 거절하면(selection_required) 다시 고르라는 한 줄.
@@ -47,6 +51,7 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
 
   async function pick(source: ChatImportSource) {
     if (busy) return
+    if (isNetworkRuntime()) { pickingFor.current = source; fileInput.current?.click(); return }
     // 고르는 창은 뒤쪽이 연다(select_local_paths conversation: JSON·JSONL·ZIP). 한 개만 쓴다. 취소하면 빈 배열.
     const picked = (await selectLocalPaths('conversation').catch(() => [] as string[]))[0]
     if (typeof picked !== 'string') return
@@ -59,9 +64,24 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
     }
   }
 
+  async function uploadPicked(file: File | undefined) {
+    const source = pickingFor.current
+    pickingFor.current = null
+    if (!source || !file) return
+    setStep({ kind: 'counting', source })
+    try {
+      const { assetId } = await uploadAttachment(file)
+      const preview = await previewChatExport(assetId, source)
+      setStep({ kind: 'ready', source, path: assetId, preview })
+    } catch (error) {
+      failure(source, error)
+    }
+  }
+
   async function start(source: ChatImportSource, path: string, preview: ChatImportPreview) {
     const requestId = `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    setStep({ kind: 'importing', source, requestId, total: preview.conversations, processed: 0, cancelling: false })
+    // 휴대폰 몸소: server 가 진행 수를 보내지 않아 "가져오는 중 0/N"에 머물지 않게 수 없이 "가져오는 중"(total 0).
+    setStep({ kind: 'importing', source, requestId, total: isNetworkRuntime() ? 0 : preview.conversations, processed: 0, cancelling: false })
     try {
       const counts = await importChatExportWithProgress(requestId, path, source, (processed) => {
         setStep((current) => (current?.kind === 'importing' && current.requestId === requestId ? { ...current, processed } : current))
@@ -100,6 +120,17 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
     <section className="settings-group chat-import" aria-labelledby="chat-import-title">
       <h3 id="chat-import-title">{words.title}</h3>
       <p className="chat-import-intro">{words.intro}</p>
+      {isNetworkRuntime() && (
+        <input
+          ref={fileInput}
+          type="file"
+          accept=".zip,.json,.html,application/zip,application/json,text/html"
+          hidden
+          tabIndex={-1}
+          aria-hidden
+          onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ''; void uploadPicked(file) }}
+        />
+      )}
       <ul className="provider-rows">
         {SOURCES.map((source) => {
           const mine = step?.source === source.id ? step : null

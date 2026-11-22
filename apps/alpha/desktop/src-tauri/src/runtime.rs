@@ -94,6 +94,31 @@ fn r2_test_root(
     Ok(None)
 }
 
+#[cfg(all(debug_assertions, feature = "g61-test-probe"))]
+fn s69_test_root(identifier: &str, requested: Option<PathBuf>) -> std::io::Result<Option<PathBuf>> {
+    let Some(root) = requested else {
+        return Ok(None);
+    };
+    let id = identifier.strip_prefix("app.momso.fixture.").unwrap_or("");
+    let parent = root
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if id.len() != 12
+        || !id.bytes().all(|value| value.is_ascii_hexdigit())
+        || !root.is_absolute()
+        || root.file_name() != Some(std::ffi::OsStr::new("runtime"))
+        || !(parent.starts_with("momso-s69-updater-") || parent.starts_with("momso-s69-reject-"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid updater fixture root",
+        ));
+    }
+    Ok(Some(root))
+}
+
 fn prepare_test_root(root: &std::path::Path) -> std::io::Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(root) {
         if !metadata.is_dir() || is_reparse(&metadata) {
@@ -146,12 +171,20 @@ impl RuntimePaths {
         app: &tauri::AppHandle,
     ) -> Result<(Self, crate::storage::StorageStatus), std::io::Error> {
         let _timer = crate::startup_timing::start_startup("runtime_prepare");
-        let test_root = r2_test_root(
+        let r2_root = r2_test_root(
             &app.config().identifier,
             std::env::var_os("MOMSO_R2_TEST_ROOT").map(PathBuf::from),
             cfg!(debug_assertions),
             R2_TEST_FOLDER,
         )?;
+        #[cfg(all(debug_assertions, feature = "g61-test-probe"))]
+        let s69_root = s69_test_root(
+            &app.config().identifier,
+            std::env::var_os("MOMSO_S69_TEST_ROOT").map(PathBuf::from),
+        )?;
+        #[cfg(not(all(debug_assertions, feature = "g61-test-probe")))]
+        let s69_root: Option<PathBuf> = None;
+        let test_root = s69_root.clone().or(r2_root);
         if let Some(root) = &test_root {
             prepare_test_root(root)?;
         }
@@ -159,7 +192,14 @@ impl RuntimePaths {
             Some(root) => root.join("data"),
             None => app.path().app_config_dir().map_err(std::io::Error::other)?,
         };
-        let logs_path = app.path().app_log_dir().map_err(std::io::Error::other)?;
+        #[cfg(windows)]
+        if crate::update_supervisor::recover_before_start(&data_root)? {
+            std::process::exit(0);
+        }
+        let logs_path = match &s69_root {
+            Some(root) => root.join("logs"),
+            None => app.path().app_log_dir().map_err(std::io::Error::other)?,
+        };
         let backups_path = data_root.join("backups");
         for directory in [
             &data_root,

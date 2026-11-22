@@ -9,7 +9,11 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 TREES = ("apps/alpha/desktop/src-tauri", ".github", "scripts", "apps/alpha/desktop/scripts")
-INTEGRATION_ONLY_FILES = {".github/pull_request_template.md"}
+INTEGRATION_ONLY_FILES = {
+    ".github/pull_request_template.md",
+    # The desktop snapshot does not contain the Linux server workspace.
+    ".github/workflows/momso-server-linux.yml",
+}
 INTEGRATION_ONLY_TREES = {".github/ISSUE_TEMPLATE"}
 SKIP_DIRS = {"target", "gen", "generated", "node_modules", ".git", "__pycache__"}
 TRACKED_GENERATED_PLACEHOLDERS = ("apps/alpha/desktop/src-tauri/generated/node/.gitkeep",)

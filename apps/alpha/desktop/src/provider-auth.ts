@@ -16,10 +16,9 @@
 //   provider_auth_status 의 state 'apiKey'(apiKeySaved)는 키를 저장했다는 뜻이고, 키가 맞는지 확인했다는 뜻이 아니다(2026-11-17 계약).
 //   이벤트 provider-auth-changed { provider, state } (받으면 상태를 다시 읽는다)
 // API 키는 받아서 바로 넘기기만 한다. 화면은 키를 어디에도 남기지 않는다.
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import type { AiProvider } from './ai-models'
-import { isDesktopRuntime } from './runtime'
+import { hasAppBackend, isDesktopRuntime } from './runtime'
 
 export type KeyVerification = 'notConfigured' | 'verifying' | 'verified' | 'rejected' | 'unavailable' | 'notSupported'
 
@@ -40,18 +39,25 @@ function need() {
   if (!isDesktopRuntime()) throw new Error('provider auth needs the desktop runtime')
 }
 
+/** 상태·로그인 시작·취소는 momso anywhere(네트워크 길)에서도 부른다(server 의 AI 연결). */
+function needAny() {
+  if (!hasAppBackend()) throw new Error('provider auth needs the desktop runtime')
+}
+
 /** 결과 값이 글자로 오든 { state } 로 오든 같은 상태 값으로. */
 function stateOf(result: unknown) {
   if (typeof result === 'string') return result
   return (result as { state?: string } | null)?.state ?? null
 }
 
-export async function getProviderAuth() { need(); return invoke<ProviderAuth[]>('provider_auth_status') }
-export async function startProviderLogin(provider: AiProvider) { need(); return stateOf(await invoke('provider_login_start', { provider })) }
-export async function cancelProviderLogin(provider: AiProvider) { need(); return stateOf(await invoke('provider_login_cancel', { provider })) }
-export async function logoutProvider(provider: AiProvider) { need(); return stateOf(await invoke('provider_logout', { provider })) }
-export async function setProviderApiKey(provider: AiProvider, apiKey: string) { need(); return stateOf(await invoke('provider_api_key_set', { provider, apiKey })) }
-export async function clearProviderApiKey(provider: AiProvider) { need(); return stateOf(await invoke('provider_api_key_clear', { provider })) }
+export async function getProviderAuth() { needAny(); return invoke<ProviderAuth[]>('provider_auth_status') }
+export async function startProviderLogin(provider: AiProvider) { needAny(); return stateOf(await invoke('provider_login_start', { provider })) }
+export async function cancelProviderLogin(provider: AiProvider) { needAny(); return stateOf(await invoke('provider_login_cancel', { provider })) }
+// 로그아웃·키 지우기는 휴대폰 몸소에서도(S75 셋째, server 의 연결 해제).
+export async function logoutProvider(provider: AiProvider) { needAny(); return stateOf(await invoke('provider_logout', { provider })) }
+/** momso anywhere 에서도 부른다(클로드·제미나이 키, S55: 'keySaved' | 'invalidKey' | 'storageUnavailable' | 'unavailable'). */
+export async function setProviderApiKey(provider: AiProvider, apiKey: string) { needAny(); return stateOf(await invoke('provider_api_key_set', { provider, apiKey })) }
+export async function clearProviderApiKey(provider: AiProvider) { needAny(); return stateOf(await invoke('provider_api_key_clear', { provider })) }
 export async function verifyProviderApiKey(provider: AiProvider) { need(); return stateOf(await invoke('provider_api_key_verify', { provider })) }
 /** 첫 실행을 넘어갈 수 있는가(뒤쪽이 정한 불리언 그대로). */
 export async function providerFirstRunEligible() { need(); return (await invoke<boolean>('provider_first_run_eligible')) === true }
@@ -105,7 +111,7 @@ export function keyProblem(item: ProviderAuth): 'verifying' | 'rejected' | 'unav
 
 // provider-auth-changed 에 reason 이 붙을 수 있다(2026-11-17): 로그인이 시간 안에 끝나지 않으면 state unavailable + reason timeout.
 export async function listenProviderAuth(onChange: (provider: AiProvider, state: string | null, reason: string | null) => void) {
-  if (!isDesktopRuntime()) return () => {}
+  if (!hasAppBackend()) return () => {}
   return listen<{ provider?: AiProvider; state?: string; reason?: string | null }>('provider-auth-changed', (event) => {
     if (event.payload?.provider) onChange(event.payload.provider, event.payload.state ?? null, typeof event.payload.reason === 'string' ? event.payload.reason : null)
   })

@@ -8,9 +8,8 @@
 //     reason 'site_access'(2026-11-21 뒤쪽 3c76dcf): 이 채팅방에서 그 호스트의 누르기·입력에 대한 결정. 허락·거절 모두 앱이 켜져 있는 동안 같은 방·호스트에 기억된다.
 //   자동 심사 단계에서도 브라우저는 위 site_access 승인으로 묻는다(2026-11-21 뒤쪽 50cf562, desktop-browser-chat-isolation-contract.md).
 //     3c76dcf 의 browser-auto-review-unavailable 이벤트는 50cf562 에서 없어졌다(화면도 듣지 않는다).
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
-import { isDesktopRuntime } from './runtime'
+import { invoke, listen } from './host'
+import { hasAppBackend, isDesktopRuntime } from './runtime'
 
 export type BrowserHumanReason = 'login' | 'password' | 'one_time_code' | 'captcha' | 'verification' | string
 
@@ -24,7 +23,8 @@ export async function listenBrowser(handlers: {
   onHumanRequired: (chatId: string, reason: BrowserHumanReason) => void
   onSession: (chatId: string, open: boolean) => void
 }) {
-  if (!isDesktopRuntime()) return () => {}
+  // 휴대폰 몸소도 browser-human-required 를 받는다(server-client.ts, S23). browser-session-updated 는 데스크톱만 온다.
+  if (!hasAppBackend()) return () => {}
   const stops = await Promise.all([
     listen<{ chatId: string; reason: string }>('browser-human-required', (event) => handlers.onHumanRequired(event.payload.chatId, event.payload.reason)),
     listen<{ chatId: string; open: boolean }>('browser-session-updated', (event) => handlers.onSession(event.payload.chatId, Boolean(event.payload.open))),

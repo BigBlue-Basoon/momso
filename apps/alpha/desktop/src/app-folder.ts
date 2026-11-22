@@ -7,8 +7,7 @@
 //   이벤트: archive-location-progress { copiedBytes, totalBytes }(전체를 모르면 totalBytes null),
 //          archive-location-done / archive-location-failed(archive_location_set 이 돌려주는 것과 같은 결과).
 //   archive_location_open → null(실패하면 오류)
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { isDesktopRuntime } from './runtime'
 
 export type FolderLocation = { path: string; isDefault: boolean; onCloudSyncFolder: boolean | null }
