@@ -1,0 +1,12 @@
+[Unit]
+Description=momso idle stop
+Requires=momso-server.service momso-vault-credential.service
+After=momso-server.service momso-vault-credential.service
+[Service]
+User=momso
+LoadCredential=server-token:/run/momso-vault/server-token
+ExecStart=/usr/bin/python3 /opt/momso/idle-stop.py --token-file ${CREDENTIALS_DIRECTORY}/server-token --state-dir /var/lib/momso/lifecycle
+Restart=on-failure
+RestartSec=60
+[Install]
+WantedBy=multi-user.target

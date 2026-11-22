@@ -37,6 +37,7 @@ class Tests(unittest.TestCase):
                 expected = {"momso-server", "momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py", "vault-provision.py", "idle-stop.py", "web/index.html", "momso_anywhere_backup.py", "momso_anywhere_backup_agent.py", "momso_anywhere_backup_google.py", "momso_anywhere_vault_identity.py"}
                 expected.add('momso-managed-history.json')
                 expected.update("momso-updater/" + name for name in ("update.py", "release_manifest.py", "server_admission.py", "systemd_host.py", "data_snapshots.py", "cloud_run_gateway.py", "github_releases.py", "progress_status.py", "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py"))
+                expected.update({"momso-updater/managed_helpers.py", "momso-updater/momso_managed_files.py", "momso-units/momso-idle-stop.service", "momso-overrides/vault.conf"})
                 self.assertEqual(set(archive.getnames()), expected)
             with self.assertRaises(ValueError): bundle.prepare(server, "0" * 64, web, root / "no.tar.gz")
 

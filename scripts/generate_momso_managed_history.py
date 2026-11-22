@@ -15,6 +15,8 @@ FILES = {
 WORKER = {name: 'apps/alpha/desktop/src-tauri/momso-server-update/' + name for name in (
     'update.py', 'release_manifest.py', 'server_admission.py', 'systemd_host.py', 'data_snapshots.py', 'cloud_run_gateway.py',
     'github_releases.py', 'progress_status.py', 'layout_migration.py', 'install_worker.py', 'worker.py', 'ensure_gcloud.py')}
+WORKER['managed_helpers.py'] = 'apps/alpha/desktop/src-tauri/momso-server-update/managed_helpers.py'
+WORKER['momso_managed_files.py'] = 'scripts/momso_managed_files.py'
 PROXY = {name: 'scripts/' + name for name in ('momso_mobile_proxy.py', 'momso_anywhere_vm_proxy.py')}
 
 

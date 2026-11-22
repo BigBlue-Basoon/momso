@@ -120,12 +120,21 @@ class ReleasePoller:
             delay = interval_seconds
             try:
                 self.updater.recover()
+                host = getattr(self.updater, "host", None)
+                if getattr(host, "worker_restart_required", False):
+                    host.restart_worker()
                 self.poll()
             except UpdateError as error:
                 self.updater._emit("failed", str(error))
                 if isinstance(error, RateLimited):
                     delay = max(delay, error.retry_seconds)
             except (OSError, ValueError):
+                self.updater._emit("failed", "update_unavailable")
+            try:
+                host = getattr(self.updater, "host", None)
+                if getattr(host, "worker_restart_required", False):
+                    host.restart_worker()
+            except OSError:
                 self.updater._emit("failed", "update_unavailable")
             if stop.wait(delay):
                 break
