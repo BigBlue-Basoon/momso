@@ -95,15 +95,20 @@ fn check_failed(version: &str, reason: &'static str) -> UpdateInfo {
 fn configured(key: &str, endpoint: &str) -> bool {
     !key.trim().is_empty()
         && endpoint.parse::<reqwest::Url>().is_ok_and(|u| {
-            if u.scheme() == "https" && u.host_str().is_some() {
-                return true;
-            }
-            #[cfg(feature = "g61-test-probe")]
-            if std::env::var_os("MOMSO_TEST_LOCAL_UPDATER").is_some() {
-                return u.scheme() == "http" && u.host_str() == Some("127.0.0.1");
-            }
-            false
+            (u.scheme() == "https" && u.host_str().is_some()) || local_fixture_allowed(&u)
         })
+}
+
+#[cfg(feature = "g61-test-probe")]
+fn local_fixture_allowed(url: &reqwest::Url) -> bool {
+    std::env::var_os("MOMSO_TEST_LOCAL_UPDATER").is_some()
+        && url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+}
+
+#[cfg(not(feature = "g61-test-probe"))]
+fn local_fixture_allowed(_url: &reqwest::Url) -> bool {
+    false
 }
 fn settings(app: &tauri::AppHandle) -> Option<(String, String)> {
     let config = app.config().plugins.0.get("updater")?;
