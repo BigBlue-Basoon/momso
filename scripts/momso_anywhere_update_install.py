@@ -18,8 +18,9 @@ def refresh_worker(provider):
     source = Path(__file__).resolve().parent.parent / 'apps/alpha/desktop/src-tauri/momso-server-update'
     names = ('update.py', 'release_manifest.py', 'server_admission.py', 'systemd_host.py',
              'data_snapshots.py', 'cloud_run_gateway.py', 'github_releases.py', 'progress_status.py',
-             'layout_migration.py', 'install_worker.py', 'worker.py', 'ensure_gcloud.py')
+             'layout_migration.py', 'install_worker.py', 'worker.py', 'ensure_gcloud.py', 'managed_helpers.py')
     payload = {name: base64.b64encode((source / name).read_bytes()).decode('ascii') for name in names}
+    payload['momso_managed_files.py'] = base64.b64encode((Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()).decode('ascii')
     module = (Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()
     code = r'''import base64,json,os,pathlib,subprocess,sys
 data=json.load(sys.stdin)
@@ -78,7 +79,7 @@ def install(provider, channel, public_key, manifest_url):
     source = Path(__file__).resolve().parent.parent / "apps/alpha/desktop/src-tauri/momso-server-update"
     names = ("update.py", "release_manifest.py", "server_admission.py", "systemd_host.py",
              "data_snapshots.py", "cloud_run_gateway.py", "github_releases.py", "progress_status.py",
-             "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py")
+             "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py", "managed_helpers.py")
     config = {"channel": channel, "updateRoot": "/opt/momso/releases", "dataDir": "/var/lib/momso",
               "statusFile": "/run/momso-update/status.json", "publicKey": "/etc/momso-update-public.pem",
               "serverTokenFile": "/run/momso-vault/server-token", "lifecycleDir": "/var/lib/momso/lifecycle",
@@ -89,6 +90,7 @@ def install(provider, channel, public_key, manifest_url):
                               for name in ("momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py")},
                "publicKey": base64.b64encode(Path(public_key).read_bytes()).decode("ascii"),
                "config": config, "manifest": manifest_url, "signature": signature}
+    payload['files']['momso_managed_files.py'] = base64.b64encode((Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()).decode('ascii')
     code = r'''data=json.load(sys.stdin);folder=pathlib.Path('/opt/momso-updater');folder.mkdir(mode=0o755,parents=True,exist_ok=True)
 install_group(folder,'update-worker',{name:base64.b64decode(value,validate=True) for name,value in data['files'].items()},WORKER_LEGACY)
 flat=pathlib.Path('/opt/momso');marker=flat/'releases/.momso-update-active';current=flat/'releases/current';override=pathlib.Path('/etc/systemd/system/momso-server.service.d/momso-update.conf')

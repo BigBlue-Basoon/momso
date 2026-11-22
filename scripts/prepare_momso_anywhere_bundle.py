@@ -32,7 +32,10 @@ def prepare(server, expected, web, output):
     entries += [(update / name, "momso-updater/" + name) for name in (
         "update.py", "release_manifest.py", "server_admission.py", "systemd_host.py",
         "data_snapshots.py", "cloud_run_gateway.py", "github_releases.py", "progress_status.py",
-        "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py")]
+        "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py", "managed_helpers.py")]
+    entries.append((scripts / "momso_managed_files.py", "momso-updater/momso_managed_files.py"))
+    entries.append((update / "units/momso-idle-stop.service", "momso-units/momso-idle-stop.service"))
+    entries.append((update / "units/vault.conf", "momso-overrides/vault.conf"))
     for path in sorted(web.rglob("*")):
         if path.is_symlink():
             raise ValueError("web build contains a symbolic link")

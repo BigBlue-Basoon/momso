@@ -111,11 +111,15 @@ class Updater:
         attempt("server_stop_failed", self.host.stop_server)
         if record.get("snapshot") is not None:
             attempt("data_restore_failed", lambda: self.host.restore_data(record["snapshot"]))
+        if hasattr(self.host, "rollback_managed"):
+            attempt("helper_restore_failed", self.host.rollback_managed)
         attempt("release_restore_failed", lambda: self.host.activate_release(record["oldRelease"]))
         if "release_restore_failed" not in errors:
             attempt("sequence_restore_failed", lambda: self.host.record_sequence(record["oldSequence"]))
         # Start all local services even if any earlier recovery step failed.
         attempt("server_start_failed", self.host.start_server)
+        if hasattr(self.host, "refresh_proxy") and record.get("newRelease"):
+            attempt("proxy_restore_failed", lambda: self.host.refresh_proxy(record["newRelease"], record["oldRelease"]))
         try:
             if not self.host.server_healthy():
                 errors.append("server_unhealthy")
@@ -219,9 +223,13 @@ class Updater:
             snapshot = self.host.snapshot_data()
             _atomic_json(self.state, {"phase": "switching", "oldRelease": old_release, "oldGateway": old_gateway, "snapshot": snapshot, "newRelease": str(stage), "sequence": release["sequence"], "oldSequence": installed})
             self._emit("installing")
+            if hasattr(self.host, "apply_managed"):
+                self.host.apply_managed(str(stage))
             self.host.activate_release(str(stage))
             self.host.migrate_data(str(stage))
             self.host.start_server()
+            if hasattr(self.host, "refresh_proxy"):
+                self.host.refresh_proxy(old_release, str(stage))
             if not self.host.server_healthy():
                 raise UpdateError("server_unhealthy")
             self._emit("updating_gateway")
@@ -230,13 +238,16 @@ class Updater:
                 raise UpdateError("gateway_unhealthy")
             self.host.record_sequence(release["sequence"])
             _atomic_json(self.state, {"phase": "complete", "sequence": release["sequence"], "needsRelease": True})
+            if hasattr(self.host, "commit_managed"):
+                try: self.host.commit_managed()
+                except Exception: self._emit("completed", "managed_cleanup_pending")
             self._emit("completed")
             return "completed"
         except Exception as failure:
             reason = str(failure) if isinstance(failure, (GatewayError, UpdateError)) and str(failure) in {"gateway_image_permission", "gateway_operation_failed", "gateway_unhealthy", "server_unhealthy"} else "update_failed"
             self._emit("rolling_back", reason)
             try:
-                self._rollback({"snapshot": snapshot, "oldRelease": old_release, "oldGateway": old_gateway, "oldSequence": installed})
+                self._rollback({"snapshot": snapshot, "oldRelease": old_release, "oldGateway": old_gateway, "oldSequence": installed, "newRelease": str(stage)})
             except Exception as error:
                 self._emit("recovery_required", "rollback_failed")
                 # Never reopen admission after an uncertain recovery.
@@ -275,6 +286,11 @@ class Updater:
                     self._emit("recovery_required", "recovery_record_invalid")
                 raise UpdateError("recovery_record_invalid") from None
             phase = record.get("phase")
+            if phase == "complete" and hasattr(self.host, "commit_managed"):
+                try: self.host.commit_managed()
+                except Exception:
+                    self._emit("recovery_required", "managed_cleanup_pending")
+                    raise UpdateError("managed_cleanup_pending") from None
             pending_release = phase in {"complete", "rolled_back"} and record.get("needsRelease") is True
             if phase != "switching" and not pending_release:
                 return "no_recovery"

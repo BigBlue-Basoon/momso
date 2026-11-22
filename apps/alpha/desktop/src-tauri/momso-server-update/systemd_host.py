@@ -5,14 +5,16 @@ from pathlib import Path
 import subprocess
 import time
 import urllib.request
+import sys
 
 from data_snapshots import DataSnapshots
 from server_admission import AdmissionError
 from update import _atomic_json
+from managed_helpers import ManagedHelpers
 
 
 class SystemdHost:
-    def __init__(self, root, data_directory, unit, health_url, admission, gateway, progress, *, proxy_unit=None, idle_unit=None):
+    def __init__(self, root, data_directory, unit, health_url, admission, gateway, progress, *, proxy_unit=None, idle_unit=None, helpers=None):
         self.root = Path(root)
         self.current = self.root / "current"
         self.sequence = self.root / "installed.json"
@@ -24,6 +26,8 @@ class SystemdHost:
         self.gateway = gateway
         self.report = progress
         self.snapshots = DataSnapshots(data_directory, self.root / "data-snapshots")
+        self.helpers = helpers or ManagedHelpers()
+        self.worker_restart_required = False
 
     def progress(self, value): self.report(value)
     def current_sequence(self): return json.loads(self.sequence.read_text())["sequence"]
@@ -89,6 +93,29 @@ class SystemdHost:
     def migrate_data(self, release):
         # The new server migrates its own DB on startup. Host admission stays closed.
         pass
+    def apply_managed(self, release):
+        self.worker_restart_required = self.helpers.apply(release)
+        if self.helpers.changed_units:
+            subprocess.run(["systemctl", "daemon-reload"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    def rollback_managed(self):
+        changed_units = (os.path.lexists(self.helpers.private / 'managed-s108-units-journal.json') or
+                         os.path.lexists(self.helpers.private / 'managed-s108-overrides-journal.json'))
+        changed_worker = os.path.lexists(self.helpers.pointer_journal) or os.path.lexists(self.helpers._groups()[2][2])
+        if os.path.lexists(self.helpers.pointer_journal) or any(os.path.lexists(journal) for _, _, journal in self.helpers._groups()):
+            self.helpers.rollback()
+        if changed_units:
+            subprocess.run(["systemctl", "daemon-reload"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        self.worker_restart_required = changed_worker
+    def commit_managed(self):
+        if os.path.lexists(self.helpers.pointer_journal) or any(os.path.lexists(journal) for _, _, journal in self.helpers._groups()):
+            self.helpers.commit()
+    def refresh_proxy(self, old_release, new_release):
+        if not self.proxy_unit or not old_release or not new_release: return
+        names = ('momso_mobile_proxy.py', 'momso_anywhere_vm_proxy.py')
+        if any((Path(old_release) / name).read_bytes() != (Path(new_release) / name).read_bytes() for name in names):
+            subprocess.run(["systemctl", "restart", self.proxy_unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    def restart_worker(self):
+        os.execv(sys.executable, [sys.executable, str(self.helpers.worker / 'worker.py'), *sys.argv[1:]])
     def activate_gateway(self, image): self.gateway.activate(image)
     def preflight_gateway(self, image):
         if hasattr(self.gateway, "preflight"): return self.gateway.preflight(image)
