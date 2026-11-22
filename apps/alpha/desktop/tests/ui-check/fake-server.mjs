@@ -469,7 +469,7 @@ createServer(async (req, res) => {
     if (aiMode === 'none') { send(res, 404, { error: 'not_found' }); return }
     if (req.method === 'GET' && url.pathname === '/providers') {
       const old = process.env.FAKE_KEYS === 'old'
-      const providers = [{ provider: 'codex', state: codex.state, accountLabel: codex.state === 'connected' ? 'fake@momso.test' : null }, { provider: 'claude', state: old ? 'not_supported' : providerKeys.claude, accountLabel: null }, { provider: 'gemini', state: old ? 'not_supported' : providerKeys.gemini, accountLabel: null }]
+      const providers = [{ provider: 'codex', state: codex.state, accountLabel: codex.state === 'connected' ? 'fake@example.test' : null }, { provider: 'claude', state: old ? 'not_supported' : providerKeys.claude, accountLabel: null }, { provider: 'gemini', state: old ? 'not_supported' : providerKeys.gemini, accountLabel: null }]
       send(res, 200, { providers })
       return
     }

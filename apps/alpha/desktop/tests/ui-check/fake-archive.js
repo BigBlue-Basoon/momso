@@ -835,7 +835,7 @@
         { id: 'login-b', origin: 'https://crm.bodycodi.com', label: '관리자', username: 'admin01', password: 'fake-b', askBeforeUse: true, loginPath: '/admin', defaultForPath: false },
         { id: 'login-c', origin: 'https://www.naver.com', label: '네이버 스마트플레이스', username: 'yoga.studio', password: 'fake-c', askBeforeUse: false, loginPath: null, defaultForPath: false },
         { id: 'login-d', origin: 'https://github.com', label: 'GitHub', username: 'studio-dev', password: 'fake-d', askBeforeUse: false, loginPath: null, defaultForPath: false },
-        { id: 'login-e', origin: 'https://partner.booking.example', label: '예약 파트너 센터', username: 'partner@studio.example', password: 'fake-e', askBeforeUse: true, loginPath: null, defaultForPath: false },
+        { id: 'login-e', origin: 'https://partner.booking.example', label: '예약 파트너 센터', username: 'partner@example.test', password: 'fake-e', askBeforeUse: true, loginPath: null, defaultForPath: false },
         { id: 'login-f', origin: 'https://www.naver.com', label: '네이버 블로그', username: 'yoga.blog', password: 'fake-f', askBeforeUse: false, loginPath: null, defaultForPath: false },
       ].map((entry, index) => ({ ...entry, ...[
         { createdAt: ago(0.1), updatedAt: ago(0.1), favorite: true, siteUrl: 'https://crm.bodycodi.com/login' },
