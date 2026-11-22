@@ -52,6 +52,8 @@ for (const [existing, channel] of [[false, 'production'], [true, 'production'], 
       if (path === '/v1/operations/enable') return ok({ done: true });
     }
     if (url.hostname === 'iam.googleapis.com') {
+      if (path.includes('/serviceAccounts/') && path.endsWith(':getIamPolicy')) return ok({ etag: 'fixture', bindings: [] });
+      if (path.includes('/serviceAccounts/') && path.endsWith(':setIamPolicy')) return ok(body.policy);
       if (path.endsWith('/serviceAccounts') && method === 'POST') {
         const email = `${body.accountId}@${projectId}.iam.gserviceaccount.com`;
         accounts.set(email, { email, description: body.serviceAccount.description }); return ok({});
@@ -104,7 +106,8 @@ for (const [existing, channel] of [[false, 'production'], [true, 'production'], 
     if (url.hostname === 'run.googleapis.com') {
       if (path.includes('/operations/')) return ok({ done: true });
       if (path.includes('/revisions/')) return ok({ containers: [{ image: service.template.containers[0].image }] });
-      if (path.endsWith(':getIamPolicy')) return ok({ bindings: [] });
+      if (path.endsWith(':getIamPolicy')) return ok({ etag: 'fixture', bindings: [] });
+      if (path.endsWith(':setIamPolicy')) return ok(body.policy);
       if (method === 'POST') { service = { ...body, name: `projects/${projectId}/locations/asia-northeast3/services/momso-any-${short}`, uri: 'https://fixture.a.run.app', etag: 'fixture', terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'fixture-rev-1', latestCreatedRevision: 'fixture-rev-1', trafficStatuses: [{ revision: 'fixture-rev-1', percent: 100 }] }; return ok({ name: `projects/${projectId}/locations/asia-northeast3/operations/create` }); }
       if (method === 'DELETE') { service = null; return ok({ name: `projects/${projectId}/locations/asia-northeast3/operations/delete` }); }
       if (method === 'PATCH') { service = { ...service, ...body, ...(body.template ? { latestReadyRevision: 'fixture-rev-2', latestCreatedRevision: 'fixture-rev-2' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) }; return ok({ name: `projects/${projectId}/locations/asia-northeast3/operations/update` }); }

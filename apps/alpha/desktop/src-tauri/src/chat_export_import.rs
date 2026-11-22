@@ -78,7 +78,13 @@ mod tests {
         );
         drop(tx);
         assert_eq!(
-            preview_parse(&data[..], &db, "claude", &mut Preview::default()),
+            preview_parse(
+                &data[..],
+                &db,
+                "claude",
+                &mut Preview::default(),
+                &AtomicBool::new(false)
+            ),
             Err("storage_error".into())
         );
     }

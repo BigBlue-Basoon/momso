@@ -1278,6 +1278,7 @@ pub(crate) struct Preview {
 struct PreviewSeed<'a> {
     db: &'a Connection,
     provider: &'a str,
+    cancelled: &'a AtomicBool,
     result: &'a mut Preview,
     operation_error: &'a mut Option<String>,
 }
@@ -1343,7 +1344,13 @@ impl<'de> Visitor<'de> for PreviewSeed<'_> {
         f.write_str("conversation array")
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-        while let Some(raw) = seq.next_element::<Box<serde_json::value::RawValue>>()? {
+        loop {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(A::Error::custom("cancelled"));
+            }
+            let Some(raw) = seq.next_element::<Box<serde_json::value::RawValue>>()? else {
+                break;
+            };
             let v: Value = serde_json::from_str(raw.get()).map_err(A::Error::custom)?;
             drop(raw);
             self.result.conversations += 1;
@@ -1395,20 +1402,39 @@ fn preview_parse<R: Read>(
     db: &Connection,
     provider: &str,
     result: &mut Preview,
+    cancelled: &AtomicBool,
 ) -> Result<(), String> {
     let mut de = serde_json::Deserializer::from_reader(BufReader::new(reader));
     let mut operation_error = None;
     PreviewSeed {
         db,
         provider,
+        cancelled,
         result,
         operation_error: &mut operation_error,
     }
     .deserialize(&mut de)
-    .map_err(|_| operation_error.unwrap_or_else(|| "invalid_format".to_string()))?;
+    .map_err(|_| {
+        if cancelled.load(Ordering::SeqCst) {
+            "cancelled".to_string()
+        } else {
+            operation_error.unwrap_or_else(|| "invalid_format".to_string())
+        }
+    })?;
     de.end().map_err(|_| "invalid_format".to_string())
 }
 pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview, String> {
+    preview_controlled(db, file, provider, &AtomicBool::new(false))
+}
+pub(crate) fn preview_controlled(
+    db: &Path,
+    file: &Path,
+    provider: &str,
+    cancelled: &AtomicBool,
+) -> Result<Preview, String> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Err("cancelled".into());
+    }
     if !matches!(provider, "chatgpt" | "claude" | "gemini") {
         return Err("unsupported_provider".into());
     }
@@ -1425,6 +1451,9 @@ pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview,
             }
             Err(error) => return Err(error),
         };
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
         let mut result = Preview {
             unreadable,
             conversations: groups.len() as u64,
@@ -1481,6 +1510,9 @@ pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview,
         }
         let mut matched = false;
         for i in 0..zip.len() {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err("cancelled".into());
+            }
             let entry = zip.by_index(i).map_err(|_| "invalid_format")?;
             let name = entry
                 .name()
@@ -1498,13 +1530,13 @@ pub(crate) fn preview(db: &Path, file: &Path, provider: &str) -> Result<Preview,
                 return Err("archive_limit".into());
             }
             matched = true;
-            preview_parse(entry, &db, provider, &mut result)?;
+            preview_parse(entry, &db, provider, &mut result, cancelled)?;
         }
         if !matched {
             return Err("unsupported_format".into());
         }
     } else {
-        preview_parse(f, &db, provider, &mut result)?;
+        preview_parse(f, &db, provider, &mut result, cancelled)?;
     }
     Ok(result)
 }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { RotateCcw, Trash2 } from 'lucide-react'
 import { archiveErrorMessage } from '../archive'
 import { listDeletedSources, previewSourceDelete, purgeSource, restoreTrashedSource, type DeletedSource, type DeletedSourceCursor } from '../source-assets'
+import { isNetworkRuntime } from '../runtime'
 import { W } from '../words'
 import { QuestionDialog } from './ZetPanel'
 
@@ -88,6 +89,10 @@ export function DeletedSourcesSettings({ onChanged }: { onChanged?: () => void }
 
   // 목록에는 아직 무언가 할 수 있는 것만 온다. 이름은 원격까지 다 지워질 때 지워지므로(그때는 목록에서 빠짐) 그대로 보인다(2026-11-17 뒤쪽 f033fd0).
   const nameOf = (item: DeletedSource) => item.originalFileName || W.zetPanel.text57(W.rawMaterial)
+  // 휴대폰 몸소는 "이 컴퓨터"가 아니라 몸소 서버에서 지운다. 예전 백업에 남을 수 있으면 그 말을 붙인다(S83 backupCopiesRemain).
+  const purgeText = (item: DeletedSource) => isNetworkRuntime()
+    ? [D.serverPurgeText, item.backupCopiesRemain ? D.backupCopiesRemain : null].filter(Boolean).join(' ')
+    : W.sourceDelete.purgeText
 
   return (
     <div className="settings-page">
@@ -132,7 +137,7 @@ export function DeletedSourcesSettings({ onChanged }: { onChanged?: () => void }
       {removing && (
         <QuestionDialog
           title={W.sourceDelete.purgeTitle(nameOf(removing))}
-          text={W.sourceDelete.purgeText}
+          text={purgeText(removing)}
           actions={[
             { label: W.chatKeep.cancel, onSelect: () => setRemoving(null), autoFocus: true },
             { label: W.sourceDelete.purge, primary: true, onSelect: () => { const id = removing.id; setRemoving(null); void run(id, () => purge(id), D.purgeFailed) } },

@@ -11,13 +11,14 @@ import {
   resetDate,
   saveLastUsage,
   scopeName,
+  usageSplit,
   type ProviderUsage,
   type UsageProvider,
   type UsageWindow,
   usageReason,
 } from '../usage'
 import { ProviderMark, useProviderMarkHover, type ProviderMarkId } from './ProviderMark'
-import { W } from '../words'
+import { W, modelNameView } from '../words'
 import { ModelName } from './ModelName'
 import { isConnected, keyProblem, type ProviderAuth } from '../provider-auth'
 import './UsageMeter.css'
@@ -46,6 +47,9 @@ const SMALL_CLAUDE_MOTION = { strength: 0.2, speed: 1.8 }
 // 고리: 지름 34px(단추 38px 안), 선 2px. 로고 칸은 26px(띠의 몸소 표시와 같은 크기).
 const RING_RADIUS = 16
 const RING_LENGTH = 2 * Math.PI * RING_RADIUS
+// 특정 모델만 따로 세는 한도의 고리: 흰 고리 바로 바깥, 선 1.25px(단추 38px 안에 들어간다).
+const SCOPED_RADIUS = 18.25
+const SCOPED_LENGTH = 2 * Math.PI * SCOPED_RADIUS
 
 // 회사가 준 기간만 이름에 쓴다(2026-11-17 본부 결정, 뒤쪽 대조 13). 백엔드는 기간(분)을 받으면 five_hour·weekly·'N_hours' 처럼 주고,
 // 못 받으면 primary·secondary 를 그대로 준다. 그때는 기간을 말하지 않는 이름으로.
@@ -92,6 +96,16 @@ function knownWindows(usage: ProviderUsage | undefined) {
   return usage?.state === 'ok'
     ? usage.windows.filter((window) => typeof window.usedPercent === 'number' && Number.isFinite(window.usedPercent))
     : []
+}
+
+/** 풍선의 기간 한 줄: 펼친 것의 한 줄과 같은 말(기간, 모델, 남은 양, 다시 차는 때). 모델 이름은 ModelName 과 같은 글(예: 페이블). */
+function windowSummary(window: UsageWindow) {
+  const scopeText = scopeName(window.scope)
+  const view = scopeText ? modelNameView(scopeText) : null
+  const scope = view ? [view.name, view.version].filter(Boolean).join(' ') : null
+  const left = Math.round(Math.max(0, Math.min(100, 100 - (window.usedPercent ?? 0))))
+  const resets = formatWhen(window.resetsAt)
+  return `${windowLabel(window)}${scope ? ` ${scope}` : ''} ${W.usageMeter.text11(left)}${resets ? `, ${W.usageMeter.text12(resets)}` : ''}`
 }
 
 /**
@@ -325,12 +339,18 @@ function useGlide(target: number | null) {
 /** 곳 하나의 단추. 로고는 띠 바탕 위에 바로 두고, 둘레의 고리는 남은 양만큼 밝게 칠한다. */
 function UsageButton({ buttonRef, name, mark, usage, open, reading, onHover, onToggle }: UsageButtonProps) {
   const hover = useProviderMarkHover()
-  const target = usage ? remainingPercent(usage) : null
+  // 모든 모델의 한도와 특정 모델의 한도가 둘 다 오면 흰 고리는 모든 모델 쪽, 바깥 가는 고리는 그 모델 쪽(2026-11-22 그의 지시).
+  const split = usage ? usageSplit(usage) : null
+  const target = split ? split.all.left : usage ? remainingPercent(usage) : null
   const left = useGlide(target)
+  const scopedLeft = useGlide(split ? split.scoped.left : null)
   const hasNumbers = knownWindows(usage).length > 0
   // 숫자가 없으면 이름만, 뒤쪽이 읽을 만한 까닭을 주면 이름 뒤에 그 까닭(풍선과 화면 읽기 이름, 있던 자리 그대로).
+  // 고리가 둘이면 풍선에 둘의 남은 양과 다시 차는 때를 한 줄씩.
   const reason = target === null ? usageReason(usage, name) : null
-  const label = target !== null ? W.usageMeter.text8(name, Math.round(target)) : reason ? `${name}: ${reason}` : name
+  const splitLines = split ? [windowSummary(split.all.window), windowSummary(split.scoped.window)] : null
+  const label = splitLines ? `${name}: ${splitLines.join(', ')}` : target !== null ? W.usageMeter.text8(name, Math.round(target)) : reason ? `${name}: ${reason}` : name
+  const tip = splitLines ? [name, ...splitLines].join('\n') : label
   const element = useRef<HTMLButtonElement | null>(null)
   const [noticeAt, setNoticeAt] = useState<{ left: number; top: number } | null>(null)
 
@@ -356,7 +376,7 @@ function UsageButton({ buttonRef, name, mark, usage, open, reading, onHover, onT
       ref={(node) => { element.current = node; buttonRef(node) }}
       className="usage-button provider-mark-trigger"
       type="button"
-      title={label}
+      title={tip}
       aria-label={label}
       aria-haspopup={hasNumbers ? 'dialog' : undefined}
       aria-expanded={hasNumbers ? open : undefined}
@@ -379,6 +399,18 @@ function UsageButton({ buttonRef, name, mark, usage, open, reading, onHover, onT
             r={RING_RADIUS}
             strokeDasharray={`${(RING_LENGTH * left) / 100} ${RING_LENGTH}`}
           />
+          {scopedLeft !== null && (
+            <>
+              <circle className="usage-ring-track usage-ring-scoped" cx="19" cy="19" r={SCOPED_RADIUS} />
+              <circle
+                className="usage-ring-fill usage-ring-scoped"
+                cx="19"
+                cy="19"
+                r={SCOPED_RADIUS}
+                strokeDasharray={`${(SCOPED_LENGTH * scopedLeft) / 100} ${SCOPED_LENGTH}`}
+              />
+            </>
+          )}
         </svg>
       )}
       <ProviderMark provider={mark} active={hover.active} onDark motion={SMALL_CLAUDE_MOTION} className="usage-logo" />
@@ -396,6 +428,8 @@ function UsageButton({ buttonRef, name, mark, usage, open, reading, onHover, onT
 /** 펼친 것: 이름, 요금제, 기간마다 남은 양과 다시 차는 때, 확인한 때. */
 function UsageDetail({ name, usage }: { name: string; usage: ProviderUsage }) {
   const checked = formatWhen(usage.checkedAt)
+  // 고리가 둘이면 두 고리가 그리는 갈래를 모두 표시한다.
+  const split = usageSplit(usage)
   return (
     <>
       <div className="usage-row-head">
@@ -405,8 +439,10 @@ function UsageDetail({ name, usage }: { name: string; usage: ProviderUsage }) {
       <div className="usage-windows">
         {knownWindows(usage).map((window, index, all) => {
           // 띠의 고리가 그리는 갈래(가장 적게 남은 것)를 펼친 것에서 알 수 있게 한다.
-          const lowest = all.every((other) => (other.usedPercent ?? 0) <= (window.usedPercent ?? 0))
-          return <UsageWindowLine key={`${window.kind}-${window.limitId ?? scopeName(window.scope) ?? ''}-${index}`} window={window} lowest={lowest && all.length > 1} />
+          const lowest = split
+            ? window === split.all.window || window === split.scoped.window
+            : all.every((other) => (other.usedPercent ?? 0) <= (window.usedPercent ?? 0)) && all.length > 1
+          return <UsageWindowLine key={`${window.kind}-${window.limitId ?? scopeName(window.scope) ?? ''}-${index}`} window={window} lowest={lowest} />
         })}
       </div>
       {checked && <p className="usage-panel-checked">{W.usageMeter.text10(checked)}</p>}

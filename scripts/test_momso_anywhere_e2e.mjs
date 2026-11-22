@@ -33,6 +33,8 @@ class FakeGoogle {
     }
     if (url.includes('serviceusage.googleapis.com')) return method === 'POST' ? ok({ name: 'operations/fixture' }) : ok({ done: true });
     if (url.includes('iam.googleapis.com')) {
+      if (url.includes('/serviceAccounts/') && url.includes(':getIamPolicy')) return ok({ etag: 'fixture', bindings: [] });
+      if (url.includes('/serviceAccounts/') && url.includes(':setIamPolicy')) return ok(body.policy);
       if (url.includes('/serviceAccounts')) {
         if (method === 'POST') {
           const email = `${body.accountId}@${this.projectId}.iam.gserviceaccount.com`;
@@ -78,7 +80,8 @@ class FakeGoogle {
     if (url.includes('run.googleapis.com')) {
       if (url.includes('/operations/')) return ok({ done: true });
       if (url.includes('/revisions/')) return ok({ containers: [{ image: this.service.template.containers[0].image }] });
-      if (url.includes(':getIamPolicy')) return ok({ bindings: [] });
+      if (url.includes(':getIamPolicy')) return ok({ etag: 'fixture', bindings: [] });
+      if (url.includes(':setIamPolicy')) return ok(body.policy);
       const operation = { name: `projects/${this.projectId}/locations/asia-northeast3/operations/fixture` };
       if (method === 'POST') {
         this.service = { ...body, uri: 'https://fixture.a.run.app', etag: 'fixture', terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'fixture-rev-1', latestCreatedRevision: 'fixture-rev-1', trafficStatuses: [{ revision: 'fixture-rev-1', percent: 100 }] };

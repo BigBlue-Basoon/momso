@@ -1,7 +1,8 @@
 // This is public VM metadata: never include an OAuth token or proxy secret here.
-export function vmStartupScript({ project, secret, bundleUrl, bundleSha256 }) {
+export function vmStartupScript({ project, secret, bundleUrl, bundleSha256, update = null }) {
   if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project) || !/^momso-transport-[a-f0-9]{12}$/.test(secret) || !/^https:\/\/[a-zA-Z0-9.-]+(?::443)?\//.test(bundleUrl) || !/^[a-f0-9]{64}$/.test(bundleSha256)) throw new Error('invalid_vm_release');
-  const config = JSON.stringify({ project, secret, bundleUrl, bundleSha256 });
+  if (update !== null && (!['development', 'production'].includes(update.channel) || !/^https:\/\/[a-zA-Z0-9.-]+(?::443)?\//.test(update.manifestUrl ?? '') || !/^[A-Za-z0-9+/]{58,60}={0,2}$/.test(update.publicKeySpki ?? ''))) throw new Error('invalid_vm_release');
+  const config = JSON.stringify({ project, secret, bundleUrl, bundleSha256, update });
   return `#!/bin/sh
 set -eu
 install -d -m 0755 /opt/momso
@@ -21,7 +22,7 @@ if not (os.path.isfile(codex) and os.path.isfile(codex_marker) and hashlib.sha25
   with tf.extractfile(entries[0]) as src,open(codex+'.new','wb') as dst:shutil.copyfileobj(src,dst)
  os.chmod(codex+'.new',0o755);os.replace(codex+'.new',codex)
  with open(codex_marker,'w') as f:f.write(hashlib.sha256(open(codex,'rb').read()).hexdigest())
-missing=[pkg for executable,pkg in (('bwrap','bubblewrap'),('git','git'),('age-keygen','age'),('flock','util-linux')) if not shutil.which(executable)]
+missing=[pkg for executable,pkg in (('bwrap','bubblewrap'),('git','git'),('ffmpeg','ffmpeg'),('age-keygen','age'),('flock','util-linux')) if not shutil.which(executable)]
 if subprocess.run(['/usr/bin/python3','-c','import cryptography'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:missing.append('python3-cryptography')
 if missing:
  os.environ['DEBIAN_FRONTEND']='noninteractive';run('apt-get','update','-qq');run('apt-get','install','-y','-qq',*missing)
@@ -69,6 +70,21 @@ if not all(os.path.isfile(os.path.join(base,name)) and not os.path.islink(os.pat
    if os.path.lexists(dest):assert os.path.isfile(dest) and not os.path.islink(dest);continue
    member=tar.getmember(name);assert member.isfile() and member.size<=1048576
    fd,temporary=tempfile.mkstemp(prefix='.momso-backup-worker-',dir=base)
+   try:
+    with tar.extractfile(member) as src,os.fdopen(fd,'wb') as dst:shutil.copyfileobj(src,dst);dst.flush();os.fsync(dst.fileno())
+    os.chmod(temporary,0o644);os.link(temporary,dest)
+   finally:os.unlink(temporary)
+update_files=('update.py','release_manifest.py','server_admission.py','systemd_host.py','data_snapshots.py','cloud_run_gateway.py','github_releases.py','progress_status.py','layout_migration.py','install_worker.py','worker.py','ensure_gcloud.py')
+update_dir='/opt/momso-updater'
+if cfg.get('update') and not all(os.path.isfile(os.path.join(update_dir,name)) and not os.path.islink(os.path.join(update_dir,name)) for name in update_files):
+ data=fetch(cfg['bundleUrl']);assert hashlib.sha256(data).hexdigest()==cfg['bundleSha256']
+ os.makedirs(update_dir,mode=0o755,exist_ok=True)
+ with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as tar:
+  for name in update_files:
+   dest=os.path.join(update_dir,name)
+   if os.path.lexists(dest):assert os.path.isfile(dest) and not os.path.islink(dest);continue
+   member=tar.getmember('momso-updater/'+name);assert member.isfile() and member.size<=1048576
+   fd,temporary=tempfile.mkstemp(prefix='.momso-updater-',dir=update_dir)
    try:
     with tar.extractfile(member) as src,os.fdopen(fd,'wb') as dst:shutil.copyfileobj(src,dst);dst.flush();os.fsync(dst.fileno())
     os.chmod(temporary,0o644);os.link(temporary,dest)
@@ -149,6 +165,26 @@ while True:
  except (OSError,urllib.error.URLError):pass
  if time.monotonic()>=deadline:raise RuntimeError('private_proxy_not_ready')
  time.sleep(1)
+if cfg.get('update'):
+ import sys,urllib.parse
+ sys.path.insert(0,update_dir)
+ import worker,install_worker,ensure_gcloud
+ ensure_gcloud.ensure()
+ raw=base64.b64decode(cfg['update']['publicKeySpki'],validate=True);assert len(raw)==44 and raw[:12]==bytes.fromhex('302a300506032b6570032100')
+ public='/etc/momso-update-public.pem'
+ pem=b'-----BEGIN PUBLIC KEY-----\\n'+base64.b64encode(raw)+b'\\n-----END PUBLIC KEY-----\\n'
+ if os.path.exists(public):assert open(public,'rb').read()==pem
+ else:
+  with open(public,'xb') as f:f.write(pem)
+ config={'channel':cfg['update']['channel'],'updateRoot':'/opt/momso/releases','dataDir':'/var/lib/momso','statusFile':'/run/momso-update/status.json','publicKey':public,'serverTokenFile':'/run/momso-vault/server-token','lifecycleDir':'/var/lib/momso/lifecycle','serverUnit':'momso-server.service','proxyUnit':'momso-private-proxy.service','project':cfg['project'],'region':'asia-northeast3','gatewayService':'momso-any-'+backup_id}
+ active='/opt/momso/releases/.momso-update-active';config_path='/etc/momso-update.json';unit='/etc/systemd/system/momso-update.service'
+ if os.path.isfile(active) and os.path.isfile(config_path) and os.path.isfile(unit):
+  assert open(active).read().strip()=='momso-update-v1' and json.load(open(config_path))==config
+  run('systemctl','enable','--now','momso-update')
+ else:
+  manifest=cfg['update']['manifestUrl'];parts=urllib.parse.urlsplit(manifest);signature=urllib.parse.urlunsplit((parts.scheme,parts.netloc,parts.path+'.sig',parts.query,''))
+  poller=worker.make_poller(config)
+  install_worker.install('/opt/momso','/etc/systemd/system',update_dir,config_path,config,poller.updater,manifest,signature)
 der=subprocess.check_output(['openssl','x509','-in',cert,'-outform','DER']);fp=hashlib.sha256(der).hexdigest()
 req=urllib.request.Request(metadata+'instance/guest-attributes/momso/fingerprint',data=fp.encode(),headers={'Metadata-Flavor':'Google'},method='PUT')
 with urllib.request.urlopen(req,timeout=10):pass

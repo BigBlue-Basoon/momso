@@ -14,7 +14,7 @@ from server_admission import ServerAdmission
 
 @unittest.skipUnless(os.environ.get("MOMSO_S55_SERVER"), "requires isolated server binary")
 class RealMaintenanceTests(unittest.TestCase):
-    def test_real_s46_blocks_update_until_backup_ready(self):
+    def test_real_server_admission_allows_signed_update_when_quiescent(self):
         with tempfile.TemporaryDirectory(prefix="momso-s55-maintenance-") as directory:
             root = Path(directory); token = uuid.uuid4().hex; token_file = root / "token"; token_file.write_text(token)
             with socket.socket() as sock:
@@ -32,23 +32,24 @@ class RealMaintenanceTests(unittest.TestCase):
                         if time.monotonic() >= deadline: raise
                         time.sleep(0.1)
                 self.assertFalse(before["maintenanceReady"])
-                self.assertEqual(before["maintenanceReason"], "backup_not_integrated")
-                admission = ServerAdmission(token_file, root / "lifecycle", port=port, timeout=0)
+                admission = ServerAdmission(token_file, root / "lifecycle", port=port, timeout=15)
                 self.assertTrue(admission.health())
                 from systemd_host import SystemdHost
                 host = SystemdHost(root / "host", root / "data", "unused.service", "http://127.0.0.1:1/health", admission, object(), lambda _: None)
                 self.assertTrue(host.server_healthy())
-                self.assertFalse(admission.acquire())
+                self.assertTrue(admission.acquire())
+                self.assertTrue(activity()["maintenance"])
+                admission.release()
                 self.assertFalse(activity()["maintenance"])
-                # Drive the signed updater up to the real gate; no host switch is allowed.
+                # The signed updater uses the real gate and fake release host.
                 from test_update import UpdateTests
                 fixture = UpdateTests("test_signed_update_and_up_to_date")
                 fixture.setUp()
                 try:
                     fixture.host.acquire_maintenance = admission.acquire
                     fixture.host.release_maintenance = admission.release
-                    self.assertEqual(fixture.install(), "busy")
-                    self.assertEqual(fixture.host.release, "old")
+                    self.assertEqual(fixture.install(), "completed")
+                    self.assertEqual(fixture.host.sequence, 2)
                     self.assertFalse(activity()["maintenance"])
                 finally:
                     fixture.tearDown()

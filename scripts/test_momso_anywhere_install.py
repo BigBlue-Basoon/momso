@@ -106,10 +106,10 @@ class Tests(unittest.TestCase):
             if args[:3] == ("compute", "instances", "add-iam-policy-binding"):
                 attempts.append(1)
                 if len(attempts) < 3:
-                    raise anywhere.InstallError("fixture role not propagated")
+                    raise anywhere.InstallError("fixture role not propagated", role_propagating=True)
             return original(*args, **kwargs)
         p.run = flaky
-        with patch("momso_wake_install.time.sleep") as sleep:
+        with patch("momso_iam_retry.time.sleep") as sleep:
             anywhere.GoogleAnywhere(p).prepare_identity()
         self.assertEqual(len(attempts), 3)
         self.assertEqual(sleep.call_count, 2)
@@ -148,10 +148,10 @@ class Tests(unittest.TestCase):
                 raise anywhere.InstallError("fixture access denied")
             return original(*args, **kwargs)
         p.run = fail
-        with patch("momso_wake_install.time.sleep"):
+        with patch("momso_iam_retry.time.sleep"):
             with self.assertRaises(anywhere.InstallError):
                 anywhere.GoogleAnywhere(p).prepare_identity()
-        self.assertEqual(len(attempts), 6)
+        self.assertEqual(len(attempts), 1)
 
     def test_codex_installer_pins_official_archive_without_reading_user_login(self):
         p = Provider()
@@ -175,8 +175,11 @@ class Tests(unittest.TestCase):
         encoded = next(node.args[0].value for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "b64decode")
         payload = base64.b64decode(encoded).decode()
         parsed = ast.parse(payload)
-        unit = next(node.value.value for node in parsed.body if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "unit")
-        self.assertIn("\nExecStart=/usr/bin/python3 /opt/momso/momso_anywhere_vm_proxy.py\n", unit)
+        unit_expr = next(node.value for node in parsed.body if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "unit")
+        for base, expected in (("/opt/momso", "/opt/momso"), ("/opt/momso/releases/version-2", "/opt/momso/releases/current")):
+            unit = eval(compile(ast.Expression(unit_expr), "fixture", "eval"), {"__builtins__": {}}, {"base": base})
+            self.assertIn("\nExecStart=/usr/bin/python3 " + expected + "/momso_anywhere_vm_proxy.py\n", unit)
+            self.assertEqual("Requires=momso-server.service" in unit, base == "/opt/momso")
 
     def test_private_proxy_health_waits_for_connection(self):
         p = Provider()

@@ -38,12 +38,14 @@ export type SourcePurgeResult = {
   localRemaining: string[]
   remoteRemaining: string[]
   removedRemoteKeys: string[]
+  /** 휴대폰 몸소: 이미 올라간 예전 백업에는 사본이 남을 수 있다(S83). 데스크톱은 false. */
+  backupCopiesRemain: boolean
 }
 
 function need() {
   if (!isDesktopRuntime()) throw new Error('source assets need the desktop runtime')
 }
-/** 삭제(휴지통)·되돌리기·삭제한 원자료 목록은 휴대폰 몸소에서도(S75 셋째, server /assets/trash). 완전히 삭제는 server 에 없다. */
+/** 삭제(휴지통)·되돌리기·삭제한 원자료 목록·완전히 삭제는 휴대폰 몸소에서도(S75 셋째·S83, server /assets/trash·purge). */
 function needAny() {
   if (!hasAppBackend()) throw new Error('source assets need the desktop runtime')
 }
@@ -93,7 +95,7 @@ export async function restoreTrashedSource(assetId: string) {
 }
 
 export async function purgeSource(assetId: string, planDigest: string) {
-  need()
+  needAny()
   const value = await invoke<Partial<SourcePurgeResult> | null>('source_asset_purge', { assetId, planDigest, confirmed: true })
   announce({ assetId, deleted: true })
   return {
@@ -101,6 +103,7 @@ export async function purgeSource(assetId: string, planDigest: string) {
     localRemaining: Array.isArray(value?.localRemaining) ? value.localRemaining : [],
     remoteRemaining: Array.isArray(value?.remoteRemaining) ? value.remoteRemaining : [],
     removedRemoteKeys: Array.isArray(value?.removedRemoteKeys) ? value.removedRemoteKeys : [],
+    backupCopiesRemain: value?.backupCopiesRemain === true,
   } satisfies SourcePurgeResult
 }
 
@@ -122,8 +125,10 @@ export type DeletedSource = {
   deletionState: string
   canRestore: boolean
   canPurge: boolean
-  /** 쓰던 곳 수. 휴대폰 몸소의 server 는 알려 주지 않아 null(줄에 수를 적지 않는다). */
+  /** 쓰던 곳 수. 휴대폰 몸소에서 server 가 문서 수를 읽지 못하면 null(줄에 수를 적지 않는다). */
   referenceCount: number | null
+  /** 휴대폰 몸소: 완전히 삭제해도 예전 백업에는 사본이 남을 수 있다(S83). 데스크톱은 false. */
+  backupCopiesRemain: boolean
 }
 export type DeletedSourceCursor = { deletedAt: string; assetId: string }
 export type DeletedSourcePage = { items: DeletedSource[]; hasMore: boolean; nextCursor: DeletedSourceCursor | null }
@@ -141,6 +146,7 @@ export async function listDeletedSources(before: DeletedSourceCursor | null = nu
     canRestore: item.canRestore === true,
     canPurge: item.canPurge === true,
     referenceCount: typeof item.referenceCount === 'number' ? item.referenceCount : item.referenceCount === null ? null : 0,
+    backupCopiesRemain: item.backupCopiesRemain === true,
   }))
   const nextCursor = value?.nextCursor && typeof value.nextCursor.assetId === 'string' ? value.nextCursor : null
   return { items, hasMore: value?.hasMore === true && nextCursor !== null, nextCursor }

@@ -30,6 +30,7 @@ function fixture() {
     ...['vm', 'gateway'].map(suffix => [`${i}serviceAccounts/momso-${suffix}-${short}@${projectId}.iam.gserviceaccount.com`, { email: `momso-${suffix}-${short}@${projectId}.iam.gserviceaccount.com`, description: marker }]),
     [`${i}roles/momsoStop${short}`, { name: `projects/${projectId}/roles/momsoStop${short}`, description: marker, includedPermissions: ['compute.instances.stop'] }],
     [`${i}roles/momsoAnywhere${short}`, { name: `projects/${projectId}/roles/momsoAnywhere${short}`, description: marker, includedPermissions: ['compute.instances.get', 'compute.instances.start'] }],
+    [`${i}roles/momsoUpdate${short}`, { name: `projects/${projectId}/roles/momsoUpdate${short}`, description: marker, includedPermissions: ['run.operations.get', 'run.revisions.get', 'run.revisions.list', 'run.services.get', 'run.services.update'] }],
   ]);
   const deleted = [];
   let networkHeld = true;
@@ -65,11 +66,12 @@ test('owned cleanup records delayed subnet and safely resumes', async () => {
 });
 
 test('foreign resource or additional router attachment aborts before any deletion', async () => {
-  for (const unsafe of ['owner', 'peer', 'disk']) {
+  for (const unsafe of ['owner', 'peer', 'disk', 'update-role']) {
     const f = fixture();
     if (unsafe === 'owner') f.resources.get(f.router).description = 'foreign';
     else if (unsafe === 'peer') f.resources.get(f.router).bgpPeers = [{ name: 'unrelated' }];
-    else [...f.resources.values()].find(value => value.name === name).disks.push({ boot: false, autoDelete: false, source: '/disks/unrelated' });
+    else if (unsafe === 'disk') [...f.resources.values()].find(value => value.name === name).disks.push({ boot: false, autoDelete: false, source: '/disks/unrelated' });
+    else [...f.resources.values()].find(value => value.name?.endsWith(`/roles/momsoUpdate${short}`)).description = 'foreign';
     await assert.rejects(f.provider.destroy(id), { step: 'resource_ownership' });
     assert.deepEqual(f.deleted, []);
   }

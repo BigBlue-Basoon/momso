@@ -101,6 +101,7 @@ class SignTests(unittest.TestCase):
                 if parts[:3] == ('run', 'services', 'describe'): return {'status': {'url': 'https://fixture.run.app'}}
                 raise AssertionError('unexpected remote operation')
             def upgrade_checkpoint(self, action): self.calls.append(('checkpoint', action))
+            def upgrade_sequence(self, sequence, commit=False): self.calls.append(('sequence', sequence, commit))
             def upgrade_server(self, *args): self.calls.append(('server',))
             def install_web(self, *args): self.calls.append(('web',))
             def health(self): self.calls.append(('health',))
@@ -108,12 +109,14 @@ class SignTests(unittest.TestCase):
         provider = Provider()
         import momso_anywhere_install
         import momso_anywhere_public_assets
-        with patch.object(release, 'download', side_effect=lambda uri, *a, **kw: responses[uri]), patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, '_objects', return_value=({'fixture': 1}, {'fixture': 1}, {'fixture': 1})), patch.object(momso_anywhere_install.GoogleAnywhere, 'upgrade_gateway') as upgrade, patch('momso_anywhere_vm_services.install') as install_services:
+        with patch.object(release, 'download', side_effect=lambda uri, *a, **kw: responses[uri]), patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, '_objects', return_value=({'fixture': 1}, {'fixture': 1}, {'fixture': 1})), patch.object(momso_anywhere_install.GoogleAnywhere, 'upgrade_gateway') as upgrade, patch('momso_anywhere_vm_services.install') as install_services, patch('momso_anywhere_update_install.grant_gateway_update') as grant_update, patch('momso_anywhere_update_install.install') as install_update:
             self.assertEqual(installer.main(args), 0)
         upgrade.assert_called_once_with('https://fixture.run.app', self.image)
-        install_services.assert_called_once_with(provider)
+        install_services.assert_called_once_with(provider, allow_upgrade_gate=True)
+        grant_update.assert_called_once_with(provider)
+        install_update.assert_called_once_with(provider, 'development', self.dev_dir / 'dev-public.pem', url)
         self.assertIn(('private_proxy',), provider.calls)
-        self.assertEqual(provider.calls, [('checkpoint', 'begin'), ('server',), ('web',), ('health',), ('checkpoint', 'finish'), ('private_proxy',)])
+        self.assertEqual(provider.calls, [('sequence', 1, False), ('checkpoint', 'begin'), ('server',), ('web',), ('health',), ('sequence', 1, True), ('checkpoint', 'finish'), ('private_proxy',)])
         self.assertEqual(json.loads(state.read_text())['anywhere']['release_channel'], 'development')
 
     def test_development_install_rejects_a_valid_production_release(self):

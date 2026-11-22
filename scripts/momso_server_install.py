@@ -23,7 +23,11 @@ MACHINE = "e2-small"
 
 
 class InstallError(Exception):
-    pass
+    def __init__(self, message, *, role_propagating=False, managed_conflict=None, managed_conflicts=None):
+        super().__init__(message)
+        self.role_propagating = role_propagating
+        self.managed_conflict = managed_conflict
+        self.managed_conflicts = managed_conflicts or ([managed_conflict] if managed_conflict else [])
 
 
 class PendingNetworkCleanup(InstallError):
@@ -132,10 +136,24 @@ class GoogleProvider:
         command = [*prefix, *args, f"--account={self.account}", f"--project={self.project}", "--quiet"]
         if parse:
             command.append("--format=json")
+        if args[:2] == ('compute', 'ssh') and len(subprocess.list2cmdline(command)) > 8000:
+            raise InstallError("VM 접속 명령이 너무 깁니다.")
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         result = subprocess.run(command, input=data, capture_output=True, timeout=600, check=False, env=env, creationflags=flags)
         if result.returncode:
-            raise InstallError(f"클라우드 작업 실패: {' '.join(args[:3])}. 권한·연결·자원 상태를 확인하세요.")
+            from momso_iam_retry import role_propagation_failure
+            stderr = getattr(result, 'stderr', b'') or b''
+            matches = re.findall(rb'momso-managed-conflict: ([a-z0-9_.-]{1,80}): (unrecognized|not_regular|invalid_name|manifest_invalid|directory_untrusted)', stderr)
+            if matches:
+                from momso_managed_history import load
+                history = load()
+                allowed = set().union(*(set(history[group]) for group in ('files', 'worker', 'proxy')))
+                allowed.update(('unknown', 'idle-token.py', 'momso-vault-credential.service', 'momso-idle-stop.service', 'vault.conf', 'backup.conf', 'momso-update-public.pem', 'managed-files.json', 'managed-helper.json', 'managed-units.json', 'managed-overrides.json', 'momso', 'system', 'momso-private', 'momso-server.service.d'))
+                conflicts = list(dict.fromkeys((name.decode('ascii'), reason.decode('ascii')) for name, reason in matches if name.decode('ascii') in allowed))
+                if conflicts:
+                    raise InstallError('\n'.join(f"관리 파일 충돌: {name}: {reason}" for name, reason in conflicts), managed_conflict=conflicts[0], managed_conflicts=conflicts)
+            raise InstallError(f"클라우드 작업 실패: {' '.join(args[:3])}. 권한·연결·자원 상태를 확인하세요.",
+                               role_propagating=role_propagation_failure(stderr))
         if parse:
             try:
                 return json.loads(result.stdout.decode("utf-8"))
@@ -172,42 +190,47 @@ class GoogleProvider:
             self.run("compute", "instances", "start", self.name, f"--zone={ZONE}")
 
     def ssh(self, code: str, data: bytes | None = None):
-        if data is not None:
-            remote_dir = f"/tmp/{self.name}-transfer-{uuid.uuid4().hex}"
-            remote = remote_dir + "/payload"
-            fd, local = tempfile.mkstemp(prefix="momso-transfer-")
-            created = False
-            try:
-                with os.fdopen(fd, "wb") as output:
-                    output.write(data)
-                self.ssh(f"import os; os.mkdir({remote_dir!r}, 0o700)")
-                created = True
-                self.run("compute", "scp", local, f"{self.name}:{remote}", f"--zone={ZONE}", "--tunnel-through-iap", "--strict-host-key-checking=yes", f"--ssh-key-file={self.key_file}")
-                digest = hashlib.sha256(data).hexdigest()
-                wrapper = (
-                    "import base64,hashlib,io,os,sys\n"
-                    f"p={remote!r}\n"
-                    "with open(p,'rb') as f: d=f.read()\n"
-                    "os.unlink(p)\n"
-                    f"os.rmdir({remote_dir!r})\n"
-                    f"assert hashlib.sha256(d).hexdigest()=={digest!r}\n"
-                    "sys.stdin=io.TextIOWrapper(io.BytesIO(d),encoding='utf-8')\n"
-                    f"exec(compile(base64.b64decode({base64.b64encode(code.encode()).decode()!r}),'<momso>','exec'))\n"
-                )
-                return self.ssh(wrapper)
-            except Exception:
-                if created:
-                    cleanup = f"import os; p={remote!r}; d={remote_dir!r}; os.path.exists(p) and os.unlink(p); os.path.isdir(d) and os.rmdir(d)"
-                    try:
-                        self.ssh(cleanup)
-                    except (InstallError, subprocess.SubprocessError, OSError):
-                        pass
-                raise
-            finally:
-                os.unlink(local)
+        remote_dir = f"/tmp/{self.name}-transfer-{uuid.uuid4().hex}"
+        remote = remote_dir + "/payload"
+        code_bytes = code.encode('utf-8')
+        package = len(code_bytes).to_bytes(8, 'big') + (b'1' if data is not None else b'0') + code_bytes + (data or b'')
+        fd, local = tempfile.mkstemp(prefix="momso-transfer-")
+        created = False
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(package)
+            self._ssh_inline(f"import os; os.mkdir({remote_dir!r}, 0o700)")
+            created = True
+            self.run("compute", "scp", local, f"{self.name}:{remote}", f"--zone={ZONE}", "--tunnel-through-iap", "--strict-host-key-checking=yes", f"--ssh-key-file={self.key_file}")
+            digest = hashlib.sha256(package).hexdigest()
+            wrapper = (
+                "import hashlib,io,os,sys\n"
+                f"p={remote!r}\n"
+                "with open(p,'rb') as f: d=f.read()\n"
+                "os.unlink(p)\n"
+                f"os.rmdir({remote_dir!r})\n"
+                f"assert hashlib.sha256(d).hexdigest()=={digest!r}\n"
+                "n=int.from_bytes(d[:8],'big'); flag=d[8:9]; code=d[9:9+n]\n"
+                "assert flag in (b'0',b'1') and len(code)==n\n"
+                "if flag==b'1': sys.stdin=io.TextIOWrapper(io.BytesIO(d[9+n:]),encoding='utf-8')\n"
+                "exec(compile(code,'<momso>','exec'))\n"
+            )
+            return self._ssh_inline(wrapper)
+        except Exception:
+            if created:
+                cleanup = f"import os; p={remote!r}; d={remote_dir!r}; os.path.exists(p) and os.unlink(p); os.path.isdir(d) and os.rmdir(d)"
+                try:
+                    self._ssh_inline(cleanup)
+                except (InstallError, subprocess.SubprocessError, OSError):
+                    pass
+            raise
+        finally:
+            os.unlink(local)
+
+    def _ssh_inline(self, code: str):
         encoded = base64.b64encode(code.encode()).decode("ascii")
         command = f"python3 -c \"exec(__import__('base64').b64decode('{encoded}'))\""
-        return self.run("compute", "ssh", self.name, f"--zone={ZONE}", "--tunnel-through-iap", "--strict-host-key-checking=yes", f"--ssh-key-file={self.key_file}", f"--command={command}", data=data)
+        return self.run("compute", "ssh", self.name, f"--zone={ZONE}", "--tunnel-through-iap", "--strict-host-key-checking=yes", f"--ssh-key-file={self.key_file}", f"--command={command}")
 
     def install(self, artifact: Path, digest: str):
         data = artifact.read_bytes()
@@ -226,8 +249,9 @@ class GoogleProvider:
 src=SOURCE
 assert hashlib.sha256(open(src,'rb').read()).hexdigest()==DIGEST
 def run(*args): subprocess.run(args,check=True,stdout=subprocess.DEVNULL)
-if not shutil.which('git'):
- os.environ['DEBIAN_FRONTEND']='noninteractive';run('apt-get','update','-qq');run('apt-get','install','-y','-qq','git')
+missing=[name for name in ('git','ffmpeg') if not shutil.which(name)]
+if missing:
+ os.environ['DEBIAN_FRONTEND']='noninteractive';run('apt-get','update','-qq');run('apt-get','install','-y','-qq',*missing)
 if subprocess.run(['id','momso'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode: run('useradd','--system','--create-home','--home-dir','/var/lib/momso','--shell','/usr/sbin/nologin','momso')
 run('install','-d','-m','0755','/opt/momso')
 run('install','-m','0755',src,'/opt/momso/.momso-server.new')
@@ -279,12 +303,20 @@ for attempt in range(12):
             raise InstallError("입구 연결을 다시 확인하지 못했습니다. 서버와 입구 상태를 확인하세요.") from error
 
     def upgrade_checkpoint(self, action):
-        if action not in ("begin", "restore", "finish"):
+        if action not in ("begin", "restore", "release", "finish"):
             raise ValueError("invalid upgrade action")
         snapshots = Path(__file__).resolve().parent.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/data_snapshots.py'
         snapshot_code = base64.b64encode(snapshots.read_bytes()).decode('ascii')
+        managed_code = base64.b64encode((Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()).decode('ascii')
         code = r'''import base64,fcntl,json,os,shutil,subprocess,tempfile,time,urllib.error,urllib.request
-root='/opt/momso';backup=root+'/.momso-upgrade-backup';server=root+'/momso-server';web=root+'/web';env='/etc/momso-server.env'
+root='/opt/momso';backup=root+'/.momso-upgrade-backup';env='/etc/momso-server.env'
+marker=root+'/releases/.momso-update-active';current=root+'/releases/current';override='/etc/systemd/system/momso-server.service.d/momso-update.conf'
+active=os.path.exists(marker) or (os.path.isfile(override) and 'ExecStart=/opt/momso/releases/current/momso-server' in open(override).read())
+if active:
+ assert (not os.path.exists(marker) or (not os.path.islink(marker) and open(marker).read().strip()=='momso-update-v1')) and os.path.islink(current)
+ target=os.path.realpath(current);assert os.path.commonpath((target,root+'/releases'))==root+'/releases' and target!=root+'/releases'
+ root=target
+server=root+'/momso-server';web=root+'/web'
 action=ACTION
 ns={};exec(compile(base64.b64decode(SNAPSHOT_CODE),'data_snapshots.py','exec'),ns);DataSnapshots=ns['DataSnapshots']
 config=dict(line.strip().split('=',1) for line in open(env) if '=' in line and not line.lstrip().startswith('#'))
@@ -340,6 +372,7 @@ if action=='begin':
    snap=DataSnapshots(data,stage+'/snapshots').snapshot()
    with open(stage+'/snapshot-name','w') as f:f.write(os.path.basename(snap))
    if os.path.exists(env):shutil.copy2(env,stage+'/server.env')
+   if active:shutil.copy2(os.path.dirname(marker)+'/installed.json',stage+'/installed.json')
    with open(stage+'/mode','w') as f:f.write(mode)
    with open(stage+'/owner','w') as f:f.write('momso-upgrade-v1')
    os.rename(stage,backup)
@@ -355,6 +388,10 @@ if action=='begin':
    if os.path.isdir(stage):shutil.rmtree(stage)
 elif action=='restore':
  owned();subprocess.run(['systemctl','stop','momso-server'],check=True)
+ managed={};exec(compile(base64.b64decode(MANAGED_CODE),'momso_managed_files.py','exec'),managed)
+ for group,path in (('overrides','/etc/systemd/system/momso-server.service.d'),('units','/etc/systemd/system'),('helper','/opt/momso')):
+  managed['rollback'](path,'/etc/momso-private/managed-'+group+'.json',backup+'/managed-'+group+'-journal.json',INSTALL_OWNER)
+ managed['rollback']('/opt/momso','/etc/momso-private/managed-files.json',backup+'/managed-files.json',INSTALL_OWNER)
  name=open(backup+'/snapshot-name').read().strip()
  DataSnapshots(data,backup+'/snapshots').restore(backup+'/snapshots/'+name)
  tmp=root+'/.momso-server-restore';shutil.copy2(backup+'/momso-server',tmp);os.replace(tmp,server)
@@ -366,13 +403,17 @@ elif action=='restore':
  finally:
   if os.path.isdir(staged):shutil.rmtree(staged)
  if os.path.isfile(backup+'/server.env'):shutil.copy2(backup+'/server.env',env)
+ if os.path.isfile(backup+'/installed.json'):shutil.copy2(backup+'/installed.json',os.path.dirname(marker)+'/installed.json')
  subprocess.run(['systemctl','reset-failed','momso-server'],check=False)
  subprocess.run(['systemctl','start','momso-server'],check=True)
+elif action=='release':
+ owned()
+ if open(backup+'/mode').read()=='gated':call('/maintenance/release','POST')
 else:
  owned()
  if open(backup+'/mode').read()=='gated':call('/maintenance/release','POST')
  shutil.rmtree(backup)
-'''.replace("ACTION", repr(action)).replace("SNAPSHOT_CODE", repr(snapshot_code))
+'''.replace("ACTION", repr(action)).replace("SNAPSHOT_CODE", repr(snapshot_code)).replace("MANAGED_CODE", repr(managed_code)).replace("INSTALL_OWNER", repr(self.install_id))
         encoded = base64.b64encode(code.encode()).decode()
         wrapper = "import base64,subprocess,sys; r=subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],capture_output=True); print('momso_server_busy' if r.returncode and b'server_busy' in r.stderr else 'momso_checkpoint_failed' if r.returncode else 'momso_checkpoint_ok')"
         result = self.ssh(wrapper).strip()
@@ -388,9 +429,15 @@ else:
         code = r'''import hashlib,os,subprocess,sys,tempfile
 data=sys.stdin.buffer.read()
 assert hashlib.sha256(data).hexdigest()==DIGEST
-dest='/opt/momso/momso-server'
+root='/opt/momso';marker=root+'/releases/.momso-update-active';current=root+'/releases/current';override='/etc/systemd/system/momso-server.service.d/momso-update.conf'
+active=os.path.exists(marker) or (os.path.isfile(override) and 'ExecStart=/opt/momso/releases/current/momso-server' in open(override).read())
+if active:
+ assert (not os.path.exists(marker) or (not os.path.islink(marker) and open(marker).read().strip()=='momso-update-v1')) and os.path.islink(current)
+ target=os.path.realpath(current);assert os.path.commonpath((target,root+'/releases'))==root+'/releases' and target!=root+'/releases'
+ root=target
+dest=root+'/momso-server'
 assert os.path.isfile(dest) and not os.path.islink(dest)
-fd,tmp=tempfile.mkstemp(prefix='.momso-upgrade-',dir='/opt/momso')
+fd,tmp=tempfile.mkstemp(prefix='.momso-upgrade-',dir=root)
 try:
  with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
  os.chmod(tmp,0o755);os.replace(tmp,dest)
@@ -403,6 +450,28 @@ finally:
         wrapper = "import base64,subprocess,sys; subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],input=sys.stdin.buffer.read(),check=True)"
         self.ssh(wrapper, data)
 
+    def upgrade_sequence(self, sequence, *, commit=False):
+        if type(sequence) is not int or sequence < 1:
+            raise InstallError("배포 순번을 확인하지 못했습니다.")
+        code = r'''import json,os,tempfile
+root='/opt/momso/releases';marker=root+'/.momso-update-active';path=root+'/installed.json';override='/etc/systemd/system/momso-server.service.d/momso-update.conf'
+active=os.path.exists(marker) or (os.path.isfile(override) and 'ExecStart=/opt/momso/releases/current/momso-server' in open(override).read())
+if active:
+ assert not os.path.exists(marker) or (not os.path.islink(marker) and open(marker).read().strip()=='momso-update-v1')
+ with open(path) as f:previous=json.load(f)['sequence']
+ assert type(previous) is int and DESIRED>=previous
+ if COMMIT:
+  fd,tmp=tempfile.mkstemp(prefix='.sequence-',dir=root)
+  try:
+   with os.fdopen(fd,'w') as f:json.dump({'sequence':DESIRED},f);f.flush();os.fsync(f.fileno())
+   os.replace(tmp,path)
+  finally:
+   if os.path.exists(tmp):os.unlink(tmp)
+'''.replace('DESIRED', repr(sequence)).replace('COMMIT', repr(commit))
+        encoded = base64.b64encode(code.encode()).decode()
+        wrapper = "import base64,subprocess; subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],check=True)"
+        self.ssh(wrapper)
+
     def install_web(self, archive: Path, digest: str):
         data = archive.read_bytes()
         if hashlib.sha256(data).hexdigest() != digest:
@@ -410,7 +479,13 @@ finally:
         code = r'''import hashlib,io,os,pathlib,shutil,subprocess,sys,tarfile,tempfile
 data=sys.stdin.buffer.read()
 assert hashlib.sha256(data).hexdigest()==DIGEST
-root='/opt/momso'; dest=root+'/web'; old=root+'/web.old'
+root='/opt/momso';marker=root+'/releases/.momso-update-active';current=root+'/releases/current';override='/etc/systemd/system/momso-server.service.d/momso-update.conf'
+active=os.path.exists(marker) or (os.path.isfile(override) and 'ExecStart=/opt/momso/releases/current/momso-server' in open(override).read())
+if active:
+ assert (not os.path.exists(marker) or (not os.path.islink(marker) and open(marker).read().strip()=='momso-update-v1')) and os.path.islink(current)
+ target=os.path.realpath(current);assert os.path.commonpath((target,root+'/releases'))==root+'/releases' and target!=root+'/releases'
+ root=target
+dest=root+'/web'; old=root+'/web.old'
 if os.path.exists(dest): assert os.path.isfile(dest+'/.momso-owned')
 if os.path.exists(old): assert os.path.isfile(old+'/.momso-owned');shutil.rmtree(old)
 tmp=tempfile.mkdtemp(prefix='.web-',dir=root)
@@ -504,7 +579,7 @@ def deploy(provider, artifact: Path, digest: str, state_path: Path, state: dict)
         save_state(state_path, state)
 
 
-def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_id, owner_sub, login_origin, gateway_image):
+def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_id, owner_sub, login_origin, gateway_image, signed_sequence=None):
     import momso_anywhere_install
     from momso_anywhere_public_assets import from_web_archive
 
@@ -534,22 +609,35 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
     elif vm.get("status") != "RUNNING":
         raise InstallError("기존 VM이 준비 중입니다. 잠시 뒤 다시 해 주세요.")
     try:
+        if signed_sequence is not None:
+            provider.upgrade_sequence(signed_sequence)
         provider.upgrade_checkpoint("begin")
         try:
             provider.upgrade_server(artifact, digest)
             provider.install_web(web, web_digest)
             provider.health()
             import momso_anywhere_vm_services
-            momso_anywhere_vm_services.install(provider)
+            momso_anywhere_vm_services.install(provider, allow_upgrade_gate=True)
             momso_anywhere_install.GoogleAnywhere(provider).upgrade_gateway(configured["url"], gateway_image)
+            if signed_sequence is not None:
+                provider.upgrade_sequence(signed_sequence, commit=True)
         except (InstallError, OSError, subprocess.SubprocessError) as error:
+            restored = False
             try:
                 provider.upgrade_checkpoint("restore")
+                restored = True
                 provider.health()
             except (InstallError, OSError, subprocess.SubprocessError) as rollback_error:
+                if restored:
+                    try:
+                        provider.upgrade_checkpoint("release")
+                    except (InstallError, OSError, subprocess.SubprocessError) as release_error:
+                        raise InstallError("이전 판을 복구했지만 접수 중단을 해제하지 못했습니다. 복구 사본을 보존했습니다.") from release_error
                 raise InstallError("새 판 확인에 실패했고 이전 판의 복구 상태도 확인하지 못했습니다. 복구 사본을 보존했습니다.") from rollback_error
             provider.upgrade_checkpoint("finish")
-            raise InstallError("새 판 확인에 실패해 이전 server와 화면으로 되돌렸습니다.") from error
+            conflicts = getattr(error, 'managed_conflicts', [])
+            suffix = ''.join(f"\n관리 파일 충돌: {name}: {reason}" for name, reason in conflicts)
+            raise InstallError("새 판 확인에 실패해 이전 server와 화면으로 되돌렸습니다." + suffix, managed_conflict=conflicts[0] if conflicts else None, managed_conflicts=conflicts) from error
         provider.upgrade_checkpoint("finish")
         return configured["url"]
     finally:
@@ -559,6 +647,21 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
 # Files distributed with the installer, checked before any customer resources change.
 INSTALLER_FILES = (
     "apps/alpha/desktop/src-tauri/momso-server-update/data_snapshots.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/update.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/release_manifest.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/server_admission.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/systemd_host.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/cloud_run_gateway.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/github_releases.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/progress_status.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/layout_migration.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/install_worker.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/worker.py",
+    "apps/alpha/desktop/src-tauri/momso-server-update/ensure_gcloud.py",
+    "scripts/momso_anywhere_update_install.py",
+    "scripts/momso_managed_files.py",
+    "scripts/momso_managed_history.py",
+    "scripts/momso_managed_history.json",
     "apps/alpha/desktop/src-tauri/momso-vault-provision/provision.py",
     "apps/alpha/desktop/src-tauri/momso-idle-stop/idle_stop.py",
 )
@@ -671,7 +774,7 @@ def main(argv=None):
         else:
             existing = state.get("anywhere", {})
             if args.action == "anywhere" and existing.get("url") and not existing.get("destroyed"):
-                url = upgrade_anywhere(provider, state, args.artifact, args.sha256.lower(), args.web_archive, args.web_sha256.lower(), args.google_client_id, args.owner_sub, args.login_origin, args.gateway_image)
+                url = upgrade_anywhere(provider, state, args.artifact, args.sha256.lower(), args.web_archive, args.web_sha256.lower(), args.google_client_id, args.owner_sub, args.login_origin, args.gateway_image, signed['sequence'])
                 print("접속 주소: " + url)
             else:
                 deploy(provider, args.artifact, args.sha256.lower(), args.state, state)
@@ -688,6 +791,10 @@ def main(argv=None):
                 import momso_anywhere_install
                 url = momso_anywhere_install.install(provider, args.state, state, args.google_client_id, args.owner_sub, args.login_origin, args.gateway_image)
                 print("접속 주소: " + url)
+            if args.action == "anywhere":
+                import momso_anywhere_update_install
+                momso_anywhere_update_install.grant_gateway_update(provider)
+                momso_anywhere_update_install.install(provider, args.release_channel, args.release_public_key, args.release_manifest_url)
         print("완료: " + args.action)
         return 0
     except (InstallError, OSError, subprocess.SubprocessError, ValueError) as error:

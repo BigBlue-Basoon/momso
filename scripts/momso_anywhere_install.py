@@ -12,6 +12,7 @@ from pathlib import Path
 
 from momso_server_install import InstallError, REGION, ZONE, save_state
 from momso_wake_install import GoogleWake
+from momso_iam_retry import bind_custom_role
 
 _adapter_path = Path(__file__).resolve().parent.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/cloud_run_gateway.py'
 _adapter_spec = importlib.util.spec_from_file_location('momso_cloud_run_gateway', _adapter_path)
@@ -65,12 +66,18 @@ os.chmod(key,0o600)
 if not os.path.exists(token):
  fd=os.open(token,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
  with os.fdopen(fd,'w') as f:f.write(secrets.token_urlsafe(48))
-os.makedirs('/opt/momso',exist_ok=True)
+base='/opt/momso';marker=base+'/releases/.momso-update-active';current=base+'/releases/current';override='/etc/systemd/system/momso-server.service.d/momso-update.conf'
+active=os.path.exists(marker) or (os.path.isfile(override) and 'ExecStart=/opt/momso/releases/current/momso-server' in open(override).read())
+if active:
+ assert (not os.path.exists(marker) or (not os.path.islink(marker) and open(marker).read().strip()=='momso-update-v1')) and os.path.islink(current)
+ target=os.path.realpath(current);assert os.path.commonpath((target,base+'/releases'))==base+'/releases' and target!=base+'/releases'
+ base=target
+os.makedirs(base,exist_ok=True)
 for name,value in data.items():
- path='/opt/momso/'+name;temp=path+'.new'
+ path=base+'/'+name;temp=path+'.new'
  with open(temp,'wb') as f:f.write(base64.b64decode(value,validate=True))
  os.chmod(temp,0o755);os.replace(temp,path)
-unit='[Unit]\nDescription=momso private proxy\nAfter=momso-server.service\nRequires=momso-server.service\n[Service]\nLoadCredential=server-env:/etc/momso-server.env\nEnvironment=MOMSO_MOBILE_HOST=private.momso\nEnvironment=MOMSO_PRIVATE_PROXY_TOKEN_FILE=/etc/momso-private/transport-token\nEnvironment=MOMSO_PRIVATE_CERT=/etc/momso-private/certificate.pem\nEnvironment=MOMSO_PRIVATE_KEY=/etc/momso-private/key.pem\nExecStart=/usr/bin/python3 /opt/momso/momso_anywhere_vm_proxy.py\nNoNewPrivileges=true\nPrivateTmp=true\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n'
+unit='[Unit]\nDescription=momso private proxy\nAfter=momso-server.service\n'+('' if base!='/opt/momso' else 'Requires=momso-server.service\n')+'[Service]\nLoadCredential=server-env:/etc/momso-server.env\nEnvironment=MOMSO_MOBILE_HOST=private.momso\nEnvironment=MOMSO_PRIVATE_PROXY_TOKEN_FILE=/etc/momso-private/transport-token\nEnvironment=MOMSO_PRIVATE_CERT=/etc/momso-private/certificate.pem\nEnvironment=MOMSO_PRIVATE_KEY=/etc/momso-private/key.pem\nExecStart=/usr/bin/python3 '+('/opt/momso/releases/current' if base!='/opt/momso' else base)+'/momso_anywhere_vm_proxy.py\nNoNewPrivileges=true\nPrivateTmp=true\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n'
 with open('/etc/systemd/system/momso-private-proxy.service','w') as f:f.write(unit)
 run('systemctl','daemon-reload');run('systemctl','enable','--now','momso-private-proxy');run('systemctl','restart','momso-private-proxy')
 import ssl,time,urllib.error,urllib.request
@@ -124,7 +131,7 @@ class GoogleAnywhere(GoogleWake):
             actual = p.run("secrets", "versions", "access", "latest", f"--secret={name}").strip()
             if not hmac.compare_digest(actual, value):
                 raise InstallError("VM과 비밀 저장소의 전송 권한이 다릅니다. 기존 값을 덮어쓰지 않았습니다.")
-        p.run("secrets", "add-iam-policy-binding", name, f"--member=serviceAccount:{self.email}", "--role=roles/secretmanager.secretAccessor")
+        bind_custom_role(p, "secrets", "add-iam-policy-binding", name, f"--member=serviceAccount:{self.email}", "--role=roles/secretmanager.secretAccessor")
 
     def activate_gateway(self, image, *, flags=(), previous=True, expected_url=None):
         p = self.p

@@ -8,7 +8,7 @@
 //   object_store_backup, object_store_restore({ ids }), app_state_backup, app_state_restore, 이벤트 object-store-progress / done / failed
 // 키는 받아서 바로 넘기기만 한다(화면에 남기지 않는다).
 import { invoke, listen } from './host'
-import { isDesktopRuntime } from './runtime'
+import { hasAppBackend, isDesktopRuntime } from './runtime'
 
 export type RemoteStatus = {
   /** redactionPending: 바꾼 키를 채팅방 사본에서 가리는 동안이라 올리기를 미뤘다(2026-11-17, 올리기 결과). */
@@ -54,8 +54,10 @@ export type StoreStatus = {
 export type StoreProgress = { completedCount: number; completedBytes: number; totalCount: number; totalBytes: number }
 
 function need() { if (!isDesktopRuntime()) throw new Error('backup needs the desktop runtime') }
+/** GitHub 상태·연결·만들기·업로드·연결 해제·자동 백업 형편과 원자료 백업 형편은 휴대폰 몸소에서도(server /github/*·/activity, server-client.ts). */
+function needAny() { if (!hasAppBackend()) throw new Error('backup needs the desktop runtime') }
 
-export async function remoteStatus() { need(); return invoke<RemoteStatus>('archive_remote_status') }
+export async function remoteStatus() { needAny(); return invoke<RemoteStatus>('archive_remote_status') }
 
 /**
  * GitHub 자동 백업(2026-11-18, 뒤쪽 feat/desktop-github-auto-backup archive_auto_backup.rs, 아직 화면 폴더에 없음).
@@ -84,12 +86,12 @@ function readAutoBackup(value: Partial<AutoBackupStatus> | null): AutoBackupStat
  * GitHub 자동 백업과 같은 꼴 { enabled, state, consecutiveFailures, reason, retryInSeconds }. state 에 not_connected 가 더 있다.
  * 바뀐 뒤 120초 묶어 올리고(30초마다 살핌), 실패하면 60초부터 두 배씩 최대 30분 뒤 다시. 기본 켬.
  */
-export async function storeAutoUploadGet() { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('object_store_auto_upload_get')) }
+export async function storeAutoUploadGet() { needAny(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('object_store_auto_upload_get')) }
 export async function storeAutoUploadSet(enabled: boolean) { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('object_store_auto_upload_set', { enabled })) }
-export async function autoBackupGet() { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('archive_auto_backup_get')) }
+export async function autoBackupGet() { needAny(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('archive_auto_backup_get')) }
 export async function autoBackupSet(enabled: boolean) { need(); return readAutoBackup(await invoke<Partial<AutoBackupStatus> | null>('archive_auto_backup_set', { enabled })) }
-export async function remoteConnect(repo: string) { need(); return invoke<RemoteStatus>('archive_remote_connect', { repo }) }
-export async function remotePush() { need(); return invoke<RemoteStatus>('archive_remote_push') }
+export async function remoteConnect(repo: string) { needAny(); return invoke<RemoteStatus>('archive_remote_connect', { repo }) }
+export async function remotePush() { needAny(); return invoke<RemoteStatus>('archive_remote_push') }
 /**
  * 따로 넣은 파일 수(desktop-document-folders.md: archive_additional_files_count() → { count }, 읽을 수 없으면 unavailable).
  * 문서 목록에 넣지 않는 일반 파일이고 GitHub 에 함께 올라간다. 명령이 없는 뒤쪽이거나 읽지 못하면 null(줄을 그리지 않는다).
@@ -101,7 +103,7 @@ export async function additionalFilesCount(): Promise<number | null> {
 }
 
 export async function remotePull() { need(); return invoke<RemoteStatus>('archive_remote_pull') }
-export async function remoteDisconnect() { need(); return invoke<RemoteStatus>('archive_remote_disconnect') }
+export async function remoteDisconnect() { needAny(); return invoke<RemoteStatus>('archive_remote_disconnect') }
 /**
  * T37: 저장된 username 으로 GitHub 에 momso-<username> 비공개 저장소를 만들어 연결한다(archive-backend-port-notes.md 264줄).
  * state: created | created_not_connected | created_unverified | create_failed | username_missing | invalid_username | already_connected
@@ -123,9 +125,9 @@ export async function listenGitInstall(onChange: (event: GitInstallEvent) => voi
   return listen<GitInstallEvent>('git-install-changed', (event) => onChange(event.payload))
 }
 
-export async function remoteCreate() { need(); return invoke<{ state: string; repo: string | null }>('archive_remote_create') }
+export async function remoteCreate() { needAny(); return invoke<{ state: string; repo: string | null }>('archive_remote_create') }
 
-export async function storeStatus() { need(); return invoke<StoreStatus>('object_store_status') }
+export async function storeStatus() { needAny(); return invoke<StoreStatus>('object_store_status') }
 export async function storeConnect(input: { provider: StoreProvider; endpoint: string; region: string; bucket: string; accessKeyId: string; secretAccessKey: string }) {
   need(); return invoke<StoreStatus>('object_store_connect', input)
 }

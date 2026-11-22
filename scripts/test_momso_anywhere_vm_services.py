@@ -1,6 +1,12 @@
 import ast
 import base64
+import hashlib
+import io
 import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -64,6 +70,132 @@ class FakeProvider:
 
 
 class InstallerTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'VM payload requires Linux filesystem operations')
+    def test_first_migration_adopts_generated_files_preserves_unmanaged_backups(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / 'opt'; root.mkdir(mode=0o700)
+            private = base / 'private'; private.mkdir(mode=0o700)
+            systemd = base / 'systemd'; systemd.mkdir(mode=0o700)
+            overrides = systemd / 'momso-server.service.d'; overrides.mkdir(mode=0o700)
+            checkpoint = root / '.momso-upgrade-backup'; checkpoint.mkdir(mode=0o700)
+            (checkpoint / 'owner').write_text('momso-upgrade-v1')
+            generated = [(root, 'idle-token.py'), (systemd, 'momso-vault-credential.service'), (systemd, 'momso-idle-stop.service'), (overrides, 'vault.conf'), (overrides, 'backup.conf')]
+            for directory, name in generated:
+                (directory / name).write_bytes(b'legacy generated content')
+            preserved = ('momso-server.06368bcfc-failed', 'momso-server.s32-ok', 'web.06368bcfc-failed', 'web.s32-ok')
+            for name in preserved:
+                path = root / name
+                if name.startswith('web.'):
+                    path.mkdir(); path = path / 'index.html'
+                path.write_bytes(b'user recovery data')
+            p = FakeProvider()
+            with patch.object(services, '_paths', return_value={'momso_anywhere_backup.py': b'new worker'}):
+                services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd))
+            stdin = io.TextIOWrapper(io.BytesIO(json.dumps(p.files).encode()))
+            with patch('sys.stdin', stdin), patch('shutil.which', return_value='/usr/bin/fixture'), patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+                exec(compile(code, '<vm fixture>', 'exec'), {})
+            for directory, name in generated:
+                self.assertNotEqual((directory / name).read_bytes(), b'legacy generated content')
+            for name in preserved:
+                path = root / name
+                self.assertEqual((path / 'index.html' if path.is_dir() else path).read_bytes(), b'user recovery data')
+            for tag in ('helper', 'units', 'overrides'):
+                self.assertTrue((private / ('managed-' + tag + '.json')).is_file())
+                self.assertTrue((checkpoint / ('managed-' + tag + '-journal.json')).is_file())
+
+    @unittest.skipIf(os.name == 'nt', 'VM payload requires Linux filesystem operations')
+    def test_preflight_reports_all_groups_without_changing_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / 'opt'; root.mkdir(mode=0o700)
+            private = base / 'private'; private.mkdir(mode=0o700)
+            systemd = base / 'systemd'; systemd.mkdir(mode=0o700)
+            overrides = systemd / 'momso-server.service.d'; overrides.mkdir(mode=0o700)
+            (root / 'momso_anywhere_backup.py').write_bytes(b'unknown worker')
+            (root / 'idle-token.py').write_bytes(b'unknown helper')
+            (systemd / 'momso-idle-stop.service').write_bytes(b'unknown unit')
+            p = FakeProvider()
+            with patch.object(services, '_paths', return_value={'momso_anywhere_backup.py': b'new'}):
+                services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
+            # An existing main ledger disables one-time adoption for all groups.
+            (private / 'managed-files.json').write_text(json.dumps({'version': 1, 'owner': p.install_id, 'files': {}}))
+            (private / 'managed-units.json').write_text('invalid fixture')
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd))
+            stdin = io.TextIOWrapper(io.BytesIO(json.dumps(p.files).encode()))
+            with patch('sys.stdin', stdin), patch.object(subprocess, 'run') as run:
+                with self.assertRaises(RuntimeError) as caught:
+                    exec(compile(code, '<vm fixture>', 'exec'), {})
+            for name in ('momso_anywhere_backup.py', 'idle-token.py', 'momso-idle-stop.service'):
+                self.assertIn('momso-managed-conflict: ' + name + ': unrecognized', str(caught.exception))
+            self.assertIn('momso-managed-conflict: managed-units.json: manifest_invalid', str(caught.exception))
+            self.assertEqual((root / 'momso_anywhere_backup.py').read_bytes(), b'unknown worker')
+            self.assertFalse((private / 'managed-helper.json').exists())
+            run.assert_not_called()
+
+    def test_unrecognized_file_is_reported_without_retrying(self):
+        p = FakeProvider()
+        conflict = services.InstallError('fixture', managed_conflict=('momso_anywhere_backup.py', 'unrecognized'))
+        with patch.object(p, 'ssh', side_effect=conflict) as ssh, patch.object(services.time, 'sleep') as sleep:
+            with self.assertRaises(services.InstallError) as caught:
+                services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
+        self.assertEqual(caught.exception.managed_conflict, ('momso_anywhere_backup.py', 'unrecognized'))
+        ssh.assert_called_once()
+        sleep.assert_not_called()
+
+    @unittest.skipIf(os.name == 'nt', 'VM payload requires Linux filesystem operations')
+    def test_legacy_worker_upgrade_records_the_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / 'opt'; root.mkdir()
+            private = base / 'private'; private.mkdir()
+            systemd = base / 'systemd'; systemd.mkdir()
+            checkpoint = root / '.momso-upgrade-backup'; checkpoint.mkdir()
+            for folder in (root, private, systemd, checkpoint): folder.chmod(0o700)
+            (checkpoint / 'owner').write_text('momso-upgrade-v1')
+            old = b'old worker'; new = b'new worker'
+            (root / 'momso_anywhere_backup.py').write_bytes(old)
+            p = FakeProvider()
+            with patch.object(services, '_paths', return_value={'momso_anywhere_backup.py': new}), patch.object(services, 'LEGACY_FILES', {'momso_anywhere_backup.py': [hashlib.sha256(old).hexdigest()]}):
+                services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd))
+            stdin = io.TextIOWrapper(io.BytesIO(json.dumps(p.files).encode()))
+            with patch('sys.stdin', stdin), patch('shutil.which', return_value='/usr/bin/fixture'), patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+                exec(compile(code, '<vm fixture>', 'exec'), {})
+            self.assertEqual((root / 'momso_anywhere_backup.py').read_bytes(), new)
+            recorded = json.loads((private / 'managed-files.json').read_text())
+            self.assertEqual(recorded['files']['momso_anywhere_backup.py'], hashlib.sha256(new).hexdigest())
+            self.assertTrue((checkpoint / 'managed-files.json').is_file())
+
+    @unittest.skipIf(os.name == 'nt', 'VM payload requires Linux filesystem operations')
+    def test_legacy_worker_upgrade_rolls_back_when_service_restart_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            root = base / 'opt'; root.mkdir()
+            private = base / 'private'; private.mkdir()
+            systemd = base / 'systemd'; systemd.mkdir()
+            checkpoint = root / '.momso-upgrade-backup'; checkpoint.mkdir()
+            for folder in (root, private, systemd, checkpoint): folder.chmod(0o700)
+            (checkpoint / 'owner').write_text('momso-upgrade-v1')
+            old = b'old worker'; new = b'new worker'
+            (root / 'momso_anywhere_backup.py').write_bytes(old)
+            p = FakeProvider()
+            with patch.object(services, '_paths', return_value={'momso_anywhere_backup.py': new}), patch.object(services, 'LEGACY_FILES', {'momso_anywhere_backup.py': [hashlib.sha256(old).hexdigest()]}):
+                services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd))
+            def run(args, **kwargs):
+                if tuple(args[:2]) == ('systemctl', 'daemon-reload'):
+                    raise subprocess.CalledProcessError(1, args)
+                return subprocess.CompletedProcess(args, 0)
+            stdin = io.TextIOWrapper(io.BytesIO(json.dumps(p.files).encode()))
+            with patch('sys.stdin', stdin), patch('shutil.which', return_value='/usr/bin/fixture'), patch.object(subprocess, 'run', side_effect=run):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    exec(compile(code, '<vm fixture>', 'exec'), {})
+            self.assertEqual((root / 'momso_anywhere_backup.py').read_bytes(), old)
+            self.assertFalse((private / 'managed-files.json').exists())
+            self.assertFalse((checkpoint / 'managed-files.json').exists())
+
     def test_new_and_upgrade_preserve_key_and_install_services(self):
         p = FakeProvider()
         with patch.object(services.time, 'sleep'):
@@ -110,7 +242,7 @@ class InstallerTests(unittest.TestCase):
             if args[:3] == ('compute', 'instances', 'add-iam-policy-binding'):
                 attempts.append(1)
                 if len(attempts) < 4:
-                    raise services.InstallError('role not propagated')
+                    raise services.InstallError('role not propagated', role_propagating=True)
             return run(*args, **kwargs)
         with patch.object(p, 'run', side_effect=delayed), patch.object(services.time, 'sleep') as sleep:
             services.identity(p)

@@ -5,6 +5,7 @@ installer must supply implementations and schedule this module before it can
 be used as a production backup.
 """
 import hashlib
+import datetime
 import errno
 import io
 import json
@@ -15,6 +16,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import time
 import uuid
 from contextlib import closing
 from pathlib import Path, PurePosixPath
@@ -198,7 +200,7 @@ def _backup_path(path, expected_hash, store, key_service, old=None):
         os.close(descriptor)
 
 
-def backup_objects(archive, store, key_service, previous=()):
+def backup_objects(archive, store, key_service, previous=(), purged=()):
     """Encrypt immutable source objects in bounded chunks; never modify originals."""
     root = Path(archive) / "objects" / "sha256"
     for path in (Path(archive) / "objects", root):
@@ -219,6 +221,8 @@ def backup_objects(archive, store, key_service, previous=()):
         for path in sorted(shard.iterdir()):
             if path.is_symlink() or not re.fullmatch(r"[0-9a-f]{64}", path.name) or not path.name.startswith(shard.name):
                 raise ValueError("invalid object path")
+            if path.name in purged:
+                raise ValueError("purged original remains in archive")
             descriptors.append(_backup_path(path, path.name, store, key_service, prior.get(path.name)))
     return descriptors
 
@@ -296,6 +300,7 @@ def _snapshot_paths(data_dir, temporary, names):
 
 
 def _backup_v3(data_dir, archive, store, key_service, names, vault_identity):
+    purged = read_purged_ledger(store, key_service)
     latest = _latest(store)
     previous_payload = _decrypt(store.read(latest[1]), key_service) if latest else None
     old_files = _unpack(previous_payload) if previous_payload else {}
@@ -311,7 +316,7 @@ def _backup_v3(data_dir, archive, store, key_service, names, vault_identity):
         has_vault = any(name == "vault.age" or name.endswith("/vault.age") for name in paths)
         if has_vault and not vault_identity:
             raise ValueError("vault_identity_unavailable")
-        originals = backup_objects(archive, store, key_service, previous)
+        originals = backup_objects(archive, store, key_service, previous, purged)
         by_hash = {entry["sha256"]: entry for entry in originals}
         files = {}
         staging = {}
@@ -403,7 +408,7 @@ def _install_verified(source, target, digest, preserve_conflict):
     return None
 
 
-def _restore_v3(data_dir, archive, store, key_service, manifest, names, identity, vault_identity_writer):
+def _restore_v3(data_dir, archive, store, key_service, manifest, names, identity, vault_identity_writer, purged=()):
     if (not isinstance(manifest, dict) or set(manifest) != {"version", "files", "staging", "originals", "descriptors"}
             or manifest["version"] != 3 or not isinstance(manifest["files"], dict)
             or not isinstance(manifest["staging"], dict) or not isinstance(manifest["originals"], list)
@@ -431,6 +436,9 @@ def _restore_v3(data_dir, archive, store, key_service, manifest, names, identity
             raise ValueError("missing backup descriptor")
     if any(value not in descriptors for value in manifest["originals"]):
         raise ValueError("missing backup descriptor")
+    if any(value in manifest["originals"] or value in manifest["files"].values()
+           or value in manifest["staging"].values() for value in purged):
+        raise ValueError("purged backup contains original")
     if any(name == "vault.age" or name.endswith("/vault.age") for name in manifest["files"]):
         if not identity:
             raise ValueError("vault_identity_unavailable")
@@ -462,7 +470,19 @@ def _restore_v3(data_dir, archive, store, key_service, manifest, names, identity
             _install_verified(source(digest), target, digest, False)
         for name, digest in manifest["files"].items():
             target = _safe_path(data_dir, name, create_parents=True)
-            conflict = _install_verified(source(digest), target, digest, True)
+            candidate = source(digest)
+            install_digest = digest
+            if name == "attachments/attachments.sqlite3" and purged:
+                candidate = Path(tmp) / "purged-attachments.sqlite3"
+                shutil.copyfile(source(digest), candidate)
+                os.chmod(candidate, 0o600)
+                with closing(sqlite3.connect(candidate)) as database:
+                    database.execute("CREATE TABLE IF NOT EXISTS asset_purged(asset_id TEXT PRIMARY KEY REFERENCES assets(id))")
+                    for deleted_hash in purged:
+                        database.execute("INSERT OR IGNORE INTO asset_purged(asset_id) SELECT id FROM assets WHERE hash=?", (deleted_hash,))
+                    database.commit()
+                install_digest = _hash_file(candidate)
+            conflict = _install_verified(candidate, target, install_digest, True)
             if conflict:
                 conflicts.append(name)
     return {"status": "conflict" if conflicts else "restored", "conflicts": conflicts}
@@ -483,6 +503,8 @@ def restore_assets(data_dir, archive, store, key_service, asset_ids):
     if not latest:
         raise ValueError("asset backup unavailable")
     files = _unpack(_decrypt(store.read(latest[1]), key_service))
+    purged = read_purged_ledger(store, key_service)
+    purged.update(_snapshot_purge_markers(files))
     if ".momso-v3.json" not in files:
         raise ValueError("asset backup unavailable")
     manifest = json.loads(files[".momso-v3.json"])
@@ -506,13 +528,26 @@ def restore_assets(data_dir, archive, store, key_service, asset_ids):
             records = []
             has_trash = source.execute("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_trash')").fetchone()[0]
             has_media = source.execute("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='media_generation')").fetchone()[0]
+            has_dates = source.execute("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_dates')").fetchone()[0]
             trash = {}
             media = {}
+            dates = {}
+            purged_ids = set()
             for identifier in asset_ids:
                 row = source.execute("SELECT id,hash,bytes,name,mime,kind FROM assets WHERE id=?", (identifier,)).fetchone()
-                if not row or not re.fullmatch(r"[0-9a-f]{64}", row[1]) or row[1] not in manifest.get("originals", []) or row[1] not in descriptors or descriptors[row[1]]["size"] != row[2]:
+                deleted = bool(row and row[1] in purged)
+                if (not row or not re.fullmatch(r"[0-9a-f]{64}", row[1])
+                        or (not deleted and (row[1] not in manifest.get("originals", []) or row[1] not in descriptors or descriptors[row[1]]["size"] != row[2]))):
                     raise ValueError("asset backup unavailable")
+                if deleted:
+                    purged_ids.add(identifier)
                 records.append(row)
+                if has_dates:
+                    date = source.execute("SELECT created_at,source FROM asset_dates WHERE asset_id=?", (identifier,)).fetchone()
+                    if date:
+                        if not isinstance(date[0], str) or not date[0] or len(date[0]) > 64 or any(ord(c) < 32 for c in date[0]) or date[1] not in ('registered', 'file_modified'):
+                            raise ValueError("invalid asset date")
+                        dates[identifier] = date
                 if has_trash:
                     deleted = source.execute("SELECT deleted_at FROM asset_trash WHERE asset_id=?", (identifier,)).fetchone()
                     if deleted:
@@ -529,7 +564,7 @@ def restore_assets(data_dir, archive, store, key_service, asset_ids):
                         if str(uuid.UUID(item[8])) != item[8] or (item[10] is not None and str(uuid.UUID(item[10])) != item[10]) or item[11] not in (None,'regenerated','edited'):
                             raise ValueError("invalid media record")
                         media[identifier] = item
-        unique = {row[1] for row in records}
+        unique = {row[1] for row in records if row[0] not in purged_ids}
         restore_objects(virtual, store, key_service, [descriptors[digest] for digest in sorted(unique)])
         attachment_dir = _safe_path(data_dir, "attachments")
         database = _safe_path(data_dir, "attachments/attachments.sqlite3")
@@ -539,15 +574,31 @@ def restore_assets(data_dir, archive, store, key_service, asset_ids):
             raise ValueError("unsafe asset database permissions")
         lock_fd = os.open(attachment_dir / "attachments.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            deadline = time.monotonic() + 2.0
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise BlockingIOError("asset restore busy") from None
+                    time.sleep(min(0.05, remaining))
             with closing(sqlite3.connect(database)) as target:
                 target.execute("CREATE TABLE IF NOT EXISTS asset_trash(asset_id TEXT PRIMARY KEY REFERENCES assets(id), deleted_at TEXT NOT NULL)")
+                target.execute("CREATE TABLE IF NOT EXISTS asset_purged(asset_id TEXT PRIMARY KEY REFERENCES assets(id))")
+                target.execute("CREATE TABLE IF NOT EXISTS asset_dates(asset_id TEXT PRIMARY KEY REFERENCES assets(id), created_at TEXT NOT NULL, source TEXT NOT NULL)")
                 target.execute("CREATE TABLE IF NOT EXISTS media_generation(asset_id TEXT PRIMARY KEY REFERENCES assets(id),prompt TEXT NOT NULL,prompt_source TEXT NOT NULL,provider TEXT NOT NULL,model TEXT,created_at TEXT NOT NULL,chat_id TEXT NOT NULL,message_id TEXT NOT NULL,lineage_id TEXT NOT NULL,version INTEGER NOT NULL,version_of TEXT,version_how TEXT,UNIQUE(lineage_id,version))")
                 target.execute("BEGIN IMMEDIATE")
                 new_ids = set()
                 for row in records:
+                    already_purged = target.execute("SELECT EXISTS(SELECT 1 FROM assets JOIN asset_purged ON asset_purged.asset_id=assets.id WHERE assets.id=? OR assets.hash=?)", (row[0], row[1])).fetchone()[0]
+                    if already_purged and row[0] not in purged_ids:
+                        raise ValueError("asset permanently deleted")
                     existing = target.execute("SELECT id,hash,bytes FROM assets WHERE id=? OR hash=?", (row[0], row[1])).fetchall()
                     if existing and (len(existing) != 1 or existing[0] != row[:3]):
+                        raise ValueError("asset restore conflict")
+                    if existing and row[0] in purged_ids and not already_purged:
                         raise ValueError("asset restore conflict")
                     if not existing:
                         new_ids.add(row[0])
@@ -557,6 +608,10 @@ def restore_assets(data_dir, archive, store, key_service, asset_ids):
                     _install_verified(source_path, destination, digest, False)
                 for row in records:
                     target.execute("INSERT OR IGNORE INTO assets(id,hash,bytes,name,mime,kind) VALUES(?,?,?,?,?,?)", row)
+                    if row[0] in purged_ids:
+                        target.execute("INSERT OR IGNORE INTO asset_purged(asset_id) VALUES(?)", (row[0],))
+                    if row[0] in new_ids and row[0] in dates:
+                        target.execute("INSERT INTO asset_dates(asset_id,created_at,source) VALUES(?,?,?)", (row[0], *dates[row[0]]))
                     if row[0] in new_ids and row[0] in trash:
                         target.execute("INSERT INTO asset_trash(asset_id,deleted_at) VALUES(?,?)", (row[0], trash[row[0]]))
                     if row[0] in new_ids and row[0] in media:
@@ -570,6 +625,363 @@ def _latest(store):
     slots = [(store.modified(i), i) for i in range(SLOT_COUNT)]
     present = [(when, i) for when, i in slots if when is not None]
     return max(present) if present else None
+
+
+def _decode_purged_ledger(encrypted, key_service):
+    if encrypted is None:
+        return set()
+    if len(encrypted) > 2 * 1024 * 1024:
+        raise ValueError("invalid purge ledger")
+    ledger = json.loads(_decrypt(encrypted, key_service))
+    if (not isinstance(ledger, dict) or set(ledger) != {"version", "digests"} or ledger["version"] != 1
+            or not isinstance(ledger["digests"], list)
+            or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value) for value in ledger["digests"])
+            or len(set(ledger["digests"])) != len(ledger["digests"])):
+        raise ValueError("invalid purge ledger")
+    return set(ledger["digests"])
+
+
+def read_purged_ledger(store, key_service):
+    """Fail closed on a malformed authoritative ledger, never guess it is empty."""
+    return _decode_purged_ledger(store.read_purge_ledger(), key_service)
+
+
+def _snapshot_purge_markers(files):
+    values = json.loads(files.get(".momso-purged-originals.json", b"[]"))
+    if (not isinstance(values, list) or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value) for value in values)
+            or len(set(values)) != len(values)):
+        raise ValueError("invalid purge markers")
+    return set(values)
+
+
+def record_purged_original(store, key_service, digest):
+    """Conditionally append a marker. Caller must hold the shared backup fence."""
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("invalid original digest")
+    versioned = store.read_purge_ledger_versioned()
+    generation, encrypted = versioned if versioned is not None else ("0", None)
+    values = _decode_purged_ledger(encrypted, key_service)
+    if digest in values:
+        return False
+    values.add(digest)
+    encoded = json.dumps({"version": 1, "digests": sorted(values)}, separators=(",", ":")).encode("ascii")
+    store.write_purge_ledger_if_generation(generation, _encrypt(encoded, key_service))
+    return True
+
+
+def plan_original_purge(store, key_service, digest):
+    """Inspect every backup slot before any destructive action.
+
+    This does not delete or rewrite anything. A hash that is also used by a
+    database or upload staging file must never be removed as an original.
+    """
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("invalid original digest")
+    slots = []
+    all_slots = []
+    chunks = set()
+    owners = {}
+    for slot in range(SLOT_COUNT):
+        if store.modified(slot) is None:
+            continue
+        all_slots.append(slot)
+        contents = _unpack(_decrypt(store.read(slot), key_service))
+        if ".momso-v3.json" not in contents:
+            raise ValueError("unsupported backup generation")
+        manifest = json.loads(contents[".momso-v3.json"])
+        if (not isinstance(manifest, dict) or set(manifest) != {"version", "files", "staging", "originals", "descriptors"} or manifest.get("version") != 3
+                or not isinstance(manifest.get("files"), dict)
+                or not isinstance(manifest.get("staging"), dict)
+                or not isinstance(manifest.get("originals"), list)
+                or not isinstance(manifest.get("descriptors"), list)):
+            raise ValueError("invalid backup manifest")
+        descriptors = {}
+        for entry in manifest["descriptors"]:
+            entry_hash, _, count, identifier = _object_descriptor(entry)
+            if entry_hash in descriptors or (identifier in owners and owners[identifier] != entry_hash):
+                raise ValueError("conflicting backup descriptors")
+            descriptors[entry_hash] = (identifier, count)
+            owners[identifier] = entry_hash
+        references = list(manifest["files"].values()) + list(manifest["staging"].values())
+        if any(value not in descriptors for value in references + manifest["originals"]):
+            raise ValueError("incomplete backup manifest")
+        if digest in references:
+            raise ValueError("original shared with backup data")
+        if digest in manifest["originals"]:
+            identifier, count = descriptors[digest]
+            slots.append(slot)
+            chunks.update((identifier, i) for i in range(count))
+    return {"slots": slots, "allSlots": all_slots, "chunks": sorted(chunks)}
+
+
+def without_original(contents, digest):
+    """Prepare a replacement v3 slot, preserving all unrelated entries.
+
+    Callers must validate every slot with plan_original_purge and use a
+    generation-conditional write; this function itself performs no I/O.
+    """
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("invalid original digest")
+    return without_originals(contents, {digest})
+
+
+def without_originals(contents, digests):
+    if (not isinstance(digests, set) or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value) for value in digests)):
+        raise ValueError("invalid original digest")
+    if not isinstance(contents, dict) or ".momso-v3.json" not in contents:
+        raise ValueError("unsupported backup generation")
+    manifest = json.loads(contents[".momso-v3.json"])
+    if (not isinstance(manifest, dict) or set(manifest) != {"version", "files", "staging", "originals", "descriptors"} or manifest.get("version") != 3
+            or not isinstance(manifest.get("files"), dict)
+            or not isinstance(manifest.get("staging"), dict)
+            or not isinstance(manifest.get("originals"), list)
+            or not isinstance(manifest.get("descriptors"), list)):
+        raise ValueError("invalid backup manifest")
+    descriptors = {}
+    for item in manifest["descriptors"]:
+        item_hash, _, _, _ = _object_descriptor(item)
+        if item_hash in descriptors:
+            raise ValueError("duplicate backup descriptor")
+        descriptors[item_hash] = item
+    references = list(manifest["files"].values()) + list(manifest["staging"].values())
+    if any(value not in descriptors for value in references + manifest["originals"]):
+        raise ValueError("incomplete backup manifest")
+    if digests.intersection(references):
+        raise ValueError("original shared with backup data")
+    updated = dict(manifest)
+    updated["originals"] = [value for value in manifest["originals"] if value not in digests]
+    updated["descriptors"] = [item for item in manifest["descriptors"] if item["sha256"] not in digests]
+    result = dict(contents)
+    result[".momso-v3.json"] = json.dumps(updated, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    purged = _snapshot_purge_markers(result)
+    result[".momso-purged-originals.json"] = json.dumps(sorted(purged | digests), separators=(",", ":")).encode("ascii")
+    return result
+
+
+def replace_slot_without_original(store, key_service, slot, digest):
+    """Conditionally rewrite one slot. Never removes a chunk or local original."""
+    versioned = store.read_versioned(slot)
+    if versioned is None:
+        return False
+    generation, encrypted = versioned
+    before = _unpack(_decrypt(encrypted, key_service))
+    after = without_original(before, digest)
+    if after == before:
+        return False
+    store.replace_if_generation(slot, generation, _encrypt(_pack(after), key_service))
+    return True
+
+
+def read_purge_journal(directory):
+    """Read a bounded, host-owned journal; a symlink is never followed."""
+    directory = Path(directory)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("unsafe purge journal directory")
+    path = directory / "original-purge.json"
+    if path.is_symlink():
+        raise ValueError("unsafe purge journal")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("invalid purge journal")
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            value = source.read(1024 * 1024 + 1)
+        if len(value) > 1024 * 1024:
+            raise ValueError("invalid purge journal")
+        return json.loads(value)
+    finally:
+        os.close(fd)
+
+
+def write_purge_journal(directory, journal):
+    """Atomically persist the journal before changing any backup slot."""
+    directory = Path(directory)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("unsafe purge journal directory")
+    value = json.dumps(journal, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(value) > 1024 * 1024:
+        raise ValueError("invalid purge journal")
+    path = directory / "original-purge.json"
+    if path.is_symlink():
+        raise ValueError("unsafe purge journal")
+    fd, temporary = tempfile.mkstemp(prefix=".original-purge-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        if hasattr(os, "O_DIRECTORY"):
+            parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def resume_original_slot_rewrite(store, key_service, digest, journal, persist):
+    """Prepare or resume slot rewrites while the caller holds a global backup fence.
+
+    `persist` must durably write the entire journal before returning. No local
+    original or encrypted chunk is removed here. This primitive is not a
+    complete purge: the caller must enforce the fence across every backup and
+    restore writer, process old object generations, and handle local metadata.
+    """
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("invalid original digest")
+    if journal is None:
+        plan = plan_original_purge(store, key_service, digest)
+        journal = _new_purge_journal(digest, plan)
+        persist(journal)
+    _validate_purge_journal(digest, journal)
+    if journal["version"] != 2:
+        raise ValueError("purge journal requires review")
+    for slot in journal["slots"]:
+        # Even a completed slot is checked again; the fence must prevent a new
+        # writer from restoring an old manifest between this check and commit.
+        replace_slot_without_original(store, key_service, slot, digest)
+        if slot not in journal["completed"]:
+            journal["completed"] = [*journal["completed"], slot]
+            persist(journal)
+    if plan_original_purge(store, key_service, digest)["slots"]:
+        raise ValueError("purge fence violated")
+    return journal
+
+
+def _validate_purge_journal(digest, journal):
+    if (not isinstance(journal, dict) or type(journal.get("version")) is not int or journal.get("version") not in (1, 2)
+            or set(journal) != ({"version", "digest", "slots", "chunks", "completed", "planHash"} if journal.get("version") == 2 else {"version", "digest", "slots", "chunks", "completed"})
+            or journal["digest"] != digest
+            or not isinstance(journal["slots"], list) or not isinstance(journal["chunks"], list)
+            or not isinstance(journal["completed"], list)
+            or any(type(slot) is not int or not 0 <= slot < SLOT_COUNT for slot in journal["slots"])
+            or len(set(journal["slots"])) != len(journal["slots"])
+            or any(type(slot) is not int or slot not in journal["slots"] for slot in journal["completed"])
+            or len(set(journal["completed"])) != len(journal["completed"])
+            or any(not isinstance(item, list) or len(item) != 2
+                   or not isinstance(item[0], str) or not re.fullmatch(r"[0-9a-f]{32}", item[0])
+                   or type(item[1]) is not int or item[1] < 0 for item in journal["chunks"])):
+        raise ValueError("invalid purge journal")
+    if journal["version"] == 2 and journal["planHash"] != _purge_plan_hash(journal):
+        raise ValueError("invalid purge journal")
+
+
+def _purge_plan_hash(journal):
+    plan = {key: journal[key] for key in ("version", "digest", "slots", "chunks")}
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def _new_purge_journal(digest, plan):
+    journal = {"version": 2, "digest": digest, "slots": plan["allSlots"],
+               "chunks": [list(item) for item in plan["chunks"]], "completed": []}
+    journal["planHash"] = _purge_plan_hash(journal)
+    return journal
+
+
+def prepare_original_backup_purge(store, key_service, digest, journal_directory):
+    """Publish the deletion ledger and rewrite slots under a caller-owned fence.
+
+    This does not remove local originals or cloud chunks and is not a complete
+    purge. The caller must hold both the per-VM lock and the shared cloud fence
+    throughout this operation, including crash recovery.
+    """
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("invalid original digest")
+    journal = read_purge_journal(journal_directory)
+    current = plan_original_purge(store, key_service, digest)
+    if journal is None:
+        journal = _new_purge_journal(digest, current)
+        write_purge_journal(journal_directory, journal)
+    _validate_purge_journal(digest, journal)
+    if journal["version"] != 2:
+        raise ValueError("purge journal requires review")
+    if not set(current["allSlots"]).issubset(set(journal["slots"])):
+        raise ValueError("purge fence violated")
+    if not set(current["chunks"]).issubset({tuple(item) for item in journal["chunks"]}):
+        raise ValueError("purge fence violated")
+    record_purged_original(store, key_service, digest)
+    return resume_original_slot_rewrite(store, key_service, digest, journal,
+                                        lambda value: write_purge_journal(journal_directory, value))
+
+
+def erase_prepared_backup_chunks(store, key_service, digest, journal):
+    """Remove recorded chunk generations only under the shared backup fence.
+
+    Older or soft-deleted slot generations may contain additional chunk names;
+    while any exist, do not delete anything or claim completion. The caller is
+    responsible for local originals, fence recovery and displaying retention.
+    """
+    _validate_purge_journal(digest, journal)
+    if journal["version"] != 2:
+        raise ValueError("purge journal requires review")
+    if digest not in read_purged_ledger(store, key_service):
+        raise ValueError("purge ledger missing")
+    if set(journal["completed"]) != set(journal["slots"]):
+        raise ValueError("purge slots incomplete")
+    if plan_original_purge(store, key_service, digest)["slots"]:
+        raise ValueError("purge fence violated")
+    recorded = {tuple(item) for item in journal["chunks"]}
+    historical = False
+    unknown_history = False
+    retained_history = []
+    for slot in range(SLOT_COUNT):
+        versioned = store.read_versioned(slot)
+        current = versioned[0] if versioned else None
+        versions = store.list_slot_generations(slot)
+        retained = store.list_slot_generations(slot, soft_deleted=True)
+        if current is not None and not any(item.get("generation") == current for item in versions):
+            raise ValueError("incomplete backup generation listing")
+        noncurrent = [item for item in versions if item["generation"] != current]
+        if retained or noncurrent:
+            historical = True
+            unknown_history = unknown_history or bool(noncurrent)
+            retained_history.extend(retained)
+        if versioned:
+            contents = _unpack(_decrypt(versioned[1], key_service))
+            if ".momso-v3.json" not in contents:
+                raise ValueError("unsupported backup generation")
+            manifest = json.loads(contents[".momso-v3.json"])
+            for item in manifest.get("descriptors", []):
+                _, _, count, identifier = _object_descriptor(item)
+                if any((identifier, index) in recorded for index in range(count)):
+                    raise ValueError("purge chunk still referenced")
+    if historical:
+        return {"state": "retained", "reason": "historical_backup",
+                "retentionUntil": None if unknown_history else _latest_retention_time(retained_history)}
+    versions_by_chunk = {}
+    # Check that all required listing permissions work before deleting anything.
+    for identifier, index in sorted(recorded):
+        versions_by_chunk[(identifier, index)] = store.list_chunk_generations(identifier, index)
+        store.list_chunk_generations(identifier, index, soft_deleted=True)
+    for (identifier, index), versions in versions_by_chunk.items():
+        for item in versions:
+            store.delete_chunk_generation(identifier, index, item["generation"])
+    pending = []
+    for identifier, index in sorted(recorded):
+        pending.extend(store.list_chunk_generations(identifier, index))
+        pending.extend(store.list_chunk_generations(identifier, index, soft_deleted=True))
+    return {"state": "retained" if pending else "deleted", "reason": "cloud_retention" if pending else None,
+            "retentionUntil": _latest_retention_time(pending)}
+
+
+def _latest_retention_time(items):
+    times = [item.get("hardDeleteTime") for item in items]
+    if not times or not all(times):
+        return None
+    try:
+        parsed = [datetime.datetime.fromisoformat(value.replace("Z", "+00:00")) for value in times]
+        if any(value.tzinfo is None for value in parsed):
+            raise ValueError()
+        return max(value.astimezone(datetime.timezone.utc) for value in parsed).isoformat().replace("+00:00", "Z")
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("invalid retention time") from None
 
 
 def backup(data_dir, store, key_service, names, temp_root=None, vault_identity=None, archive=None, quiescent=False):
@@ -615,14 +1027,21 @@ def restore(data_dir, store, key_service, names=DATABASE_AND_VAULT, vault_identi
     if not latest:
         return {"status": "no_backup", "conflicts": []}
     files = _unpack(_decrypt(store.read(latest[1]), key_service))
+    ledger = read_purged_ledger(store, key_service)
+    if ledger:
+        files = without_originals(files, ledger)
     identity = files.pop(".momso-vault-identity", None)
+    purged = _snapshot_purge_markers(files)
+    files.pop(".momso-purged-originals.json", None)
     v3 = files.pop(".momso-v3.json", None)
     if v3 is not None:
         if files:
             raise ValueError("unexpected backup entry")
         if archive is None:
             raise ValueError("archive_destination_required")
-        return _restore_v3(data_dir, archive, store, key_service, json.loads(v3), names, identity, vault_identity_writer)
+        return _restore_v3(data_dir, archive, store, key_service, json.loads(v3), names, identity, vault_identity_writer, purged)
+    if purged:
+        raise ValueError("unsupported purge markers")
     objects = files.pop(".momso-objects.json", None)
     if not set(files).issubset(set(names)):
         raise ValueError("unexpected backup entry")

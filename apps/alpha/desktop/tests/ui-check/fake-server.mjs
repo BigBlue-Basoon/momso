@@ -94,16 +94,32 @@
 // 사용자 정보(S75 셋째): GET /profile → { name, about, style, updatedAt }, PUT /profile { name, about, style }(같은 꼴). FAKE_PROFILE=conflict 면 PUT 이 409 profile_conflict.
 // AI 연결 해제: POST /providers/{codex|claude|gemini}/disconnect → { state: not_connected }. 답하는 중이면 409 turn_in_progress, 코덱스 로그인 중이면(코덱스만) 409 login_in_progress.
 // 다른 AI 채팅 가져오기: POST /chat-imports/preview { assetId, provider } → { conversations, alreadyImported, unreadable, oldest, newest }(저장 안 함),
-//   POST /chat-imports { assetId, provider, requestId? } → { imported, duplicate, updated, … }(1.5초 걸림), POST /chat-imports/{requestId}/cancel → 그 가져오기가 409 cancelled.
+//   POST /chat-imports { assetId, provider, requestId? } → { imported, duplicate, updated, … }(대화 하나에 1초), POST /chat-imports/{requestId}/cancel → 그 가져오기가 409 cancelled.
+//   GET /chat-imports/{requestId}/progress → { requestId, state, processed, total }(S83, chat_import_bridge.rs 와 같은 꼴). 모르는 번호는 404 not_found.
 //   올린 파일 이름이 zip·json·html 이 아니면 400 unsupported_format. JSON 배열이면 그 항목의 title 로, 아니면 정해 둔 셋으로 채팅방을 만든다(importedFrom). 같은 것은 duplicate.
 // 원자료 휴지통(S75 셋째, attachment_bridge.rs trash_list·trash·restore_from_trash 와 같은 꼴): GET /assets/trash?offset&limit → { items: [{ assetId, name, mediaType, byteLength, deletedAt }], offset, limit },
 //   POST /assets/{id}/trash · /restore → { assetId, deleted, changed, recordStatus }. 휴지통의 것은 찾기·사진과 동영상에서 빠지고 내려받기는 409 asset_trashed.
 //   "지난 학기 출석표.xlsx" 하나가 휴지통에 든 채로 시작한다.
+//   S83: 항목에 references { chats, documents }, canPurge, purgeReason, backupCopiesRemain:true. "수강생 명단 11월.csv"는 채팅방 1·문서 1이 쓴다(asset_in_use).
+//   POST /assets/{id}/purge → { assetId, deleted: true, backupCopiesRemain: true }. 휴지통에 없으면 409 asset_not_trashed, 쓰는 곳이 있으면 409 asset_in_use + references.
+//   FAKE_TRASH=docs_unknown 이면 documents 가 null(references_unavailable), FAKE_TRASH=no_backup 이면 backup_purge_unavailable, FAKE_TRASH=purge_fail 이면 purge 가 503 purge_backup_unavailable.
 // 사진과 동영상(S75 셋째, attachment_bridge.rs media_list·media_versions·media_download 와 같은 꼴): GET /media?kind&chatId&offset&limit → { items, offset, limit, pendingGenerations },
 //   항목 { assetId, kind, name, mediaType, byteLength, prompt, promptSource, provider, model, createdAt, chatId, messageId, lineageId, version, versionOf, versionHow, versionCount, chatAvailable }
-//   (사람이 올린 것은 생성 값이 null 이고 createdAt 이 없다). 같은 묶음은 최신 판 하나만, 휴지통의 것은 빠진다.
+//   (사람이 올린 것은 생성 값이 null). S83: createdAt·createdAtSource(올린 것 registered, 생성물 generated), 동영상은 thumbnailState:on_demand·thumbnailUrl.
+//   GET /media/{id}/thumbnail → 첫 장면 JPEG(dev-samples 의 poster jpg). FAKE_THUMB=fail 이면 503 thumbnail_decoder_unavailable,
+//   FAKE_THUMB=busy 이면 동영상마다 처음 두 번은 503 thumbnail_busy, 그 뒤로 그림. 같은 묶음은 최신 판 하나만, 휴지통의 것은 빠진다.
 //   GET /media/lineages/{id}/versions → { lineageId, versions: [생성 기록 + deleted] }, GET /media/{id}/download → 원본(octet-stream). 그림은 src/dev-samples 의 jpg·mp4.
 //   POST /chats/{id}/turns 의 regenerateOf: 그 채팅방의 생성물이면 같은 묶음에 새 판(regenerated)을 더한다. 아니면 400 media_generation_unavailable.
+// GitHub 백업(S17 GitHub 부분, github_bridge.rs 와 같은 꼴): POST /github/login → { sessionId }, GET /github/login(X-Momso-Login-Session) → { provider, state: pending|connected|cancelled|expired|failed, url, code, expiresInSeconds },
+//   POST /github/login/cancel → { state: cancelled }. 승인은 POST /__fake/github-approve(사람이 GitHub 페이지에서 승인한 것). 다른 세션이면 404 login_not_found.
+//   GET /github/repositories → { account, repositories: [{ nameWithOwner, defaultBranch }] }(로그인 전 503 not_connected), POST /github/repository { nameWithOwner } → { repository, backupStatus: queued }
+//   (로그인 전 503 not_connected, 목록에 없으면 503 repository_not_found), GET /github/repository → { repository|null, backupStatus, backupReason }, POST /github/sync → { state: queued }(저장소 전 409 repository_not_selected).
+//   저장은 queued·pending → syncing(1.5초) → saved. FAKE_GITHUB=connected 면 로그인된 채로, FAKE_GITHUB=fail 이면 저장이 failed(authentication_failed)이고 로그인이 풀린다
+//   (그 뒤 GitHub 요청은 503 not_connected, 다시 로그인하면 저장된다).
+//   S97·S98: 승인되면 momso-kimhaneul 비공개 저장소를 저절로 만들어 연결(이미 고른 것이 있으면 그대로). POST /github/repository/create → { repository, backupStatus: queued }
+//   (로그인 전 503 not_connected, FAKE_GITHUB=public 이면 503 repository_not_private 이고 저절로 만들지도 않음). GET /github/repository 에 account·lastSavedAt.
+//   POST /github/disconnect → { state: not_connected }(로그인 중이면 409 login_in_progress). GET /activity → 원자료 백업 objectBackupEnabled·objectBackupStatus·objectBackupReason
+//   (FAKE_OBJECT=none 이면 설정 안 됨, FAKE_OBJECT=fail 이면 failed·object_backup_unavailable, 그 밖에는 saved).
 import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
@@ -165,6 +181,8 @@ for (const [name, mediaType, kind, text] of [
   assetBytes.set(id, bytes)
 }
 const generations = new Map()
+const thumbnails = new Map()
+const thumbTries = new Map()
 {
   const sample = (name) => readFileSync(new URL(`../../src/dev-samples/${name}`, import.meta.url))
   const add = (file, kind, mediaType, generation) => {
@@ -178,13 +196,46 @@ const generations = new Map()
   const sky1 = add('sky-1-poster.jpg', 'image', 'image/jpeg', { prompt: '천천히 밝아지는 아침 하늘, 수업 안내 첫 장 배경으로 쓸 가로 사진', provider: 'codex', createdAt: '2026-11-20T09:10:00Z', chatId: 'chat-s3', lineageId: 'lineage-sky', version: 1 })
   add('sky-2-poster.jpg', 'image', 'image/jpeg', { prompt: '천천히 밝아지는 아침 하늘, 수업 안내 첫 장 배경으로 쓸 가로 사진', provider: 'codex', createdAt: '2026-11-20T09:20:00Z', chatId: 'chat-s3', lineageId: 'lineage-sky', version: 2, versionOf: sky1, versionHow: 'regenerated' })
   add('waves-1-poster.jpg', 'image', 'image/jpeg', { prompt: '잔잔한 물결 무늬, 차분한 파란색, 수업 시간표 배경', provider: 'codex', createdAt: '2026-11-21T10:00:00Z', chatId: 'chat-s1', lineageId: 'lineage-waves', version: 1 })
-  add('waves-1.mp4', 'video', 'video/mp4', { prompt: '물결이 잔잔히 움직이는 4초 세로 영상(릴스용)', provider: 'codex', model: 'sora-2', createdAt: '2026-11-21T11:00:00Z', chatId: 'chat-s1', lineageId: 'lineage-reel', version: 1 })
-  add('sky-2.mp4', 'video', 'video/mp4', null)
+  const waves = add('waves-1.mp4', 'video', 'video/mp4', { prompt: '물결이 잔잔히 움직이는 4초 세로 영상(릴스용)', provider: 'codex', model: 'sora-2', createdAt: '2026-11-21T11:00:00Z', chatId: 'chat-s1', lineageId: 'lineage-reel', version: 1 })
+  const upload = add('sky-2.mp4', 'video', 'video/mp4', null)
+  assets.get(upload).originalFileName = '토요일 오전반 마무리.mp4'
+  assets.get(upload).registeredAt = '2026-11-19T08:30:00Z'
+  thumbnails.set(upload, sample('sky-2-poster.jpg'))
+  thumbnails.set(waves, sample('waves-1-poster.jpg'))
+  // 사람이 올린 사진 하나(같은 그림을 다른 이름으로).
+  const photo = sample('sky-1-poster.jpg')
+  const photoId = `asset-${createHash('sha256').update(photo).update('upload').digest('hex').slice(0, 12)}`
+  assets.set(photoId, { id: photoId, sha256: createHash('sha256').update(photo).update('upload').digest('hex'), byteLength: photo.length, originalFileName: '수요일 저녁반 단체 사진.jpg', mediaType: 'image/jpeg', kind: 'image', registeredAt: '2026-11-19T19:40:00Z' })
+  assetBytes.set(photoId, photo)
 }
 const trashed = new Map([[[...assets.values()].find((a) => a.originalFileName === '지난 학기 출석표.xlsx').id, '2026-11-18T10:20:00Z']])
 let dropNextChunk = false
 const profile = { name: '김하늘', about: '서울에서 작은 요가원을 운영합니다. 수요일 저녁반과 토요일 오전반을 가르칩니다.', style: '', updatedAt: '2026-11-20T09:00:00Z' }
+const github = { connected: process.env.FAKE_GITHUB === 'connected' || process.env.FAKE_GITHUB === 'fail', login: null, repository: null, status: 'not_configured', reason: null }
+const GITHUB_DEFAULT = { nameWithOwner: 'kimhaneul/momso-kimhaneul', defaultBranch: 'main' }
+/** 승인 뒤 server 가 하는 일(S97): 고른 저장소가 없으면 momso-<계정> 을 만들어 연결하고 저장을 예약한다. */
+function githubEnsureDefault() {
+  if (github.repository) return github.repository
+  if (process.env.FAKE_GITHUB === 'public') return null
+  github.repository = GITHUB_DEFAULT
+  githubSave()
+  return github.repository
+}
+const GITHUB_REPOS = [{ nameWithOwner: 'kimhaneul/momso-notes', defaultBranch: 'main' }, { nameWithOwner: 'kimhaneul/yoga-studio', defaultBranch: 'main' }]
+function githubSave() {
+  github.status = 'pending'
+  github.reason = null
+  setTimeout(() => { github.status = 'syncing' }, 500)
+  setTimeout(() => {
+    if (process.env.FAKE_GITHUB === 'fail' && !github.relogged) { github.status = 'failed'; github.reason = 'authentication_failed'; github.connected = false } else { github.status = 'saved'; github.lastSavedAt = now() }
+  }, 2000)
+}
 const importCancels = new Map()
+const importProgress = new Map()
+/** 휴지통 항목의 사용처(S83). 없으면 채팅방 0·문서 0. */
+const assetUses = new Map([[[...assets.values()].find((a) => a.originalFileName === '수강생 명단 11월.csv').id, { chats: ['chat-s1'], documents: ['doc-1'] }]])
+const usesOf = (id) => assetUses.get(id) ?? { chats: [], documents: [] }
+const purged = new Set()
 const importedKeys = new Set()
 let lastTurn = null
 const FAKE_MODEL_LISTS = {
@@ -632,7 +683,8 @@ createServer(async (req, res) => {
       const sha256 = createHash('sha256').update(all).digest('hex')
       const kind = ['image', 'audio', 'video', 'text'].find((k) => u.mediaType.startsWith(`${k}/`)) ?? 'other'
       u.done = { id: `asset-${sha256.slice(0, 12)}`, sha256, byteLength: all.length, originalFileName: u.fileName, mediaType: u.mediaType, kind }
-      if (!assets.has(u.done.id)) { assets.set(u.done.id, u.done); assetBytes.set(u.done.id, all) }
+      if (purged.has(u.done.id)) { u.done = null; send(res, 409, { error: 'asset_purged' }); return }
+      if (!assets.has(u.done.id)) { assets.set(u.done.id, { ...u.done, registeredAt: now() }); assetBytes.set(u.done.id, all) }
       u.parts = []
       send(res, 200, u.done)
       return
@@ -757,10 +809,15 @@ createServer(async (req, res) => {
       return
     }
     const requestId = typeof input.requestId === 'string' ? input.requestId : null
-    if (requestId) importCancels.set(requestId, false)
-    await new Promise((done) => setTimeout(done, 1500))
-    if (requestId && importCancels.get(requestId)) { importCancels.delete(requestId); send(res, 409, { error: 'cancelled' }); return }
-    if (requestId) importCancels.delete(requestId)
+    if (requestId) { importCancels.set(requestId, false); importProgress.set(requestId, { requestId, state: 'running', processed: 0, total: null }) }
+    await new Promise((done) => setTimeout(done, 400))
+    for (let n = 0; n < titles.length; n++) {
+      if (requestId) importProgress.set(requestId, { requestId, state: 'running', processed: n, total: titles.length })
+      await new Promise((done) => setTimeout(done, 1000))
+      if (requestId && importCancels.get(requestId)) break
+    }
+    if (requestId && importCancels.get(requestId)) { importCancels.delete(requestId); importProgress.set(requestId, { requestId, state: 'cancelled', error: 'cancelled' }); send(res, 409, { error: 'cancelled' }); return }
+    if (requestId) { importCancels.delete(requestId); importProgress.set(requestId, { requestId, state: 'completed', processed: titles.length, total: titles.length }) }
     let imported = 0
     titles.forEach((title, i) => {
       if (importedKeys.has(keys[i])) return
@@ -773,12 +830,85 @@ createServer(async (req, res) => {
     send(res, 200, { imported, duplicate: titles.length - imported, skipped: 0, updated: 0, addedMessages: 0, conflicts: 0, omittedAttachments: 0 })
     return
   }
+  const progressMatch = url.pathname.match(/^\/chat-imports\/([^/]+)\/progress$/)
+  if (progressMatch && req.method === 'GET') {
+    const value = importProgress.get(decodeURIComponent(progressMatch[1]))
+    if (!value) { send(res, 404, { error: 'not_found' }); return }
+    send(res, 200, value)
+    return
+  }
   const cancelMatch = url.pathname.match(/^\/chat-imports\/([^/]+)\/cancel$/)
   if (cancelMatch && req.method === 'POST') {
     const requestId = decodeURIComponent(cancelMatch[1])
     if (importCancels.has(requestId)) importCancels.set(requestId, true)
     send(res, 200, { requestId })
     return
+  }
+  if (url.pathname === '/activity' && req.method === 'GET') {
+    const mode = process.env.FAKE_OBJECT
+    send(res, 200, { busy: false, objectBackupEnabled: mode !== 'none', objectBackupStatus: mode === 'none' ? 'not_configured' : mode === 'fail' ? 'failed' : 'saved', objectBackupReason: mode === 'fail' ? 'object_backup_unavailable' : null,
+      githubBackupEnabled: Boolean(github.repository), backupStatus: github.repository ? github.status : 'not_configured', backupReason: github.reason })
+    return
+  }
+  if (url.pathname === '/__fake/github-approve' && req.method === 'POST') {
+    if (github.login?.state === 'pending') { github.login.state = 'connected'; github.relogged = github.connected === false && Boolean(github.repository); github.connected = true; githubEnsureDefault() }
+    send(res, 200, { ok: true })
+    return
+  }
+  if (url.pathname.startsWith('/github/')) {
+    const loginSession = req.headers['x-momso-login-session']
+    if (url.pathname === '/github/login' && req.method === 'POST') {
+      github.login = { id: `gh-${++seq}`, state: 'pending', code: 'B7KD-42QX', expires: Date.now() + 899_000 }
+      send(res, 200, { sessionId: github.login.id })
+      return
+    }
+    if ((url.pathname === '/github/login' && req.method === 'GET') || (url.pathname === '/github/login/cancel' && req.method === 'POST')) {
+      if (!github.login || loginSession !== github.login.id) { send(res, 404, { error: 'login_not_found' }); return }
+      if (req.method === 'POST') { github.login.state = 'cancelled'; send(res, 200, { state: 'cancelled' }); return }
+      const l = github.login
+      if (l.state === 'pending' && Date.now() >= l.expires) l.state = 'expired'
+      const pending = l.state === 'pending'
+      send(res, 200, { provider: 'github', state: l.state, url: pending ? 'https://github.com/login/device' : null, code: pending ? l.code : null, expiresInSeconds: pending ? Math.round((l.expires - Date.now()) / 1000) : null })
+      return
+    }
+    if (url.pathname === '/github/repositories' && req.method === 'GET') {
+      if (!github.connected) { send(res, 503, { error: 'not_connected' }); return }
+      send(res, 200, { account: 'kimhaneul', repositories: GITHUB_REPOS })
+      return
+    }
+    if (url.pathname === '/github/repository' && req.method === 'POST') {
+      const input = (await body(req)) ?? {}
+      if (!github.connected) { send(res, 503, { error: 'not_connected' }); return }
+      const repository = GITHUB_REPOS.find((r) => r.nameWithOwner === input.nameWithOwner)
+      if (!repository) { send(res, 503, { error: 'repository_not_found' }); return }
+      github.repository = repository
+      githubSave()
+      send(res, 200, { repository, backupStatus: 'queued' })
+      return
+    }
+    if (url.pathname === '/github/repository' && req.method === 'GET') {
+      send(res, 200, { repository: github.repository, account: github.connected ? 'kimhaneul' : null, lastSavedAt: github.lastSavedAt ?? null, backupStatus: github.repository ? github.status : 'not_configured', backupReason: github.reason })
+      return
+    }
+    if (url.pathname === '/github/repository/create' && req.method === 'POST') {
+      if (!github.connected) { send(res, 503, { error: 'not_connected' }); return }
+      const repository = githubEnsureDefault()
+      if (!repository) { send(res, 503, { error: 'repository_not_private' }); return }
+      send(res, 200, { repository, backupStatus: 'queued' })
+      return
+    }
+    if (url.pathname === '/github/disconnect' && req.method === 'POST') {
+      if (github.login?.state === 'pending') { send(res, 409, { error: 'login_in_progress' }); return }
+      Object.assign(github, { connected: false, repository: null, status: 'not_configured', reason: null, lastSavedAt: null, login: null })
+      send(res, 200, { state: 'not_connected' })
+      return
+    }
+    if (url.pathname === '/github/sync' && req.method === 'POST') {
+      if (!github.repository) { send(res, 409, { error: 'repository_not_selected' }); return }
+      githubSave()
+      send(res, 200, { state: 'queued' })
+      return
+    }
   }
   if (url.pathname === '/assets/search' && req.method === 'GET') {
     const term = (url.searchParams.get('q') ?? '').trim()
@@ -797,9 +927,11 @@ createServer(async (req, res) => {
     const list = [...assets.values()].filter((a) => (a.kind === 'image' || a.kind === 'video') && !trashed.has(a.id) && (!kind || a.kind === kind)).filter((a) => { const g = generations.get(a.id); return !g || latest.get(g.lineageId)?.assetId === a.id })
     const items = list.reverse().slice(offset, offset + limit).map((a) => {
       const g = generations.get(a.id)
-      const base = { assetId: a.id, kind: a.kind, name: a.originalFileName, mediaType: a.mediaType, byteLength: a.byteLength, prompt: null, lineageId: null, version: null, versionOf: null, versionHow: null, versionCount: null, chatAvailable: false }
+      const base = { assetId: a.id, kind: a.kind, name: a.originalFileName, mediaType: a.mediaType, byteLength: a.byteLength, prompt: null, lineageId: null, version: null, versionOf: null, versionHow: null, versionCount: null, chatAvailable: false,
+        thumbnailState: a.kind === 'video' ? 'on_demand' : 'not_applicable', thumbnailUrl: a.kind === 'video' ? `/media/${a.id}/thumbnail` : null,
+        createdAt: a.registeredAt ?? null, createdAtSource: a.registeredAt ? 'registered' : null }
       if (!g) return base
-      return { ...base, ...g, versionCount: [...generations.values()].filter((x) => x.lineageId === g.lineageId).length, chatAvailable: chats.has(g.chatId) }
+      return { ...base, ...g, createdAtSource: 'generated', versionCount: [...generations.values()].filter((x) => x.lineageId === g.lineageId).length, chatAvailable: chats.has(g.chatId) }
     })
     send(res, 200, { items, offset, limit, pendingGenerations: 0 })
     return
@@ -809,6 +941,22 @@ createServer(async (req, res) => {
     const id = decodeURIComponent(lineageMatch[1])
     const versions = [...generations.values()].filter((g) => g.lineageId === id).sort((a, b) => a.version - b.version).map((g) => ({ ...g, deleted: trashed.has(g.assetId) }))
     send(res, 200, { lineageId: id, versions })
+    return
+  }
+  if (path[0] === 'media' && path[1] && path[2] === 'thumbnail' && req.method === 'GET') {
+    const asset = assets.get(decodeURIComponent(path[1]))
+    if (!asset || asset.kind !== 'video') { send(res, 404, { error: 'not_found' }); return }
+    if (trashed.has(asset.id)) { send(res, 409, { error: 'asset_trashed' }); return }
+    if (process.env.FAKE_THUMB === 'fail') { send(res, 503, { error: 'thumbnail_decoder_unavailable' }); return }
+    if (process.env.FAKE_THUMB === 'busy') {
+      const n = (thumbTries.get(asset.id) ?? 0) + 1
+      thumbTries.set(asset.id, n)
+      if (n <= 2) { send(res, 503, { error: 'thumbnail_busy' }); return }
+    }
+    const data = thumbnails.get(asset.id)
+    if (!data) { send(res, 503, { error: 'thumbnail_unavailable' }); return }
+    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'X-Content-Type-Options': 'nosniff', 'Content-Length': data.length })
+    res.end(data)
     return
   }
   if (path[0] === 'media' && path[1] && path[2] === 'download' && req.method === 'GET') {
@@ -823,7 +971,14 @@ createServer(async (req, res) => {
   if (url.pathname === '/assets/trash' && req.method === 'GET') {
     const offset = Number(url.searchParams.get('offset') ?? 0)
     const limit = Number(url.searchParams.get('limit') ?? 50)
-    const items = [...trashed.entries()].sort((a, b) => b[1].localeCompare(a[1])).slice(offset, offset + limit).map(([id, deletedAt]) => { const a = assets.get(id); return { assetId: id, name: a.originalFileName, mediaType: a.mediaType, byteLength: a.byteLength, deletedAt } })
+    const mode = process.env.FAKE_TRASH
+    const items = [...trashed.entries()].sort((a, b) => b[1].localeCompare(a[1])).slice(offset, offset + limit).map(([id, deletedAt]) => {
+      const a = assets.get(id)
+      const uses = usesOf(id)
+      const documents = mode === 'docs_unknown' ? null : uses.documents.length
+      const reason = uses.chats.length || documents ? 'asset_in_use' : documents === null ? 'references_unavailable' : mode === 'no_backup' ? 'backup_purge_unavailable' : null
+      return { assetId: id, name: a.originalFileName, mediaType: a.mediaType, byteLength: a.byteLength, deletedAt, references: { chats: uses.chats.length, documents }, canPurge: reason === null, purgeReason: reason, backupCopiesRemain: true }
+    })
     send(res, 200, { items, offset, limit })
     return
   }
@@ -835,6 +990,22 @@ createServer(async (req, res) => {
     if (toTrash && changed) trashed.set(id, now())
     if (!toTrash) trashed.delete(id)
     send(res, 200, { assetId: id, deleted: toTrash, changed, recordStatus: changed ? 'recorded' : null })
+    return
+  }
+  if (path[0] === 'assets' && path[1] && path[2] === 'purge' && !path[3] && req.method === 'POST') {
+    const id = decodeURIComponent(path[1])
+    if (!assets.has(id)) { send(res, 404, { error: 'asset_not_found' }); return }
+    if (!trashed.has(id)) { send(res, 409, { error: 'asset_not_trashed' }); return }
+    const uses = usesOf(id)
+    if (uses.chats.length || uses.documents.length) { send(res, 409, { error: 'asset_in_use', references: uses }); return }
+    if (process.env.FAKE_TRASH === 'no_backup') { send(res, 503, { error: 'backup_purge_unavailable' }); return }
+    if (process.env.FAKE_TRASH === 'purge_fail') { send(res, 503, { error: 'purge_backup_unavailable' }); return }
+    await new Promise((done) => setTimeout(done, 600))
+    trashed.delete(id)
+    assets.delete(id)
+    assetBytes.delete(id)
+    purged.add(id)
+    send(res, 200, { assetId: id, deleted: true, backupCopiesRemain: true })
     return
   }
   if (path[0] === 'assets' && path[1] && path[2] === 'download' && req.method === 'GET') {

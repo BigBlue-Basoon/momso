@@ -13,7 +13,7 @@ from momso_anywhere_vault_identity import rewrap_for_host
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("backup", "restore", "restore-assets"))
+    parser.add_argument("action", choices=("backup", "restore", "restore-assets", "check-purge", "record-purge"))
     args = parser.parse_args()
     data = Path(os.environ.get("MOMSO_SERVER_DATA_DIR", "/var/lib/momso"))
     runtime = Path(os.environ.get("MOMSO_BACKUP_RUNTIME_DIR", data / ".backup-runtime"))
@@ -27,7 +27,15 @@ def main():
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     with os.fdopen(os.open(runtime / "lock", flags, 0o600), "a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if args.action == "backup":
+        if args.action in ("check-purge", "record-purge"):
+            request = json.load(sys.stdin)
+            if not isinstance(request, dict) or set(request) != {"digest"}:
+                raise ValueError("invalid purge request")
+            backup.plan_original_purge(store, keys, request["digest"])
+            if args.action == "record-purge":
+                backup.record_purged_original(store, keys, request["digest"])
+            result = "purge-recorded" if args.action == "record-purge" else "purge-checked"
+        elif args.action == "backup":
             if os.environ.get("MOMSO_BACKUP_QUIESCENT") != "1":
                 raise ValueError("quiescence_required")
             credential_root = os.environ.get("CREDENTIALS_DIRECTORY")
@@ -42,7 +50,7 @@ def main():
             target = os.environ.get("MOMSO_BACKUP_VAULT_CREDENTIAL")
             writer = (lambda identity: rewrap_for_host(identity, target)) if target else None
             result = backup.restore(data, store, keys, vault_identity_writer=writer, archive=data / "archive")["status"]
-        print("momso-backup-v3:" + result if args.action in ("backup", "restore-assets") else result)
+        print("momso-backup-v3:" + result if args.action in ("backup", "restore-assets", "check-purge", "record-purge") else result)
 
 
 if __name__ == "__main__":

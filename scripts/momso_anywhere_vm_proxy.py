@@ -1,7 +1,9 @@
 """TLS endpoint on the private VM, forwarding only authenticated gateway requests."""
 import hmac
 import http.server
+import json
 import os
+import re
 import ssl
 from pathlib import Path
 
@@ -15,6 +17,9 @@ class Handler(momso_mobile_proxy.Handler):
             provided = self.headers.get("Authorization", "")
             if not expected or not hmac.compare_digest(provided, "Bearer " + expected):
                 self.send_error(403)
+                return
+            if self.command in ("GET", "HEAD") and self.path == "/update/status":
+                self.update_status()
                 return
             del self.headers["Authorization"]
             host = os.environ["MOMSO_MOBILE_HOST"]
@@ -30,6 +35,34 @@ class Handler(momso_mobile_proxy.Handler):
             super().handle_request()
         except (OSError, KeyError, ValueError):
             self.send_error(503)
+
+    def update_status(self):
+        path = Path(os.environ.get("MOMSO_UPDATE_STATUS_FILE", "/run/momso-update/status.json"))
+        try:
+            with path.open("rb") as stream:
+                raw = stream.read(4097)
+            if len(raw) > 4096:
+                raise ValueError("invalid_status")
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError("invalid_status")
+            states = {"checking", "up_to_date", "downloading", "waiting_for_idle", "backing_up",
+                      "installing", "updating_gateway", "completed", "rolling_back", "rolled_back",
+                      "recovery_required", "failed"}
+            reason = value.get("reason")
+            if (value.get("state") not in states or (reason is not None and
+                    (not isinstance(reason, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", reason)))):
+                raise ValueError("invalid_status")
+            body = json.dumps({"state": value["state"], "reason": reason}).encode("utf-8")
+        except FileNotFoundError:
+            body = b'{"state":"failed","reason":"update_unavailable"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     do_GET = handle_request
     do_HEAD = handle_request

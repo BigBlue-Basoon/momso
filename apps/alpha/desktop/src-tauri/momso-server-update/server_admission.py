@@ -56,15 +56,64 @@ class ServerAdmission:
             deadline = time.monotonic() + self.timeout
             while True:
                 state = self._request("/activity")
-                if state.get("maintenance") is True and state.get("quiescent") is True and state.get("maintenanceReady") is True:
+                if state.get("maintenance") is True and state.get("quiescent") is True:
                     return True
-                if state.get("maintenanceReason") == "backup_not_integrated" or time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     self.release(); return False
                 time.sleep(self.interval)
         except Exception:
             # If POST may have reached the server, preserve the lease for recovery.
             if not self.held: self._unlock()
             raise AdmissionError("maintenance_unavailable") from None
+
+    def reacquire_for_recovery(self):
+        """Only an updater with its durable switching record may call this."""
+        if self.lock is not None:
+            return False
+        lock = (self.directory / "lifecycle.lock").open("a+b")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close(); return False
+        self.lock = lock
+        try:
+            if (self.directory / "idle-stop.pending").exists():
+                self._unlock(); return False
+            state = self._request("/activity")
+            if state.get("maintenance") is False:
+                self._unlock()
+                return self.acquire()
+            if state.get("maintenance") is not True:
+                self._unlock(); return False
+            self.held = True
+            deadline = time.monotonic() + self.timeout
+            while state.get("quiescent") is not True:
+                if time.monotonic() >= deadline:
+                    # Keep admission closed; another attempt can recover it.
+                    self.held = False; self._unlock(); return False
+                time.sleep(self.interval)
+                state = self._request("/activity")
+                if state.get("maintenance") is not True:
+                    raise AdmissionError("maintenance_unconfirmed")
+            return True
+        except Exception:
+            self.held = False; self._unlock()
+            raise AdmissionError("maintenance_unavailable") from None
+
+    def acquire_offline_for_recovery(self):
+        """Caller has stopped the server and holds the updater's switching record."""
+        if self.lock is not None:
+            return False
+        lock = (self.directory / "lifecycle.lock").open("a+b")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close(); return False
+        self.lock = lock
+        if (self.directory / "idle-stop.pending").exists():
+            self._unlock(); return False
+        self.held = True
+        return True
 
     def release(self):
         if not self.held: raise AdmissionError("maintenance_not_owned")

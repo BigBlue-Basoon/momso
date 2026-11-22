@@ -1,6 +1,7 @@
 import hashlib
 import http.client
 import http.server
+import json
 import os
 import tempfile
 import threading
@@ -24,6 +25,30 @@ class Upstream(http.server.BaseHTTPRequestHandler):
 
 
 class Tests(unittest.TestCase):
+    def test_update_status_remains_available_without_server_and_requires_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tokenfile = Path(directory) / "token"
+            statusfile = Path(directory) / "status.json"
+            tokenfile.write_text("fixture-proxy-token", encoding="utf-8")
+            statusfile.write_text(json.dumps({"state": "installing", "reason": None, "private": "ignored"}), encoding="utf-8")
+            proxy = http.server.ThreadingHTTPServer(("127.0.0.1", 0), private.Handler)
+            thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.dict(os.environ, {"MOMSO_PRIVATE_PROXY_TOKEN_FILE": str(tokenfile), "MOMSO_UPDATE_STATUS_FILE": str(statusfile)}):
+                    for token, expected in (("wrong", 403), ("fixture-proxy-token", 200)):
+                        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1])
+                        conn.request("GET", "/update/status", headers={"Authorization": "Bearer " + token})
+                        response = conn.getresponse()
+                        self.assertEqual(response.status, expected)
+                        body = response.read()
+                        if expected == 200:
+                            self.assertEqual(json.loads(body), {"state": "installing", "reason": None})
+                            self.assertEqual(response.getheader("Cache-Control"), "no-store")
+                        conn.close()
+            finally:
+                proxy.shutdown(); proxy.server_close(); thread.join(2)
+
     def test_certificate_fingerprint_is_checked_before_requests(self):
         sock = MagicMock()
         sock.getpeercert.return_value = b"fixture-certificate"

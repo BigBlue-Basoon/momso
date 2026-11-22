@@ -346,6 +346,12 @@ html.is-network-app .server-gate {
     grid-column: 1;
   }
 
+  /* 연결과 백업의 "저장소 만들기": 좁은 폭에서 글자가 단추 안에서 두 줄로 끊기지 않게(글이 줄어든다). */
+  .desktop-shell[data-host='network'] .backup-create .secondary-button {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
   /* 한 번 묻는 창(QuestionDialog): 단추 셋이 한 줄에 들어가지 않으면 단추째 다음 줄로(글자가 단추 안에서 끊기지 않게). 창 밖 여백도 줄인다. */
   html.is-network-app .zet-confirm-backdrop {
     padding: 16px;

@@ -217,23 +217,26 @@ test('VM is private, verifies its release, and retries the same instance', async
 
 test('gateway provisions pinned image and secrets privately before opening its authenticated entry', async () => {
   const release = { bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'f'.repeat(64), gatewayImage: `registry.example.test/team/gateway@sha256:${'c'.repeat(64)}`, loginOrigin: 'https://login.example.test' };
-  let role = null;
+  const roles = new Map();
   let service = null;
   let vmPolicy = { etag: 'fixture', bindings: [{ role: 'roles/reader', members: ['user:fixture@example.test'], condition: { title: 'keep' } }] };
   let publicBindings = false;
   let bindingAttempts = 0;
   const actions = [];
+  const updatePolicies = [];
   const provider = new GoogleBrowserProvider('fixture', { release, releaseVerifier: async value => value, clientId: 'fixture.apps.googleusercontent.com', ownerSub: '12345', sleep: async () => {}, fetchImpl: async (url, options) => {
     const method = options.method;
     if (url.includes('/getGuestAttributes')) return response({ queryValue: { items: [{ namespace: 'momso', key: 'fingerprint', value: 'b'.repeat(64) }] } });
     if (url.includes('iam.googleapis.com') && url.includes('/roles')) {
-      if (method === 'POST') { role = JSON.parse(options.body).role; return response(role); }
+      if (method === 'POST') { const body = JSON.parse(options.body); roles.set(body.roleId, body.role); return response(body.role); }
+      const role = roles.get(url.split('/').pop());
       return role ? response(role) : response({}, 404);
     }
     if (url.includes('/getIamPolicy') && url.includes('compute.googleapis.com')) return response(vmPolicy);
-    if (url.includes('/setIamPolicy') && url.includes('compute.googleapis.com')) { if (++bindingAttempts < 3) return response({}, 400); vmPolicy = JSON.parse(options.body).policy; return response(vmPolicy); }
+    if (url.includes('/setIamPolicy') && url.includes('compute.googleapis.com')) { if (++bindingAttempts < 3) return response({ error: { message: 'Role (projects/fixture-project/roles/momsoFixture) does not exist in the resource\'s hierarchy.' } }, 400); vmPolicy = JSON.parse(options.body).policy; return response(vmPolicy); }
     if (url.includes('/operations/')) return response({ done: true });
-    if (url.endsWith(':getIamPolicy?options.requestedPolicyVersion=3')) return response({ bindings: publicBindings ? [{ role: 'roles/run.invoker', members: ['allUsers'] }] : [] });
+    if (url.endsWith(':getIamPolicy?options.requestedPolicyVersion=3')) return response({ etag: 'fixture', bindings: publicBindings ? [{ role: 'roles/run.invoker', members: ['allUsers'] }] : [] });
+    if (url.endsWith(':setIamPolicy')) { updatePolicies.push({ url, policy: JSON.parse(options.body).policy }); return response({}); }
     if (url.includes('run.googleapis.com')) {
       if (url.includes('/revisions/')) return response({ containers: [{ image: service.template.containers[0].image }] });
       if (method === 'POST') {
@@ -258,6 +261,9 @@ test('gateway provisions pinned image and secrets privately before opening its a
   assert.deepEqual(actions, [{ type: 'create', value: false }, { type: 'patch', value: undefined }, { type: 'patch', value: true }]);
   assert.equal(provider.gatewayUrl(), 'https://fixture.a.run.app');
   assert.equal(vmPolicy.bindings[0].condition.title, 'keep');
+  const vmMember = `serviceAccount:momso-vm-${id.slice(0, 12)}@${projectId}.iam.gserviceaccount.com`;
+  assert(updatePolicies.some(item => item.url.includes('run.googleapis.com') && item.policy.bindings.some(binding => binding.role.endsWith(`/roles/momsoUpdate${id.slice(0, 12)}`) && binding.members.includes(vmMember))));
+  assert(updatePolicies.some(item => item.url.includes('iam.googleapis.com') && item.policy.bindings.some(binding => binding.role === 'roles/iam.serviceAccountUser' && binding.members.includes(vmMember))));
   const vars = service.template.containers[0].env;
   assert.equal(vars.find(item => item.name === 'MOMSO_PRIVATE_CERT_SHA256').value, 'b'.repeat(64));
   assert.equal(vars.find(item => item.name === 'MOMSO_PRIVATE_PROXY_TOKEN').valueSource.secretKeyRef.secret, `momso-transport-${id.slice(0, 12)}`);

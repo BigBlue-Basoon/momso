@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{mpsc, Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const GITHUB_WEB: &str = "https://github.com";
@@ -42,8 +42,73 @@ struct DeviceReply {
 #[derive(Deserialize)]
 struct TokenReply {
     access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
+    refresh_token_expires_in: Option<u64>,
     error: Option<String>,
     interval: Option<u64>,
+}
+
+const BUNDLE_PREFIX: &str = "momso-github-token-v1:";
+
+#[derive(Serialize, Deserialize)]
+struct TokenBundle {
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64,
+    refresh_expires_at: u64,
+}
+
+fn now_seconds() -> Result<u64, &'static str> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "clock_unavailable")?
+        .as_secs())
+}
+
+fn encode_reply(reply: &TokenReply) -> Result<String, &'static str> {
+    let access = reply
+        .access_token
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .ok_or("provider_invalid_response")?;
+    match (
+        &reply.refresh_token,
+        reply.expires_in,
+        reply.refresh_token_expires_in,
+    ) {
+        (None, None, None) => Ok(access.to_owned()),
+        (Some(refresh), Some(expires), Some(refresh_expires))
+            if !refresh.is_empty() && expires > 0 && refresh_expires > 0 =>
+        {
+            let now = now_seconds()?;
+            let bundle = TokenBundle {
+                access_token: access.to_owned(),
+                refresh_token: refresh.clone(),
+                expires_at: now
+                    .checked_add(expires)
+                    .ok_or("provider_invalid_response")?,
+                refresh_expires_at: now
+                    .checked_add(refresh_expires)
+                    .ok_or("provider_invalid_response")?,
+            };
+            Ok(format!(
+                "{BUNDLE_PREFIX}{}",
+                serde_json::to_string(&bundle).map_err(|_| "provider_invalid_response")?
+            ))
+        }
+        _ => Err("provider_invalid_response"),
+    }
+}
+
+fn decode_secret(secret: &str) -> Result<(String, Option<String>), &'static str> {
+    if let Some(json) = secret.strip_prefix(BUNDLE_PREFIX) {
+        let bundle: TokenBundle =
+            serde_json::from_str(json).map_err(|_| "credential_store_unavailable")?;
+        Ok((bundle.access_token, Some(bundle.refresh_token)))
+    } else {
+        Ok((secret.to_owned(), None))
+    }
 }
 
 #[derive(Deserialize)]
@@ -107,6 +172,7 @@ pub struct Github {
     client_id: String,
     vault: Arc<LinuxVault>,
     session: Mutex<Option<Session>>,
+    token_lock: Mutex<()>,
     #[cfg(any(test, all(debug_assertions, feature = "test-fixtures")))]
     test_remote: Mutex<Option<String>>,
 }
@@ -172,6 +238,7 @@ impl Github {
             client_id,
             vault,
             session: Mutex::new(None),
+            token_lock: Mutex::new(()),
             #[cfg(any(test, all(debug_assertions, feature = "test-fixtures")))]
             test_remote: Mutex::new(None),
         })
@@ -281,10 +348,9 @@ impl Github {
                     .map_err(|_| "provider_unavailable")?
                     .json()
                     .map_err(|_| "provider_invalid_response")?;
-                if let Some(token) = response.access_token {
-                    if token.is_empty() {
-                        return Err("provider_invalid_response");
-                    }
+                if response.access_token.is_some() {
+                    let _token_guard = self.token_lock.lock().map_err(|_| "unavailable")?;
+                    let token = encode_reply(&response)?;
                     self.vault
                         .store_service_secret(VAULT_KEY, &token)
                         .map_err(|_| "credential_store_unavailable")?;
@@ -321,10 +387,79 @@ impl Github {
     }
 
     fn token(&self) -> Result<String, &'static str> {
+        let _guard = self.token_lock.lock().map_err(|_| "unavailable")?;
+        self.token_locked()
+    }
+
+    fn token_locked(&self) -> Result<String, &'static str> {
         self.vault
-            .read_service_secret(VAULT_KEY)
-            .map_err(|_| "credential_store_unavailable")?
-            .ok_or("not_connected")
+            .update_service_secret(VAULT_KEY, |stored| {
+                let stored = stored.ok_or("not_connected")?;
+                let Some(json) = stored.strip_prefix(BUNDLE_PREFIX) else {
+                    return Ok((stored.to_owned(), None));
+                };
+                let bundle: TokenBundle =
+                    serde_json::from_str(json).map_err(|_| "credential_store_unavailable")?;
+                let now = now_seconds()?;
+                if now.saturating_add(60) < bundle.expires_at {
+                    return Ok((bundle.access_token, None));
+                }
+                if now >= bundle.refresh_expires_at {
+                    return Err("not_connected");
+                }
+                let response: TokenReply = self
+                    .http
+                    .post(format!("{}/login/oauth/access_token", self.web_base))
+                    .header("Accept", "application/json")
+                    .form(&[
+                        ("client_id", self.client_id.as_str()),
+                        ("grant_type", "refresh_token"),
+                        ("refresh_token", bundle.refresh_token.as_str()),
+                    ])
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .map_err(|_| "provider_unavailable")?
+                    .json()
+                    .map_err(|_| "provider_invalid_response")?;
+                if response.error.as_deref() == Some("bad_refresh_token") {
+                    return Err("not_connected");
+                }
+                if response.refresh_token.is_none()
+                    || response.expires_in.is_none()
+                    || response.refresh_token_expires_in.is_none()
+                {
+                    return Err("provider_invalid_response");
+                }
+                let new_secret = encode_reply(&response)?;
+                let access = response
+                    .access_token
+                    .filter(|s| !s.is_empty())
+                    .ok_or("provider_invalid_response")?;
+                Ok((access, Some(new_secret)))
+            })
+            .map_err(|reason| match reason {
+                "storage_unavailable" | "storage_invalid" | "credential_invalid" => {
+                    "credential_store_unavailable"
+                }
+                other => other,
+            })
+    }
+
+    fn with_backup_secrets<T>(
+        &self,
+        f: impl FnOnce(&str, &[String]) -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        // Serialize login and refresh for the whole backup, then acquire the vault lock.
+        let _guard = self.token_lock.lock().map_err(|_| "unavailable")?;
+        self.token_locked()?;
+        self.vault.with_backup_secrets(VAULT_KEY, |stored, logins| {
+            let (access, refresh) = decode_secret(stored)?;
+            let mut secrets = logins.to_vec();
+            if let Some(refresh) = refresh {
+                secrets.push(refresh);
+            }
+            f(&access, &secrets)
+        })
     }
 
     fn authorized(&self, request: RequestBuilder) -> Result<RequestBuilder, &'static str> {
@@ -522,7 +657,7 @@ impl Github {
             .clone()
             .unwrap_or(url);
         let _guard = momso_core::lock::exclusive(root)?;
-        self.vault.with_backup_secrets(VAULT_KEY, |token, _| {
+        self.with_backup_secrets(|token, _| {
             let reference = format!("refs/heads/{branch}");
             let fetch = git(
                 root,
@@ -591,7 +726,7 @@ impl Github {
             .clone()
             .unwrap_or(url);
         let _guard = momso_core::lock::exclusive(root)?;
-        self.vault.with_backup_secrets(VAULT_KEY, |token, logins| {
+        self.with_backup_secrets(|token, logins| {
             let known: Vec<&str> = std::iter::once(token)
                 .chain(logins.iter().map(String::as_str))
                 .chain(extra.iter().copied())
@@ -687,7 +822,7 @@ impl Github {
         }
         let guard = momso_core::lock::exclusive(root)?;
         let paths = momso_core::git::changed_paths_guarded(root, &guard)?;
-        self.vault.with_backup_secrets(VAULT_KEY, |token, logins| {
+        self.with_backup_secrets(|token, logins| {
             let known: Vec<&str> = std::iter::once(token)
                 .chain(logins.iter().map(String::as_str))
                 .chain(extra.iter().copied())
@@ -806,7 +941,7 @@ impl Github {
             return Err("vault_inside_archive");
         }
         let _guard = momso_core::lock::exclusive(root)?;
-        self.vault.with_backup_secrets(VAULT_KEY, |token, logins| {
+        self.with_backup_secrets(|token, logins| {
             let known: Vec<&str> = std::iter::once(token)
                 .chain(logins.iter().map(String::as_str))
                 .chain(extra.iter().copied())
@@ -1337,6 +1472,230 @@ mod tests {
                     .any(|part| part == token.as_bytes()));
             }
         }
+    }
+
+    #[test]
+    fn device_tokens_rotate_for_api_and_backup_without_exposing_secrets() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = vault(&temp.path().join("secrets"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for step in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|p| p == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]);
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let body = match step {
+                    0 => serde_json::json!({"device_code":"device-only","user_code":"TEST-CODE","verification_uri":VERIFY_URL,"expires_in":900,"interval":0}),
+                    1 => serde_json::json!({"access_token":"old-access-fixture","refresh_token":"old-refresh-fixture","expires_in":1,"refresh_token_expires_in":1000}),
+                    2 => {
+                        assert!(request.contains("grant_type=refresh_token"));
+                        assert!(request.contains("refresh_token=old-refresh-fixture"));
+                        assert!(!request.contains("client_secret"));
+                        serde_json::json!({"access_token":"new-access-fixture","refresh_token":"new-refresh-fixture","expires_in":3600,"refresh_token_expires_in":10000})
+                    }
+                    _ => { assert!(request.to_ascii_lowercase().contains("authorization: bearer new-access-fixture")); serde_json::json!({"login":"teacher"}) }
+                }.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let github =
+            Github::with_endpoints("fixture-client".into(), store.clone(), &base, &base).unwrap();
+        let session = github.start_device_login().unwrap();
+        assert_eq!(
+            github.poll_login(&session.session_id).unwrap().state,
+            "connected"
+        );
+        assert_eq!(github.account_name().unwrap(), "teacher");
+        drop(github);
+        let restarted =
+            Github::with_endpoints("fixture-client".into(), store.clone(), &base, &base).unwrap();
+        restarted
+            .with_backup_secrets(|access, secrets| {
+                assert_eq!(access, "new-access-fixture");
+                assert!(secrets.iter().any(|s| s == "new-refresh-fixture"));
+                Ok(())
+            })
+            .unwrap();
+        let archive = temp.path().join("archive");
+        momso_core::filesystem::initialize(&archive).unwrap();
+        std::fs::write(archive.join("zettels/fixture.md"), "fixture document").unwrap();
+        let remote = temp.path().join("remote.git");
+        assert!(Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&remote)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        restarted.save_changes(&archive).unwrap();
+        restarted
+            .push_to(&archive, remote.to_str().unwrap(), "main")
+            .unwrap();
+        assert_token_absent(&remote, "new-access-fixture");
+        assert_token_absent(&remote, "new-refresh-fixture");
+        assert_token_absent(&temp.path().join("secrets"), "old-refresh-fixture");
+        assert_token_absent(&temp.path().join("secrets"), "new-refresh-fixture");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn expired_refresh_requires_reconnecting_without_network() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = vault(&temp.path().join("secrets"));
+        let bundle = TokenBundle {
+            access_token: "expired-access".into(),
+            refresh_token: "expired-refresh".into(),
+            expires_at: 0,
+            refresh_expires_at: 0,
+        };
+        store
+            .store_service_secret(
+                VAULT_KEY,
+                &format!("{BUNDLE_PREFIX}{}", serde_json::to_string(&bundle).unwrap()),
+            )
+            .unwrap();
+        let github = Github::with_endpoints(
+            "fixture-client".into(),
+            store,
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+        assert!(matches!(github.token(), Err("not_connected")));
+    }
+
+    #[test]
+    fn rejected_refresh_requires_reconnecting() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = vault(&temp.path().join("secrets"));
+        let now = now_seconds().unwrap();
+        let bundle = TokenBundle {
+            access_token: "old".into(),
+            refresh_token: "rejected".into(),
+            expires_at: now,
+            refresh_expires_at: now + 1000,
+        };
+        store
+            .store_service_secret(
+                VAULT_KEY,
+                &format!("{BUNDLE_PREFIX}{}", serde_json::to_string(&bundle).unwrap()),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|p| p == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]);
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"error":"bad_refresh_token"}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let github = Github::with_endpoints("fixture-client".into(), store, &base, &base).unwrap();
+        assert!(matches!(github.token(), Err("not_connected")));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn separate_clients_share_vault_rotation_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = vault(&temp.path().join("secrets"));
+        let now = now_seconds().unwrap();
+        let bundle = TokenBundle {
+            access_token: "old".into(),
+            refresh_token: "old-refresh".into(),
+            expires_at: now,
+            refresh_expires_at: now + 1000,
+        };
+        store
+            .store_service_secret(
+                VAULT_KEY,
+                &format!("{BUNDLE_PREFIX}{}", serde_json::to_string(&bundle).unwrap()),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|p| p == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]);
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let body = r#"{"access_token":"new","refresh_token":"new-refresh","expires_in":3600,"refresh_token_expires_in":10000}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let a = Github::with_endpoints("fixture".into(), store.clone(), &base, &base).unwrap();
+        let b = Github::with_endpoints("fixture".into(), store, &base, &base).unwrap();
+        let a = std::thread::spawn(move || a.token());
+        let b = std::thread::spawn(move || b.token());
+        assert_eq!(a.join().unwrap().unwrap(), "new");
+        assert_eq!(b.join().unwrap().unwrap(), "new");
+        server.join().unwrap();
     }
 
     #[test]
