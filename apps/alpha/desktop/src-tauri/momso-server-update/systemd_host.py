@@ -12,12 +12,13 @@ from update import _atomic_json
 
 
 class SystemdHost:
-    def __init__(self, root, data_directory, unit, health_url, admission, gateway, progress, *, proxy_unit=None):
+    def __init__(self, root, data_directory, unit, health_url, admission, gateway, progress, *, proxy_unit=None, idle_unit=None):
         self.root = Path(root)
         self.current = self.root / "current"
         self.sequence = self.root / "installed.json"
         self.unit = unit
         self.proxy_unit = proxy_unit
+        self.idle_unit = idle_unit
         self.health_url = health_url
         self.admission = admission
         self.gateway = gateway
@@ -37,15 +38,42 @@ class SystemdHost:
             except AdmissionError:
                 # A switching journal exists, but the new server may not start.
                 # Stop restart attempts before taking the lifecycle lock offline.
-                self.stop_server()
-                return self.admission.acquire_offline_for_recovery()
+                try:
+                    self.stop_server()
+                except Exception:
+                    self._restart_after_failed_acquire()
+                    raise
+                try:
+                    acquired = self.admission.acquire_offline_for_recovery()
+                except Exception:
+                    self._restart_after_failed_acquire()
+                    raise
+                if not acquired:
+                    self._restart_after_failed_acquire()
+                return acquired
         return self.admission.acquire()
+    def _restart_after_failed_acquire(self):
+        try:
+            self.start_server()
+        finally:
+            self.server_healthy()
     def release_maintenance(self): self.admission.release()
     def stop_server(self): self._systemctl("stop")
     def start_server(self):
-        self._systemctl("start")
-        if self.proxy_unit:
-            subprocess.run(["systemctl", "start", self.proxy_unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        failed = False
+        for unit in (self.unit, self.proxy_unit, self.idle_unit):
+            if not unit: continue
+            try:
+                subprocess.run(["systemctl", "start", unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                if unit == self.idle_unit:
+                    try:
+                        result = subprocess.run(["systemctl", "show", unit, "--property=LoadState", "--value"], capture_output=True, check=False, timeout=30)
+                        if result.returncode == 0 and result.stdout.strip() == b"not-found": continue
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                failed = True
+        if failed: raise RuntimeError("service_start_failed")
     def _systemctl(self, operation):
         subprocess.run(["systemctl", operation, self.unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
     def snapshot_data(self): return self.snapshots.snapshot()
@@ -62,6 +90,8 @@ class SystemdHost:
         # The new server migrates its own DB on startup. Host admission stays closed.
         pass
     def activate_gateway(self, image): self.gateway.activate(image)
+    def preflight_gateway(self, image):
+        if hasattr(self.gateway, "preflight"): return self.gateway.preflight(image)
     def gateway_healthy(self): return self.gateway.healthy()
     def server_healthy(self):
         for _ in range(40):

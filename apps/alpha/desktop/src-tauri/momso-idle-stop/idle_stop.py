@@ -104,6 +104,16 @@ def _idle(view, now, idle_seconds, *, gated):
     return elapsed >= idle_seconds
 
 
+def wait_for_recovery(monitor, poll_seconds):
+    # An updater may hold the lifecycle lock while restarting this service.
+    # Wait without touching the server or the recovery marker until it releases.
+    while True:
+        result = monitor.recover()
+        if result != "lifecycle_busy":
+            return result
+        time.sleep(poll_seconds)
+
+
 class IdleStop:
     def __init__(self, server, compute, state_dir, idle_seconds=1800, boot_id=None):
         if idle_seconds <= 0: raise ValueError("invalid_idle_seconds")
@@ -174,8 +184,8 @@ def main():
     if args.poll_seconds <= 0: raise SystemExit("invalid_poll_seconds")
     monitor = IdleStop(Server(args.token_file, args.port), Compute(), args.state_dir, args.idle_seconds)
     try:
-        recovered = monitor.recover()
-        if recovered in {"stop_pending", "lifecycle_busy"}: raise IdleError("stop_pending")
+        recovered = wait_for_recovery(monitor, args.poll_seconds)
+        if recovered == "stop_pending": raise IdleError("stop_pending")
         if args.recover_only: return
         while True:
             try: monitor.step()

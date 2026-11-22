@@ -1,4 +1,5 @@
 import os
+import errno
 import hashlib
 import io
 import json
@@ -159,6 +160,29 @@ class AnywhereBackupTests(unittest.TestCase):
         self.store = FakeStore()
         self.keys = FakeKeys()
         self.names = ["server.sqlite3", "vault.age"]
+
+    @unittest.skipUnless(os.name == "posix", "backup agent requires POSIX locking")
+    def test_snapshot_signal_is_opt_in_for_older_servers(self):
+        import momso_anywhere_backup_agent as agent
+        self.write_db("example")
+        env = {"MOMSO_SERVER_DATA_DIR": str(self.data), "MOMSO_BACKUP_BUCKET": "fixture",
+               "MOMSO_BACKUP_KMS_KEY": "fixture"}
+        stale = self.data / ".backup-runtime/snapshot-stale"
+        stale.mkdir(parents=True)
+        (stale / "old").write_bytes(b"fixture")
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(agent, "GoogleClient"), \
+             mock.patch.object(agent, "CloudStorage", return_value=self.store), \
+             mock.patch.object(agent, "CloudKms", return_value=self.keys), \
+             mock.patch("sys.argv", ["agent", "backup"]):
+            os.environ["MOMSO_BACKUP_QUIESCENT"] = "1"
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                agent.main()
+                self.assertEqual(output.getvalue(), "momso-backup-v3:uploaded\n")
+                self.assertFalse(stale.exists())
+            os.environ["MOMSO_BACKUP_SNAPSHOT_SIGNAL"] = "1"
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                agent.main()
+                self.assertTrue(output.getvalue().startswith("momso-backup-v3:snapshot-ready\n"))
 
     @unittest.skipUnless(os.name == "posix", "backup agent requires POSIX locking")
     def test_agent_records_purge_under_backup_lock_and_retries(self):
@@ -758,6 +782,58 @@ class AnywhereBackupTests(unittest.TestCase):
         backup.restore_assets(destination,destination / "archive",self.store,self.keys,[identifier])
         with closing(sqlite3.connect(target)) as db:
             self.assertEqual(db.execute("SELECT prompt FROM media_generation").fetchone()[0],"local edit")
+
+    def test_live_snapshot_remains_stable_after_user_continues(self):
+        self.write_db("before")
+        (self.data / "github-repository.json").write_text("before", encoding="utf8")
+        digest = hashlib.sha256(b"original").hexdigest()
+        source = self.data / "archive" / "objects" / "sha256" / digest[:2] / digest
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"original")
+        staged = self.root / "snapshot"
+        backup.stage_live_snapshot(self.data, staged)
+        self.write_db("after")
+        replacement = self.data / "replacement"
+        replacement.write_text("after", encoding="utf8")
+        replacement.replace(self.data / "github-repository.json")
+        source.unlink()
+        with closing(sqlite3.connect(staged / "server.sqlite3")) as db:
+            self.assertEqual(db.execute("SELECT body FROM messages").fetchall(), [("before",)])
+        self.assertEqual((staged / "github-repository.json").read_text(encoding="utf8"), "before")
+        self.assertEqual((staged / "archive/objects/sha256" / digest[:2] / digest).read_bytes(), b"original")
+
+    def test_live_snapshot_copies_objects_across_filesystems(self):
+        digest = hashlib.sha256(b"example").hexdigest()
+        source = self.data / "archive" / "objects" / "sha256" / digest[:2] / digest
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"example")
+        staged = self.root / "snapshot"
+        with mock.patch.object(backup.os, "link", side_effect=OSError(errno.EXDEV, "different filesystem")):
+            backup.stage_live_snapshot(self.data, staged)
+        self.assertEqual((staged / "archive/objects/sha256" / digest[:2] / digest).read_bytes(), b"example")
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "Linux in-memory file required")
+    def test_live_snapshot_keeps_codex_auth_out_of_temporary_files(self):
+        secret = os.urandom(32).hex().encode()
+        (self.data / "codex").mkdir()
+        (self.data / "codex/auth.json").write_bytes(secret)
+        staged = self.root / "snapshot"
+        memory = backup.stage_live_snapshot(self.data, staged)
+        self.assertEqual(memory["codex/auth.json"], secret)
+        self.assertFalse((staged / "codex/auth.json").exists())
+        for path in staged.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(secret, path.read_bytes())
+        self.assertEqual(backup.backup(staged, self.store, self.keys, backup.DATABASE_AND_VAULT,
+                                      archive=staged / "archive", quiescent=True,
+                                      memory_files=memory), "uploaded")
+        for _, value in self.store.objects.values():
+            self.assertNotIn(secret, value)
+        for value in self.store.chunks.values():
+            self.assertNotIn(secret, value)
+        restored = self.root / "restored"
+        backup.restore(restored, self.store, self.keys, archive=restored / "archive")
+        self.assertEqual((restored / "codex/auth.json").read_bytes(), secret)
 
     def test_wal_snapshot_encrypts_and_restores(self):
         with closing(sqlite3.connect(self.data / "server.sqlite3")) as db:

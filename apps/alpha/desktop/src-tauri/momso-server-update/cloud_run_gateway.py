@@ -18,8 +18,30 @@ class CloudRunGateway:
     def _run(self, *args):
         command = ["gcloud", "run", *args, "--project", self.project, "--region", self.region, "--quiet"]
         result = self.runner(command, capture_output=True, timeout=600, check=False)
-        if result.returncode: raise GatewayError("gateway_operation_failed")
+        if result.returncode:
+            error = (result.stderr or b"")
+            if isinstance(error, bytes): error = error.decode("utf-8", "replace")
+            if "artifactregistry.repositories.downloadArtifacts" in error or "permission to read the image" in error.lower():
+                raise GatewayError("gateway_image_permission")
+            raise GatewayError("gateway_operation_failed")
         return result.stdout
+
+    def preflight(self, image):
+        if not isinstance(image, str) or not re.fullmatch(r"[a-zA-Z0-9._/-]+@sha256:[a-f0-9]{64}", image):
+            raise GatewayError("gateway_image_invalid")
+        try:
+            result = self.runner(["gcloud", "artifacts", "docker", "images", "describe", image, "--format=json", "--quiet"], capture_output=True, timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if result.returncode:
+            error = result.stderr or b""
+            if isinstance(error, bytes): error = error.decode("utf-8", "replace")
+            if "artifactregistry.repositories.downloadArtifacts" in error:
+                raise GatewayError("gateway_image_permission")
+            # Describing an image can require a different permission than
+            # pulling it; an inconclusive probe must not block an update.
+            return False
+        return True
 
     def _describe(self):
         try: return json.loads(self._run("services", "describe", self.service, "--format=json"))

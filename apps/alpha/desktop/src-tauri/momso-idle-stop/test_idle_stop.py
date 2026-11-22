@@ -6,8 +6,9 @@ import tempfile
 import threading
 import unittest
 import uuid
+from unittest.mock import Mock, patch
 
-from idle_stop import Compute, IdleError, IdleStop, Server
+from idle_stop import Compute, IdleError, IdleStop, Server, wait_for_recovery
 
 
 class State:
@@ -108,6 +109,28 @@ class IdleTests(unittest.TestCase):
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertEqual(self.monitor.step(), "lifecycle_busy")
         self.assertEqual(self.fixture.stop_calls, 0)
+
+    def test_updater_lock_waits_without_failing_or_stopping(self):
+        with self.monitor.lock.open("a+b") as held:
+            import fcntl
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            def release_lock(_seconds):
+                self.assertEqual(self.fixture.stop_calls, 0)
+                self.assertFalse(self.monitor.marker.exists())
+                fcntl.flock(held, fcntl.LOCK_UN)
+            with patch("idle_stop.time.sleep", side_effect=release_lock) as sleep:
+                self.assertEqual(wait_for_recovery(self.monitor, 1), "no_recovery")
+            sleep.assert_called_once_with(1)
+        self.assertEqual(self.fixture.stop_calls, 0)
+
+    def test_recovery_wait_preserves_pending_and_errors(self):
+        monitor = Mock()
+        monitor.recover.side_effect = ["lifecycle_busy", "stop_pending"]
+        with patch("idle_stop.time.sleep"):
+            self.assertEqual(wait_for_recovery(monitor, 1), "stop_pending")
+        monitor.recover.side_effect = IdleError("marker_invalid")
+        with self.assertRaisesRegex(IdleError, "marker_invalid"):
+            wait_for_recovery(monitor, 1)
 
 
 if __name__ == "__main__": unittest.main()

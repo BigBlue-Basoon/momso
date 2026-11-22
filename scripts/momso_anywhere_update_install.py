@@ -13,6 +13,38 @@ LEGACY_WORKER = _HISTORY['worker']
 LEGACY_PROXY = _HISTORY['proxy']
 
 
+def refresh_worker(provider):
+    """Replace only managed worker files and restart it; preserve recovery journal and data."""
+    source = Path(__file__).resolve().parent.parent / 'apps/alpha/desktop/src-tauri/momso-server-update'
+    names = ('update.py', 'release_manifest.py', 'server_admission.py', 'systemd_host.py',
+             'data_snapshots.py', 'cloud_run_gateway.py', 'github_releases.py', 'progress_status.py',
+             'layout_migration.py', 'install_worker.py', 'worker.py', 'ensure_gcloud.py')
+    payload = {name: base64.b64encode((source / name).read_bytes()).decode('ascii') for name in names}
+    module = (Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()
+    code = r'''import base64,json,os,pathlib,subprocess,sys
+data=json.load(sys.stdin)
+module={};exec(compile(base64.b64decode(MANAGED_MODULE),'momso_managed_files.py','exec'),module)
+root=pathlib.Path('/opt/momso-updater')
+config=pathlib.Path('/etc/momso-update.json');unit=pathlib.Path('/etc/systemd/system/momso-update.service')
+expected='ExecStart=/usr/bin/python3 /opt/momso-updater/worker.py --config /etc/momso-update.json'
+if (not root.is_dir() or root.is_symlink() or config.is_symlink() or not config.is_file()
+    or unit.is_symlink() or not unit.is_file() or expected not in unit.read_text().splitlines()):raise RuntimeError('worker_not_installed')
+manifest='/etc/momso-private/managed-update-worker.json';journal='/etc/momso-private/managed-update-worker-journal.json'
+try:
+ subprocess.run(['systemctl','stop','momso-update.service'],check=True,timeout=60)
+ module['install'](root,manifest,journal,OWNER,{name:base64.b64decode(value,validate=True) for name,value in data.items()},LEGACY,0o644)
+ os.unlink(journal)
+except BaseException:
+ if os.path.exists(journal):module['rollback'](root,manifest,journal,OWNER)
+ raise
+finally:
+ subprocess.run(['systemctl','start','momso-update.service'],check=True,timeout=60)
+'''
+    code = code.replace('MANAGED_MODULE', repr(base64.b64encode(module).decode('ascii'))).replace('OWNER', repr(provider.install_id)).replace('LEGACY', repr(LEGACY_WORKER))
+    wrapper = "import base64,subprocess,sys; subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(base64.b64encode(code.encode()).decode('ascii')) + ").decode()],input=sys.stdin.buffer.read(),check=True)"
+    provider.ssh(wrapper, json.dumps(payload).encode())
+
+
 def grant_gateway_update(provider):
     """Grant only the customer's VM access to its own gateway and runtime identity."""
     from momso_iam_retry import bind_custom_role

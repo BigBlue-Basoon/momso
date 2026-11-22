@@ -1,0 +1,48 @@
+[package]
+name = "momso-server"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+test-fixtures = ["momso-server-browser/fixture-sites", "momso-server-providers/test-fixtures", "momso-github-backup/test-fixtures"]
+
+[[bin]]
+name = "fake-codex"
+path = "tests/fixtures/fake_codex.rs"
+required-features = ["test-fixtures"]
+
+[dependencies]
+axum = "0.8"
+chrono = "0.4"
+futures-util = "0.3"
+encoding_rs = "0.8"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "io-util", "time", "sync", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+sha2 = "0.10"
+momso-core = { path = "../desktop/src-tauri/momso-core" }
+scraper = { version = "0.24", default-features = false }
+zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+momso-server-browser = { path = "../server-browser" }
+momso-server-crm = { path = "../server-crm" }
+momso-server-attachments = { path = "../server-attachments" }
+momso-server-providers = { path = "../server-providers" }
+momso-github-backup = { path = "../desktop/src-tauri/momso-github-backup" }
+momso-saved-login-core = { path = "../desktop/src-tauri/saved-login-core" }
+zeroize = "1"
+hmac = "0.12"
+
+[dev-dependencies]
+age = "0.12.1"
+base64 = "0.22"
+
+# Separate optimized artifact so the previous S17 release stays untouched.
+[profile.s25-release]
+inherits = "release"

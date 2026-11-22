@@ -11,6 +11,7 @@ import tempfile
 import urllib.request
 from urllib.parse import urlparse
 from release_manifest import ManifestError, verify as verify_manifest
+from cloud_run_gateway import GatewayError
 
 
 class UpdateError(Exception):
@@ -89,11 +90,58 @@ class Updater:
         self.state = self.root / "update-state.json"
 
     def _emit(self, state, reason=None):
+        # Only fixed state and reason codes are written to journald.
+        import re
+        if re.fullmatch(r"[a-z_]{1,80}", state) and (reason is None or re.fullmatch(r"[a-z_]{1,80}", reason)):
+            print(f"update stage={state} reason={reason or 'none'}", flush=True)
         # A disconnected screen must never prevent a rollback.
         try:
             self.host.progress({"state": state, "reason": reason})
         except Exception:
             pass
+
+    def _rollback(self, record):
+        errors = []
+        def attempt(stage, action):
+            try:
+                action()
+            except Exception:
+                errors.append(stage)
+                self._emit("rolling_back", stage)
+        attempt("server_stop_failed", self.host.stop_server)
+        if record.get("snapshot") is not None:
+            attempt("data_restore_failed", lambda: self.host.restore_data(record["snapshot"]))
+        attempt("release_restore_failed", lambda: self.host.activate_release(record["oldRelease"]))
+        if "release_restore_failed" not in errors:
+            attempt("sequence_restore_failed", lambda: self.host.record_sequence(record["oldSequence"]))
+        # Start all local services even if any earlier recovery step failed.
+        attempt("server_start_failed", self.host.start_server)
+        try:
+            if not self.host.server_healthy():
+                errors.append("server_unhealthy")
+                self._emit("rolling_back", "server_unhealthy")
+        except Exception:
+            errors.append("server_health_failed")
+            self._emit("rolling_back", "server_health_failed")
+        try:
+            try:
+                unchanged = self.host.current_gateway() == record["oldGateway"]
+            except Exception:
+                unchanged = False
+            if not unchanged: self.host.activate_gateway(record["oldGateway"])
+        except Exception:
+            errors.append("gateway_restore_failed")
+            self._emit("rolling_back", "gateway_restore_failed")
+        try:
+            if not self.host.gateway_healthy():
+                errors.append("gateway_unhealthy")
+                self._emit("rolling_back", "gateway_unhealthy")
+        except Exception:
+            errors.append("gateway_health_failed")
+            self._emit("rolling_back", "gateway_health_failed")
+        if errors:
+            raise UpdateError("rollback_failed")
+        _atomic_json(self.state, {"phase": "rolled_back", "sequence": record["oldSequence"], "needsRelease": True})
 
     def check(self, manifest_url, signature_url):
         manifest = _download(manifest_url, self.allow_http, 65536)
@@ -127,6 +175,11 @@ class Updater:
         if release["sequence"] <= installed:
             self._emit("up_to_date")
             return "up_to_date"
+        try:
+            if hasattr(self.host, "preflight_gateway"):
+                self.host.preflight_gateway(release["gatewayImage"])
+        except GatewayError as error:
+            raise UpdateError(str(error)) from None
         self._emit("downloading")
         bundle = _download(release["bundleUrl"], self.allow_http)
         if hashlib.sha256(bundle).hexdigest() != release["bundleSha256"]:
@@ -142,7 +195,12 @@ class Updater:
             shutil.rmtree(stage)
             raise
         self._emit("waiting_for_idle")
-        if not self.host.acquire_maintenance():
+        try:
+            acquired = self.host.acquire_maintenance()
+        except Exception:
+            shutil.rmtree(stage)
+            raise UpdateError("maintenance_unavailable") from None
+        if not acquired:
             shutil.rmtree(stage)
             return "busy"
         try:
@@ -171,31 +229,31 @@ class Updater:
             if not self.host.gateway_healthy():
                 raise UpdateError("gateway_unhealthy")
             self.host.record_sequence(release["sequence"])
-            _atomic_json(self.state, {"phase": "complete", "sequence": release["sequence"]})
+            _atomic_json(self.state, {"phase": "complete", "sequence": release["sequence"], "needsRelease": True})
             self._emit("completed")
             return "completed"
-        except Exception:
-            self._emit("rolling_back")
+        except Exception as failure:
+            reason = str(failure) if isinstance(failure, (GatewayError, UpdateError)) and str(failure) in {"gateway_image_permission", "gateway_operation_failed", "gateway_unhealthy", "server_unhealthy"} else "update_failed"
+            self._emit("rolling_back", reason)
             try:
-                self.host.stop_server()
-                if snapshot is not None:
-                    self.host.restore_data(snapshot)
-                self.host.activate_release(old_release)
-                self.host.activate_gateway(old_gateway)
-                self.host.record_sequence(installed)
-                self.host.start_server()
-                if not self.host.server_healthy() or not self.host.gateway_healthy():
-                    raise UpdateError("rollback_unhealthy")
-                _atomic_json(self.state, {"phase": "rolled_back", "sequence": installed})
+                self._rollback({"snapshot": snapshot, "oldRelease": old_release, "oldGateway": old_gateway, "oldSequence": installed})
             except Exception as error:
                 self._emit("recovery_required", "rollback_failed")
                 # Never reopen admission after an uncertain recovery.
                 raise UpdateError("rollback_failed") from error
             self._emit("rolled_back")
-            raise UpdateError("update_failed_rolled_back") from None
+            raise UpdateError(reason if reason != "update_failed" else "update_failed_rolled_back") from None
         finally:
-            if self.state.exists() and json.loads(self.state.read_text(encoding="utf-8")).get("phase") in {"complete", "rolled_back"}:
-                self.host.release_maintenance()
+            if self.state.exists():
+                record = json.loads(self.state.read_text(encoding="utf-8"))
+                if record.get("phase") in {"complete", "rolled_back"} and record.get("needsRelease") is True:
+                    try:
+                        self.host.release_maintenance()
+                    except Exception:
+                        self._emit("failed", "maintenance_release_failed")
+                        raise UpdateError("maintenance_release_failed") from None
+                    record["needsRelease"] = False
+                    _atomic_json(self.state, record)
 
     def recover(self):
         """Run before the host accepts requests after an interrupted update."""
@@ -203,27 +261,53 @@ class Updater:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if not self.state.exists():
                 return "no_recovery"
-            record = json.loads(self.state.read_text(encoding="utf-8"))
-            if record.get("phase") != "switching":
+            try:
+                record = json.loads(self.state.read_text(encoding="utf-8"))
+                if not isinstance(record, dict): raise ValueError("invalid_record")
+            except (OSError, ValueError):
+                try:
+                    self.host.start_server()
+                except Exception:
+                    self._emit("recovery_required", "server_start_failed")
+                finally:
+                    try: self.host.server_healthy()
+                    except Exception: pass
+                    self._emit("recovery_required", "recovery_record_invalid")
+                raise UpdateError("recovery_record_invalid") from None
+            phase = record.get("phase")
+            pending_release = phase in {"complete", "rolled_back"} and record.get("needsRelease") is True
+            if phase != "switching" and not pending_release:
                 return "no_recovery"
             acquire = getattr(self.host, "acquire_recovery_maintenance", self.host.acquire_maintenance)
-            if not acquire():
+            try:
+                acquired = acquire()
+            except Exception:
+                self._emit("recovery_required", "recovery_lease_unavailable")
+                raise UpdateError("recovery_lease_unavailable") from None
+            if not acquired:
                 raise UpdateError("busy")
+            if pending_release:
+                try:
+                    self.host.release_maintenance()
+                    record["needsRelease"] = False
+                    _atomic_json(self.state, record)
+                    return "released"
+                except Exception:
+                    self._emit("recovery_required", "maintenance_release_failed")
+                    raise UpdateError("maintenance_release_failed") from None
             try:
                 self._emit("rolling_back")
-                self.host.stop_server()
-                if record["snapshot"] is not None:
-                    self.host.restore_data(record["snapshot"])
-                self.host.activate_release(record["oldRelease"])
-                self.host.activate_gateway(record["oldGateway"])
-                self.host.record_sequence(record["oldSequence"])
-                self.host.start_server()
-                if not self.host.server_healthy() or not self.host.gateway_healthy():
-                    raise UpdateError("rollback_unhealthy")
-                _atomic_json(self.state, {"phase": "rolled_back", "sequence": record["oldSequence"]})
-                self._emit("rolled_back")
-                self.host.release_maintenance()
-                return "rolled_back"
+                self._rollback(record)
             except Exception as error:
                 self._emit("recovery_required", "rollback_failed")
                 raise UpdateError("rollback_failed") from error
+            self._emit("rolled_back")
+            try:
+                self.host.release_maintenance()
+                record = json.loads(self.state.read_text(encoding="utf-8"))
+                record["needsRelease"] = False
+                _atomic_json(self.state, record)
+                return "rolled_back"
+            except Exception:
+                self._emit("recovery_required", "maintenance_release_failed")
+                raise UpdateError("maintenance_release_failed") from None

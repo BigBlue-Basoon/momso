@@ -10,9 +10,10 @@ import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import update
+from cloud_run_gateway import GatewayError
 from update import Updater, UpdateError, _atomic_json
 
 
@@ -100,7 +101,7 @@ class UpdateTests(unittest.TestCase):
         self.assertTrue((output / 'web/index.html').is_file())
     def test_failure_restores_release_gateway_and_data(self):
         self.host.healthy = False
-        with self.assertRaisesRegex(UpdateError, "update_failed_rolled_back"): self.install()
+        with self.assertRaisesRegex(UpdateError, "server_unhealthy"): self.install()
         self.assertEqual((self.host.release, self.host.gateway, self.host.data, self.host.sequence), ("old", "old-gateway", "before", 1))
         self.assertFalse(self.host.lease)
     def test_bad_signature_or_bundle_never_switches(self):
@@ -113,13 +114,13 @@ class UpdateTests(unittest.TestCase):
     def test_screen_disconnect_does_not_stop_rollback(self):
         self.host.healthy = False
         self.host.progress = lambda _: (_ for _ in ()).throw(RuntimeError("screen disconnected"))
-        with self.assertRaisesRegex(UpdateError, "update_failed_rolled_back"): self.install()
+        with self.assertRaisesRegex(UpdateError, "server_unhealthy"): self.install()
         self.assertEqual((self.host.release, self.host.data), ("old", "before"))
         self.assertFalse(self.host.lease)
 
     def test_retry_after_rolled_back_release(self):
         self.host.healthy = False
-        with self.assertRaisesRegex(UpdateError, "update_failed_rolled_back"): self.install()
+        with self.assertRaisesRegex(UpdateError, "server_unhealthy"): self.install()
         self.host.healthy = True
         self.assertEqual(self.install(), "completed")
 
@@ -137,6 +138,75 @@ class UpdateTests(unittest.TestCase):
         _atomic_json(self.updater.state, {"phase":"switching", "oldRelease":"old", "oldGateway":"old-gateway", "snapshot":"snapshot-1", "oldSequence":1})
         self.assertEqual(self.updater.recover(), "rolled_back")
         self.assertEqual((self.host.release, self.host.data), ("old", "before")); self.assertFalse(self.host.lease)
+
+    def test_permission_failure_keeps_server_running_and_skips_unchanged_gateway(self):
+        starts = []
+        self.host.start_server = lambda: starts.append(self.host.release)
+        def deny(image):
+            if image == "old-gateway": raise AssertionError("unchanged gateway must not be rolled back")
+            raise GatewayError("gateway_image_permission")
+        self.host.activate_gateway = deny
+        with self.assertRaisesRegex(UpdateError, "gateway_image_permission"): self.install()
+        self.assertEqual(starts[-1], "old")
+        self.assertEqual(self.host.data, "before")
+        self.assertEqual(json.loads(self.updater.state.read_text())["phase"], "rolled_back")
+        self.assertEqual(self.host.events[-1], {"state": "failed", "reason": "gateway_image_permission"})
+
+    def test_failed_gateway_rollback_does_not_leave_server_stopped(self):
+        running = []
+        self.host.start_server = lambda: running.append(self.host.release)
+        def deny(image):
+            self.host.gateway = "changed"
+            raise GatewayError("gateway_operation_failed")
+        self.host.activate_gateway = deny
+        with self.assertRaisesRegex(UpdateError, "rollback_failed"): self.install()
+        self.assertEqual(running[-1], "old")
+        self.assertEqual(json.loads(self.updater.state.read_text())["phase"], "switching")
+
+    def test_recovery_of_switching_record_restarts_old_release_and_preserves_snapshot(self):
+        self.host.release = "old"; self.host.snapshot = "before"; self.host.data = "partial"
+        started = []
+        self.host.start_server = lambda: started.append(self.host.release)
+        _atomic_json(self.updater.state, {"phase":"switching", "oldRelease":"old", "oldGateway":"old-gateway", "snapshot":"snapshot-1", "newRelease":"new", "sequence":2, "oldSequence":1})
+        self.assertEqual(self.updater.recover(), "rolled_back")
+        self.assertEqual(started, ["old"])
+        self.assertEqual(self.host.snapshot, "before")
+        self.assertEqual(self.install(), "completed")
+
+    def test_preflight_permission_error_does_not_stop_server(self):
+        self.host.preflight_gateway = lambda _: (_ for _ in ()).throw(GatewayError("gateway_image_permission"))
+        self.host.stop_server = lambda: self.fail("server must remain running")
+        with self.assertRaisesRegex(UpdateError, "gateway_image_permission"): self.install()
+        self.assertFalse(self.host.lease)
+
+    def test_journal_reports_only_safe_codes(self):
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            self.updater._emit("failed", "gateway_image_permission")
+            self.updater._emit("failed", "private value /secret")
+        self.assertEqual(captured.getvalue(), "update stage=failed reason=gateway_image_permission\n")
+
+    def test_invalid_recovery_record_still_starts_and_checks_server(self):
+        self.updater.state.write_text('{broken')
+        self.host.start_server = Mock()
+        self.host.server_healthy = Mock(return_value=True)
+        with self.assertRaisesRegex(UpdateError, "recovery_record_invalid"): self.updater.recover()
+        self.host.start_server.assert_called_once_with()
+        self.host.server_healthy.assert_called_once_with()
+        self.assertEqual(self.updater.state.read_text(), '{broken')
+
+    def test_failed_release_is_retried_without_restoring_data_again(self):
+        self.host.healthy = False
+        self.host.release_maintenance = Mock(side_effect=RuntimeError("temporary"))
+        with self.assertRaisesRegex(UpdateError, "maintenance_release_failed"): self.install()
+        record = json.loads(self.updater.state.read_text())
+        self.assertEqual(record["phase"], "rolled_back")
+        self.assertTrue(record["needsRelease"])
+        self.host.data = "new local work"
+        self.host.release_maintenance = Mock()
+        self.assertEqual(self.updater.recover(), "released")
+        self.assertEqual(self.host.data, "new local work")
+        self.assertFalse(json.loads(self.updater.state.read_text())["needsRelease"])
 
 
 if __name__ == "__main__": unittest.main()

@@ -4,6 +4,8 @@ import fcntl
 import os
 import json
 import sys
+import tempfile
+import shutil
 from pathlib import Path
 
 import momso_anywhere_backup as backup
@@ -27,6 +29,10 @@ def main():
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     with os.fdopen(os.open(runtime / "lock", flags, 0o600), "a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        for stale in runtime.glob("snapshot-*"):
+            if stale.is_symlink() or not stale.is_dir():
+                raise ValueError("unsafe backup snapshot")
+            shutil.rmtree(stale)
         if args.action in ("check-purge", "record-purge"):
             request = json.load(sys.stdin)
             if not isinstance(request, dict) or set(request) != {"digest"}:
@@ -41,8 +47,14 @@ def main():
             credential_root = os.environ.get("CREDENTIALS_DIRECTORY")
             credential = Path(credential_root) / "momso-vault-identity" if credential_root else None
             identity = credential.read_bytes() if credential and credential.is_file() else None
-            result = backup.backup(data, store, keys, backup.DATABASE_AND_VAULT, temp_root=runtime,
-                                   vault_identity=identity, archive=data / "archive", quiescent=True)
+            with tempfile.TemporaryDirectory(prefix="snapshot-", dir=runtime) as directory:
+                staged = Path(directory)
+                private = backup.stage_live_snapshot(data, staged)
+                if os.environ.get("MOMSO_BACKUP_SNAPSHOT_SIGNAL") == "1":
+                    print("momso-backup-v3:snapshot-ready", flush=True)
+                result = backup.backup(staged, store, keys, backup.DATABASE_AND_VAULT, temp_root=runtime,
+                                       vault_identity=identity, archive=staged / "archive", quiescent=True,
+                                       memory_files=private)
         elif args.action == "restore-assets":
             backup.restore_assets(data, data / "archive", store, keys, json.load(sys.stdin))
             result = "assets-restored"

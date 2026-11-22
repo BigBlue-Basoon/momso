@@ -32,5 +32,19 @@ class CloudRunTests(unittest.TestCase):
         gateway = CloudRunGateway("fixture-project", "asia-northeast3", "fixture-gateway", runner=FakeCloudRun())
         with self.assertRaises(GatewayError): gateway.activate("registry.example/momso:latest")
 
+    def test_download_permission_is_reported_without_provider_text(self):
+        def denied(command, **kwargs):
+            return subprocess.CompletedProcess(command, 1, b"", b"secret fixture: artifactregistry.repositories.downloadArtifacts denied")
+        gateway = CloudRunGateway("fixture-project", "asia-northeast3", "fixture-gateway", runner=denied)
+        with self.assertRaisesRegex(GatewayError, "^gateway_image_permission$"):
+            gateway.preflight("registry.example/momso@sha256:" + "1" * 64)
+        with self.assertRaisesRegex(GatewayError, "^gateway_image_permission$"):
+            gateway.activate("registry.example/momso@sha256:" + "1" * 64)
+
+    def test_inconclusive_describe_does_not_block(self):
+        def denied(command, **kwargs): return subprocess.CompletedProcess(command, 1, b"", b"different permission")
+        gateway = CloudRunGateway("fixture-project", "asia-northeast3", "fixture-gateway", runner=denied)
+        self.assertFalse(gateway.preflight("registry.example/momso@sha256:" + "1" * 64))
+
 
 if __name__ == "__main__": unittest.main()
