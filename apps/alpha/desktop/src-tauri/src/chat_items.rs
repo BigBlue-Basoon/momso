@@ -18,27 +18,6 @@ const ENCODING_CACHE_LIMIT: usize = 32;
 type EncodingCache = HashMap<PathBuf, (u64, SystemTime, bool)>;
 static ENCODING_CACHE: OnceLock<Mutex<EncodingCache>> = OnceLock::new();
 
-fn is_utf8_stream(reader: &mut impl Read) -> std::io::Result<bool> {
-    let mut block = vec![0u8; TEXT_PAGE_BYTES as usize + 4];
-    let mut pending = 0;
-    loop {
-        let count = reader.read(&mut block[pending..])?;
-        if count == 0 {
-            return Ok(pending == 0);
-        }
-        let end = pending + count;
-        match std::str::from_utf8(&block[..end]) {
-            Ok(_) => pending = 0,
-            Err(error) if error.error_len().is_some() => return Ok(false),
-            Err(error) => {
-                let valid = error.valid_up_to();
-                pending = end - valid;
-                block.copy_within(valid..end, 0);
-            }
-        }
-    }
-}
-
 fn file_is_utf8(file: &mut fs::File, path: &Path) -> Result<bool, String> {
     let metadata = file.metadata().map_err(|_| "unavailable")?;
     let modified = metadata.modified().ok();
@@ -53,7 +32,7 @@ fn file_is_utf8(file: &mut fs::File, path: &Path) -> Result<bool, String> {
         }
     }
     file.seek(SeekFrom::Start(0)).map_err(|_| "unavailable")?;
-    let utf8 = is_utf8_stream(&mut *file).map_err(|_| "unavailable")?;
+    let utf8 = crate::text_encoding::is_utf8_stream(&mut *file).map_err(|_| "unavailable")?;
     let after = file.metadata().map_err(|_| "unavailable")?;
     if after.len() != metadata.len() || after.modified().ok() != modified {
         return Err("unavailable".into());
@@ -733,10 +712,10 @@ mod tests {
     fn utf8_detection_is_streamed_across_character_boundaries() {
         let mut bytes = vec![b'a'; TEXT_PAGE_BYTES as usize + 3];
         bytes.extend_from_slice("요가".as_bytes());
-        assert!(is_utf8_stream(&mut bytes.as_slice()).unwrap());
+        assert!(crate::text_encoding::is_utf8_stream(&mut bytes.as_slice()).unwrap());
         bytes.extend_from_slice(&[0xb0, 0xa1]);
-        assert!(!is_utf8_stream(&mut bytes.as_slice()).unwrap());
-        assert!(!is_utf8_stream(&mut &[0xe3, 0x81][..]).unwrap());
+        assert!(!crate::text_encoding::is_utf8_stream(&mut bytes.as_slice()).unwrap());
+        assert!(!crate::text_encoding::is_utf8_stream(&mut &[0xe3, 0x81][..]).unwrap());
     }
     #[cfg(windows)]
     #[test]

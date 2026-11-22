@@ -4,6 +4,22 @@
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
+    #[cfg(windows)]
+    if first
+        .as_ref()
+        .is_some_and(|arg| arg == "--momso-update-supervisor")
+    {
+        momso_desktop_lib::run_update_supervisor(args.collect());
+        return;
+    }
+    #[cfg(windows)]
+    if first
+        .as_ref()
+        .is_some_and(|arg| arg == "--momso-update-recover")
+    {
+        momso_desktop_lib::run_update_recovery();
+        return;
+    }
     #[cfg(all(windows, debug_assertions, feature = "g61-test-probe"))]
     if first
         .as_ref()

@@ -52,6 +52,7 @@ export function SearchDialog({
   onOpenChat,
   onOpenDocument,
   onOpenMedia,
+  onDownloadSource,
 }: {
   chats: ChatEntry[]
   groups: ChatGroup[] | null
@@ -61,7 +62,10 @@ export function SearchDialog({
   onOpenDocument: (id: string) => void
   /** 사진·소리·영상 원자료를 고르면 미디어 화면으로. */
   onOpenMedia?: () => void
+  /** 휴대폰 몸소(S75 둘째): 문서에 이어지지 않은 원자료를 고르면 내려받는다(미디어 화면이 없음). */
+  onDownloadSource?: (id: string, name: string) => void
 }) {
+  const tabs = TABS
   // 화면을 덮는 창이라 열려 있는 동안 패널 브라우저를 숨긴다.
   usePanelBrowserHold()
   const [query, setQuery] = useState('')
@@ -201,14 +205,18 @@ export function SearchDialog({
     window.setTimeout(onClose, 120)
   }
 
-  const canOpen = (item: Item) => item.kind !== 'source' || Boolean(item.documentId) || (item.media && Boolean(onOpenMedia))
+  const canOpen = (item: Item) => item.kind !== 'source' || Boolean(item.documentId) || (item.media && Boolean(onOpenMedia)) || Boolean(onDownloadSource)
   const choose = (item: Item | undefined) => {
     if (!item || !canOpen(item)) return
     close()
     window.setTimeout(() => {
       if (item.kind === 'chat') onOpenChat(item.id)
       else if (item.kind === 'document') onOpenDocument(item.id)
-      else if (item.kind === 'source') { if (item.documentId) onOpenDocument(item.documentId); else onOpenMedia?.() }
+      else if (item.kind === 'source') {
+        if (item.documentId) onOpenDocument(item.documentId)
+        else if (item.media && onOpenMedia) onOpenMedia()
+        else onDownloadSource?.(item.id, item.title)
+      }
       else item.run()
     }, 130)
   }
@@ -226,9 +234,9 @@ export function SearchDialog({
     if (event.key === 'Enter') { event.preventDefault(); choose(flat[active]) }
     if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && !event.altKey && !event.shiftKey) {
       event.preventDefault()
-      const at = TABS.findIndex((item) => item.id === tab)
-      const next = (at + (event.key === 'ArrowRight' ? 1 : -1) + TABS.length) % TABS.length
-      setTab(TABS[next].id)
+      const at = tabs.findIndex((item) => item.id === tab)
+      const next = (at + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length
+      setTab(tabs[next].id)
     }
   }
 
@@ -243,7 +251,7 @@ export function SearchDialog({
           </button>
         </header>
         <div className="search-tabs" role="tablist" aria-label={W.searchDialog.aria2}>
-          {TABS.map((item) => (
+          {tabs.map((item) => (
             <button key={item.id} type="button" role="tab" aria-selected={tab === item.id} className="search-tab" onClick={() => { setTab(item.id); input.current?.focus() }}>
               {item.label}
             </button>

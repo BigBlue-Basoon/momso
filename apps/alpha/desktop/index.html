@@ -2,9 +2,18 @@
 <html lang="ko">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover: 휴대폰 홈 화면 앱이 노치·홈 막대 자리까지 쓰고 안전 영역은 CSS(env)로 비운다. interactive-widget: 안드로이드 크롬에서 키보드가 올라오면 화면 크기를 줄인다. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#f7f8f5" />
     <link rel="icon" type="image/png" href="/brand/agar.png" />
+    <!-- 휴대폰 홈 화면에 추가(2026-11-21, 몸소 휴대폰 화면). 아이콘은 브랜드 정본(docs/brand: bahiranga 코랄 타일)의 빌드 산출물 그대로.
+         매니페스트는 앞단 로그인 문(쿠키) 뒤에 있으므로 쿠키와 함께 받는다(crossorigin=use-credentials). -->
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
+    <link rel="apple-touch-icon" href="/app-icons/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="momso" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <title>momso</title>
   </head>
   <body>

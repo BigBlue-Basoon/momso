@@ -561,6 +561,31 @@ pub(crate) async fn request(
     query: &[(&str, &str)],
     body: Vec<u8>,
 ) -> Result<reqwest::Response, &'static str> {
+    request_inner(config, keys, method, object, query, body, false).await
+}
+
+pub(crate) async fn overwrite_class_student_slot(
+    config: &Config,
+    keys: &Keys,
+    slot: u8,
+    body: Vec<u8>,
+) -> Result<reqwest::Response, &'static str> {
+    if slot >= 7 {
+        return Err("invalid_remote_object");
+    }
+    let key = format!("{PREFIX}/class-student/slot-{slot}.age");
+    request_inner(config, keys, reqwest::Method::PUT, &key, &[], body, true).await
+}
+
+async fn request_inner(
+    config: &Config,
+    keys: &Keys,
+    method: reqwest::Method,
+    object: &str,
+    query: &[(&str, &str)],
+    body: Vec<u8>,
+    overwrite: bool,
+) -> Result<reqwest::Response, &'static str> {
     if crate::r2_oauth::uses_oauth(config) {
         return crate::r2_oauth::request(config, keys, method, object, query, body).await;
     }
@@ -598,7 +623,7 @@ pub(crate) async fn request(
             .header("x-amz-date", signed.date)
             .header("x-amz-content-sha256", signed.payload_hash)
     };
-    if is_put && config.write_safety == Some(WriteSafety::Conditional) {
+    if is_put && !overwrite && config.write_safety == Some(WriteSafety::Conditional) {
         builder = if config.provider == "gcp" {
             builder.header("x-goog-if-generation-match", "0")
         } else {

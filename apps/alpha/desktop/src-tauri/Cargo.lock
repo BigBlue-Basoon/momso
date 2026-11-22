@@ -963,6 +963,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
+name = "crx3"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d46f98e7ee615f50255c4d9bbb651b194e5ac784f8197d13f2922ea54ce73bad"
+dependencies = [
+ "aws-lc-rs",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "crypto-bigint"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3055,10 +3065,12 @@ dependencies = [
  "age",
  "base64 0.22.1",
  "chrono",
+ "crx3",
  "flate2",
  "hmac",
  "keyring",
  "log",
+ "momso-update-recovery",
  "quick-xml",
  "regex",
  "reqwest",
@@ -3089,6 +3101,17 @@ dependencies = [
  "windows-core 0.61.2",
  "windows-sys 0.61.2",
  "zip",
+]
+
+[[package]]
+name = "momso-update-recovery"
+version = "0.1.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

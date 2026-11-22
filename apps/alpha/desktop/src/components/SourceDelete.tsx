@@ -105,6 +105,22 @@ export function SourceDeleteDialog({ assetId, name, onClose, onNotice, onChanged
       />
     )
   }
+  // 휴대폰 몸소: server 가 사용처를 알려 주지 않고 완전히 삭제도 없다. 사용처 줄 없이 되돌릴 수 있다는 말과 [취소] [삭제]만(S75 셋째).
+  if (preview && !preview.usesKnown) {
+    return (
+      <QuestionDialog
+        key="ask"
+        title={W.sourceDelete.title(name)}
+        text={W.sourceDelete.trashText}
+        working={working}
+        actions={[
+          { label: W.signIn.cancel, onSelect: onClose, autoFocus: true },
+          { label: W.sourceDelete.trash, primary: true, onSelect: () => void run('trash') },
+        ]}
+        onDismiss={onClose}
+      />
+    )
+  }
   const parts = [
     uses.documents.length > 0 && W.sourceDelete.documents(uses.documents.length),
     uses.receipts > 0 && W.sourceDelete.receipts(uses.receipts),

@@ -94,9 +94,16 @@ fn check_failed(version: &str, reason: &'static str) -> UpdateInfo {
 }
 fn configured(key: &str, endpoint: &str) -> bool {
     !key.trim().is_empty()
-        && endpoint
-            .parse::<reqwest::Url>()
-            .is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some())
+        && endpoint.parse::<reqwest::Url>().is_ok_and(|u| {
+            if u.scheme() == "https" && u.host_str().is_some() {
+                return true;
+            }
+            #[cfg(feature = "g61-test-probe")]
+            if std::env::var_os("MOMSO_TEST_LOCAL_UPDATER").is_some() {
+                return u.scheme() == "http" && u.host_str() == Some("127.0.0.1");
+            }
+            false
+        })
 }
 fn settings(app: &tauri::AppHandle) -> Option<(String, String)> {
     let config = app.config().plugins.0.get("updater")?;
@@ -289,6 +296,22 @@ pub(crate) async fn update_install(
         }
     }
 }
+async fn lock_idle_turns(
+    active: &crate::chat_codex::Active,
+) -> Option<
+    tokio::sync::MutexGuard<
+        '_,
+        std::collections::HashMap<String, tokio_util::sync::CancellationToken>,
+    >,
+> {
+    let guard = active.lock().await;
+    if guard.is_empty() {
+        Some(guard)
+    } else {
+        None
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn update_restart(
     app: tauri::AppHandle,
@@ -305,6 +328,14 @@ pub(crate) async fn update_restart(
             reason: Some("configuration_unavailable"),
         });
     }
+    // Hold the same lock used to start a turn until the installer is launched.
+    // This makes the idle check and installation one uninterrupted operation.
+    let Some(active_turns) = lock_idle_turns(&workspace.chat_active).await else {
+        return Ok(Stage {
+            state: "busy",
+            reason: Some("active_turn"),
+        });
+    };
     let (update, bytes) = {
         let mut inner = state.0.lock().await;
         if inner.busy {
@@ -331,18 +362,47 @@ pub(crate) async fn update_restart(
     let lease = workspace.paths.archive.current.clone().read_owned().await;
     let database = workspace.paths.database_path.clone();
     let backups = workspace.paths.backups_path.clone();
-    // On Windows, Tauri exits the application when the signed installer is launched.
+    #[cfg(windows)]
+    let protected = vec![
+        workspace.paths.data_root.clone(),
+        workspace.paths.logs_path.clone(),
+        (*lease).clone(),
+    ];
+    #[cfg(windows)]
+    let result = {
+        // `bytes` came only from Tauri's signature-verifying download above.
+        let _ = update;
+        let app_for_exit = app.clone();
+        let mode = app
+            .config()
+            .plugins
+            .0
+            .get("updater")
+            .and_then(|value| value.get("windows"))
+            .and_then(|value| value.get("installMode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("passive")
+            .to_owned();
+        tauri::async_runtime::spawn_blocking(move || {
+            let _lease = lease;
+            install_after_backup(&database, &backups, || {
+                crate::update_supervisor::launch(&backups, &protected, &bytes, &mode)
+                    .map_err(|_| ())?;
+                app_for_exit.cleanup_before_exit();
+                std::process::exit(0)
+            })
+        })
+        .await
+    };
+    #[cfg(not(windows))]
     let result = tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
         install_after_backup(&database, &backups, || {
-            log::info!(
-                "lifecycle update_installer_starting pid={}",
-                std::process::id()
-            );
             update.install(bytes).map_err(|_| ())
         })
     })
     .await;
+    drop(active_turns);
     state.0.lock().await.busy = false;
     match result {
         Ok(Ok(())) => {
@@ -368,6 +428,65 @@ pub(crate) async fn update_restart(
             Ok(stage)
         }
     }
+}
+
+/// Only compiled into the isolated updater fixture, never into release builds.
+#[cfg(feature = "g61-test-probe")]
+pub(crate) fn start_local_fixture(app: tauri::AppHandle) {
+    let Some(path) = std::env::var_os("MOMSO_TEST_LOCAL_UPDATER_FILE") else {
+        return;
+    };
+    if std::env::var_os("MOMSO_TEST_LOCAL_UPDATER").is_none() {
+        return;
+    }
+    let path = std::path::PathBuf::from(path);
+    tauri::async_runtime::spawn(async move {
+        if let Some(snapshot) = std::env::var_os("MOMSO_UPDATE_SNAPSHOT") {
+            let snapshot = std::path::PathBuf::from(snapshot);
+            for _ in 0..180 {
+                if !snapshot.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            if snapshot.exists() {
+                let _ = std::fs::write(&path, "cleanup_failed");
+                app.exit(1);
+                return;
+            }
+        }
+        if std::env::var_os("MOMSO_UPDATE_RESTORED").is_some() {
+            let _ = std::fs::write(&path, "restored:0.1.1");
+            app.exit(0);
+            return;
+        }
+        if app.package_info().version.to_string() == "0.1.2" {
+            let _ = std::fs::write(&path, "restarted:0.1.2");
+            app.exit(0);
+            return;
+        }
+        let check = update_check(app.clone()).await;
+        if !matches!(check, Ok(ref value) if value.state == "available") {
+            let _ = std::fs::write(&path, "check_failed");
+            return;
+        }
+        let download = update_install(app.clone(), app.state::<UpdateState>()).await;
+        if !matches!(download, Ok(ref value) if value.state == "downloaded") {
+            let _ = std::fs::write(&path, "download_failed");
+            return;
+        }
+        let _ = std::fs::write(&path, "installing");
+        let result = update_restart(
+            app.clone(),
+            app.state::<UpdateState>(),
+            app.state::<crate::AppState>(),
+        )
+        .await;
+        let _ = std::fs::write(
+            &path,
+            format!("install_failed:{:?}", result.map(|value| value.state)),
+        );
+    });
 }
 
 fn install_after_backup(
@@ -397,6 +516,27 @@ mod tests {
         }
         Ok(())
     }
+    #[tokio::test]
+    async fn update_waits_for_active_turn_and_prevents_new_turns() {
+        let active = crate::chat_codex::Active::default();
+        active
+            .lock()
+            .await
+            .insert("fixture".into(), tokio_util::sync::CancellationToken::new());
+        assert!(lock_idle_turns(&active).await.is_none());
+        active.lock().await.clear();
+        let guard = lock_idle_turns(&active).await.expect("idle");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), active.lock())
+                .await
+                .is_err()
+        );
+        drop(guard);
+        assert!(tokio::time::timeout(Duration::from_secs(1), active.lock())
+            .await
+            .is_ok());
+    }
+
     #[test]
     fn fixture_waits_for_split_request_headers() {
         use std::io::Write;

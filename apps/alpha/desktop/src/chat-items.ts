@@ -7,8 +7,7 @@
 //   evidence: 'tool'(도구가 성공을 알림) | 'diff'(파일 전후 비교로 확인) | null(옛 기록). 값만 받고 화면에는 보이지 않는다(보일지는 그가 정하지 않음).
 //   null 인 칸은 화면이 비워 둔다(짐작해 채우지 않는다. by 가 null 이면 누가 했다고 적지 않는다).
 //   이벤트 chat-items-updated { chatId }: 첨부, 채팅방 번호가 든 작업 내역, AI 답 완료 때.
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import type { AiProvider } from './ai-models'
 import type { MediaItem } from './media'
 import { applySourceAssetImport, isDesktopRuntime, planSourceAssetImport, type SourceAssetImportProposal } from './runtime'

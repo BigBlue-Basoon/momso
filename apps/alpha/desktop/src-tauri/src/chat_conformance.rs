@@ -19,9 +19,18 @@ $null = [Console]::ReadLine()
 $null = [Console]::ReadLine()
 '{"id":2,"result":{"thread":{"id":"fixture-thread"},"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"},"model":"fixture-model","reasoningEffort":"low"}}'
 $turn = [Console]::ReadLine() | ConvertFrom-Json
-if ($turn.params.PSObject.Properties.Name -contains 'effort') { exit 25 }
+if ($env:SCENE -ne 'complete' -and $turn.params.PSObject.Properties.Name -contains 'effort') { exit 25 }
 if ($turn.params.input[0].text.Contains('C15_PRIVATE_DICTIONARY_MARKER')) { exit 25 }
 if (-not $turn.params.input[0].text.Contains('history-marker') -or -not $turn.params.input[0].text.Contains('attachment-marker.txt')) { exit 21 }
+if ($env:SCENE -eq 'complete') {
+  if ($turn.params.model -ne 'fixture-model' -or $turn.params.effort -ne 'high' -or $turn.params.serviceTierForTurn -ne 'fast') { exit 32 }
+  foreach ($name in @('attachment-image.png','attachment-file.pdf')) { if (-not $turn.params.input[0].text.Contains($name)) { exit 29 } }
+  foreach ($path in @($env:MOMSO_COMPARE_PDF,$env:MOMSO_COMPARE_IMAGE)) { if (-not $turn.params.input[0].text.Contains((Split-Path -Leaf $path))) { exit 34 } }
+  if (-not $turn.params.input[0].text.Contains((Split-Path -Leaf $env:MOMSO_COMPARE_TEXT)) -or [IO.File]::ReadAllText($env:MOMSO_COMPARE_TEXT) -ne 'fake file') { exit 35 }
+  $image = @($turn.params.input | Where-Object { $_.type -eq 'localImage' })
+  if ($image.Count -ne 1 -or [IO.File]::ReadAllBytes($image[0].path)[0] -ne 137) { exit 31 }
+  if ([IO.File]::ReadAllBytes($env:MOMSO_COMPARE_PDF)[0] -ne 37 -or [IO.File]::ReadAllBytes($env:MOMSO_COMPARE_IMAGE)[0] -ne 137) { exit 30 }
+}
 if (-not $turn.params.input[0].text.Contains('momso_skill_read') -or -not $turn.params.input[0].text.Contains('sample')) { exit 22 }
 if ($env:SCENE -eq 'complete') { & $env:MOMSO_COMPARE_EXE --exact chat_conformance::document_bridge_helper --nocapture | Out-Null; if ($LASTEXITCODE -ne 0) { exit 27 } }
 '{"method":"thread/tokenUsage/updated","params":{"threadId":"fixture-thread","tokenUsage":{"last":{"totalTokens":12},"modelContextWindow":1000}}}'
@@ -58,9 +67,18 @@ const CLAUDE: &str = r#"
 $null = [Console]::ReadLine()
 '{"type":"control_response","response":{"request_id":"momso-init","subtype":"success"}}'
 $turn = [Console]::ReadLine() | ConvertFrom-Json
-if ($turn.message.content.Contains('C15_PRIVATE_DICTIONARY_MARKER')) { exit 25 }
-if (-not $turn.message.content.Contains('history-marker') -or -not $turn.message.content.Contains('attachment-marker.txt')) { exit 21 }
-if (-not $turn.message.content.StartsWith('/sample ')) { exit 22 }
+$text = if ($turn.message.content -is [array]) { $turn.message.content[0].text } else { $turn.message.content }
+if ($text.Contains('C15_PRIVATE_DICTIONARY_MARKER')) { exit 25 }
+if (-not $text.Contains('history-marker') -or -not $text.Contains('attachment-marker.txt')) { exit 21 }
+if ($env:SCENE -eq 'complete') {
+  foreach ($name in @('attachment-image.png','attachment-file.pdf')) { if (-not $text.Contains($name)) { exit 29 } }
+  foreach ($path in @($env:MOMSO_COMPARE_PDF,$env:MOMSO_COMPARE_IMAGE)) { if (-not $text.Contains((Split-Path -Leaf $path))) { exit 34 } }
+  $images = @($turn.message.content | Where-Object { $_.type -eq 'image' -and $_.source.media_type -eq 'image/png' })
+  if ($images.Count -ne 1 -or $images[0].source.data -ne [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:MOMSO_COMPARE_IMAGE))) { exit 31 }
+  if (-not (($turn.message.content | ConvertTo-Json -Depth 12 -Compress).Contains('fake file'))) { exit 35 }
+  if ([IO.File]::ReadAllBytes($env:MOMSO_COMPARE_PDF)[0] -ne 37 -or [IO.File]::ReadAllBytes($env:MOMSO_COMPARE_IMAGE)[0] -ne 137) { exit 30 }
+}
+if (-not $text.StartsWith('/sample ')) { exit 22 }
 if ($env:SCENE -eq 'complete') { & $env:MOMSO_COMPARE_EXE --exact chat_conformance::document_bridge_helper --nocapture | Out-Null; if ($LASTEXITCODE -ne 0) { exit 27 } }
 '{"type":"system","subtype":"init","session_id":"fixture-session"}'
 '{"type":"assistant","message":{"model":"fixture-model","content":[]}}'
@@ -106,7 +124,7 @@ const GEMINI: &str = r#"
 while ($line = [Console]::ReadLine()) {
   $v = $line | ConvertFrom-Json
   switch ($v.method) {
-    'initialize' { '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}' }
+    'initialize' { '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"promptCapabilities":{"image":true,"embeddedContext":true},"sessionCapabilities":{"resume":{}}}}}' }
     'authenticate' { '{"jsonrpc":"2.0","id":2,"result":{}}' }
     'session/new' { '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"fixture-session","configOptions":[{"id":"mode","currentValue":"default"},{"id":"model","currentValue":"fixture-model"}]}}' }
     'session/set_config_option' { if ($v.params.configId -eq 'thought_level') { exit 25 }; exit 26 }
@@ -115,6 +133,15 @@ while ($line = [Console]::ReadLine()) {
       if (-not $v.params.prompt[0].text.Contains('history-marker') -or -not $v.params.prompt[0].text.Contains('attachment-marker.txt')) { exit 21 }
       if (-not $v.params.prompt[0].text.StartsWith('/sample ')) { exit 22 }
       if (-not (($v.params.prompt | ConvertTo-Json -Depth 10 -Compress).Contains('fake file'))) { exit 28 }
+      if ($env:SCENE -eq 'complete') {
+        $pdf = @($v.params.prompt | Where-Object { $_.type -eq 'resource' -and $_.resource.mimeType -eq 'application/pdf' })
+        $image = @($v.params.prompt | Where-Object { $_.type -eq 'image' -and $_.mimeType -eq 'image/png' })
+        if ($pdf.Count -ne 1 -or $image.Count -ne 1) { exit 29 }
+        if ($pdf[0].resource.blob -ne [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:MOMSO_COMPARE_PDF)) -or $image[0].data -ne [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:MOMSO_COMPARE_IMAGE))) { exit 30 }
+        $body = @{contents=@(@{parts=@(@{inlineData=@{mimeType='application/pdf';data=$pdf[0].resource.blob}},@{inlineData=@{mimeType='image/png';data=$image[0].data}},@{text='fake file'})})} | ConvertTo-Json -Depth 15 -Compress
+        $reply = Invoke-RestMethod -Method Post -Uri ($env:GOOGLE_GEMINI_BASE_URL + '/v1beta/models/fixture:generateContent') -Headers @{'x-goog-api-key'=$env:GEMINI_API_KEY} -ContentType 'application/json' -Body $body
+        if ($reply.fixture -ne 'ok') { exit 33 }
+      }
       if ($env:SCENE -eq 'complete') { & $env:MOMSO_COMPARE_EXE --exact chat_conformance::document_bridge_helper --nocapture | Out-Null; if ($LASTEXITCODE -ne 0) { exit 27 } }
       '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}'
       if ($env:SCENE -eq 'stop') {
@@ -197,6 +224,32 @@ async fn three_providers_compare_document_attachment_approval_stop_and_authentic
     std::fs::write(object_dir.join(&hash), "fake file").unwrap();
     let connection = rusqlite::Connection::open(&db).unwrap();
     connection.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,media_type,captured_by,created_at) VALUES('fixture','other',?1,9,?2,'attachment-marker.txt','text/plain','test','test')", rusqlite::params![hash,format!("sha256/{}/{hash}", &hash[..2])]).unwrap();
+    let mut extras = Vec::new();
+    for (id, name, media, bytes) in [
+        (
+            "fixture-image",
+            "attachment-image.png",
+            "image/png",
+            include_bytes!("../tests/fixtures/s67-sample.png").as_slice(),
+        ),
+        (
+            "fixture-pdf",
+            "attachment-file.pdf",
+            "application/pdf",
+            include_bytes!("../tests/fixtures/s67-sample.pdf").as_slice(),
+        ),
+    ] {
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let path = dir
+            .path()
+            .join("objects/sha256")
+            .join(&digest[..2])
+            .join(&digest);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        connection.execute("INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,media_type,captured_by,created_at) VALUES(?1,'other',?2,?3,?4,?5,?6,'test','test')", rusqlite::params![id,digest,bytes.len() as i64,format!("sha256/{}/{digest}", &digest[..2]),name,media]).unwrap();
+        extras.push((id, path));
+    }
     drop(connection);
     let mut outcomes = Vec::new();
     for (index, (provider, script)) in [("codex", CODEX), ("claude", CLAUDE), ("gemini", GEMINI)]
@@ -256,6 +309,9 @@ async fn three_providers_compare_document_attachment_approval_stop_and_authentic
                 crate::chat_handoff::prepare(&db, &id, provider, false, "question").unwrap();
             assert_eq!(handoff.not_handed_over, 0);
             rusqlite::Connection::open(&db).unwrap().execute("INSERT INTO chat_attachments(receipt_id,chat_id,asset_id) VALUES (?1,?2,'fixture')", rusqlite::params![format!("receipt-{id}"),id]).unwrap();
+            for (asset, _) in &extras {
+                rusqlite::Connection::open(&db).unwrap().execute("INSERT INTO chat_attachments(receipt_id,chat_id,asset_id) VALUES (?1,?2,?3)", rusqlite::params![format!("receipt-{id}-{asset}"),id,asset]).unwrap();
+            }
             let user = chat::append_for_send(&db, &id, "question", Some("sample".into())).unwrap();
             let attachments =
                 chat::message_attachment_paths(&db, dir.path(), &id, &user.id).unwrap();
@@ -278,7 +334,73 @@ async fn three_providers_compare_document_attachment_approval_stop_and_authentic
             let mut fake = command(&script_path, scene);
             fake.current_dir(dir.path())
                 .env("ZET_EDIT", &edit_id)
-                .env("ZET_CREATE", &create_id);
+                .env("ZET_CREATE", &create_id)
+                .env("MOMSO_COMPARE_TEXT", object_dir.join(&hash))
+                .env("MOMSO_COMPARE_IMAGE", &extras[0].1)
+                .env("MOMSO_COMPARE_PDF", &extras[1].1);
+            let fake_api = if provider == "gemini" && scene == "complete" {
+                use std::io::{Read, Write};
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                fake.env(
+                    "GOOGLE_GEMINI_BASE_URL",
+                    format!("http://{}", listener.local_addr().unwrap()),
+                );
+                Some(std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+                    let (mut socket, _) = loop {
+                        match listener.accept() {
+                            Ok(value) => break value,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && std::time::Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(20))
+                            }
+                            Err(error) => panic!("fake API did not receive request: {error}"),
+                        }
+                    };
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    loop {
+                        let n = socket.read(&mut buffer).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = request.windows(4).position(|v| v == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    assert!(request
+                        .to_ascii_lowercase()
+                        .contains("x-goog-api-key: fake-test-only"));
+                    assert!(
+                        request.contains("application/pdf")
+                            && request.contains("image/png")
+                            && request.contains("fake file")
+                    );
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"fixture\":\"ok\"}").unwrap();
+                }))
+            } else {
+                None
+            };
             let root = dir.path().to_path_buf();
             let bridge_db = db.clone();
             let handler: crate::setup_bridge::Handler = Arc::new(move |input| {
@@ -339,10 +461,11 @@ async fn three_providers_compare_document_attachment_approval_stop_and_authentic
                             dir.path(),
                             &id,
                             &prompt,
-                            None,
-                            None,
+                            &chat_codex::verified_image_paths(dir.path(), &attachments).unwrap(),
+                            (scene == "complete").then_some("fixture-model"),
+                            (scene == "complete").then_some("high"),
                             Some("sample"),
-                            if scene == "reported" {
+                            if matches!(scene, "reported" | "complete") {
                                 Some(true)
                             } else {
                                 None
@@ -365,6 +488,7 @@ async fn three_providers_compare_document_attachment_approval_stop_and_authentic
                             dir.path(),
                             &id,
                             &prompt,
+                            &chat_claude::input_blocks(dir.path(), &attachments).unwrap(),
                             None,
                             None,
                             false,
@@ -398,10 +522,13 @@ async fn three_providers_compare_document_attachment_approval_stop_and_authentic
                     }
                 }
             };
+            if let Some(server) = fake_api {
+                server.join().unwrap();
+            }
             let stream = events
                 .iter()
                 .find(|(name, _)| name == "chat-stream")
-                .unwrap();
+                .unwrap_or_else(|| panic!("fake provider={provider} scene={scene} result={result:?} events={events:?}"));
             assert_eq!(stream.1["chatId"], id);
             assert_eq!(stream.1["delta"], "hello");
             assert!(!events.iter().any(|(name, _)| name == "chat-delta"));

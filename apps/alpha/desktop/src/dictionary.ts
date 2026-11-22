@@ -12,9 +12,8 @@
 //   2026-11-17: 각 용어의 userKind 는 'modified'(기본을 고침) | 'added'(내가 새로 더함) | null(기본 그대로). origin 만으로 "내가 더함"을 적지 않는다.
 //   canDelete 가 참이면 yoga_term_delete({ id, expectedRevision }) → 'deleted' | 'base_term'(기본 용어는 지울 수 없고 끄기만 된다).
 //   yoga_term_edit 의 input.category 는 새 용어의 갈래(고르지 않으면 뒤쪽이 '사용자').
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
-import { isDesktopRuntime } from './runtime'
+import { invoke, listen } from './host'
+import { hasAppBackend, isDesktopRuntime } from './runtime'
 
 export type DictionaryVariant = { text: string; origin?: string; label?: string; recognitionOnly?: boolean }
 export type DictionaryTerm = {
@@ -41,8 +40,9 @@ export type DictionaryList = {
   peopleRevision: string
 }
 
+// 데스크톱 또는 휴대폰 몸소(S75 server 의 /dictionary). 바뀜 알림(yoga-dictionary-updated)은 데스크톱에만 있다.
 function need() {
-  if (!isDesktopRuntime()) throw new Error('yoga dictionary needs the desktop runtime')
+  if (!hasAppBackend()) throw new Error('yoga dictionary needs the desktop runtime')
 }
 
 export async function listYogaTerms(): Promise<DictionaryList> {

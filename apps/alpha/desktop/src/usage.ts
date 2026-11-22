@@ -1,7 +1,6 @@
 // AI 세 곳의 남은 사용량을 부르는 얇은 층. 모양은 본부가 전한 계약을 따른다(usage_status, usage-updated 이벤트).
 // 백엔드가 들어오면 momso-public-prep/archive-backend-port-notes.md 의 사용량 절과 견준다.
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { isDesktopRuntime } from './runtime'
 import { W } from './words'
 

@@ -56,6 +56,8 @@ const ANSWER_STYLE: 'a' | 'b' = (() => {
 type AssistantPanelProps = {
   /** 대화 칸 맨 위 줄의 오른쪽 끝에 놓는 단추. */
   headerActions?: ReactNode
+  /** 대화 칸 맨 위 줄의 왼쪽 끝에 놓는 단추(네트워크 길의 휴대폰 너비에서 채팅방 목록 열기). */
+  headerStart?: ReactNode
   /** 지금 대화의 이름. 아직 없으면 빈 글자. */
   title: string
   /** 이름을 바꿀 수 있는지. 새 대화를 쓰는 중(아직 저장 전)이면 바꿀 수 없다. */
@@ -102,6 +104,7 @@ type AssistantPanelProps = {
  */
 export function AssistantPanel({
   headerActions,
+  headerStart,
   title,
   canRename,
   messages,
@@ -228,6 +231,7 @@ export function AssistantPanel({
   return (
     <section ref={panelRef} className="assistant-panel" aria-label={W.assistantPanel.aria1} data-answer-style={ANSWER_STYLE}>
       <header className="assistant-header">
+        {headerStart}
         <ChatTitle key={shownTitle} title={shownTitle} canRename={canRename} onRename={onRename} />
         {browserOpen && (
           <span className="assistant-browser" role="status">

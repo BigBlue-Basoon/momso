@@ -91,15 +91,9 @@ pub(crate) fn update(
     model: Option<&str>,
     params: &Value,
 ) -> Result<Option<Context>, String> {
-    let used = params
-        .pointer("/tokenUsage/last/totalTokens")
-        .and_then(Value::as_i64)
-        .filter(|v| *v >= 0);
-    let limit = params
-        .pointer("/tokenUsage/modelContextWindow")
-        .and_then(Value::as_i64)
-        .filter(|v| *v > 0);
-    let Some(used) = used else { return Ok(None) };
+    let Some((used, limit)) = crate::context_shared::codex_last_usage(params) else {
+        return Ok(None);
+    };
     update_measurement(path, chat_id, "codex", model, used, limit)
 }
 pub(crate) fn update_measurement(

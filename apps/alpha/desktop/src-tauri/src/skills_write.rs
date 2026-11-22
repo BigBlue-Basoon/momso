@@ -215,7 +215,10 @@ fn git_predicate(tool: &Path, root: &Path, args: &[&str]) -> Result<bool, &'stat
         .args(args)
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "NUL")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -370,6 +373,28 @@ fn transact(
     } else {
         None
     };
+    // Removing a never-tracked provider copy has no Git change to stage. This
+    // occurs when a user disables a bundled skill before the first commit.
+    if let Some(tool) = &tool {
+        let mut tracked_paths = Vec::new();
+        for path in paths {
+            let removing = changes
+                .iter()
+                .any(|change| change.path == root.join(&path) && change.after.is_none());
+            if removing
+                && git(tool, root, &["ls-files", "--", &path])?
+                    .trim()
+                    .is_empty()
+            {
+                continue;
+            }
+            tracked_paths.push(path);
+        }
+        paths = tracked_paths;
+        if paths.is_empty() {
+            return apply(&changes);
+        }
+    }
     let index = if let Some(tool) = &tool {
         let mut entries = Vec::new();
         for path in &paths {
@@ -667,7 +692,7 @@ fn install_builtin_locked(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "standalone")))]
 pub(crate) fn disable_for_test(root: &Path, name: &str) -> Result<(), &'static str> {
     mutate(root, root, name, Operation::Enable(false))
 }
@@ -1046,6 +1071,7 @@ enum Operation {
     Remove,
 }
 
+#[cfg(not(feature = "standalone"))]
 async fn command(
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
@@ -1065,6 +1091,7 @@ async fn command(
     Ok(serde_json::json!({"status":"ok"}))
 }
 
+#[cfg(not(feature = "standalone"))]
 #[tauri::command]
 pub(crate) async fn skill_create(
     app: tauri::AppHandle,
@@ -1087,6 +1114,7 @@ pub(crate) async fn skill_create(
     .await
 }
 
+#[cfg(not(feature = "standalone"))]
 #[tauri::command]
 pub(crate) async fn skill_update(
     app: tauri::AppHandle,
@@ -1107,6 +1135,7 @@ pub(crate) async fn skill_update(
     .await
 }
 
+#[cfg(not(feature = "standalone"))]
 #[tauri::command]
 pub(crate) async fn skill_set_enabled(
     app: tauri::AppHandle,
@@ -1117,6 +1146,7 @@ pub(crate) async fn skill_set_enabled(
     command(app, state, name, Operation::Enable(enabled)).await
 }
 
+#[cfg(not(feature = "standalone"))]
 #[tauri::command]
 pub(crate) async fn skill_remove(
     app: tauri::AppHandle,
@@ -1126,7 +1156,55 @@ pub(crate) async fn skill_remove(
     command(app, state, name, Operation::Remove).await
 }
 
-#[cfg(test)]
+#[cfg(feature = "standalone")]
+pub(crate) fn core_create(
+    root: &Path,
+    name: &str,
+    title: String,
+    description: String,
+    body: String,
+) -> Result<(), &'static str> {
+    mutate(
+        root,
+        root,
+        name,
+        Operation::Create {
+            title,
+            description,
+            body,
+        },
+    )
+}
+
+#[cfg(feature = "standalone")]
+pub(crate) fn core_update(
+    root: &Path,
+    name: &str,
+    changes: SkillChanges,
+    expected_hash: String,
+) -> Result<(), &'static str> {
+    mutate(
+        root,
+        root,
+        name,
+        Operation::Update {
+            changes,
+            expected_hash,
+        },
+    )
+}
+
+#[cfg(feature = "standalone")]
+pub(crate) fn core_set_enabled(root: &Path, name: &str, enabled: bool) -> Result<(), &'static str> {
+    mutate(root, root, name, Operation::Enable(enabled))
+}
+
+#[cfg(feature = "standalone")]
+pub(crate) fn core_remove(root: &Path, name: &str) -> Result<(), &'static str> {
+    mutate(root, root, name, Operation::Remove)
+}
+
+#[cfg(all(test, not(feature = "standalone")))]
 mod tests {
     use super::*;
 

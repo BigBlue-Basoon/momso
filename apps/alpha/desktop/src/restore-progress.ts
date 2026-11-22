@@ -4,8 +4,7 @@
 //   chat-archive-restore-progress { completed, total, state, available }: 받은 채팅 사본을 앱에 되살릴 때. completed/total 은 사본 수.
 //     state: restoring | complete | failed. 진행 중에는 available 이 false 이고, 끝나야(complete) 새로 받은 채팅방을 쓸 수 있다.
 //     그동안 화면은 채팅방을 바꾸는 요청을 보내지 않는다(보내기, 새 채팅방, 이름 바꾸기·고정·보관·삭제·묶음). 실패하면 이 PC 에 있던 채팅방은 그대로다.
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { isDesktopRuntime } from './runtime'
 
 // 2026-11-17 뒤쪽 fdce0939: 처음 받아 오기 값에 reason(first_receive_conflict 등)과 conflictPaths(같은 이름이 있어 멈춘 파일)가 더해졌다.

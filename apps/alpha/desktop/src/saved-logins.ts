@@ -1,5 +1,13 @@
 // 저장된 로그인(2026-11-21 뒤쪽 275e017, 계약: 통합 가지 docs/development/desktop-saved-logins-s7-design.md "화면 계약 초안").
-//   saved_login_list() → [{ id, origin, label, username, askBeforeUse, loginPath, defaultForPath }]
+// 2026-11-21 줄6 S14(hq/s14-done 52daf0eb2): 항목별 보관(개수 제한 없음), 목록에 siteUrl·createdAt·updatedAt·favorite, 사람용 보기·복사, 열고 채우기.
+//   saved_login_list() → [{ id, origin, label, username, siteUrl, createdAt, updatedAt, favorite, askBeforeUse, loginPath, defaultForPath }]
+//     siteUrl·createdAt·updatedAt 은 없으면 null(옛 항목의 저장한 때는 알 수 없어 null: 화면은 "날짜 모름"으로 묶는다). 시각은 RFC 3339.
+//   saved_login_reveal({ id }) → 비밀번호 글(사람이 주 화면에서 보기를 누를 때만, 감추기·화면 이탈은 화면이 맡는다).
+//   saved_login_copy({ id }) → 빈 값(비밀번호를 응답에 싣지 않고 Windows 클립보드에 직접 씀), 실패 clipboard_unavailable.
+//   saved_login_open_and_fill({ input: { chatId, id, x, y, width, height } }) → { status }: 이 채팅방 패널에서 그 사이트를 열고 그 로그인만 채운다
+//     (제출 단추는 누르지 않음). status: filled, human_required, target_changed, blocked, panel_closed, panel_page_changed, panel_busy, human_takeover,
+//     driver_unavailable, unavailable. 명령 오류: panel_not_active(활성 채팅이 다름), not_found.
+//   사이트 그림(파비콘)은 계약에 없다: 화면은 이름 앞 두 글자를 쓴다.
 //   saved_login_set({ input: { id?, origin, label, username, password?, askBeforeUse?, loginPath?, defaultForPath? } }) → 같은 모양
 //     새 항목은 비밀번호가 꼭 있어야 하고, askBeforeUse 를 빼면 자동 사용(false). 고칠 때 뺀 설정·경로는 그대로, loginPath '' 는 경로 지우기,
 //     비밀번호를 빼면 기존 것을 그대로 쓴다. 사이트 주소는 고칠 수 없다(origin_change_requires_new_login: 삭제한 뒤 새로 저장).
@@ -14,9 +22,8 @@
 //   오류 값: capacity_exceeded(저장 항목 전체 2,200바이트 넘음), credential_store_unavailable, invalid_origin, invalid_input,
 //     duplicate_label(같은 사이트에 같은 이름), origin_change_requires_new_login, default_conflict, not_found, unavailable.
 // 비밀번호는 목록·이벤트 어디에도 오지 않는다. 화면은 비밀번호를 상태·기록(console)·오류 글에 남기지 않는다(보낸 뒤 칸을 비운다).
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
-import { isDesktopRuntime } from './runtime'
+import { invoke, listen } from './host'
+import { hasAppBackend } from './runtime'
 
 export type SavedLogin = {
   id: string
@@ -31,6 +38,17 @@ export type SavedLogin = {
   loginPath: string | null
   /** 같은 사이트·경로에 계정이 여럿일 때의 기본 계정. */
   defaultForPath: boolean
+  /** 로그인 화면 주소(같은 출처). 없으면 null(그때는 origin + loginPath). */
+  siteUrl: string | null
+  /** 저장한 때·고친 때(RFC 3339). 옛 항목은 null. */
+  createdAt: string | null
+  updatedAt: string | null
+  favorite: boolean
+  /**
+   * 사이트 그림(줄6 S24, hq/s24-done desktop-saved-logins-s7-design.md "사이트 그림"): saved_login_list 항목의 선택 필드 iconDataUrl,
+   * data:image/png;base64,… 또는 null. 패널에서 그 사이트를 연 적이 있어야 생긴다. 2026-11-21 스냅샷 0483eba 에는 아직 없다(늘 null).
+   */
+  iconDataUrl: string | null
 }
 
 export type SavedLoginInput = {
@@ -42,6 +60,9 @@ export type SavedLoginInput = {
   askBeforeUse?: boolean
   loginPath?: string
   defaultForPath?: boolean
+  /** 로그인 화면 주소(같은 출처, 경로까지). */
+  siteUrl?: string
+  favorite?: boolean
 }
 
 export type LoginChoiceRequest = { requestId: string; chatId: string | null; entries: SavedLogin[] }
@@ -58,6 +79,11 @@ function readLogin(value: unknown): SavedLogin | null {
     askBeforeUse: item.askBeforeUse === true,
     loginPath: typeof item.loginPath === 'string' && item.loginPath ? item.loginPath : null,
     defaultForPath: item.defaultForPath === true,
+    siteUrl: typeof item.siteUrl === 'string' && item.siteUrl ? item.siteUrl : null,
+    createdAt: typeof item.createdAt === 'string' && item.createdAt ? item.createdAt : null,
+    updatedAt: typeof item.updatedAt === 'string' && item.updatedAt ? item.updatedAt : null,
+    favorite: item.favorite === true,
+    iconDataUrl: typeof item.iconDataUrl === 'string' && item.iconDataUrl.startsWith('data:image/png;base64,') ? item.iconDataUrl : null,
   }
 }
 
@@ -86,6 +112,25 @@ export function cancelLoginChoice(requestId: string) {
   return invoke<void>('saved_login_cancel', { requestId })
 }
 
+/** 비밀번호를 사람에게 보인다(보기 단추). 받은 글은 화면에만 잠깐 두고 감추면 버린다. */
+export async function revealSavedLogin(id: string) {
+  const value = await invoke<unknown>('saved_login_reveal', { id })
+  return typeof value === 'string' ? value : ''
+}
+
+/** 비밀번호를 Windows 클립보드에 넣는다(뒤쪽이 직접, 화면은 값을 받지 않는다). */
+export function copySavedLoginPassword(id: string) {
+  return invoke<void>('saved_login_copy', { id })
+}
+
+export type OpenAndFillBounds = { x: number; y: number; width: number; height: number }
+
+/** 이 채팅방 패널에서 그 사이트를 열고 이 로그인만 채운다(제출은 하지 않음). 돌려준 status 글(모르는 값도 그대로). */
+export async function openAndFillSavedLogin(chatId: string, id: string, bounds: OpenAndFillBounds) {
+  const value = await invoke<{ status?: unknown } | null>('saved_login_open_and_fill', { input: { chatId, id, ...bounds } })
+  return typeof value?.status === 'string' ? value.status : 'unavailable'
+}
+
 const ERRORS = [
   'capacity_exceeded',
   'credential_store_unavailable',
@@ -95,6 +140,8 @@ const ERRORS = [
   'duplicate_label',
   'default_conflict',
   'not_found',
+  'clipboard_unavailable',
+  'panel_not_active',
   'unavailable',
 ] as const
 export type SavedLoginError = (typeof ERRORS)[number]
@@ -125,8 +172,9 @@ export function siteHost(origin: string) {
   try { return new URL(origin).host || origin } catch { return origin }
 }
 
+// 휴대폰 몸소(줄3 S32 select_saved_login)도 같은 이벤트(server-client.ts 가 낸다).
 export async function listenLoginChoices(onRequest: (request: LoginChoiceRequest) => void) {
-  if (!isDesktopRuntime()) return () => {}
+  if (!hasAppBackend()) return () => {}
   return listen<{ requestId?: unknown; chatId?: unknown; entries?: unknown }>('saved-login-selection-request', (event) => {
     const p = event.payload ?? {}
     if (typeof p.requestId !== 'string' || !p.requestId) return
@@ -140,7 +188,7 @@ export type LoginChoiceClosedReason = 'selected' | 'cancelled' | 'timeout'
 
 /** 고르기 물음이 닫힘(saved-login-selection-closed). 모르는 까닭 값이면 null. */
 export async function listenLoginChoicesClosed(onClosed: (requestId: string, reason: LoginChoiceClosedReason | null) => void) {
-  if (!isDesktopRuntime()) return () => {}
+  if (!hasAppBackend()) return () => {}
   return listen<{ requestId?: unknown; reason?: unknown }>('saved-login-selection-closed', (event) => {
     const p = event.payload ?? {}
     if (typeof p.requestId !== 'string' || !p.requestId) return

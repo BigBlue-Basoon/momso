@@ -6,10 +6,9 @@ import { W } from './words'
 //   이벤트 agent-approval-closed:  { requestId, chatId, reason }
 //     reason(2026-11-17): responded(답함) / timeout(5분 동안 답 없음) / provider_cancelled(AI 쪽이 거둠·대화 멈춤) / auto_declined(몸소가 받치지 않는 코덱스 요청을 스스로 거절). 옛 값은 없음.
 //   명령 agent_approval_respond:   { requestId, choice } → null
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import type { AiProvider } from './ai-models'
-import { isDesktopRuntime } from './runtime'
+import { hasAppBackend } from './runtime'
 
 export type ApprovalChoice = 'allow_once' | 'allow_session' | 'deny' | 'cancel'
 export type ApprovalKind = 'command' | 'file_change' | 'setup_change' | 'browser_action_scope' | 'browser_action' | 'other'
@@ -97,7 +96,8 @@ export function orderedChoices(options: ApprovalChoice[], request?: ApprovalRequ
 }
 
 export async function respondApproval(requestId: string, choice: ApprovalChoice) {
-  if (!isDesktopRuntime()) throw new Error('agent_approval_respond needs the desktop runtime')
+  // 휴대폰 몸소(네트워크 길)도 같은 명령·이벤트(server-client.ts 가 S23 으로 잇는다).
+  if (!hasAppBackend()) throw new Error('agent_approval_respond needs the desktop runtime')
   await invoke<null>('agent_approval_respond', { requestId, choice })
 }
 
@@ -105,7 +105,7 @@ export async function listenApprovals(handlers: {
   onRequest: (request: ApprovalRequest) => void
   onClosed: (requestId: string, reason: string | null) => void
 }) {
-  if (!isDesktopRuntime()) return () => {}
+  if (!hasAppBackend()) return () => {}
   const stops = await Promise.all([
     listen<ApprovalRequest>('agent-approval-request', (event) => handlers.onRequest(event.payload)),
     listen<{ requestId: string; reason?: string | null }>('agent-approval-closed', (event) => handlers.onClosed(event.payload.requestId, typeof event.payload.reason === 'string' ? event.payload.reason : null)),

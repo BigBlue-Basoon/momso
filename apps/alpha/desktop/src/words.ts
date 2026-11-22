@@ -398,6 +398,8 @@ const ko = {
     folderNotAllowed: '폴더는 첨부할 수 없습니다. 파일을 놓아 주세요',
     /** 내 말풍선 위 첨부 목록의 화면 읽기 이름. 2026-11-18 새로 씀, 그의 확인 전. */
     sentLabel: (a: unknown) => `첨부 ${a}개`,
+    /** momso anywhere 에서 파일을 올리는 동안(S39). 2026-11-22 새로 씀, 그의 확인 전. */
+    uploading: (percent: number) => `파일을 올리는 중 ${percent}%`,
   },
   // ---- 채팅방 고정·보관(왼쪽 목록)과 설정의 보관된 채팅방. 2026-11-16 새로 쓴 글(그가 아직 정하지 않음, 낱말 목록에 올림). ----
   chatKeep: {
@@ -604,6 +606,12 @@ const ko = {
     text3: '다시 시작해 업데이트 완료',
     text4: '업데이트 받는 중',
     text5: (a: unknown) => `업데이트${a}`,
+    /** 2026-11-22 새로 씀(그의 확인 전, S69): 다시 시작해 업데이트하려는데 진행 중인 채팅이 있어 뒤쪽이 미뤘을 때(busy·active_turn). 알림 줄. */
+    restartDeferred: 'AI가 답하는 중이라 업데이트를 미뤘습니다. 답이 끝나면 다시 시작해 주세요.',
+    /** 2026-11-22 새로 씀(그의 확인 전, S69): 다른 업데이트 작업 중이라 미뤘을 때(busy, 까닭 없음). 알림 줄. */
+    restartBusy: '다른 업데이트 작업이 끝난 뒤 다시 시작해 주세요.',
+    /** 2026-11-22 새로 씀(그의 확인 전, S69): 미뤘던 업데이트를, 이 창의 AI 답이 끝난 뒤 다시 묻는 알림 줄(단추 "다시 시작"). */
+    restartAfterTurn: '답이 끝났습니다. 다시 시작해 업데이트를 마칠 수 있습니다.',
   },
   // ---- App.tsx ----
   app: {
@@ -616,6 +624,13 @@ const ko = {
       verification: '브라우저에서 본인 확인을 직접 해 주세요.',
     } as Record<string, string>,
     browserHumanAfter: '끝나면 이 채팅방에 알려 주세요.',
+    /**
+     * 휴대폰 몸소(momso server, S23 browser-human-required): 캡차·패스키처럼 server 의 브라우저에서 사람이 직접 해야 하는 것은 휴대폰에서 이어서 할 수 없다.
+     * 인증 번호는 S32 부터 채팅 안 카드로 받는다(serverInput). 2026-11-21 새로 씀, 그의 확인 전.
+     */
+    serverBrowserHuman: {
+      verification: '사이트가 본인 확인을 더 요구합니다. 휴대폰에서는 아직 이어서 할 수 없습니다.',
+    } as Record<string, string>,
     /** "다시 보내기"를 눌렀는데 그 말을 다시 보낼 수 없을 때(chat_send → retry_unavailable). 2026-11-16 새로 씀, 그의 확인 전. */
     retryUnavailable: '이 말은 다시 보낼 수 없어 입력창에 다시 넣었습니다.',
     /** 앱을 켤 때(runtime_info) 실패했고 뒤쪽 글이 한글이 아닐 때(2026-11-17 본부 결정). 알림에 "다시 시도"와 함께. */
@@ -650,6 +665,13 @@ const ko = {
       toolMissing: (a: unknown) => `${a} 프로그램이 없거나 오래되었습니다. 설정의 AI 연결에서 설치해 주세요.`,
       serviceUnavailable: (a: unknown) => `${a} 쪽이 잠깐 안 됩니다. 조금 뒤에 다시 보내 주세요.`,
       contextTooLong: (a: unknown) => `채팅방이 너무 길어 ${a}가 더 받지 못합니다. 새 채팅방에서 이어 가 주세요.`,
+      /** 휴대폰 몸소(momso server) 가 준 까닭 값(S17 6ec22f472)마다. 화면 글의 제품 이름은 데스크톱처럼 "몸소". 2026-11-21 새로 씀, 그의 확인 전. */
+      serverCliUnavailable: (a: unknown) => `몸소에서 ${a}를 쓸 수 없습니다. ${a}가 설치되어 있고 로그인되어 있는지 확인해 주세요.`,
+      serverProviderFailed: (a: unknown) => `${a}가 답하지 못했습니다. 몸소의 ${a} 로그인이 풀렸거나 쓸 수 있는 양을 다 썼을 수 있습니다.`,
+      serverCliStopped: (a: unknown) => `${a}가 답하는 도중 멈췄습니다. 다시 보내 주세요.`,
+      serverEmpty: (a: unknown) => `${a}가 빈 답을 보냈습니다. 다시 보내 주세요.`,
+      serverRestarted: () => '답을 쓰는 동안 몸소가 다시 시작되어 답을 받지 못했습니다. 다시 보내 주세요.',
+      serverStorage: () => '몸소에 저장하지 못했습니다. 잠시 뒤 다시 보내 주세요.',
     } as Record<string, (a: unknown) => string>,
     /** 회사가 다시 쓸 수 있는 때를 주었을 때 위 줄 뒤에 붙는다. */
     retryAt: (a: unknown) => `${a}에 다시 쓸 수 있습니다.`,
@@ -762,6 +784,8 @@ const ko = {
        * 새 글이 아니다: 허락 단추는 approvals.text2, 답한 줄은 approvals.text6 의 앞 문장만(뒷 문장 "AI를 바꾸면 다시 묻습니다"는 이 승인에 맞지 않음).
        */
       siteAllowedHere: '이 채팅방에서 계속 허락했습니다',
+      /** 사이트 승인의 물음 글. 새 글이 아니다: 데스크톱 뒤쪽(browser_runtime.rs site_access)이 보내는 글 그대로. 휴대폰 몸소(S23 browser_site)는 화면이 채운다. */
+      siteQuestion: '이 사이트에서 누르고 입력해도 될까요',
       site: '사이트',
       result: '누르면',
       effect: {
@@ -805,6 +829,37 @@ const ko = {
     },
   },
   // ---- components/SecretRequestCard.tsx: 스킬로 하는 연결에서 키를 사람이 직접 넣는 칸. 2026-11-16 새로 쓴 글. ----
+  /**
+   * 휴대폰 몸소의 입력 카드(줄3 S32 agent-input-request): 키 넣기 카드(secretRequest)와 같은 꼴. 칸 이름은 열쇠 창의 말(savedLogins.field*) 그대로.
+   * 2026-11-21 새로 씀, 그의 확인 전.
+   */
+  serverInput: {
+    one_time_code: {
+      aria: '인증 번호 넣기',
+      title: '사이트가 보낸 인증 번호를 넣어 주세요',
+      code: '인증 번호',
+      note: '넣은 인증 번호는 AI에게 보내지 않고 그 사이트에만 넣습니다.',
+      done: '인증 번호를 넣었습니다',
+      cancelled: '인증 번호 입력을 취소했습니다',
+      closed: '인증 번호를 넣기 전에 요청이 닫혔습니다',
+      closedTimeout: '인증 번호를 넣지 않아 요청이 닫혔습니다. 다시 하려면 AI에게 다시 말해 주세요',
+      invalid: '인증 번호를 다시 확인해 주세요. 숫자와 영문자만 넣을 수 있습니다.',
+      failed: '인증 번호를 보내지 못했습니다',
+      submit: '보내기',
+    },
+    saved_login: {
+      aria: '이 사이트의 로그인 저장',
+      title: '이 사이트의 로그인을 저장해 주세요',
+      note: '비밀번호는 AI에게 보내지 않고 암호화해 저장하며 이 사이트에만 넣습니다.',
+      done: '저장했습니다',
+      cancelled: '로그인 저장을 취소했습니다',
+      closed: '로그인을 저장하기 전에 요청이 닫혔습니다',
+      closedTimeout: '로그인을 저장하지 않아 요청이 닫혔습니다. 다시 하려면 AI에게 다시 말해 주세요',
+      invalid: '아이디와 비밀번호를 넣어 주세요.',
+      failed: '저장하지 못했습니다',
+      submit: '저장',
+    },
+  } as Record<string, { aria: string; title: string; code?: string; note: string; done: string; cancelled: string; closed: string; closedTimeout: string; invalid: string; failed: string; submit: string }>,
   secretRequest: {
     aria: '연결에 필요한 키 넣기',
     title: (a: unknown) => `${a} 연결에 필요한 키를 넣어 주세요`,
@@ -943,6 +998,9 @@ const ko = {
     cancel: '취소',
     browserText: (a: unknown) => `기본 브라우저에서 ${a} 로그인 창이 열립니다. 로그인을 마치면 몸소로 돌아와 주세요.`,
     ok: '확인',
+    /** momso anywhere(휴대폰): 한 번 눌러 코드를 복사하고 로그인 페이지를 새 탭으로(VS Code 의 "Copy & Continue" 꼴), 코드 시간이 지났을 때 다시 받기. 2026-11-21 새로 씀, 그의 확인 전. */
+    copyAndOpen: '코드 복사하고 로그인 페이지 열기',
+    restart: '코드 다시 받기',
   },
   composer: {
     /** 사진과 동영상의 "다시 만들기"로 붙인 생성물 칩(2026-11-18). 새로 씀, 그의 확인 전. */
@@ -1048,6 +1106,61 @@ const ko = {
   },
   // ---- components/SavedLoginsSettings.tsx, SavedLoginChoiceCard.tsx: 설정 › 저장된 로그인(2026-11-21 뒤쪽 275e017). ----
   // 낱말(저장된 로그인, 사이트 주소, 이름, 아이디, 비밀번호, 쓸 때마다 묻기)은 본부가 정해 준 말. 나머지 글은 새로 씀, 그의 확인 전.
+  /**
+   * 오른쪽 패널 브라우저의 확장 프로그램(2026-11-21 줄1 스냅샷 b18832c, 계약 hq/s28-done desktop-panel-extensions-s12.md). 어사이드의 퍼즐 단추 꼴
+   * (aside-2·3·4: Manage all extensions · Import extensions · Installed extensions · 고정 · … · 확장 프로그램 관리 화면). 크롬 한국어판의 이름("확장 프로그램 관리", "고정").
+   * 2026-11-21 새로 씀, 그의 확인 전.
+   */
+  extensions: {
+    button: '확장 프로그램',
+    manageAll: '확장 프로그램 관리',
+    importMenu: '확장 프로그램 가져오기',
+    installed: '설치된 확장 프로그램',
+    none: '설치된 확장 프로그램이 없습니다.',
+    pin: '고정',
+    unpin: '고정 해제',
+    more: '더 보기',
+    remove: '삭제',
+    enable: '사용',
+    disable: '사용 중지',
+    off: '사용 중지됨',
+    pageTitle: '확장 프로그램',
+    total: (n: number) => `확장 프로그램 ${n}개`,
+    storeLabel: '크롬 웹 스토어 주소 또는 확장 프로그램 ID',
+    storeExample: 'https://chromewebstore.google.com/detail/…',
+    storeInstall: '설치',
+    folderInstall: '폴더에서 설치',
+    importTitle: '크롬·엣지에서 가져오기',
+    importText: '크롬과 엣지에 있는 확장 프로그램 파일을 몸소로 복사합니다. 비밀번호와 쿠키는 가져오지 않습니다.',
+    importIdNote: '가져온 확장 프로그램은 ID가 달라질 수 있어, 그 확장 프로그램의 로그인은 다시 해야 할 수 있습니다.',
+    importButton: '가져오기',
+    importNone: '가져올 확장 프로그램을 찾지 못했습니다.',
+    browserName: { chrome: '크롬', edge: '엣지' } as Record<string, string>,
+    permissionNote: '확장 프로그램은 권한에 따라 방문한 페이지와 로그인 정보를 볼 수 있습니다. 믿을 수 있는 것만 설치해 주세요.',
+    loading: '불러오는 중',
+    working: '하는 중',
+    installedDone: '설치했습니다',
+    removed: '삭제했습니다',
+    removeTitle: (a: unknown) => `“${a}” 확장 프로그램을 삭제할까요?`,
+    removeText: '삭제해도 원래 브라우저나 복사해 둔 파일은 지우지 않습니다.',
+    close: '닫기',
+    loadFailed: '확장 프로그램 목록을 읽지 못했습니다.',
+    popupNone: '이 확장 프로그램에는 열 창이 없습니다.',
+    popupFailed: '확장 프로그램 창을 열지 못했습니다.',
+    /** 뒤쪽 오류 값마다(계약의 값). 모르는 값은 failed. cancelled 는 글 없이. timeout 은 목록을 다시 읽는다. */
+    errors: {
+      invalid_store_address: '크롬 웹 스토어 주소나 확장 프로그램 ID를 다시 확인해 주세요.',
+      store_unavailable: '크롬 웹 스토어에서 받지 못했습니다. 잠시 뒤 다시 해 주세요.',
+      store_package_invalid: '받은 파일이 올바르지 않아 설치하지 않았습니다.',
+      store_signature_invalid: '서명을 확인하지 못해 설치하지 않았습니다.',
+      store_id_mismatch: '요청한 확장 프로그램과 받은 파일이 달라 설치하지 않았습니다.',
+      panel_unavailable: '브라우저를 연 뒤 다시 해 주세요.',
+      unsupported: '이 컴퓨터에서는 확장 프로그램을 쓸 수 없습니다.',
+      timeout: '끝났는지 확인하지 못해 목록을 다시 읽었습니다.',
+      source_unavailable: '그 브라우저의 확장 프로그램 파일을 읽지 못했습니다.',
+      failed: '하지 못했습니다. 잠시 뒤 다시 해 주세요.',
+    } as Record<string, string>,
+  },
   savedLogins: {
     title: '저장된 로그인',
     /** 새 컴퓨터에서는 다시 넣어야 한다는 뜻을 화면에서 알린다(계약 "WebView2와 새 컴퓨터"). */
@@ -1093,6 +1206,66 @@ const ko = {
       default_conflict: '이 로그인 화면에는 이미 기본 계정이 있습니다.',
       not_found: '그사이 삭제된 로그인입니다. 목록을 다시 읽었습니다.',
     } as Record<string, string>,
+    /** 오른쪽 패널 브라우저 주소 줄의 열쇠 단추를 누르면 뜨는 카드(2026-11-21 본부 지시, 어사이드 열쇠 창 꼴). 단추 이름은 title. 새로 씀, 그의 확인 전. */
+    /** 왼쪽 위 찾기 칸(어사이드 "Search all accounts"). 이름·아이디·사이트로 모든 로그인에서 찾는다. */
+    searchAll: '모든 로그인 찾기',
+    /** 찾기 칸 아래 고르기(어사이드 "All accounts" 자리): 지금 사이트의 로그인만 / 모든 로그인. */
+    scopeSite: '이 사이트',
+    scopeAll: '모든 로그인',
+    noMatch: '찾는 로그인이 없습니다.',
+    /** 오른쪽 판 위 줄 왼쪽 작은 글(어사이드 "소유자 > 보관함" 자리): 저장된 로그인 › 이 컴퓨터(Windows 자격 증명 관리자에 저장). */
+    onThisComputer: '이 컴퓨터',
+    /** 오른쪽 판 위 줄 오른쪽 … 단추(수정·삭제). */
+    more: '더 보기',
+    /** 판 위 작은 회색 제목: 아이디·비밀번호 판(어사이드 "Credentials"), 몸소의 경로·쓸 때마다 묻기·기본 계정 판. */
+    credentials: '로그인 정보',
+    usage: '사용 설정',
+    /** 입력 칸의 흐린 보기 글. */
+    usernameExample: 'id@example.com',
+    siteExample: 'https://example.com',
+    /** 비밀번호 줄에 올리면 나오는 보기·복사(2026-11-21 S14 saved_login_reveal·saved_login_copy). */
+    showPassword: '비밀번호 보기',
+    hidePassword: '비밀번호 숨기기',
+    copyPassword: '비밀번호 복사',
+    copiedPassword: '비밀번호를 복사했습니다',
+    copyPasswordFailed: '비밀번호를 복사하지 못했습니다',
+    revealFailed: '비밀번호를 읽지 못했습니다',
+    /** … 메뉴: 열고 채우기(saved_login_open_and_fill, 제출 단추는 누르지 않음)와 결과. */
+    openFill: '열고 채우기',
+    openFillDone: '로그인 정보를 채웠습니다. 로그인 단추는 직접 눌러 주세요.',
+    openFillFailed: '채우지 못했습니다',
+    openFillStatus: {
+      human_required: '인증번호나 확인 단계가 있거나 입력 칸을 찾지 못했습니다. 직접 입력해 주세요.',
+      target_changed: '그사이 페이지가 바뀌어 채우지 않았습니다.',
+      panel_page_changed: '그사이 페이지가 바뀌어 채우지 않았습니다.',
+      blocked: '이 페이지에는 채울 수 없습니다.',
+      panel_closed: '브라우저가 닫혀 있어 채우지 못했습니다.',
+      panel_busy: 'AI가 브라우저를 쓰고 있어 채우지 못했습니다.',
+      human_takeover: '브라우저를 직접 쓰는 중이라 채우지 않았습니다.',
+      panel_not_active: '이 채팅방의 브라우저가 아니어서 채우지 못했습니다.',
+      driver_unavailable: '지금은 채울 수 없습니다. 잠시 뒤 다시 해 주세요.',
+      unavailable: '지금은 채울 수 없습니다. 잠시 뒤 다시 해 주세요.',
+    } as Record<string, string>,
+    /** … 메뉴: 즐겨찾기(favorite). 목록·보기의 별 표시 이름도 favorite. */
+    favorite: '즐겨찾기',
+    unfavorite: '즐겨찾기 해제',
+    favorited: '즐겨찾기에 넣었습니다',
+    unfavorited: '즐겨찾기에서 뺐습니다',
+    /** 왼쪽 위 거르기·순서 그림 단추(어사이드의 두 단추)와 메뉴. */
+    filter: '거르기',
+    filterAll: '전체',
+    sort: '순서',
+    sortCreated: '저장한 때',
+    sortUpdated: '고친 때',
+    sortName: '이름',
+    sortSite: '사이트',
+    /** 저장한 때·고친 때로 묶은 목록의 제목(어사이드 "This Week" 자리). 옛 항목은 때를 몰라 날짜 모름. */
+    dateGroup: { today: '오늘', yesterday: '어제', week: '이번 주', month: '이번 달', unknown: '날짜 모름' } as Record<string, string>,
+    dateGroupMonth: (year: number, month: number) => `${year}년 ${month}월`,
+    /** 카드의 로그인 보기에서 아이디 옆 복사 단추(풍선·화면 읽기 이름)와 알림 줄. */
+    copyUsername: '아이디 복사',
+    copiedUsername: '아이디를 복사했습니다',
+    copyUsernameFailed: '아이디를 복사하지 못했습니다',
     /** 채팅방 안에서 계정을 고르는 카드(saved-login-selection-request). 지금 있는 승인 카드 꼴. */
     choice: {
       aria: '저장된 로그인 선택',
@@ -1100,6 +1273,135 @@ const ko = {
       chosen: '선택했습니다',
       failed: '선택을 보내지 못했습니다. 다시 눌러 주세요',
     },
+  },
+  /**
+   * 네트워크 길(momso server, 같은 출처) 화면의 문(2026-11-21 S19b): 처음에 서버를 확인하는 동안, 앞단 로그인(Cloudflare Access)이 풀렸을 때,
+   * 서버에 닿지 못할 때(VM 이 꺼짐 등). 새로 씀, 그의 확인 전.
+   */
+  /** momso anywhere 의 AI 연결(채팅 전에 먼저 연결하게 이끄는 화면). 2026-11-21 새로 씀, 그의 확인 전. 제목·상태·단추·안내는 첫 실행·설정의 말을 그대로 쓴다. */
+  serverAi: {
+    intro: '몸소가 쓸 AI에 로그인해 주세요. 휴대폰에서 바로 할 수 있습니다.',
+    startFailed: 'AI 로그인을 시작하지 못했습니다. 잠시 뒤 다시 해 주세요.',
+    /** 클로드·제미나이 줄: server 가 키를 보관할 암호화 보관소를 열 수 없을 때(S55 storage_unavailable). 2026-11-22 새로 씀, 그의 확인 전. */
+    keyStorageUnavailable: '키를 보관할 곳을 열지 못했습니다. 지금은 API 키를 저장할 수 없습니다.',
+  },
+  /**
+   * 휴대폰에서 시작하기(줄2 S26 hq/s26-done 7fa9efbc1 momso-anywhere-onboarding-s26.md "화면 담당 계약", StartScreen.tsx). 2026-11-21 새로 씀, 그의 확인 전.
+   * 첫 실행(FirstRun)처럼 제목 한 줄 + 흐린 설명, 단추는 아래. 홈 화면에 추가하는 법은 Apple·Google 공식 도움말의 단추 이름 그대로
+   * (아이폰: support.apple.com/ko-kr/guide/iphone/iph42ab2f3a7 "공유", "홈 화면에 추가", "동작 편집", "웹 앱으로 열기", "추가",
+   *  안드로이드 크롬: support.google.com/chrome/answer/9658361?hl=ko "더보기", "설치 및 바로가기 만들기", "설치").
+   */
+  start: {
+    preparing: '준비하는 중',
+    unavailable: '시작 화면을 준비하지 못했습니다. 잠시 뒤 다시 열어 주세요.',
+    title: '내 Google Cloud에 몸소를 설치합니다',
+    text: '설치가 끝나면 휴대폰에서 바로 몸소를 쓸 수 있습니다. 몸소의 자료와 대화는 내 Google Cloud 안에만 있습니다.',
+    whatTitle: '시작하면',
+    what: [
+      'Google 계정으로 로그인합니다.',
+      '몸소가 쓸 Google Cloud 프로젝트를 만들고 관리할 권한을 허락합니다.',
+      '프로젝트와 서버, 몸소 입구를 만듭니다. 몇 분 걸립니다.',
+    ],
+    cost: 'Google Cloud 사용 요금은 내 결제 계정으로 청구됩니다. 서버를 꺼 두어도 디스크 같은 일부 요금은 남을 수 있습니다.',
+    begin: 'Google 계정으로 시작하기',
+    find: '이미 설치했다면 내 몸소 찾기',
+    runningTitle: '몸소를 설치하는 중',
+    runningText: '몇 분 걸릴 수 있습니다. 이 화면을 닫으면 멈추고, 다시 시작하면 멈춘 곳부터 이어서 합니다.',
+    // S64 프로젝트·결제 계정 고르기. 2026-11-22 새로 씀, 그의 확인 전.
+    chooseTitle: '설치할 곳 고르기',
+    chooseText: '몸소를 설치할 Google Cloud 프로젝트와 사용 요금을 낼 결제 계정을 고릅니다.',
+    project: 'Google Cloud 프로젝트',
+    newProject: '새 프로젝트 만들기',
+    billingAccount: '결제 계정',
+    billingPick: '결제 계정 고르기',
+    billingKept: '이 프로젝트에 이미 결제 계정이 연결되어 있으면 바꾸지 않습니다.',
+    billingNone: '열린 결제 계정이 없습니다. Google Cloud에서 결제 계정을 만들거나 다시 연 뒤 처음부터 다시 해 주세요.',
+    install: '설치 시작',
+    chooseAgain: '다시 고르기',
+    // S65 돌아온 뒤 이어 가기·지운 결과. 2026-11-22 새로 씀, 그의 확인 전.
+    next: '다음',
+    destroyingTitle: '몸소를 지우는 중',
+    destroyingText: '몇 분 걸릴 수 있습니다. 이 화면을 닫지 말아 주세요.',
+    destroyedTitle: '몸소를 지웠습니다',
+    destroyedText: '몸소 서버와 그 안의 자료, 저장된 로그인을 여는 열쇠까지 지웠습니다. 프로젝트와 결제 계정은 그대로 둡니다.',
+    destroyPartialTitle: '아직 남은 것이 있습니다',
+    destroyPartialText: '아래 항목은 아직 지우지 못했습니다. 나중에 같은 몸소를 다시 지우면 남은 것만 확인해 지웁니다.',
+    destroyItems: {
+      gateway: '몸소 입구', vm: '몸소 서버', router: '라우터', firewall: '방화벽', subnet: '서브넷', network: '네트워크',
+      secret_transport: '비밀값(연결)', secret_session: '비밀값(로그인 유지)', secret_vault: '저장된 로그인을 여는 열쇠',
+      account_vm: '서비스 계정(서버)', account_gateway: '서비스 계정(입구)', role_stop: '역할(서버 멈춤)', role_anywhere: '역할(서버 켜기)',
+      unknown: '확인하지 못한 항목',
+    } as Record<string, string>,
+    steps: {
+      project: 'Google Cloud 프로젝트 만들기',
+      billing: '결제 계정 연결',
+      services: '필요한 서비스 켜기',
+      privateNetwork: '전용 네트워크 만들기',
+      server: '몸소 서버 만들기',
+      gateway: '몸소 입구 만들기',
+      gatewayReady: '입구 준비 확인',
+    } as Record<string, string>,
+    stepState: { waiting: '기다리는 중', working: '하는 중', done: '끝남', failed: '멈춤', pending: '나중에 다시 함' } as Record<string, string>,
+    failedTitle: '설치가 멈췄습니다',
+    /** 멈춘 까닭(SetupError 의 step 값을 묶음). 모르는 값은 other. */
+    errors: {
+      billing: '이 프로젝트에 쓸 수 있는 결제 계정이 없습니다. Google Cloud에서 결제 계정을 만들거나 다시 켠 뒤 다시 시도해 주세요.',
+      billingChoice: '쓸 결제 계정을 고르지 않았습니다. 결제 계정을 고른 뒤 다시 시작해 주세요.',
+      // S64. 2026-11-22 새로 씀, 그의 확인 전.
+      billingAccount: '고른 결제 계정을 쓸 수 없습니다. 닫혔거나 이 계정에 권한이 없습니다. 다른 결제 계정을 골라 주세요.',
+      project: '고른 프로젝트를 쓸 수 없습니다. 이 계정에 권한이 있는지 확인하거나 다른 프로젝트를 골라 주세요.',
+      serverNotReady: '몸소 서버가 아직 준비되지 않았습니다. 다시 시도하면 멈춘 곳부터 다시 확인합니다.',
+      gatewayNotReady: '몸소 입구가 아직 준비되지 않았습니다. 다시 시도하면 멈춘 곳부터 다시 확인합니다.',
+      declined: 'Google 권한을 허락하지 않아 멈췄습니다. 다시 시도하면 다시 묻습니다.',
+      expired: 'Google 로그인이 만료되었습니다. 다시 시도해 주세요.',
+      permission: '이 Google 계정에는 프로젝트를 만들거나 바꿀 권한이 없습니다. 다른 계정으로 다시 시도해 주세요.',
+      quota: 'Google Cloud 사용 한도에 걸렸습니다. 잠시 뒤 다시 시도해 주세요.',
+      notReady: '아직 설치를 시작할 수 없습니다. 몸소 쪽 준비가 끝나지 않았습니다.',
+      checkpoint: '이 브라우저에 설치 기록을 남길 수 없습니다. 사생활 보호 모드를 끄고 다시 시도해 주세요.',
+      identity: 'Google 계정 정보를 확인하지 못했습니다. 다시 시도해 주세요.',
+      ownership: '이미 있는 자원이 몸소가 만든 것과 맞지 않아 멈췄습니다. 바꾸지 않았습니다.',
+      google: 'Google Cloud가 잠깐 응답하지 않습니다. 다시 시도하면 멈춘 곳부터 다시 확인합니다.',
+      other: '설치하는 중 문제가 생겼습니다. 다시 시도하면 멈춘 곳부터 다시 확인합니다.',
+    } as Record<string, string>,
+    retry: '다시 시도',
+    openBilling: 'Google Cloud 결제 열기',
+    back: '처음으로',
+    doneTitle: '몸소가 준비되었습니다',
+    doneText: '아래 주소가 내 몸소입니다. 열면 Google 계정으로 한 번 로그인합니다.',
+    address: '내 몸소 주소',
+    copy: '주소 복사',
+    copied: '주소를 복사했습니다',
+    copyFailed: '주소를 복사하지 못했습니다',
+    open: '몸소 열기',
+    homeTitle: '홈 화면에 추가하기',
+    homeText: '몸소를 연 화면에서 홈 화면에 추가하면 앱처럼 열립니다.',
+    iphone: 'iPhone(Safari)',
+    android: 'Android(Chrome)',
+    iphoneSteps: [
+      '아래 막대의 … 버튼을 누른 뒤 공유를 누릅니다. 공유 버튼이 바로 보이면 그것을 누릅니다.',
+      '목록을 아래로 내려 홈 화면에 추가를 누릅니다. 보이지 않으면 맨 아래 동작 편집에서 켭니다.',
+      '웹 앱으로 열기가 켜져 있는지 보고 추가를 누릅니다.',
+    ],
+    androidSteps: [
+      '주소 표시줄 오른쪽의 더보기(⋮)를 누릅니다.',
+      '설치 및 바로가기 만들기를 누릅니다.',
+      '설치를 누릅니다.',
+    ],
+    homeNote: '홈 화면의 몸소는 브라우저와 로그인이 따로라, 처음 열 때 Google로 다시 로그인할 수 있습니다.',
+    forgetNote: '주소를 잊어도 이 화면의 내 몸소 찾기로 다시 찾을 수 있습니다.',
+    findingTitle: '내 몸소를 찾는 중',
+    foundTitle: '내 몸소',
+    foundText: '이 Google 계정으로 설치한 몸소입니다.',
+    foundNone: '이 Google 계정으로 설치한 몸소를 찾지 못했습니다. 다른 계정으로 설치했거나, 막 설치했다면 잠시 뒤 다시 찾아 주세요.',
+    findFailed: '내 몸소를 찾지 못했습니다. 다시 시도해 주세요.',
+  },
+  serverGate: {
+    checking: '몸소에 연결하는 중',
+    signedOutTitle: '로그인이 풀렸습니다',
+    signedOutText: '다시 로그인하면 이어서 쓸 수 있습니다.',
+    signIn: '다시 로그인',
+    unreachableTitle: '몸소에 닿지 못했습니다',
+    unreachableText: '서버가 꺼져 있거나 인터넷 연결이 끊겼을 수 있습니다. 잠시 뒤 다시 해 주세요.',
   },
   /** 고른 지 5분이 지나 뒤쪽이 거절했을 때(selection_required). 첨부·대화 가져오기·몸소 폴더가 같은 글을 쓴다. 2026-11-17 새로 씀, 그의 확인 전. */
   selectAgain: '선택한 지 오래되어 진행하지 못했습니다. 파일을 다시 선택해 주세요',

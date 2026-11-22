@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Search, X } from 'lucide-react'
 import { listMedia, mediaChat, type MediaItem } from '../media'
 import { MediaGallery } from './MediaGallery'
@@ -15,7 +15,13 @@ type Kind = 'all' | 'image' | 'video'
  * 읽는 동안·없을 때·읽지 못했을 때는 문서 목록과 같은 꼴의 한 줄(2026-11-17, 하얗게 빈 화면이 되지 않게).
  * 개발 앱(import.meta.env.DEV)에서만 생성물 몇 개를 더해 보인다(dev-samples). 설치판에는 들어가지 않는다.
  */
-export function MediaView({ onOpenChat, onNotice, onRegenerate }: { onOpenChat?: (chatId: string) => void; onNotice?: SourceNotice; onRegenerate?: (item: MediaItem) => void }) {
+export function MediaView({ onOpenChat, onNotice, onRegenerate, menu }: {
+  onOpenChat?: (chatId: string) => void
+  onNotice?: SourceNotice
+  onRegenerate?: (item: MediaItem) => void
+  /** 휴대폰 몸소(S75 셋째): 맨 위 줄 왼쪽의 채팅방 목록 단추(문서 화면과 같은 것). */
+  menu?: ReactNode
+}) {
   const [items, setItems] = useState<MediaItem[] | null>(null)
   const [failed, setFailed] = useState(false)
   const [kind, setKind] = useState<Kind>('all')
@@ -56,6 +62,7 @@ export function MediaView({ onOpenChat, onNotice, onRegenerate }: { onOpenChat?:
   return (
     <section className="media-view" aria-label={W.mediaView.aria1}>
       <header className="media-header">
+        {menu}
         <h1>{W.mediaView.aria1}</h1>
         {items && items.length > 0 && (
           <div className="media-tools">

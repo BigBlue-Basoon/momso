@@ -223,12 +223,18 @@ pub(crate) async fn app_state_restore(
     let keys = object_store::load_keys(&config)?;
     let identity = transfer::identity(&paths.database_path)?;
     let (snapshot, manifest) = download_latest_snapshot(&config, &keys, &identity, &paths).await?;
+    let class_snapshot =
+        crate::class_student_backup::download(&config, &keys, &identity, &paths).await?;
     preserve_recovery_identity(snapshot.path(), &identity)?;
+    let class_root = paths.data_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
         apply_snapshot_with_progress(snapshot.path(), &paths, Some(&app))
     })
     .await
     .map_err(|_| "restore_failed")??;
+    if let Some(file) = class_snapshot {
+        crate::class_student_backup::install(file, &class_root)?;
+    }
     Ok(AppStateRestoreResult {
         state: "restored",
         snapshot_at: manifest.created_at,
@@ -875,6 +881,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             &archive_root,
             &chat_id,
             &retry_text,
+            &[],
             None,
             None,
             None,
@@ -1506,7 +1513,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                     }
                 } else if method == "PUT" {
                     let mut data = remote.lock().unwrap();
-                    assert!(!data.contains_key(key));
+                    assert!(!data.contains_key(key) || key.contains("/class-student/slot-"));
                     data.insert(key.to_owned(), received[end..end + length].to_vec());
                     ("200 OK", Vec::new())
                 } else {
@@ -1608,6 +1615,132 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             archive: storage_location,
             archive_lease: None,
         };
+        if oauth {
+            let crm_path = paths.data_root.join(crate::class_student_backup::FILE_NAME);
+            let crm = Connection::open(&crm_path).unwrap();
+            crm.execute_batch(
+                "CREATE TABLE fixture(value TEXT); INSERT INTO fixture VALUES('fictional');",
+            )
+            .unwrap();
+            drop(crm);
+            crate::class_student_backup::backup_inner(&config, &keys, &identity, &paths)
+                .await
+                .unwrap();
+            crate::class_student_backup::backup_inner(&config, &keys, &identity, &paths)
+                .await
+                .unwrap();
+            {
+                let snapshots = objects.lock().unwrap();
+                let slots: Vec<_> = snapshots
+                    .iter()
+                    .filter(|(key, _)| key.contains("/class-student/slot-"))
+                    .collect();
+                assert_eq!(slots.len(), 1);
+                assert!(!slots[0]
+                    .1
+                    .windows(b"fictional".len())
+                    .any(|window| window == b"fictional"));
+            }
+            let restored =
+                crate::class_student_backup::download(&config, &keys, &identity, &storage_paths)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            crate::class_student_backup::install(restored, &storage_paths.data_root).unwrap();
+            let restored = Connection::open(
+                storage_paths
+                    .data_root
+                    .join(crate::class_student_backup::FILE_NAME),
+            )
+            .unwrap();
+            assert_eq!(
+                restored
+                    .query_row("SELECT value FROM fixture", [], |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "fictional"
+            );
+            drop(restored);
+            crate::class_student_backup::restore_if_missing(
+                &config,
+                &keys,
+                &identity,
+                &storage_paths,
+            )
+            .await
+            .unwrap();
+            let changed = Connection::open(
+                storage_paths
+                    .data_root
+                    .join(crate::class_student_backup::FILE_NAME),
+            )
+            .unwrap();
+            changed
+                .execute("INSERT INTO fixture VALUES('local')", [])
+                .unwrap();
+            drop(changed);
+            crate::class_student_backup::restore_if_missing(
+                &config,
+                &keys,
+                &identity,
+                &storage_paths,
+            )
+            .await
+            .unwrap();
+            let recovered = fs::read_dir(&storage_paths.data_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("class-student-recovered-")
+                })
+                .count();
+            assert_eq!(recovered, 1);
+            let old_database = fs::read(&crm_path).unwrap();
+            {
+                let mut remote = objects.lock().unwrap();
+                for number in 0..7 {
+                    let mut plain = b"MOMSOCR1".to_vec();
+                    let at =
+                        chrono::Utc::now().timestamp_millis() - (8 + number as i64) * 86_400_000;
+                    plain.extend_from_slice(&at.to_be_bytes());
+                    plain.extend_from_slice(&old_database);
+                    remote.insert(
+                        format!("{}/class-student/slot-{number}.age", object_store::PREFIX),
+                        transfer::encrypt_bytes(&plain, &identity).unwrap(),
+                    );
+                }
+            }
+            let changed = Connection::open(&crm_path).unwrap();
+            changed
+                .execute("INSERT INTO fixture VALUES('next')", [])
+                .unwrap();
+            drop(changed);
+            crate::class_student_backup::backup_inner(&config, &keys, &identity, &paths)
+                .await
+                .unwrap();
+            let slots = objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|key| key.contains("/class-student/slot-"))
+                .count();
+            assert_eq!(slots, 7);
+            let next =
+                crate::class_student_backup::download(&config, &keys, &identity, &storage_paths)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let next = Connection::open(next.path()).unwrap();
+            assert_eq!(
+                next.query_row("SELECT count(*) FROM fixture", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+        }
         let (storage_snapshot, _) =
             download_latest_snapshot(&config, &keys, &identity, &storage_paths)
                 .await
@@ -1877,6 +2010,7 @@ $null = [Console]::ReadLine()
             &archive_root,
             &chat_id,
             "continued on the new device",
+            &[],
             None,
             None,
             None,

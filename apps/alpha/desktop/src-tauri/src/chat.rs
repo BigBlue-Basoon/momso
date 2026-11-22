@@ -13,6 +13,10 @@ pub(crate) fn canonical_provider(value: Option<&str>) -> Option<&str> {
     }
 }
 
+pub(crate) fn new_import_id() -> String {
+    format!("chat_{}", uuid::Uuid::new_v4())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ChatSummary {
@@ -841,7 +845,23 @@ fn append_internal(
     let h = one(&tx, id)?;
     let time = stamp();
     let msg_id = Uuid::new_v4().to_string();
-    tx.execute("INSERT INTO chat_messages(id,chat_id,role,text,created_at,provider,model,effort,skill,actual_effort,finish_reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![msg_id,id,role.as_str(),text,time,provider,model,effort,skill,actual_effort,finish_reason.map(FinishReason::as_str)]).map_err(|_| "말을 저장하지 못했습니다".to_string())?;
+    crate::chat_message_storage::insert(
+        &tx,
+        &crate::chat_message_storage::Message {
+            id: &msg_id,
+            chat_id: id,
+            role: role.as_str(),
+            text,
+            created_at: &time,
+            provider: provider.as_deref(),
+            model: model.as_deref(),
+            effort: effort.as_deref(),
+            skill: skill.as_deref(),
+            actual_effort: actual_effort.as_deref(),
+            finish_reason: finish_reason.map(FinishReason::as_str),
+        },
+    )
+    .map_err(|_| "말을 저장하지 못했습니다".to_string())?;
     if claim_attachments {
         tx.execute(
             "UPDATE chat_attachments SET message_id=?1 WHERE chat_id=?2 AND message_id IS NULL",

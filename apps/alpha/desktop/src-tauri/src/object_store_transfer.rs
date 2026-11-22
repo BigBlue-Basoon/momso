@@ -96,47 +96,7 @@ pub(crate) fn identity(database: &Path) -> Result<x25519::Identity, &'static str
         .ok_or("recovery_key_missing")
 }
 
-pub(crate) fn safe_relative(path: &Path) -> bool {
-    let Some(raw) = path.to_str() else {
-        return false;
-    };
-    if raw.is_empty() || raw.encode_utf16().count() > 32_000 {
-        return false;
-    }
-    path.components().all(|component| {
-        let Component::Normal(part) = component else {
-            return false;
-        };
-        let Some(name) = part.to_str() else {
-            return false;
-        };
-        if name.is_empty()
-            || name.encode_utf16().count() > 255
-            || name.ends_with(['.', ' '])
-            || name
-                .chars()
-                .any(|c| c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
-        {
-            return false;
-        }
-        let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-        if matches!(
-            stem.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-        ) {
-            return false;
-        }
-        let device_suffix = stem
-            .strip_prefix("COM")
-            .or_else(|| stem.strip_prefix("LPT"));
-        !device_suffix.is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-            )
-        })
-    })
-}
+pub(crate) use crate::safe_path::safe_relative;
 
 // Legacy objects can have arbitrary names. Only the reserved, canonical
 // content-addressed layout promises that the file name is its SHA-256.

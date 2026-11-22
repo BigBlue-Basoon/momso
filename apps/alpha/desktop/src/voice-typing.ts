@@ -4,7 +4,7 @@
 //     microphone 은 참고값일 뿐 준비됐다는 뜻이 아니라 화면은 막는 데 쓰지 않는다. unsupported 면 마이크 단추를 막는다.
 //   voice_typing_open() → { state: 'requested' | 'not_focused' | 'keys_busy' | 'input_rejected' | 'unsupported' }
 //     받아쓰기 글은 Windows 가 지금 글자 칸(입력 칸)에 넣는다. 그래서 부르기 전에 입력 칸에 커서를 둔다.
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './host'
 import { isDesktopRuntime } from './runtime'
 
 export type VoiceTypingStatus = { state: string; microphone?: string; language?: string; permission?: string; network?: string }

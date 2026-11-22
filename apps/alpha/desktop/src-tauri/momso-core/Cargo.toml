@@ -1,0 +1,23 @@
+[package]
+name = "momso-core"
+version = "0.1.1"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4"
+log = "0.4"
+fs2 = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[features]
+default = ["standalone"]
+standalone = []

@@ -13,6 +13,7 @@ mod backup;
 mod backup_profile;
 mod browser_choice;
 mod browser_driver;
+mod browser_engine;
 mod browser_gateway;
 mod browser_pipe;
 #[cfg(test)]
@@ -40,14 +41,19 @@ mod chat_gemini;
 mod chat_group;
 mod chat_handoff;
 mod chat_items;
+mod chat_message_storage;
 mod chat_output;
 mod chat_recovery;
 mod chat_redaction_recheck;
 mod chat_search_index;
+mod class_student_backup;
 mod class_student_store;
+mod codex_protocol;
 #[cfg(test)]
 mod command_entry_tests;
 mod connections;
+#[path = "../momso-core/src/context.rs"]
+mod context_shared;
 mod credentials;
 #[allow(dead_code)] // The terminology dictionary is retained for its future interface.
 mod dictionary;
@@ -65,6 +71,8 @@ mod hidden_process;
 mod instagram_preview_contract_tests;
 mod install_staging;
 mod media;
+#[path = "../momso-core/src/media_format.rs"]
+mod media_format;
 mod media_generation;
 mod media_save;
 mod momso_archive_read;
@@ -76,15 +84,28 @@ mod panel_browser;
 pub mod panel_cdp;
 mod panel_chat;
 mod panel_download;
+mod panel_extension_catalog;
+mod panel_extension_store;
+mod panel_extensions;
 pub mod panel_navigation;
+mod panel_overlay;
 pub mod panel_ownership;
 pub mod panel_worker;
+#[path = "../momso-core/src/profile_format.rs"]
+mod profile_format;
 #[cfg(test)]
 mod provider_engine_smoke;
+#[path = "../momso-core/src/receipt_format.rs"]
+mod receipt_format;
 mod redaction_wait;
+#[path = "../momso-core/src/safe_path.rs"]
+mod safe_path;
+mod saved_login_icons;
 mod saved_logins;
 #[cfg(test)]
 mod scale_benchmark;
+#[path = "../momso-core/src/text_encoding.rs"]
+mod text_encoding;
 mod tray_lifecycle;
 mod yoga_dictionary;
 
@@ -123,8 +144,20 @@ mod source_integrity;
 mod source_search;
 mod startup_timing;
 mod storage;
+#[cfg(windows)]
+mod update_supervisor;
 mod usage_status;
 mod voice_typing;
+
+#[cfg(windows)]
+pub fn run_update_supervisor(args: Vec<std::ffi::OsString>) {
+    let _ = update_supervisor::entry(args);
+}
+
+#[cfg(windows)]
+pub fn run_update_recovery() {
+    let _ = update_supervisor::resume();
+}
 
 use runtime::RuntimePaths;
 use serde::Serialize;
@@ -2297,6 +2330,7 @@ async fn chat_send(
                     &archive,
                     &chat_id,
                     &provider_text,
+                    &attachment_paths,
                     model.as_deref(),
                     effort.as_deref(),
                     &permission_mode,
@@ -2334,6 +2368,7 @@ async fn chat_send(
                     &archive,
                     &chat_id,
                     &provider_text,
+                    &attachment_paths,
                     model.as_deref(),
                     effort.as_deref(),
                     skill.as_deref(),
@@ -3461,6 +3496,7 @@ pub fn run() {
             if window.label() != "main" {
                 return;
             }
+            panel_overlay::main_window_event(window, event);
             if let Some(state) = window.app_handle().try_state::<AppState>() {
                 state.selections.record_window_event(event);
             }
@@ -3569,6 +3605,7 @@ pub fn run() {
             tray_lifecycle::install(app.handle())?;
             archive_auto_backup::start(app.handle().clone());
             object_store_auto_upload::start(app.handle().clone());
+            class_student_backup::start(app.handle().clone());
             chat_redaction_recheck::start(
                 app.handle().clone(),
                 app.state::<AppState>().paths.clone(),
@@ -3582,17 +3619,40 @@ pub fn run() {
                     available: true,
                 },
             );
+            #[cfg(windows)]
+            if status.health == "ok" && update_supervisor::confirm_healthy(&app.state::<AppState>().paths.backups_path).is_err() {
+                log::warn!("update recovery completion deferred");
+            }
+            #[cfg(feature = "g61-test-probe")]
+            app_updates::start_local_fixture(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             tray_lifecycle::app_exit_respond,
             panel_browser::panel_browser_open,
             saved_logins::saved_login_list,
+            saved_logins::saved_login_reveal,
+            saved_logins::saved_login_copy,
+            saved_logins::saved_login_open_and_fill,
             saved_logins::saved_login_set,
             saved_logins::saved_login_delete,
             saved_logins::saved_login_select,
             saved_logins::saved_login_cancel,
+            panel_overlay::panel_overlay_open,
+            panel_overlay::panel_extension_popup_open,
+            panel_overlay::panel_overlay_state,
+            panel_overlay::panel_overlay_close,
             panel_browser::panel_browser_select_chat,
+            panel_extensions::panel_extensions_list,
+            panel_extensions::panel_extensions_install,
+            panel_extensions::panel_extensions_set_enabled,
+            panel_extensions::panel_extensions_remove,
+            panel_extension_catalog::panel_extensions_import_candidates,
+            panel_extension_catalog::panel_extensions_import,
+            panel_extension_catalog::panel_extensions_pin_get,
+            panel_extension_catalog::panel_extensions_pin_set,
+            panel_extension_catalog::panel_extensions_popup,
+            panel_extension_store::panel_extensions_install_store,
             panel_browser::panel_browser_create_draft,
             panel_browser::panel_browser_adopt_draft,
             panel_browser::panel_browser_open_agent,

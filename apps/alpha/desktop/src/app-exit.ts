@@ -3,8 +3,7 @@
 //   명령 app_exit_respond({ requestId, decision: 'exit' | 'stay' }) → { state: 'accepted' | 'stale' | 'invalid' | 'unavailable' }.
 //   이벤트 app-exit-request-closed { requestId, reason: 'approved' | 'stayed' | 'timeout' }: 5분 동안 답이 없으면 timeout(종료 취소, 늦은 답은 stale).
 // 듣기는 앱에 하나(App 이 켠다). 고치던 글을 아는 곳(오른쪽 패널)이 떠 있으면 그쪽이 묻고 답한다. 없으면 고치던 글도 없으니 바로 exit.
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { isDesktopRuntime } from './runtime'
 
 export type ExitDecision = 'exit' | 'stay'

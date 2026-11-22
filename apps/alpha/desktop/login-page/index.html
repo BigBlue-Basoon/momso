@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <!--
+    몸소 입구의 로그인 화면(2026-11-21 본부 지시: 휴대폰에서 몸소를 열 때 처음 보는 화면). 화면은 화면 담당, 동작은 줄2(boot.mjs).
+    React 없이 혼자 서는 정적 파일. 바깥 글꼴·스크립트를 끌어오지 않는다. 꼴은 시작 화면(src/start/StartScreen.tsx)과 같다.
+    줄2 와의 약속: #google-button 안의 <button id="google-login"> 은 이 HTML 에 있다(Google 의 "Sign in with Google" 상표 지침대로). boot.mjs 는 누름만 걸고, ready 가 아닐 때 disabled 로 둔다.
+    #error 자리의 글은 이 HTML 에 있다.
+    body 의 data-state = ready(단추) · working(로그인 확인 중) · error(실패, 다시 할 수 있음) · invalid(잘못 들어온 주소). 값이 없으면 스크립트가 돌기 전(준비하는 중).
+    그림은 입구가 로그인 전에도 내주는 공개 파일(/app-icons/…, /manifest.webmanifest)만 쓴다.
+  -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#f8f9f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#1f2220" media="(prefers-color-scheme: dark)" />
+  <meta name="color-scheme" content="light dark" />
+  <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
+  <link rel="apple-touch-icon" href="/app-icons/apple-touch-icon.png" />
+  <link rel="icon" type="image/png" href="/app-icons/favicon-32.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="momso" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <title>momso</title>
+  <link rel="stylesheet" href="./login.css" />
+</head>
+<body>
+  <main class="login">
+    <div class="login-column">
+      <header class="login-head">
+        <img class="login-mark" src="/app-icons/icon-192.png" alt="" width="56" height="56" />
+        <h1>몸소에 로그인</h1>
+        <p class="for-start">몸소를 설치할 때 쓴 Google 계정으로 로그인해 주세요.</p>
+        <p class="for-invalid">이 주소로는 로그인할 수 없습니다. 받은 몸소 주소로 다시 열어 주세요.</p>
+      </header>
+      <div class="login-action">
+        <div id="google-button">
+          <!-- G 로고는 Google 지침 페이지의 공식 단추 만들기 도구가 내주는 그림 그대로(색·모양을 바꾸지 않는다). -->
+          <button id="google-login" type="button">
+            <span class="google-login-state" aria-hidden="true"></span>
+            <svg class="google-login-mark" viewBox="0 0 48 48" width="20" height="20" aria-hidden="true" focusable="false">
+              <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+              <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+              <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+              <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+              <path fill="none" d="M0 0h48v48H0z"/>
+            </svg>
+            <span class="google-login-text">Google 계정으로 로그인</span>
+          </button>
+        </div>
+        <p class="login-status for-boot" role="status"><span class="login-spin" aria-hidden="true"></span>준비하는 중</p>
+        <p class="login-status for-working" role="status"><span class="login-spin" aria-hidden="true"></span>로그인을 확인하는 중</p>
+      </div>
+      <p id="error" role="alert"><span class="for-error">로그인하지 못했습니다. 다시 시도해 주세요.</span></p>
+      <p class="login-note for-start">로그인하면 이 기기에서 30일 동안 유지됩니다.</p>
+    </div>
+  </main>
+  <script type="module" src="./boot.mjs"></script>
+</body>
+</html>

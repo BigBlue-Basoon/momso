@@ -1,8 +1,8 @@
 import { W } from './words'
 // 보관함(읽는 글, 원본, 작업 기록) 명령을 부르는 얇은 층.
 // 화면은 이 파일의 함수만 쓴다. 명령의 모양은 momso-public-prep/archive-backend-port-notes.md 를 따른다.
-import { invoke } from '@tauri-apps/api/core'
-import { isDesktopRuntime } from './runtime'
+import { invoke } from './host'
+import { hasAppBackend, isDesktopRuntime } from './runtime'
 
 export type ZetKind = 'summary' | 'transcript' | 'note'
 export type ZetStatus = 'draft' | 'confirmed'
@@ -155,6 +155,11 @@ function requireArchive() {
   if (!isArchiveAvailable()) throw new Error('archive commands need the desktop runtime')
 }
 
+/** 문서 읽기·이전 판·되돌리기는 휴대폰 몸소(S75 둘째 server 길)에서도 부른다. */
+function requireDocs() {
+  if (!hasAppBackend()) throw new Error('document commands need the desktop runtime')
+}
+
 // 개발 앱에서만, 실제 문서가 하나도 없을 때 문서·폴더 몇 개를 보인다(dev-samples/doc-samples.ts, 읽기·고치기·옮기기는 메모리에서만).
 // 실제 문서가 있으면 섞지 않는다(2026-11-18). 설치판 빌드에는 들어가지 않는다.
 const devDocs = import.meta.env.DEV ? import('./dev-samples/doc-samples') : null
@@ -162,7 +167,7 @@ const devDoc = async (id: string) => (devDocs && id.startsWith('dev-doc-') ? dev
 let showingDevDocs = false
 
 export async function listZets() {
-  requireArchive()
+  requireDocs()
   const list = await invoke<ZetListEntry[]>('zet_list', { kind: null, status: null })
   showingDevDocs = Boolean(devDocs) && list.length === 0
   if (!devDocs || !showingDevDocs) return list
@@ -198,7 +203,7 @@ export async function renameZetFolder(from: string, to: string) {
 }
 
 export async function readZet(id: string) {
-  requireArchive()
+  requireDocs()
   const sample = await devDoc(id)
   if (sample) return (await sample).devSampleDocument(id)
   return invoke<ZetDocument>('zet_read', { id })
@@ -231,14 +236,14 @@ export async function readZetLinked(id: string) {
 }
 
 export async function readZetHistory(id: string) {
-  requireArchive()
+  requireDocs()
   const sample = await devDoc(id)
   if (sample) return (await sample).devSampleHistory
   return invoke<ZetHistoryEntry[]>('zet_history', { id })
 }
 
 export async function readZetVersion(id: string, revision: string) {
-  requireArchive()
+  requireDocs()
   return invoke<ZetVersion>('zet_read_version', { id, revision })
 }
 
@@ -247,7 +252,7 @@ export async function readZetVersion(id: string, revision: string) {
  * 사람이 그 내용을 버리기로 한 뒤에만 discardUnsaved 를 true 로 준다.
  */
 export async function restoreZetVersion(id: string, revision: string, discardUnsaved = false) {
-  requireArchive()
+  requireDocs()
   await invoke<null>('zet_restore_version', { id, revision, discardUnsaved })
 }
 
@@ -274,7 +279,7 @@ export type SourceSearchResult = {
 }
 
 export async function searchSources(query: string) {
-  if (!isDesktopRuntime()) throw new Error('source_search needs the desktop runtime')
+  if (!hasAppBackend()) throw new Error('source_search needs the desktop runtime')
   return invoke<SourceSearchResult[]>('source_search', { query })
 }
 

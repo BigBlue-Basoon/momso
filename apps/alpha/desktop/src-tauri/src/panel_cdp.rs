@@ -352,6 +352,15 @@ pub(crate) mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    #[ignore = "requires WebView2 on an isolated desktop and a fake credential store"]
+    fn saved_login_open_and_fill_selected_without_submitting() {
+        assert!(std::env::var_os("MOMSO_TEST_FAKE_CREDENTIAL_STORE").is_some());
+        assert!(std::env::var_os("MOMSO_S14_OPEN_FILL").is_some());
+        run_local_fixture(true, true, false, true, false);
+    }
+
+    #[cfg(windows)]
     fn run_local_fixture(
         allow_tcp_without_data: bool,
         run_mcp: bool,
@@ -435,6 +444,8 @@ pub(crate) mod tests {
                             "<html><title>Frame</title><iframe src='http://127.0.0.1:1/login'></iframe><form method='post' action='/auth'><input name='user' type='text'><input name='pw' type='password'><button type='submit'>login</button></form></html>"
                         } else if saved && request.starts_with("GET /dashboard ") {
                             "<html><title>Done</title><body>signed in</body></html>"
+                        } else if saved && request.starts_with("GET /otp ") {
+                            "<html><title>Verification</title><input autocomplete='one-time-code'></html>"
                         } else {
                             body
                         };
@@ -465,6 +476,7 @@ pub(crate) mod tests {
             if PanelTransport::bind(app.handle()).is_ok() { return Err(std::io::Error::other("main was incorrectly bound").into()); }
             let mut view = tauri::webview::WebviewBuilder::new(PANEL_LABEL, WebviewUrl::External("about:blank".parse()?))
                 .data_directory(profile.clone())
+                .browser_extensions_enabled(saved)
                 .on_navigation(|url| crate::panel_browser::navigation_gate().permits_navigation(url.as_str()))
                 .on_new_window(|_, _| { let _ = crate::panel_browser::navigation_gate().permits_popup(); tauri::webview::NewWindowResponse::Deny });
             if let Ok(args) = std::env::var("MOMSO_TEST_PANEL_BROWSER_ARGS") { view = view.additional_browser_args(&args); }
@@ -473,6 +485,9 @@ pub(crate) mod tests {
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 let result = runtime.block_on(async {
+                    if saved {
+                        crate::panel_extensions::install_fixture(&handle, &data_root).await?;
+                    }
                     let transport = PanelTransport::bind(&handle)?;
                     let mut events = transport.subscribe("Runtime.consoleAPICalled").await?;
                     transport.call("Runtime.enable", serde_json::json!({})).await?;
@@ -683,7 +698,10 @@ pub(crate) mod tests {
         stop_server.store(true, std::sync::atomic::Ordering::Release);
         server.join().unwrap();
         if saved {
-            assert!(posted.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                posted.load(std::sync::atomic::Ordering::SeqCst),
+                std::env::var_os("MOMSO_S14_OPEN_FILL").is_none()
+            );
             assert!(!secret_in_get.load(std::sync::atomic::Ordering::SeqCst));
             // Keep this isolated profile until the parent verifies it after process exit.
             let _ = temp.keep();
@@ -716,7 +734,11 @@ pub(crate) mod tests {
             return Err("panel_close_failed");
         }
         let ui_app = app.clone();
-        let ui_profile = root.join("simulated-ui-panel");
+        let ui_profile = if saved {
+            root.with_file_name("profile")
+        } else {
+            root.join("simulated-ui-panel")
+        };
         let open_listener = app.listen("panel-agent-open-request", move |_| {
             let app = ui_app.clone();
             let profile = ui_profile.clone();
@@ -732,6 +754,7 @@ pub(crate) mod tests {
                             tauri::WebviewUrl::External("about:blank".parse().unwrap()),
                         )
                         .data_directory(profile)
+                        .browser_extensions_enabled(saved)
                         .on_navigation(|url| {
                             crate::panel_browser::navigation_gate().permits_navigation(url.as_str())
                         })
@@ -754,6 +777,35 @@ pub(crate) mod tests {
         let saved_listener = app.listen("saved-login-used", move |event| {
             if let Ok(mut events) = captured_saved_events.lock() {
                 events.push(event.payload().to_owned());
+            }
+        });
+        let selection_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let selection_observed = selection_seen.clone();
+        let selection_app = app.clone();
+        let selection_listener = app.listen("saved-login-selection-request", move |event| {
+            let Ok(payload) = serde_json::from_str::<Value>(event.payload()) else {
+                return;
+            };
+            let Some(request_id) = payload["requestId"].as_str() else {
+                return;
+            };
+            let Some(id) = payload["entries"]
+                .as_array()
+                .and_then(|entries| entries.iter().find(|entry| entry["label"] == "fixture"))
+                .and_then(|entry| entry["id"].as_str())
+            else {
+                return;
+            };
+            if let Some(main) = selection_app.get_webview("main") {
+                if crate::saved_logins::saved_login_select(
+                    main,
+                    request_id.to_owned(),
+                    id.to_owned(),
+                )
+                .is_ok()
+                {
+                    selection_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
         });
         let state = app.state::<crate::AppState>();
@@ -826,6 +878,56 @@ pub(crate) mod tests {
             if !crate::saved_logins::for_origin("http://127.0.0.1:1")?.is_empty() {
                 return Err("saved_login_wrong_origin_exposed");
             }
+        }
+        if std::env::var_os("MOMSO_S14_OPEN_FILL").is_some() {
+            crate::saved_logins::fixture_set_login_path("/saved")?;
+            let info = crate::saved_logins::for_origin(&site)?
+                .into_iter()
+                .next()
+                .ok_or("not_found")?;
+            crate::panel_chat::select("panel-mcp-fixture")?;
+            let main = app.get_webview("main").ok_or("unavailable")?;
+            let input = serde_json::from_value(serde_json::json!({"chatId":"panel-mcp-fixture","id":info.id,"x":0,"y":0,"width":640,"height":480})).map_err(|_| "unavailable")?;
+            let result = crate::saved_logins::saved_login_open_and_fill(
+                main,
+                app.clone(),
+                app.state(),
+                input,
+            )
+            .await
+            .map_err(|_| "open_fill_failed")?;
+            if result["status"] != "filled" {
+                return Err(match result["status"].as_str() {
+                    Some("driver_unavailable") => "open_fill_driver_unavailable",
+                    Some("policy_unavailable") => "open_fill_policy_unavailable",
+                    Some("panel_page_changed") => "open_fill_panel_changed",
+                    Some("panel_not_active") => "open_fill_panel_not_active",
+                    Some("panel_closed") => "open_fill_panel_closed",
+                    Some("panel_busy") => "open_fill_panel_busy",
+                    Some("human_takeover") => "open_fill_human_takeover",
+                    Some("not_open") => "open_fill_not_open",
+                    Some("credential_store_unavailable") => "open_fill_store_unavailable",
+                    Some("human_required") => "open_fill_human_required",
+                    Some("target_changed") => "open_fill_target_changed",
+                    Some("blocked") => "open_fill_blocked",
+                    Some("unavailable") => "open_fill_unavailable",
+                    _ => "open_fill_other_status",
+                });
+            }
+            let transport = PanelTransport::bind(app)?;
+            let expected = serde_json::to_string(&secret).map_err(|_| "unavailable")?;
+            let expression =
+                format!("document.querySelector('input[type=password]')?.value === {expected}");
+            let value = transport
+                .call(
+                    "Runtime.evaluate",
+                    serde_json::json!({"expression":expression,"returnByValue":true}),
+                )
+                .await?;
+            if value.pointer("/result/value").and_then(Value::as_bool) != Some(true) {
+                return Err("open_fill_value_missing");
+            }
+            return Ok(());
         }
         let policy = Ok(Some(fixture_policy));
         let handler_app = app.clone();
@@ -962,6 +1064,7 @@ pub(crate) mod tests {
         crate::setup_bridge::bind(&chat, Some(std::process::id()));
         let pipe = crate::setup_bridge::name(&chat).ok_or("mcp_pipe_missing")?;
         let expected_site = format!("{site}/");
+        let extension_app = app.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<(), &'static str> {
             let file = std::fs::OpenOptions::new().read(true).write(true).open(pipe).map_err(|_| "mcp_connect_failed")?;
             let mut client = crate::momso_mcp::test_bridge(file);
@@ -974,6 +1077,9 @@ pub(crate) mod tests {
             };
             if call("browser_open", serde_json::json!({}))?["status"] != "ok" { return Err("mcp_open_failed"); }
             if saved {
+                let extensions = tauri::async_runtime::block_on(crate::panel_extensions::panel_extensions_list(extension_app))?;
+                let extensions = serde_json::to_value(extensions).map_err(|_| "fixture_list")?;
+                if !extensions.as_array().is_some_and(|items| items.iter().any(|item| item["name"] == "momso fixture" && item["enabled"].as_bool() == Some(true))) { return Err("fixture_not_enabled"); }
                 if call("browser_navigate", serde_json::json!({"url":format!("{site}/saved")}))?["status"] != "human_required" { return Err("saved_login_page_not_detected"); }
                 let login = call("browser_request_saved_login", serde_json::json!({}))?;
                 if login["status"] != "logged_in" {
@@ -988,6 +1094,10 @@ pub(crate) mod tests {
                     });
                 }
                 if call("browser_read", serde_json::json!({}))?["status"] != "page" { return Err("saved_login_read_failed"); }
+                if std::env::var_os("MOMSO_S74_OTP").is_some() {
+                    if call("browser_navigate", serde_json::json!({"url":format!("{site}/otp")}))?["status"] != "human_required" { return Err("otp_not_detected"); }
+                    return Ok(());
+                }
                 if call("browser_navigate", serde_json::json!({"url":format!("{site}/frame")}))?["status"] != "human_required" { return Err("saved_login_frame_guard_missing"); }
                 if call("browser_request_saved_login", serde_json::json!({}))?["status"] != "human_required" { return Err("saved_login_frame_not_refused"); }
                 return Ok(());
@@ -1023,9 +1133,22 @@ pub(crate) mod tests {
         drop(bridge);
         app.unlisten(listener);
         app.unlisten(open_listener);
+        app.unlisten(selection_listener);
         responder.abort();
         result?;
         if saved {
+            if std::env::var_os("MOMSO_S74_OTP").is_some() {
+                if !selection_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("saved_login_selection_missing");
+                }
+                let events = panel_events.lock().map_err(|_| "panel_event_lock_failed")?;
+                if !events
+                    .iter()
+                    .any(|event| event["reason"] == "one_time_code")
+                {
+                    return Err("otp_event_missing");
+                }
+            }
             // This baseline branch requests a site-scope card on browser_open.
             // The saved-login card is the additional one only in ask mode.
             if cards_count.load(std::sync::atomic::Ordering::SeqCst)

@@ -53,6 +53,25 @@ fn claude_effort(id: &str) -> Effort {
     .to_owned();
     value
 }
+
+// Keep the documented Gemini levels aligned with the server's S62 catalogue.
+// Unknown models deliberately expose no guessed levels.
+fn gemini_efforts(model: &str) -> &'static [&'static str] {
+    match model {
+        "gemini-4-carbon" | "gemini-4-argon" | "gemini-3.8-flash" | "gemini-3.1-pro-preview" => {
+            &["low", "medium", "high"]
+        }
+        "gemini-4-neon" | "gemini-4-hydrogen" => &["low", "medium", "high", "xhigh"],
+        "gemini-3.6-flash"
+        | "gemini-3.5-flash-lite"
+        | "gemini-3.1-flash-lite"
+        | "gemini-3-flash-preview"
+        | "gemini-robotics-er-2-preview" => &["minimal", "low", "medium", "high"],
+        "gemini-3.1-flash-lite-image" => &["minimal", "high"],
+        "gemini-3-pro-preview" => &["low", "high"],
+        _ => &[],
+    }
+}
 // Support means documented model capability, not proof of account eligibility.
 // No supported CLI query has verified the current setting for this session.
 fn fast(provider: &str, model: &str) -> Fast {
@@ -587,7 +606,10 @@ fn gemini_models(output: &str) -> ProviderModels {
                 family: None,
                 label: label.to_owned(),
                 resolved: None,
-                efforts: vec![],
+                efforts: gemini_efforts(id)
+                    .iter()
+                    .map(|level| effort(level, None, None))
+                    .collect(),
                 effort_note: None,
                 toggles: vec![],
                 fast: fast("gemini", ""),
@@ -834,12 +856,31 @@ mod tests {
         assert_eq!(model.fast.state, "unavailable");
         assert_eq!(fast("claude", "claude-sonnet-5-5").supported, Some(false));
         assert_eq!(fast("codex", "future-model").supported, Some(false));
+        for id in [
+            "claude-fable-5-2",
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+        ] {
+            assert_eq!(fast("claude", id).supported, Some(true));
+        }
+        assert_eq!(fast("claude", "claude-mythos-5-2").supported, Some(false));
     }
     #[test]
     fn gemini_reads_cli_model_list() {
         let p = gemini_models("Fetching available models...\nm\tM\n");
         assert_eq!(p.state, "ok");
         assert_eq!(p.models[0].id, "m");
+        assert!(p.models[0].efforts.is_empty());
+        let documented = gemini_models("gemini-3-pro-preview\tGemini Pro\n");
+        assert_eq!(
+            documented.models[0]
+                .efforts
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "high"]
+        );
         assert_eq!(gemini_models("not a model").state, "unavailable");
     }
 

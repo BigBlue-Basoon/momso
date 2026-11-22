@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -45,6 +46,31 @@ export function selectStageParent(tempRoot, tauriRoot, pathApi = path) {
   return tempDrive === tauriDrive ? tempRoot : pathApi.join(tauriRoot, 'target');
 }
 
+// Use the redistributable CRT shipped with the same Visual Studio installation
+// that supplies the MSVC linker. System32 is not a redistributable source.
+export async function locateMsvcCrt() {
+  const vswhere = path.join(process.env['ProgramFiles(x86)'], 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
+  const { stdout } = await promisify(execFile)(vswhere, ['-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath']);
+  const root = path.join(stdout.trim(), 'VC', 'Redist', 'MSVC');
+  const versions = (await readdir(root, { withFileTypes: true }))
+    .filter(entry => entry.isDirectory() && /^\d+(?:\.\d+)+$/.test(entry.name))
+    .map(entry => entry.name).sort((a, b) => b.localeCompare(a, 'en', { numeric: true }));
+  for (const version of versions) {
+    const arch = path.join(root, version, 'x64');
+    try {
+      const families = (await readdir(arch, { withFileTypes: true }))
+        .filter(entry => entry.isDirectory() && /^Microsoft\.VC\d+\.CRT$/i.test(entry.name))
+        .map(entry => entry.name).sort((a, b) => b.localeCompare(a, 'en', { numeric: true }));
+      for (const family of families) {
+        const folder = path.join(arch, family);
+        const names = (await readdir(folder)).filter(name => /^(?:msvcp|vcruntime|concrt|vccorlib)\d.*\.dll$/i.test(name));
+        if (['vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll'].every(name => names.some(actual => actual.toLowerCase() === name))) return { folder, names };
+      }
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  throw new Error('Visual C++ x64 redistributable files are required to build the installer');
+}
+
 export async function withStage(parent, action) {
   const stage = await mkdtemp(path.join(parent, 'momso-bundle-'));
   try {
@@ -86,12 +112,22 @@ async function main() {
     const notices = path.join(stage, 'third-party');
     await cp(nodeSource, node, { recursive: true, filter: source => !omitNodeFile(path.relative(nodeSource, source)) });
     await cp(noticeSource, notices, { recursive: true });
+    const crt = await locateMsvcCrt();
+    await promisify(execFile)('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      "$ErrorActionPreference='Stop'; Import-Module (Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1'); foreach ($name in (ConvertFrom-Json $env:MOMSO_CRT_NAMES)) { $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $env:MOMSO_CRT_SOURCE $name); if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw 'Invalid Microsoft runtime signature' } }"],
+    { env: { ...process.env, MOMSO_CRT_SOURCE: crt.folder, MOMSO_CRT_NAMES: JSON.stringify(crt.names) } });
+    const crtStage = path.join(stage, 'crt');
+    await mkdir(crtStage);
+    for (const name of crt.names) {
+      await cp(path.join(crt.folder, name), path.join(crtStage, name));
+      await cp(path.join(crt.folder, name), path.join(node, name));
+    }
     const nodeFiles = await filesBelow(node);
     const noticeFiles = await filesBelow(notices);
     for (const required of ['node.exe', path.join('node_modules', 'npm', 'bin', 'npm-cli.js')]) {
       if (!nodeFiles.includes(required)) throw new Error(`Missing Node runtime file: ${required}`);
     }
-    for (const file of nodeFiles) {
+    for (const file of nodeFiles.filter(file => !crt.names.includes(file))) {
       if (await digest(path.join(node, file)) !== await digest(path.join(nodeSource, file))) throw new Error(`Node staging mismatch: ${file}`);
     }
     for (const file of noticeFiles) {
@@ -104,9 +140,15 @@ async function main() {
     const resources = { 'generated/node/': null, '../third-party/': null };
     resources[`${node.replaceAll('\\', '/')}/`] = 'node/';
     resources[`${notices.replaceAll('\\', '/')}/`] = 'third-party/';
+    for (const name of crt.names) resources[path.join(crtStage, name).replaceAll('\\', '/')] = name;
     const config = { build: { beforeBuildCommand: 'npm run build' }, bundle: { resources } };
     if (args.includes('--updater')) config.bundle.createUpdaterArtifacts = true;
     await run(process.execPath, [cli, 'build', '--bundles', 'nsis', '--config', JSON.stringify(config)]);
+    const { version } = JSON.parse(await readFile(path.join(tauri, 'tauri.conf.json'), 'utf8'));
+    const target = process.env.CARGO_TARGET_DIR ? path.resolve(process.env.CARGO_TARGET_DIR) : path.join(tauri, 'target');
+    const release = path.join(target, 'release');
+    const installer = path.join(release, 'bundle', 'nsis', `momso_${version}_x64-setup.exe`);
+    await run(process.execPath, [path.join(desktop, 'scripts/verify-desktop-installer.mjs'), installer, path.join(release, 'momso-desktop.exe'), path.join(node, 'node.exe'), crtStage]);
   });
 }
 

@@ -1,171 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-pub(crate) const EDGE_TYPES: [&str; 5] = [
-    "summarizes",
-    "derived_from",
-    "continues",
-    "references",
-    "supersedes",
-];
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Edge {
-    #[serde(rename = "type")]
-    pub(crate) kind: String,
-    pub(crate) target: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ZetHead {
-    pub(crate) id: String,
-    pub(crate) title: String,
-    pub(crate) summary: String,
-    pub(crate) kind: String,
-    pub(crate) status: String,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
-    pub(crate) assets: Vec<String>,
-    pub(crate) edges: Vec<Edge>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) folder: String,
-    #[serde(skip)]
-    original_header: Option<String>,
-}
-
-pub(crate) fn valid_zet_id(id: &str) -> bool {
-    let bytes = id.as_bytes();
-    bytes.len() == 19
-        && &bytes[..4] == b"zet_"
-        && bytes[12] == b'_'
-        && bytes[4..12]
-            .iter()
-            .chain(bytes[13..19].iter())
-            .all(u8::is_ascii_digit)
-        && chrono::NaiveDateTime::parse_from_str(&id[4..], "%Y%m%d_%H%M%S").is_ok()
-}
-
-pub(crate) fn valid_asset_id(asset: &str) -> bool {
-    asset.len() == 71
-        && asset.starts_with("sha256:")
-        && asset[7..]
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-}
-
-pub(crate) fn validate(head: &ZetHead) -> Result<(), String> {
-    validate_folder(&head.folder)?;
-    if !valid_zet_id(&head.id) {
-        return Err("글 번호가 올바르지 않습니다".into());
-    }
-    if head.title.trim().is_empty() {
-        return Err("제목을 입력해 주세요".into());
-    }
-    if head.summary.trim().is_empty() {
-        return Err("요약을 입력해 주세요".into());
-    }
-    if !["summary", "transcript", "note"].contains(&head.kind.as_str()) {
-        return Err("글 종류가 올바르지 않습니다".into());
-    }
-    if !["draft", "confirmed"].contains(&head.status.as_str()) {
-        return Err("글 상태가 올바르지 않습니다".into());
-    }
-    if chrono::DateTime::parse_from_rfc3339(&head.created_at).is_err()
-        || chrono::DateTime::parse_from_rfc3339(&head.updated_at).is_err()
-    {
-        return Err("글의 시간이 올바르지 않습니다".into());
-    }
-    for asset in &head.assets {
-        if !valid_asset_id(asset) {
-            return Err("원본 번호가 올바르지 않습니다".into());
-        }
-    }
-    for edge in &head.edges {
-        if !EDGE_TYPES.contains(&edge.kind.as_str()) || !valid_zet_id(&edge.target) {
-            return Err("글의 연결이 올바르지 않습니다".into());
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_folder(folder: &str) -> Result<(), String> {
-    if folder.is_empty() {
-        return Ok(());
-    }
-    if folder.len() > 4096
-        || folder.chars().any(char::is_control)
-        || folder
-            .split('/')
-            .any(|part| part.is_empty() || part.trim() != part || part == ".." || part == ".")
-        || folder.contains('\\')
-    {
-        return Err("invalid_folder".into());
-    }
-    Ok(())
-}
-
-pub(crate) fn parse(text: &str) -> Result<(ZetHead, &str), String> {
-    let (remaining, boundary) = if let Some(text) = text.strip_prefix("---\r\n") {
-        (text, "\r\n---\r\n")
-    } else if let Some(text) = text.strip_prefix("---\n") {
-        (text, "\n---\n")
-    } else {
-        return Err("글 머리가 올바르지 않습니다".into());
-    };
-    let (yaml, body) = remaining
-        .split_once(boundary)
-        .ok_or_else(|| "글 머리가 올바르지 않습니다".to_string())?;
-    let fields: serde_yaml::Value =
-        serde_yaml::from_str(yaml).map_err(|_| "글 머리가 올바르지 않습니다".to_string())?;
-    let keys: Vec<&str> = fields
-        .as_mapping()
-        .ok_or_else(|| "글 머리가 올바르지 않습니다".to_string())?
-        .keys()
-        .map(|key| key.as_str().unwrap_or(""))
-        .collect();
-    let expected = [
-        "id",
-        "title",
-        "summary",
-        "kind",
-        "status",
-        "created_at",
-        "updated_at",
-        "assets",
-        "edges",
-    ];
-    let without_folder: Vec<_> = keys
-        .iter()
-        .copied()
-        .filter(|key| *key != "folder")
-        .collect();
-    if without_folder != expected || keys.len() > expected.len() + 1 {
-        return Err("글 머리 항목이나 순서가 올바르지 않습니다".into());
-    }
-    let mut head: ZetHead =
-        serde_yaml::from_str(yaml).map_err(|_| "글 머리가 올바르지 않습니다".to_string())?;
-    validate(&head)?;
-    head.original_header = Some(text[..text.len() - body.len()].to_string());
-    Ok((head, body))
-}
-
-pub(crate) fn render(head: &ZetHead, body: &str) -> Result<String, String> {
-    validate(head)?;
-    if let Some(original) = &head.original_header {
-        let source = format!("{original}{body}");
-        if let Ok((mut previous, _)) = parse(&source) {
-            let mut current = head.clone();
-            previous.original_header = None;
-            current.original_header = None;
-            if previous == current {
-                return Ok(source);
-            }
-        }
-    }
-    let yaml = serde_yaml::to_string(head).map_err(|_| "글을 만들지 못했습니다".to_string())?;
-    Ok(format!("---\n{}---\n{}", yaml, body))
-}
+#[path = "../momso-core/src/document.rs"]
+mod document_format;
+#[cfg(test)]
+pub(crate) use document_format::EDGE_TYPES;
+pub(crate) use document_format::{
+    parse, render, valid_asset_id, valid_zet_id, validate, validate_folder, Edge, ZetHead,
+};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -316,114 +157,13 @@ pub(crate) fn add_folders(
     Ok(())
 }
 
-const FOLDERS_FILE: &str = ".folders.json";
-
-fn folder_directory(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let directory = root.join("zettels");
-    let metadata = std::fs::symlink_metadata(&directory).map_err(|_| "unavailable".to_string())?;
-    if !metadata.is_dir() || crate::archive_location::is_link_or_reparse(&metadata) {
-        return Err("unavailable".into());
-    }
-    Ok(directory)
-}
-
-fn ensure_regular_file(path: &std::path::Path) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| "unavailable".to_string())?;
-    if !metadata.is_file() || crate::archive_location::is_link_or_reparse(&metadata) {
-        return Err("unavailable".into());
-    }
-    Ok(())
-}
-
-pub(crate) fn read_folder_registry(
-    root: &std::path::Path,
-) -> Result<std::collections::BTreeSet<String>, String> {
-    let path = folder_directory(root)?.join(FOLDERS_FILE);
-    match std::fs::symlink_metadata(&path) {
-        Ok(metadata)
-            if !metadata.is_file() || crate::archive_location::is_link_or_reparse(&metadata) =>
-        {
-            return Err("invalid_folders".into())
-        }
-        Ok(_) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(_) => return Err("unavailable".into()),
-    }
-    match std::fs::read(&path) {
-        Ok(data) => {
-            let folders: std::collections::BTreeSet<String> =
-                serde_json::from_slice(&data).map_err(|_| "invalid_folders".to_string())?;
-            for folder in &folders {
-                validate_folder(folder)?;
-                if folder.is_empty() {
-                    return Err("invalid_folders".into());
-                }
-            }
-            Ok(folders)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
-        Err(_) => Err("unavailable".into()),
-    }
-}
-
-fn add_ancestors(folders: &mut std::collections::BTreeSet<String>, folder: &str) {
-    let mut current = String::new();
-    for part in folder.split('/').filter(|part| !part.is_empty()) {
-        if !current.is_empty() {
-            current.push('/');
-        }
-        current.push_str(part);
-        folders.insert(current.clone());
-    }
-}
-
-fn write_folder_registry(
-    root: &std::path::Path,
-    folders: &std::collections::BTreeSet<String>,
-) -> Result<(), String> {
-    use std::io::Write;
-    let dir = folder_directory(root)?;
-    let mut temp = tempfile::NamedTempFile::new_in(&dir).map_err(|_| "unavailable".to_string())?;
-    serde_json::to_writer_pretty(&mut temp, folders).map_err(|_| "unavailable".to_string())?;
-    temp.write_all(b"\n")
-        .map_err(|_| "unavailable".to_string())?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|_| "unavailable".to_string())?;
-    temp.persist(dir.join(FOLDERS_FILE))
-        .map_err(|_| "unavailable".to_string())?;
-    Ok(())
-}
-
-fn document_files(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
-    let mut paths = Vec::new();
-    for entry in
-        std::fs::read_dir(folder_directory(root)?).map_err(|_| "unavailable".to_string())?
-    {
-        let entry = entry.map_err(|_| "unavailable".to_string())?;
-        if entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.strip_suffix(".md"))
-            .is_some_and(valid_zet_id)
-        {
-            ensure_regular_file(&entry.path())?;
-            paths.push(entry.path());
-        }
-    }
-    Ok(paths)
-}
-
-pub(crate) fn folders(root: &std::path::Path) -> Result<Vec<String>, String> {
-    let _guard = WRITE_LOCK.lock().map_err(|_| "unavailable".to_string())?;
-    let mut result = read_folder_registry(root)?;
-    for path in document_files(root)? {
-        let text = std::fs::read_to_string(path).map_err(|_| "unavailable".to_string())?;
-        let (head, _) = parse(&text)?;
-        add_ancestors(&mut result, &head.folder);
-    }
-    Ok(result.into_iter().collect())
-}
+#[path = "../momso-core/src/folders.rs"]
+mod folder_core;
+use folder_core::{
+    add_ancestors, ensure_regular_file, folder_directory, write_document_folder,
+    write_folder_registry,
+};
+pub(crate) use folder_core::{folders, read_folder_registry};
 
 pub(crate) fn create_folder(
     root: &std::path::Path,
@@ -439,32 +179,6 @@ pub(crate) fn create_folder(
     let mut registry = read_folder_registry(root)?;
     add_ancestors(&mut registry, folder);
     write_folder_registry(root, &registry)
-}
-
-fn document_with_folder(text: &str, folder: &str) -> Result<String, String> {
-    let (mut head, body) = parse(text)?;
-    head.folder = folder.to_owned();
-    render(&head, body)
-}
-
-fn replace_document(path: &std::path::Path, expected: &str, content: &str) -> Result<(), String> {
-    use std::io::Write;
-    let mut temp = tempfile::NamedTempFile::new_in(path.parent().ok_or("unavailable")?)
-        .map_err(|_| "unavailable".to_string())?;
-    temp.write_all(content.as_bytes())
-        .map_err(|_| "unavailable".to_string())?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|_| "unavailable".to_string())?;
-    if std::fs::read_to_string(path).map_err(|_| "unavailable".to_string())? != expected {
-        return Err("conflict".into());
-    }
-    temp.persist(path).map_err(|_| "unavailable".to_string())?;
-    Ok(())
-}
-
-fn write_document_folder(path: &std::path::Path, text: &str, folder: &str) -> Result<(), String> {
-    replace_document(path, text, &document_with_folder(text, folder)?)
 }
 
 pub(crate) fn set_folder(
@@ -508,59 +222,7 @@ pub(crate) fn rename_folder(
     }
     let _guard = WRITE_LOCK.lock().map_err(|_| "unavailable".to_string())?;
     crate::archive_remote::ensure_document_write_allowed(root, database)?;
-    let mut registry = read_folder_registry(root)?;
-    let mut changes = Vec::new();
-    for path in document_files(root)? {
-        let original = std::fs::read_to_string(&path).map_err(|_| "unavailable".to_string())?;
-        let (head, _) = parse(&original)?;
-        let expected_name = format!("{}.md", head.id);
-        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
-            return Err("invalid_document".into());
-        }
-        let suffix = head
-            .folder
-            .strip_prefix(from)
-            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'));
-        if let Some(suffix) = suffix {
-            let folder = format!("{to}{suffix}");
-            let updated = document_with_folder(&original, &folder)?;
-            changes.push((path, original, updated));
-        }
-    }
-    let matching: Vec<_> = registry
-        .iter()
-        .filter(|f| *f == from || f.starts_with(&format!("{from}/")))
-        .cloned()
-        .collect();
-    if matching.is_empty() && changes.is_empty() {
-        return Err("not_found".into());
-    }
-    for folder in matching {
-        let renamed = format!("{to}{}", &folder[from.len()..]);
-        validate_folder(&renamed)?;
-        registry.remove(&folder);
-        add_ancestors(&mut registry, &renamed);
-    }
-    for (_, _, updated) in &changes {
-        add_ancestors(&mut registry, &parse(updated)?.0.folder);
-    }
-    let mut applied: Vec<(std::path::PathBuf, String, String)> = Vec::new();
-    for (path, original, updated) in changes {
-        if let Err(error) = replace_document(&path, &original, &updated) {
-            for (path, original, updated) in applied.iter().rev() {
-                let _ = replace_document(path, updated, original);
-            }
-            return Err(error);
-        }
-        applied.push((path, original, updated));
-    }
-    if let Err(error) = write_folder_registry(root, &registry) {
-        for (path, original, updated) in applied.iter().rev() {
-            let _ = replace_document(path, updated, original);
-        }
-        return Err(error);
-    }
-    Ok(())
+    folder_core::rename_folder_locked(root, from, to)
 }
 
 #[derive(Deserialize)]
@@ -575,8 +237,7 @@ pub(crate) struct ZetUpdate {
 }
 
 pub(crate) fn content_hash(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+    document_format::content_hash(text)
 }
 
 pub(crate) static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

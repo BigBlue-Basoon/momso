@@ -1,6 +1,14 @@
-import { useEffect, useRef, useState, useLayoutEffect } from 'react'
-import { ArrowLeft, ArrowRight, ExternalLink, LoaderCircle, Lock, LockOpen, RefreshCw, RotateCw, X } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, useLayoutEffect } from 'react'
+import { createPortal } from 'react-dom'
+import { ArrowLeft, ArrowRight, ExternalLink, KeyRound, LoaderCircle, Lock, LockOpen, Puzzle, RefreshCw, RotateCw, X } from 'lucide-react'
 import { openWebAddress } from '../archive'
+import { SavedLoginsCard } from './SavedLoginsCard'
+import { openAndFillSavedLogin, type SavedLogin } from '../saved-logins'
+import { isMissingCommand } from '../ai-models'
+import { closePanelOverlay, LOGIN_CARD_MARGIN, listenOverlayFilled, listenPanelOverlayClosed, openPanelOverlay, overlayKind } from '../panel-overlay'
+import { extensionErrorCode, listenExtensionsChanged, listenExtensionsPage, listExtensions, openExtensionPopup, pinnedExtensions, type ExtensionsSection, type PanelExtension } from '../panel-extensions'
+import { ExtensionsManager } from './ExtensionsManager'
+import { ExtensionIcon, ExtensionsMenu } from './ExtensionsMenu'
 import {
   closePanelBrowser,
   listenPanelAgent,
@@ -23,6 +31,7 @@ import {
   listenPanelPopup,
   type PanelPopup,
   typedAddress,
+  useAvoidPanelBrowser,
   usePanelBrowserHeld,
   usePanelChat,
   type PanelBounds,
@@ -36,7 +45,8 @@ const B = W.panelBrowser
 
 /**
  * 오른쪽 패널의 브라우저 탭 안(2026-11-17 본부 결정, ui-panel-browser-plan-20261117.md).
- * 맨 위 한 줄은 문서 탭의 zet-viewbar 줄 꼴 그대로: 뒤로·앞으로·새로 고침(불러오는 중에는 멈추기), 자물쇠와 호스트(누르면 전체 주소를 고치는 칸), 기본 브라우저로 열기.
+ * 맨 위 한 줄은 문서 탭의 zet-viewbar 줄 꼴 그대로: 뒤로·앞으로·새로 고침(불러오는 중에는 멈추기), 자물쇠와 호스트(누르면 전체 주소를 고치는 칸),
+ * 저장된 로그인(열쇠, 2026-11-21: 어사이드처럼 주소 칸 오른쪽. 누르면 단추 아래에 떠 있는 카드), 기본 브라우저로 열기.
  * 그 아래 빈 자리를 재서 뒤쪽 웹뷰를 그 위에 띄운다. 호스트·자물쇠는 뒤쪽 이벤트의 값만 쓴다(사이트 화면 안의 글은 쓰지 않는다).
  *
  * 채팅방마다 하나(2026-11-21, panel-browser.ts "채팅방마다 따로"): 이 부품은 chatId 방의 브라우저다. 뒤쪽이 그 방을 고른 뒤에만
@@ -72,6 +82,22 @@ export function PanelBrowserView({
   const [page, setPage] = useState<PanelPage | null>(null)
   const [history, setHistory] = useState<{ canGoBack: boolean | null; canGoForward: boolean | null }>({ canGoBack: null, canGoForward: null })
   const [editing, setEditing] = useState<string | null>(null)
+  // 저장된 로그인 카드가 떠 있는가(열쇠 단추). 카드 자리는 열쇠 단추 바로 아래, 단추 오른쪽 끝에 맞춘다(어사이드 꼴).
+  const [logins, setLogins] = useState(false)
+  const [cardAt, setCardAt] = useState<{ top: number; right: number; width: number; height: number } | null>(null)
+  const keyButton = useRef<HTMLButtonElement>(null)
+  const loginCard = useRef<HTMLElement>(null)
+  const browserBox = useRef<HTMLDivElement>(null)
+  // 이번 누름이 카드(또는 카드에서 연 묻는 창, 열쇠 단추) 안에서 시작됐는가. React 이벤트는 포털을 거쳐서도 카드로 올라오고,
+  // document 의 듣기보다 먼저 돈다. 그래서 바깥 누름만 카드를 닫는다.
+  const pressInside = useRef(false)
+  // 아래 logins 카드는 떠 있는 창이 없는 뒤쪽(가짜 화면·옛 앱)일 때만 쓴다: 웹뷰가 따로 뜨는 층이라 떠 있는 동안 웹뷰를 숨긴다.
+  useAvoidPanelBrowser(loginCard, logins)
+  // 떠 있는 창(S13, panel-overlay.ts)으로 연 카드: 페이지를 숨기지 않고 그 위에 뜬다(어사이드 꼴). 창 id 와, 열쇠를 누르는 사이 바깥 누름으로 닫힌 때.
+  const [overlayId, setOverlayId] = useState<string | null>(null)
+  const overlayIdRef = useRef<string | null>(null)
+  const overlayMissing = useRef(false)
+  const overlayClosedAt = useRef(0)
   const held = usePanelBrowserHeld()
   const lastBounds = useRef<string>('')
   const openedRef = useRef(false)
@@ -234,7 +260,9 @@ export function PanelBrowserView({
 
   // 보임: 이 탭이 보이고, 뒤쪽이 이 방을 골랐고, 몸소 것이 덮고 있지 않을 때만.
   // 다른 방을 고르면 뒤쪽이 이 방의 웹뷰를 숨긴다. 돌아오면 뒤쪽이 웹뷰를 보이므로 지금 보여야 하는지 다시 알린다.
-  const visible = opened && active && !held && selected
+  // 확장 프로그램 관리 화면(어사이드처럼 탭 자리를 쓰는 화면): 열려 있는 동안 페이지(웹뷰)는 숨기고 그 자리에 관리 화면.
+  const [manage, setManage] = useState<ExtensionsSection | null>(null)
+  const visible = opened && active && !held && selected && !manage
   useEffect(() => {
     if (!opened || !selected) return
     void setPanelBrowserVisible(chatRef.current, visible).catch(() => {})
@@ -419,12 +447,220 @@ export function PanelBrowserView({
   const [typing, setTyping] = useState(false)
 
   const host = page?.host ?? null
+  // 저장된 로그인 칸의 사이트: 지금 페이지의 https 사이트(https://호스트[:포트], 뒤쪽이 받는 꼴). 페이지가 없거나 https 가 아니면 null(모든 로그인).
+  const loginSite = (() => {
+    try {
+      const parsed = new URL(page?.url ?? '')
+      return parsed.protocol === 'https:' ? parsed.origin : null
+    } catch {
+      return null
+    }
+  })()
+  function closeLogins() {
+    setLogins(false)
+    requestAnimationFrame(() => keyButton.current?.focus())
+  }
+  // 새 로그인의 사이트 주소 칸에 채울 지금 페이지 주소(https 만).
+  const loginPageUrl = page?.url && /^https:/i.test(page.url) ? page.url : null
+  /**
+   * 열고 채우기(S14 saved_login_open_and_fill): 이 방의 패널 자리(x·y·너비·높이)를 넘기면 뒤쪽이 그 사이트를 열고 그 로그인만 채운다(제출은 안 함).
+   * 채웠으면 카드를 닫아 페이지를 보이고 알린다. 아직 연 적 없는 빈 브라우저였으면 뒤쪽이 연 페이지를 이 탭이 보이도록 연 것으로 둔다.
+   */
+  // ---- 확장 프로그램(퍼즐 단추·고정한 확장 단추·관리 화면). 떠 있는 창은 열쇠 창과 같은 길(동시에 하나: overlayWhat 으로 무엇이 떠 있는지). ----
+  const [extensions, setExtensions] = useState<PanelExtension[]>([])
+  const [pins, setPins] = useState<string[]>([])
+  const [extMenu, setExtMenu] = useState<{ top: number; right: number; width: number } | null>(null)
+  const puzzleButton = useRef<HTMLButtonElement>(null)
+  const overlayWhat = useRef<string | null>(null)
+  const reloadExtensions = useCallback(() => {
+    listExtensions().then(setExtensions).catch(() => setExtensions([]))
+    pinnedExtensions().then(setPins).catch(() => setPins([]))
+  }, [])
+  useEffect(() => { reloadExtensions() }, [reloadExtensions])
+  useEffect(() => {
+    let disposed = false
+    const stops: Array<() => void> = []
+    const keep = (stop: () => void) => { if (disposed) stop(); else stops.push(stop) }
+    void listenExtensionsChanged(reloadExtensions).then(keep).catch(() => {})
+    // 떠 있는 메뉴의 "확장 프로그램 관리"·"가져오기": 이 방이면 관리 화면.
+    void listenExtensionsPage((owner, section) => { if (owner === chatRef.current) { setExtMenu(null); setManage(section) } }).then(keep).catch(() => {})
+    return () => { disposed = true; stops.forEach((stop) => stop()) }
+  }, [reloadExtensions])
+  // 다른 탭·방으로 가면 관리 화면은 닫는다(페이지로 돌아옴).
+  useEffect(() => { if (!active) setManage(null) }, [active])
+  /** 퍼즐: 떠 있는 창(열쇠 창과 같은 길)으로 메뉴. 창이 없는 뒤쪽이면 화면 안 메뉴(웹뷰를 피해). */
+  async function toggleExtensions() {
+    if (overlayIdRef.current && overlayWhat.current === 'extensions') { void closePanelOverlay(overlayIdRef.current).catch(() => {}); return }
+    if (Date.now() - overlayClosedAt.current < 400 && overlayWhat.current === null) return
+    if (extMenu) { setExtMenu(null); return }
+    const chat = chatRef.current
+    const puzzle = puzzleButton.current?.getBoundingClientRect()
+    if (!puzzle) return
+    const width = 300
+    const top = Math.round(puzzle.bottom + 6)
+    const right = Math.max(8, Math.round(window.innerWidth - puzzle.right))
+    if (!overlayMissing.current && chat) {
+      const rows = Math.max(1, extensions.length)
+      // 메뉴 + … 작은 메뉴가 들어갈 자리.
+      const height = Math.round(Math.max(220, Math.min(480, window.innerHeight - top - 12, 120 + rows * 34 + 170)))
+      const m = LOGIN_CARD_MARGIN
+      try {
+        const id = await openPanelOverlay(overlayKind('extensions', {}), chat, { x: Math.round(puzzle.right - width) - m.side, y: top - m.top, width: width + m.side * 2, height: height + m.top + m.bottom })
+        overlayIdRef.current = id
+        overlayWhat.current = 'extensions'
+        setOverlayId(id)
+        return
+      } catch (error) {
+        if (isMissingCommand(error)) overlayMissing.current = true
+      }
+    }
+    setExtMenu({ top, right, width })
+  }
+  /** 고정한 확장 단추: 그 확장의 팝업을 떠 있는 창으로(panel_extension_popup_open). 같은 단추를 다시 누르면 닫는다. */
+  async function togglePopup(item: PanelExtension, button: HTMLElement) {
+    const what = `popup:${item.id}`
+    if (overlayIdRef.current && overlayWhat.current === what) { void closePanelOverlay(overlayIdRef.current).catch(() => {}); return }
+    if (Date.now() - overlayClosedAt.current < 400 && overlayWhat.current === null) return
+    const chat = chatRef.current
+    if (!chat) return
+    const at = button.getBoundingClientRect()
+    const width = Math.round(Math.min(380, window.innerWidth - 24))
+    const top = Math.round(at.bottom + 6)
+    const height = Math.round(Math.max(200, Math.min(560, window.innerHeight - top - 12)))
+    const left = Math.round(Math.max(12, Math.min(at.right - width, window.innerWidth - width - 12)))
+    try {
+      const id = await openExtensionPopup(item.id, chat, { x: left, y: top, width, height })
+      overlayIdRef.current = id
+      overlayWhat.current = what
+      setOverlayId(id)
+    } catch (error) {
+      callbacks.current.onNotice(extensionErrorCode(error) === 'no_popup' ? W.extensions.popupNone : W.extensions.popupFailed)
+    }
+  }
+  useEffect(() => {
+    if (!extMenu) return
+    const onPress = (event: PointerEvent) => {
+      const target = event.target as Element | null
+      if (target?.closest('.ext-menu-card, .chat-menu') || puzzleButton.current?.contains(target as Node)) return
+      setExtMenu(null)
+    }
+    document.addEventListener('pointerdown', onPress)
+    return () => document.removeEventListener('pointerdown', onPress)
+  }, [extMenu])
+  const extMenuRef = useRef<HTMLElement>(null)
+  useAvoidPanelBrowser(extMenuRef, extMenu !== null)
+  const pinnedOn = pins.flatMap((id) => { const item = extensions.find((entry) => entry.id === id && entry.enabled); return item ? [item] : [] })
+
+  // 떠 있는 창이 닫힘(closed·outside·chat_changed·panel_hidden·window_changed·replaced·failed): 같은 id 만. 명시적으로 닫았으면 열쇠로 초점.
+  // 떠 있는 창의 열고 채우기가 채움: 이 방이면 패널을 보이게 두고 알린다. 이 부품이 사라지면 떠 있는 창도 닫는다.
+  useEffect(() => {
+    let disposed = false
+    const stops: Array<() => void> = []
+    const keep = (stop: () => void) => { if (disposed) stop(); else stops.push(stop) }
+    void listenPanelOverlayClosed((id, reason) => {
+      if (id !== overlayIdRef.current) return
+      const what = overlayWhat.current
+      overlayIdRef.current = null
+      overlayWhat.current = null
+      setOverlayId(null)
+      overlayClosedAt.current = Date.now()
+      if (reason === 'closed') requestAnimationFrame(() => (what === 'extensions' ? puzzleButton.current : what === null || what === 'logins' ? keyButton.current : null)?.focus())
+    }).then(keep).catch(() => {})
+    void listenOverlayFilled((owner) => {
+      if (owner !== chatRef.current) return
+      if (!openedRef.current) { openedRef.current = true; setOpened(true) }
+      callbacks.current.onNotice(W.savedLogins.openFillDone)
+    }).then(keep).catch(() => {})
+    return () => {
+      disposed = true
+      stops.forEach((stop) => stop())
+      if (overlayIdRef.current) void closePanelOverlay(overlayIdRef.current).catch(() => {})
+    }
+  }, [])
+  // 이 탭이 안 보이게 되면(다른 탭·다른 방·패널 닫힘) 떠 있는 창도 닫는다(뒤쪽도 방 바뀜·패널 숨김에 닫는다).
+  useEffect(() => {
+    if (!active && overlayIdRef.current) void closePanelOverlay(overlayIdRef.current).catch(() => {})
+  }, [active])
+  /**
+   * 열쇠: 떠 있는 창이 열려 있으면 닫고, 아니면 연다. 창 = 카드(열쇠 아래 6, 오른쪽 끝을 열쇠에 맞춤, 어사이드 크기 570x410 안) + 그림자 자리.
+   * 카드가 그릴 것(지금 사이트·페이지 주소·열고 채우기의 패널 자리)은 kind 에 싣는다. 창이 없는 뒤쪽이거나 열지 못하면 예전 카드(웹뷰를 숨김).
+   */
+  async function toggleLogins() {
+    if (overlayIdRef.current && (overlayWhat.current === 'logins' || overlayWhat.current === null)) { void closePanelOverlay(overlayIdRef.current).catch(() => {}); return }
+    // 열쇠를 누르면 떠 있는 창이 먼저 초점을 잃어(outside) 닫힌다. 그 직후의 같은 누름으로 다시 열지 않는다.
+    if (Date.now() - overlayClosedAt.current < 400) return
+    if (logins) { setLogins(false); return }
+    const chat = chatRef.current
+    const key = keyButton.current?.getBoundingClientRect()
+    if (!overlayMissing.current && chat && key) {
+      const top = Math.round(key.bottom + 6)
+      const width = Math.round(Math.min(570, key.right - 12))
+      const height = Math.round(Math.max(240, Math.min(410, window.innerHeight - top - 12)))
+      const left = Math.round(key.right - width)
+      const m = LOGIN_CARD_MARGIN
+      const kind = overlayKind('saved-logins', { site: loginSite, pageUrl: loginPageUrl, spot: measure() })
+      try {
+        const id = await openPanelOverlay(kind, chat, { x: left - m.side, y: top - m.top, width: width + m.side * 2, height: height + m.top + m.bottom })
+        overlayIdRef.current = id
+        overlayWhat.current = 'logins'
+        setOverlayId(id)
+        return
+      } catch (error) {
+        if (isMissingCommand(error)) overlayMissing.current = true
+      }
+    }
+    setLogins(true)
+  }
+  async function openAndFill(login: SavedLogin) {
+    const chat = chatRef.current
+    const bounds = measure()
+    if (!chat || !bounds) return 'panel_closed'
+    const status = await openAndFillSavedLogin(chat, login.id, bounds)
+    if (status === 'filled') {
+      if (!openedRef.current) { openedRef.current = true; setOpened(true) }
+      setLogins(false)
+      callbacks.current.onNotice(W.savedLogins.openFillDone)
+    }
+    return status
+  }
+  useLayoutEffect(() => {
+    if (!logins) { setCardAt(null); return }
+    // 어사이드 크기(570x410)를 넘지 않게, 창 안에 들게(왼쪽·아래 12 띄움).
+    const place = () => {
+      const key = keyButton.current?.getBoundingClientRect()
+      if (!key) return
+      const top = Math.round(key.bottom + 6)
+      setCardAt({
+        top,
+        right: Math.max(8, Math.round(window.innerWidth - key.right)),
+        width: Math.round(Math.min(570, key.right - 12)),
+        height: Math.round(Math.max(240, Math.min(410, window.innerHeight - top - 12))),
+      })
+    }
+    place()
+    const observer = new ResizeObserver(place)
+    if (browserBox.current) observer.observe(browserBox.current)
+    window.addEventListener('resize', place)
+    return () => { observer.disconnect(); window.removeEventListener('resize', place) }
+  }, [logins])
+  useEffect(() => {
+    if (!logins) return
+    pressInside.current = false
+    requestAnimationFrame(() => loginCard.current?.focus())
+    const onPress = () => {
+      if (pressInside.current) { pressInside.current = false; return }
+      setLogins(false)
+    }
+    document.addEventListener('pointerdown', onPress)
+    return () => document.removeEventListener('pointerdown', onPress)
+  }, [logins])
   // 빈 브라우저(url null)는 페이지가 오기 전까지 불러오는 중이 아니다. 여는 중(주소·AI 요청·친 주소)이면 불러오는 중.
   const loading = opened ? (page ? page.loading : url !== null) : selected && !failed && (url !== null || agentOpen || typing)
   return (
-    <div className="panel-browser">
+    <div ref={browserBox} className="panel-browser">
       <div className="zet-viewbar panel-browser-bar">
-        <button className="icon-button" type="button" aria-label={W.tip.back} title={W.tip.back} disabled={!opened || history.canGoBack === false} onClick={() => act('back')}>
+        {/* 관리 화면에서 뒤로 = 페이지로 돌아감. */}
+        <button className="icon-button" type="button" aria-label={W.tip.back} title={W.tip.back} disabled={manage ? false : !opened || history.canGoBack === false} onClick={() => (manage ? setManage(null) : act('back'))}>
           <ArrowLeft size={16} aria-hidden />
         </button>
         <button className="icon-button" type="button" aria-label={W.tip.forward} title={W.tip.forward} disabled={!opened || history.canGoForward === false} onClick={() => act('forward')}>
@@ -439,7 +675,12 @@ export function PanelBrowserView({
             <RotateCw size={15} aria-hidden />
           </button>
         )}
-        {editing !== null ? (
+        {manage ? (
+          <span className="zet-search panel-browser-address" aria-label={`${B.address}: ${W.extensions.pageTitle}`}>
+            <Puzzle size={13} aria-hidden />
+            <span className="panel-browser-host">{W.extensions.pageTitle}</span>
+          </span>
+        ) : editing !== null ? (
           <form className="zet-search panel-browser-address" onSubmit={(event) => { event.preventDefault(); submitAddress() }}>
             {page?.secure ? <Lock size={13} aria-hidden /> : <LockOpen size={13} aria-hidden />}
             <input
@@ -468,10 +709,81 @@ export function PanelBrowserView({
             <span className="panel-browser-host"><bdi>{host ?? ''}</bdi></span>
           </button>
         )}
+        {/* 고정한 확장(켜진 것만, 고정한 차례): 누르면 그 확장의 팝업. */}
+        {pinnedOn.map((item) => (
+          <button
+            key={item.id}
+            className="icon-button ext-bar-button"
+            type="button"
+            aria-label={item.name}
+            title={item.name}
+            aria-haspopup="dialog"
+            aria-expanded={overlayId !== null && overlayWhat.current === `popup:${item.id}`}
+            onClick={(event) => void togglePopup(item, event.currentTarget)}
+          >
+            <ExtensionIcon src={item.iconDataUrl} />
+          </button>
+        ))}
+        <button
+          ref={keyButton}
+          className="icon-button"
+          type="button"
+          aria-label={W.savedLogins.title}
+          title={W.savedLogins.title}
+          aria-haspopup="dialog"
+          aria-expanded={logins || (overlayId !== null && (overlayWhat.current === 'logins' || overlayWhat.current === null))}
+          onPointerDown={() => { pressInside.current = true }}
+          onClick={() => void toggleLogins()}
+        >
+          <KeyRound size={15} aria-hidden />
+        </button>
+        <button
+          ref={puzzleButton}
+          className="icon-button"
+          type="button"
+          aria-label={W.extensions.button}
+          title={W.extensions.button}
+          aria-haspopup="menu"
+          aria-expanded={extMenu !== null || (overlayId !== null && overlayWhat.current === 'extensions')}
+          onClick={() => void toggleExtensions()}
+        >
+          <Puzzle size={15} aria-hidden />
+        </button>
         <button className="icon-button" type="button" aria-label={B.openExternal} title={B.openExternal} disabled={!page?.url} onClick={() => { if (page?.url) void openWebAddress(page.url).catch(() => onNotice(W.zetPanel.text18)) }}>
           <ExternalLink size={15} aria-hidden />
         </button>
       </div>
+      {/* 저장된 로그인 카드(닫기 X 없음): 바깥을 누르거나 Esc 면 닫히고 열쇠 단추로 돌아간다. 안쪽은 SavedLoginsCard(왼쪽 목록, 오른쪽 보기·입력). */}
+      {logins && createPortal(
+        <section
+          ref={loginCard}
+          className="panel-login-card"
+          role="dialog"
+          aria-label={W.savedLogins.title}
+          tabIndex={-1}
+          hidden={!cardAt}
+          style={cardAt ? { top: cardAt.top, right: cardAt.right, width: cardAt.width, height: cardAt.height } : undefined}
+          onPointerDown={() => { pressInside.current = true }}
+          onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); closeLogins() } }}
+        >
+          <SavedLoginsCard site={loginSite} pageUrl={loginPageUrl} onOpenAndFill={chatId ? openAndFill : undefined} />
+        </section>,
+        document.body,
+      )}
+      {/* 퍼즐 메뉴(떠 있는 창이 없는 뒤쪽일 때만 화면 안에). */}
+      {extMenu && createPortal(
+        <section
+          ref={extMenuRef}
+          className="ext-menu-card is-inline"
+          role="dialog"
+          aria-label={W.extensions.button}
+          style={{ top: extMenu.top, right: extMenu.right, width: extMenu.width, maxHeight: Math.max(220, window.innerHeight - extMenu.top - 12) }}
+          onKeyDown={(event) => { if (event.key === 'Escape' && !(event.target as HTMLElement).closest('.chat-menu')) { event.preventDefault(); setExtMenu(null); puzzleButton.current?.focus() } }}
+        >
+          <ExtensionsMenu onManage={(section) => { setExtMenu(null); setManage(section) }} onPinsChanged={reloadExtensions} />
+        </section>,
+        document.body,
+      )}
       {/* 팝업이 열려 있는 동안 한 줄: 어느 사이트에서 연 어떤 창인지(뒤쪽 값만, 창 제목은 풍선). */}
       {popup && popup.host && (
         <div className="zet-viewbar panel-agent-line" role="status" title={popup.title ?? undefined}>
@@ -494,7 +806,8 @@ export function PanelBrowserView({
         </div>
       )}
       <div ref={spot} className="panel-browser-spot">
-        {failed && (
+        {manage && <ExtensionsManager section={manage} onPinsChanged={reloadExtensions} />}
+        {failed && !manage && (
           <div className="zet-message" role="alert">
             <span>{B.openFailed}</span>
             <button className="secondary-button" type="button" onClick={() => { setFailed(false); openedRef.current = false; setOpened(false); callbacks.current.onTitle(null, null); void retryOpen() }}>

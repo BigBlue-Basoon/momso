@@ -817,7 +817,10 @@
     return undefined
   }
   // 저장된 로그인(가짜, 275e017). 보관함은 window.__savedLogins(비밀번호는 가짜 값), 명령 기록은 window.__savedLoginCalls(비밀번호는 있는지만).
-  //   ?logins=two 면 같은 사이트 로그인 둘로 시작, ?logins=store 면 모든 명령이 credential_store_unavailable.
+  //   2026-11-21 S14: 목록에 siteUrl·createdAt·updatedAt·favorite, saved_login_reveal(가짜 비밀번호를 돌려줌), saved_login_copy(?clip=fail 이면 clipboard_unavailable),
+  //   saved_login_open_and_fill(?fill=<status> 면 그 status, 기본 filled: 그 방 패널을 열고 siteUrl 또는 사이트로 이동), 개수 제한 없음. window.__lastFill 에 마지막 입력.
+  //   ?logins=two 면 같은 사이트 로그인 둘로 시작, ?logins=many 면 여러 사이트의 로그인 여섯(저장한 때가 오늘·어제·이번 주·지난달·모름, 즐겨찾기 둘),
+  //   ?logins=store 면 모든 명령이 credential_store_unavailable.
   //   window.__loginChoice(chatId) 는 고르기 물음을 보내고 requestId 를 돌려준다. window.__loginChoiceExpire() 는 남은 물음을 timeout 으로 닫고,
   //   window.__loginChoiceStop(requestId) 는 뒤쪽이 답 멈춤으로 닫은 것처럼 cancelled 로 닫는다(e8dab5e saved-login-selection-closed).
   //   ?loginclose=silent 면 닫힘 이벤트를 보내지 않는다(닫힌 뒤 고르면 unavailable 만).
@@ -826,7 +829,23 @@
       { id: 'login-a', origin: 'https://crm.bodycodi.com', label: '센터 계정', username: 'center01', password: 'fake-a', askBeforeUse: false, loginPath: null, defaultForPath: false },
       { id: 'login-b', origin: 'https://crm.bodycodi.com', label: '관리자', username: 'admin01', password: 'fake-b', askBeforeUse: true, loginPath: '/admin', defaultForPath: false },
     ]
-    : []
+    : query.get('logins') === 'many'
+      ? ((ago) => [
+        { id: 'login-a', origin: 'https://crm.bodycodi.com', label: '센터 계정', username: 'center01', password: 'fake-a', askBeforeUse: false, loginPath: null, defaultForPath: true },
+        { id: 'login-b', origin: 'https://crm.bodycodi.com', label: '관리자', username: 'admin01', password: 'fake-b', askBeforeUse: true, loginPath: '/admin', defaultForPath: false },
+        { id: 'login-c', origin: 'https://www.naver.com', label: '네이버 스마트플레이스', username: 'yoga.studio', password: 'fake-c', askBeforeUse: false, loginPath: null, defaultForPath: false },
+        { id: 'login-d', origin: 'https://github.com', label: 'GitHub', username: 'studio-dev', password: 'fake-d', askBeforeUse: false, loginPath: null, defaultForPath: false },
+        { id: 'login-e', origin: 'https://partner.booking.example', label: '예약 파트너 센터', username: 'partner@studio.example', password: 'fake-e', askBeforeUse: true, loginPath: null, defaultForPath: false },
+        { id: 'login-f', origin: 'https://www.naver.com', label: '네이버 블로그', username: 'yoga.blog', password: 'fake-f', askBeforeUse: false, loginPath: null, defaultForPath: false },
+      ].map((entry, index) => ({ ...entry, ...[
+        { createdAt: ago(0.1), updatedAt: ago(0.1), favorite: true, siteUrl: 'https://crm.bodycodi.com/login' },
+        { createdAt: ago(1), updatedAt: ago(0.05), favorite: false, siteUrl: null },
+        { createdAt: ago(3), updatedAt: ago(3), favorite: true, siteUrl: null },
+        { createdAt: ago(40), updatedAt: ago(40), favorite: false, siteUrl: null },
+        { createdAt: null, updatedAt: null, favorite: false, siteUrl: null },
+        { createdAt: ago(1.2), updatedAt: ago(1.2), favorite: false, siteUrl: null },
+      ][index] })))((days) => new Date(Date.now() - days * 86_400_000).toISOString())
+      : []
   window.__savedLoginCalls = []
   window.__loginChoices = {}
   let loginSeq = 0
@@ -844,12 +863,79 @@
   }
   window.__loginChoiceExpire = () => { for (const requestId of Object.keys(window.__loginChoices)) closeChoice(requestId, 'timeout') }
   window.__loginChoiceStop = (requestId) => { if (window.__loginChoices[requestId]) closeChoice(requestId, 'cancelled') }
+  // 확장 프로그램(줄1 스냅샷 b18832c, 계약 hq/s28-done desktop-panel-extensions-s12.md). ?ext=none 이면 하나도 없음, ?extfail=명령 이면 그 명령이 그 값으로 실패.
+  //   S41(스냅샷 1c369e5): iconDataUrl(시험용으로 만든 초록 칸 그림, 실제 상표 아님) · origin. builtin 두 개는 화면에 보이면 안 된다. ?exticon=broken 이면 그림을 그리지 못하는 값.
+  const fakeExtIcon = query.get('exticon') === 'broken' ? 'data:image/png;base64,AAAA' : 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAASElEQVR42mNgGAVQoNeT95+eeNQBow4YdcDQdwA6oJsDCAGaOoBYMDwdQCoYdcDwc8BoLhgUBdGgKIpHa8NRB4w6YPg6YMQCAMilZQqZKFyYAAAAAElFTkSuQmCC'
+  window.__extensions = query.get('ext') === 'none' ? [] : [
+    { id: 'dgiklkfkllikcanfonkcabmbdfmgleag', name: 'Microsoft Clipboard Extension', enabled: true, iconDataUrl: null, origin: 'builtin' },
+    { id: 'ofmndgpfnokmdmfhapepfbmffbhiokib', name: 'Tab Zoo', enabled: true, iconDataUrl: fakeExtIcon, origin: 'user' },
+    { id: 'efaidnbmnnnibpcajpcglclefindmkaj', name: 'Adobe Acrobat: PDF 편집, 변환, 서명 도구', enabled: false, iconDataUrl: null, origin: 'unknown' },
+    { id: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', name: 'Microsoft Edge PDF Viewer', enabled: true, iconDataUrl: null, origin: 'builtin' },
+  ]
+  window.__extensionPins = query.get('ext') === 'none' ? [] : ['ofmndgpfnokmdmfhapepfbmffbhiokib']
+  window.__extensionCalls = []
+  function extensionCommand(command, args) {
+    window.__extensionCalls.push([command, args])
+    const fail = query.get('extfail')
+    if (fail && fail.split(':')[0] === command) throw fail.split(':')[1] || 'operation_failed'
+    const list = window.__extensions
+    const copy = () => list.map((e) => ({ ...e }))
+    const changed = () => emit('panel-extensions-changed', {})
+    switch (command) {
+      case 'panel_extensions_list': return copy()
+      case 'panel_extensions_install': return 'cancelled'
+      case 'panel_extensions_install_store': {
+        const m = String(args.addressOrId || '').match(/([a-p]{32})/)
+        if (!m) throw 'invalid_store_address'
+        if (!list.some((e) => e.id === m[1])) list.push({ id: m[1], name: '스토어에서 받은 확장', enabled: true, iconDataUrl: fakeExtIcon, origin: 'user' })
+        changed()
+        return copy()
+      }
+      case 'panel_extensions_set_enabled': { const e = list.find((x) => x.id === args.extensionId); if (!e) throw 'not_found'; e.enabled = Boolean(args.enabled); changed(); return null }
+      case 'panel_extensions_remove': { const at = list.findIndex((x) => x.id === args.extensionId); if (at < 0) throw 'not_found'; list.splice(at, 1); window.__extensionPins = window.__extensionPins.filter((id) => id !== args.extensionId); changed(); return null }
+      case 'panel_extensions_import_candidates': return query.get('ext') === 'none' ? [] : [
+        { browser: 'chrome', profile: 'Default', extensionId: 'nngceckbapebfimnlniiiahkandclblb', version: '2026.11.0_0', name: 'Bitwarden 비밀번호 관리자' },
+        { browser: 'edge', profile: 'Profile 1', extensionId: 'cjpalhdlnbpafiamejdnhcphjbkeiagm', version: '1.62.0_0', name: 'uBlock Origin' },
+      ]
+      case 'panel_extensions_import': { if (!list.some((e) => e.id === args.extensionId)) list.push({ id: args.extensionId, name: args.extensionId === 'cjpalhdlnbpafiamejdnhcphjbkeiagm' ? 'uBlock Origin' : 'Bitwarden 비밀번호 관리자', enabled: true, iconDataUrl: null, origin: 'user' }); changed(); return copy() }
+      case 'panel_extensions_pin_get': return window.__extensionPins.slice()
+      case 'panel_extensions_pin_set': { const p = window.__extensionPins.filter((id) => id !== args.extensionId); if (args.pinned) p.push(args.extensionId); window.__extensionPins = p; return null }
+      case 'panel_extension_popup_open': if (query.get('popup') === 'none') throw 'no_popup'; window.__extensionPopup = args; return { id: 'ext-popup-1' }
+      default: return undefined
+    }
+  }
   function savedLoginCommand(command, args) {
     const store = window.__savedLogins
     window.__savedLoginCalls.push([command, command === 'saved_login_set' ? { ...args.input, password: undefined, hasPassword: typeof args.input.password === 'string' } : args])
     if (query.get('logins') === 'store' && command !== 'saved_login_select' && command !== 'saved_login_cancel') throw 'credential_store_unavailable'
-    const view = ({ password, ...rest }) => rest
+    const view = ({ password, ...rest }) => ({ siteUrl: null, createdAt: null, updatedAt: null, favorite: false, ...rest })
     if (command === 'saved_login_list') return store.map(view)
+    if (command === 'saved_login_reveal') {
+      const entry = store.find((e) => e.id === args.id)
+      if (!entry) throw 'not_found'
+      return entry.password
+    }
+    if (command === 'saved_login_copy') {
+      if (!store.some((e) => e.id === args.id)) throw 'not_found'
+      if (query.get('clip') === 'fail') throw 'clipboard_unavailable'
+      window.__clipboardCopied = args.id
+      return null
+    }
+    if (command === 'saved_login_open_and_fill') {
+      const input = args.input || {}
+      const entry = store.find((e) => e.id === input.id)
+      if (!entry) throw 'not_found'
+      if (window.__panelState.active !== input.chatId) throw 'panel_not_active'
+      window.__lastFill = { ...input }
+      const status = query.get('fill') || 'filled'
+      if (status === 'filled') {
+        const v = panelView(input.chatId)
+        v.open = true
+        v.bounds = { x: input.x, y: input.y, width: input.width, height: input.height }
+        panelGo(input.chatId, entry.siteUrl || `${entry.origin}${entry.loginPath || '/'}`)
+      }
+      return { status }
+    }
     if (command === 'saved_login_delete') {
       const at = store.findIndex((e) => e.id === args.id)
       if (at < 0) throw 'not_found'
@@ -889,7 +975,9 @@
       entry = next.find((e) => e.id === input.id)
       if (!entry) throw 'not_found'
       if (entry.origin !== origin) throw 'origin_change_requires_new_login'
-      Object.assign(entry, { label: input.label, username: input.username })
+      Object.assign(entry, { label: input.label, username: input.username, updatedAt: new Date().toISOString() })
+      if (input.favorite !== undefined) entry.favorite = input.favorite === true
+      if (input.siteUrl !== undefined) entry.siteUrl = input.siteUrl || null
       if (input.askBeforeUse !== undefined) entry.askBeforeUse = input.askBeforeUse
       if (input.loginPath !== undefined) entry.loginPath = input.loginPath || null
       if (input.defaultForPath !== undefined) entry.defaultForPath = input.defaultForPath
@@ -897,7 +985,8 @@
     } else {
       if (!input.password) throw 'invalid_input'
       loginSeq += 1
-      entry = { id: `login-${loginSeq}-new`, origin, label: input.label, username: input.username, password: input.password, askBeforeUse: input.askBeforeUse ?? false, loginPath: input.loginPath || null, defaultForPath: input.defaultForPath ?? false }
+      const now = new Date().toISOString()
+      entry = { id: `login-${loginSeq}-new`, origin, label: input.label, username: input.username, password: input.password, askBeforeUse: input.askBeforeUse ?? false, loginPath: input.loginPath || null, defaultForPath: input.defaultForPath ?? false, siteUrl: input.siteUrl || null, createdAt: now, updatedAt: now, favorite: input.favorite === true }
       next.push(entry)
     }
     if (entry.defaultForPath) {
@@ -905,7 +994,6 @@
       if (others.length && input.defaultForPath !== true) throw 'default_conflict'
       for (const e of others) e.defaultForPath = false
     }
-    if (JSON.stringify(next).length > 2200) throw 'capacity_exceeded'
     store.splice(0, store.length, ...next)
     return view(entry)
   }
@@ -1497,8 +1585,13 @@
         }, 300)
         return null
       }
+      // S69: 답하는 중인 채팅이 있으면 { state: busy, reason: active_turn }(설치하지 않음). ?restart=busy(다른 업데이트 작업 중) / fail(backup_failed).
       case 'update_restart':
         window.__restartCalls = (window.__restartCalls || 0) + 1
+        if (Object.keys(running).length > 0) return { state: 'busy', reason: 'active_turn' }
+        if (query.get('restart') === 'busy') return { state: 'busy' }
+        if (query.get('restart') === 'fail') return { state: 'failed', reason: 'backup_failed' }
+        window.__restarted = (window.__restarted || 0) + 1
         return null
       // ---- 몸소 폴더 위치(가짜). ?folder=ok(기본) / onedrive / none ----
       // 실제 계약(archive_location.rs): get → { path, isDefault, onCloudSyncFolder }, set → { state, path, previousPath, previousKept }(끝날 때까지 기다림).
@@ -1641,7 +1734,11 @@
         if (query.get('importfail')) throw query.get('importfail')
         return new Promise((done) => setTimeout(() => done({ imported: 2, duplicate: 1, skipped: 0, omittedNonTextMessages: 0, omittedAttachments: 0, updated: 0, addedMessages: 0, conflicts: 0 }), 900))
       }
+      case 'panel_extensions_list': case 'panel_extensions_install': case 'panel_extensions_install_store': case 'panel_extensions_set_enabled': case 'panel_extensions_remove':
+      case 'panel_extensions_import_candidates': case 'panel_extensions_import': case 'panel_extensions_pin_get': case 'panel_extensions_pin_set': case 'panel_extension_popup_open':
+        return extensionCommand(command, args)
       case 'saved_login_list': case 'saved_login_set': case 'saved_login_delete': case 'saved_login_select': case 'saved_login_cancel':
+      case 'saved_login_reveal': case 'saved_login_copy': case 'saved_login_open_and_fill':
         return savedLoginCommand(command, args)
       case 'yoga_terms_list': {
         // 용어 사전(가짜). ?big=1 이면 용어 1,000개·사람 이름 300개, 아니면 용어 몇 개. ?dict=fail 이면 읽기 실패, ?dict=slow 면 3초 뒤.

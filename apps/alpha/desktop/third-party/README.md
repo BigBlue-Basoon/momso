@@ -1,5 +1,7 @@
 # 제3자 프로그램 고지
 
+- Windows 설치 파일에는 Microsoft Visual C++ 재배포 가능 런타임 DLL이 포함된다. [Microsoft 재배포 안내](https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files)와 [Visual Studio 2022 재배포 대상](https://learn.microsoft.com/visualstudio/releases/2022/redistribution)을 따른다.
+
 - 이 앱에는 Git for Windows의 MinGit 2.56.1이 포함된다. 라이선스 원문은 같은 폴더의 `MinGit-LICENSE.txt`이고, MinGit에 포함된 구성 요소별 라이선스 파일은 설치된 `mingit/` 안에도 있다.
 - 고정된 공식 배포본: https://github.com/git-for-windows/git/releases/tag/v2.56.1.windows.1
 - 해당 Git 소스 패키지: https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/mingw-w64-git-2.56.1.1-1.src.tar.gz

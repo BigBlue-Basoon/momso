@@ -1,0 +1,4 @@
+{
+  "clientId": "fake-client.apps.googleusercontent.com",
+  "release": { "loginOrigin": "https://login.example.test", "gatewayImage": "example.test/momso/gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000" }
+}

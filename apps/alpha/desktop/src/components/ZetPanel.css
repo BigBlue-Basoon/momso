@@ -1157,6 +1157,7 @@ button.zet-link-row:hover {
 }
 
 .panel-browser {
+  position: relative;
   display: flex;
   height: 100%;
   flex-direction: column;
@@ -1219,6 +1220,643 @@ button.zet-link-row:hover {
   position: relative;
   flex: 1 1 auto;
   min-height: 0;
+}
+
+/* 열쇠 단추(2026-11-21): 카드가 떠 있는 동안은 눌린 바탕(어사이드처럼). */
+.panel-browser-bar .icon-button[aria-expanded='true'] {
+  border-color: transparent;
+  background: var(--surface-muted);
+}
+
+/* 열쇠 단추를 누르면 뜨는 저장된 로그인 카드(2026-11-21, 어사이드 열쇠 창 Aside Vault 꼴: 1388x868 화면에서 570x410, 열쇠 단추 바로 아래·
+   단추 오른쪽 끝에 맞춰 페이지 위에 뜨는 크게 둥근 카드, 그림자, 제목·닫기 없음, 안은 좌우 두 칸). 패널이 좁아도 어사이드처럼 왼쪽으로 넓게 뜨도록
+   문서 맨 위 층(document.body)에 고정 자리로 띄우고, 자리·크기는 PanelBrowser 가 열쇠 단추를 재서 준다. 웹뷰는 따로 뜨는 층이라 카드가 웹뷰와
+   겹치는 동안은 지금 메뉴들처럼 웹뷰를 숨긴다(줄1 의 위에 띄우는 길 S13 이 나오면 바꾼다). */
+.panel-login-card {
+  position: fixed;
+  z-index: 30;
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  outline: 0;
+  background: var(--surface-soft);
+  box-shadow: 0 18px 44px rgba(35, 42, 38, 0.18), 0 4px 12px rgba(35, 42, 38, 0.08);
+}
+
+/* 떠 있는 창(S13) 안의 카드: 창 = 카드 + 그림자 자리(panel-overlay.ts LOGIN_CARD_MARGIN: 위 20·옆 32·아래 44). 창 배경은 투명,
+   그림자는 그 자리 안에 들도록 0 12px 32px · 0 3px 10px. 페이지(웹뷰)는 숨기지 않고 그대로 뒤에 보인다. */
+html.is-panel-overlay,
+html.is-panel-overlay body,
+html.is-panel-overlay #root {
+  overflow: hidden;
+  background: transparent !important;
+}
+
+.panel-overlay-root {
+  position: fixed;
+  inset: 0;
+}
+
+.panel-login-card.is-overlay {
+  position: absolute;
+  box-shadow: 0 12px 32px rgba(35, 42, 38, 0.18), 0 3px 10px rgba(35, 42, 38, 0.08);
+}
+
+/* 떠 있는 창 안의 삭제 물음: 창 크기만 한 뒤 가림 대신 카드 위에 물음만. */
+html.is-panel-overlay .zet-confirm-backdrop {
+  background: transparent;
+}
+
+.login-vault {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 왼쪽 칸: 찾기 칸과 + 단추, 고르기 줄, 사이트별 묶음과 줄(이 칸만 굴림). */
+.login-vault-side {
+  display: flex;
+  flex: 0 0 265px;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  padding: 12px 6px 8px 12px;
+}
+
+.login-vault-find {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 6px;
+}
+
+.login-vault-search {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 32px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.login-vault-search:focus-within {
+  border-color: rgba(49, 95, 143, 0.4);
+}
+
+.login-vault-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.login-vault-search input::placeholder {
+  color: var(--faint);
+}
+
+.login-vault-add {
+  display: grid;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.login-vault-add:hover:not(:disabled) {
+  background: var(--surface-muted);
+}
+
+.login-vault-add:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.login-vault-scope {
+  display: flex;
+  align-items: center;
+  margin: 10px 0 0;
+  padding-right: 6px;
+}
+
+/* 고르기 줄 오른쪽 끝의 거르기·순서 그림 단추(어사이드의 두 단추). 거르기가 켜져 있으면 눌린 바탕. */
+.login-vault-tools {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.login-vault-tool {
+  width: 28px;
+  height: 28px;
+  color: var(--muted);
+}
+
+.login-vault-tool.is-on,
+.login-vault-tool[aria-expanded='true'] {
+  border-color: transparent;
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+.chat-menu-item.login-vault-choice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.login-vault-star {
+  flex: none;
+  margin-left: 5px;
+  color: #c99a2e;
+  vertical-align: -1px;
+}
+
+.login-vault-scope-button {
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  gap: 6px;
+  margin-left: -2px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.login-vault-scope-button svg {
+  color: var(--ink-soft);
+}
+
+.login-vault-scope-button svg:last-child:not(:first-child) {
+  color: var(--muted);
+}
+
+button.login-vault-scope-button:hover,
+.login-vault-scope-button[aria-expanded='true'] {
+  background: var(--surface-muted);
+}
+
+.login-vault-scope-button.is-static {
+  cursor: default;
+}
+
+.login-vault-rows {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 6px;
+  scrollbar-width: thin;
+  scrollbar-color: #c7ccc8 transparent;
+}
+
+.login-vault-group {
+  margin: 10px 4px 4px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-vault-row {
+  display: flex;
+  width: 100%;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 10px;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.login-vault-row:hover {
+  background: rgba(40, 43, 42, 0.04);
+}
+
+.login-vault-row.is-chosen {
+  background: var(--surface-muted);
+}
+
+.login-vault-row:focus-visible {
+  box-shadow: inset 0 0 0 2px rgba(49, 95, 143, 0.3);
+}
+
+/* 아이콘 칸: 이름 앞 두 글자가 든 둥근 네모(사이트 그림은 뒤쪽이 주지 않는다). */
+.login-vault-icon {
+  display: grid;
+  flex: none;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* 사이트 그림(S24 iconDataUrl)은 칸 안에 작게, 없으면 지구본 그림(흐린 색). */
+.login-vault-icon img { width: 62%; height: 62%; object-fit: contain; }
+.login-vault-icon svg { color: var(--muted); }
+
+.login-vault-icon.is-large {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  box-shadow: 0 2px 8px rgba(35, 42, 38, 0.1);
+  font-size: 15px;
+}
+
+.login-vault-icon.is-plain {
+  border-color: transparent;
+  background: var(--surface-muted);
+  box-shadow: none;
+  color: var(--muted);
+}
+
+.login-vault-row-text {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.login-vault-row-text strong,
+.login-vault-row-text span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-vault-row-text strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.login-vault-row-text span {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* 오른쪽 칸: 왼쪽보다 밝은 흰 둥근 판. 보기와 입력 꼴이 같은 판을 쓴다. */
+.login-vault-pane {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  margin: 8px 8px 8px 2px;
+  padding: 10px 14px 6px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  scrollbar-width: thin;
+  scrollbar-color: #c7ccc8 transparent;
+}
+
+.login-vault-top {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.login-vault-crumb {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-vault-more {
+  width: 28px;
+  height: 28px;
+  margin-right: -6px;
+}
+
+.login-vault-note {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.login-vault-note.is-alert {
+  color: var(--coral);
+}
+
+.login-vault-hero {
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  margin: 8px 0 14px;
+  text-align: center;
+}
+
+.login-vault-hero h3 {
+  max-width: 100%;
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 17px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-vault-hero p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.login-vault-name {
+  width: 100%;
+  margin-top: 6px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 17px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.login-vault-name::placeholder {
+  color: var(--faint);
+}
+
+.login-vault-name:hover {
+  border-color: var(--line);
+}
+
+.login-vault-name:focus {
+  border-color: rgba(49, 95, 143, 0.4);
+}
+
+.login-vault-caption {
+  margin: 0 2px 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.login-vault-box {
+  display: grid;
+  margin: 0 0 12px;
+  padding: 0 12px;
+  border-radius: 10px;
+  background: #f3f5f3;
+}
+
+.login-vault-line {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 8px 0;
+}
+
+.login-vault-line + .login-vault-line {
+  border-top: 1px solid var(--line);
+}
+
+.login-vault-line dt,
+.login-vault-line > span:not([class]) {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.login-vault-line dd {
+  display: flex;
+  min-height: 22px;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.login-vault-line dd strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+/* 줄에 올리면(또는 초점) 줄 끝 단추가 나타난다(어사이드 비밀번호 줄의 눈·복사). 보이는 중인 비밀번호 줄은 늘 보인다(숨기기 단추). */
+.login-vault-line-actions {
+  display: flex;
+  flex: none;
+  gap: 2px;
+  margin: -4px -6px -4px auto;
+  opacity: 0;
+}
+
+.login-vault-line-actions .icon-button {
+  width: 26px;
+  height: 26px;
+}
+
+.login-vault-line:hover .login-vault-line-actions,
+.login-vault-line:focus-within .login-vault-line-actions,
+.login-vault-line.is-revealed .login-vault-line-actions {
+  opacity: 1;
+}
+
+.login-vault-revealed {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.login-vault-secret {
+  color: var(--ink);
+  font-size: 13px;
+  letter-spacing: 1px;
+}
+
+/* 사이트 주소: 도메인은 진하게, 나머지는 흐리게. */
+.login-vault-url {
+  overflow-wrap: anywhere;
+  color: var(--faint);
+  font-size: 12.5px;
+}
+
+.login-vault-url b {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.login-vault-flag {
+  color: var(--ink);
+  font-size: 12.5px;
+}
+
+.login-vault-line input {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.login-vault-line input::placeholder {
+  color: var(--faint);
+  font-weight: 400;
+}
+
+.login-vault-line input:disabled {
+  color: var(--muted);
+}
+
+.login-vault-line small {
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.login-vault-box:focus-within {
+  box-shadow: 0 0 0 2px rgba(49, 95, 143, 0.16);
+}
+
+.login-vault-line.is-switch {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 10px;
+}
+
+.login-vault-line.is-switch > span {
+  color: var(--ink);
+  font-size: 12.5px;
+}
+
+.login-vault-line.is-switch small {
+  grid-column: 1 / -1;
+}
+
+.login-vault-form-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+}
+
+.login-vault-cancel {
+  height: 28px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.login-vault-cancel:hover {
+  background: var(--surface-muted);
+  color: var(--ink);
+}
+
+/* 저장: 검은 알약(어사이드 Save). */
+.login-vault-save {
+  height: 28px;
+  padding: 0 15px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--ink);
+  color: #ffffff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.login-vault-save:hover:not(:disabled) {
+  background: var(--ink-soft);
+}
+
+.login-vault-save:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.chat-menu-item.login-vault-delete {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--coral);
+}
+
+.login-vault-empty {
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.login-vault-empty p {
+  margin: 0;
+}
+
+/* 빈 판의 열쇠 그림: 어사이드 열쇠 창의 둥근 네모 열쇠 꼴. */
+.login-vault-mark {
+  display: grid;
+  width: 64px;
+  height: 64px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--surface-soft);
+  color: var(--faint);
 }
 
 /* AI 가 패널을 쓰는 동안의 한 줄(2026-11-18). 맨 위 줄(zet-viewbar)과 같은 꼴, 글과 단추 하나. */

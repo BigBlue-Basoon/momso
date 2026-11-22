@@ -4,7 +4,7 @@
 //   momso_username_get() → { state: 'ok' | 'unavailable', username: string | null }
 //   momso_username_set({ username }) → { state: 'ok' | 'invalid_username' | 'unavailable', username }
 //   받는 글자: 영문자·숫자·- _ . (94자까지, .git·.wiki 로 끝나면 안 됨)
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './host'
 import { isMissingCommand } from './ai-models'
 import { getProviderAuth, isConnected, providerFirstRunEligible } from './provider-auth'
 

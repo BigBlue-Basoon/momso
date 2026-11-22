@@ -1,6 +1,6 @@
 import { type DragEvent, memo, type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Archive, ChevronDown, ChevronRight, FolderPlus, MoreHorizontal, Pin, PinOff, SquarePen } from 'lucide-react'
+import { Archive, ChevronDown, ChevronRight, FileText, FolderPlus, Images, MoreHorizontal, Pin, PinOff, Search, Settings, SquarePen } from 'lucide-react'
 import { useAvoidPanelBrowser } from '../panel-browser'
 import type { ChatEntry, ChatGroup } from '../chats'
 import { GROUP_WORD, W } from '../words'
@@ -31,6 +31,13 @@ type ChatSidebarProps = {
   /** 읽지 못했을 때 "다시 불러오기". */
   onRetry?: () => void
   onNewChat: () => void
+  /** 휴대폰 몸소: 문서 화면 열기(데스크톱은 아이콘 띠). 넘기지 않으면 줄을 두지 않는다. */
+  onOpenDocuments?: () => void
+  /** 휴대폰 몸소(S75 셋째): 사진과 동영상 열기(데스크톱은 아이콘 띠). 넘기지 않으면 줄을 두지 않는다. */
+  onOpenMedia?: () => void
+  /** 휴대폰 몸소(S75): 찾기 창과 설정 열기(데스크톱은 창 맨 위 돋보기와 아이콘 띠). 넘기지 않으면 줄을 두지 않는다. */
+  onOpenSearch?: () => void
+  onOpenSettings?: () => void
   onSelectChat: (id: string) => void
   /** 채팅방 묶음. null 이면 묶음 백엔드가 없다(묶음 만들기가 눌리지 않는다, 글 없음). */
   groups: ChatGroup[] | null
@@ -60,6 +67,8 @@ function loadFolded(): Record<string, boolean> {
 function sameSidebar(a: ChatSidebarProps, b: ChatSidebarProps) {
   return a.chats === b.chats && a.groups === b.groups && a.selectedChatId === b.selectedChatId && a.error === b.error && Boolean(a.loading) === Boolean(b.loading) && a.loadingDetail === b.loadingDetail && a.restoring === b.restoring
     && (a.busyChatId ?? null) === (b.busyChatId ?? null) && Boolean(a.onPinChat) === Boolean(b.onPinChat) && Boolean(a.onArchiveChat) === Boolean(b.onArchiveChat)
+    // 사진과 동영상 줄(휴대폰 몸소): 미디어 목록을 읽고 나서야 생기므로 생기고 없어짐을 본다.
+    && Boolean(a.onOpenMedia) === Boolean(b.onOpenMedia)
     && (a.waitingChatIds ?? []).join('|') === (b.waitingChatIds ?? []).join('|')
 }
 
@@ -69,6 +78,10 @@ export function ChatSidebar(props: ChatSidebarProps) {
   latest.current = props
   const stable = useMemo(() => ({
     onNewChat: () => latest.current.onNewChat(),
+    onOpenDocuments: () => latest.current.onOpenDocuments?.(),
+    onOpenMedia: () => latest.current.onOpenMedia?.(),
+    onOpenSearch: () => latest.current.onOpenSearch?.(),
+    onOpenSettings: () => latest.current.onOpenSettings?.(),
     onSelectChat: (id: string) => latest.current.onSelectChat(id),
     onCreateGroup: () => latest.current.onCreateGroup(),
     onRenameGroup: (id: string, name: string) => latest.current.onRenameGroup(id, name),
@@ -86,6 +99,10 @@ export function ChatSidebar(props: ChatSidebarProps) {
       {...stable}
       onPinChat={props.onPinChat ? stable.onPinChat : undefined}
       onArchiveChat={props.onArchiveChat ? stable.onArchiveChat : undefined}
+      onOpenDocuments={props.onOpenDocuments ? stable.onOpenDocuments : undefined}
+      onOpenMedia={props.onOpenMedia ? stable.onOpenMedia : undefined}
+      onOpenSearch={props.onOpenSearch ? stable.onOpenSearch : undefined}
+      onOpenSettings={props.onOpenSettings ? stable.onOpenSettings : undefined}
     />
   )
 }
@@ -106,6 +123,10 @@ const ChatSidebarList = memo(function ChatSidebarList({
   restoring = null,
   onRetry,
   onNewChat,
+  onOpenDocuments,
+  onOpenMedia,
+  onOpenSearch,
+  onOpenSettings,
   onSelectChat,
   groups,
   onCreateGroup,
@@ -185,6 +206,33 @@ const ChatSidebarList = memo(function ChatSidebarList({
             </button>
           </ShortcutTip>
         </div>
+        {/* 휴대폰 몸소에는 아이콘 띠가 없어 문서로 가는 줄을 새 채팅방 아래에 둔다(데스크톱 아이콘 띠의 "문서"와 같은 말). */}
+        {onOpenDocuments && (
+          <div className="chat-new-row">
+            <button className="chat-new" type="button" onClick={onOpenDocuments}>
+              <FileText size={16} strokeWidth={1.75} aria-hidden />{W.tip.documents}</button>
+          </div>
+        )}
+        {/* 휴대폰 몸소: 아이콘 띠의 "사진과 동영상"도 문서 줄 아래에 같은 말·같은 그림으로(S75 셋째). */}
+        {onOpenMedia && (
+          <div className="chat-new-row">
+            <button className="chat-new" type="button" onClick={onOpenMedia}>
+              <Images size={16} strokeWidth={1.75} aria-hidden />{W.tip.media}</button>
+          </div>
+        )}
+        {/* 휴대폰 몸소: 창 맨 위 돋보기(찾기)와 아이콘 띠의 "설정"이 없어 문서 줄 아래에 같은 말로 둔다(S75). */}
+        {onOpenSearch && (
+          <div className="chat-new-row">
+            <button className="chat-new" type="button" onClick={onOpenSearch}>
+              <Search size={16} strokeWidth={1.75} aria-hidden />{W.search}</button>
+          </div>
+        )}
+        {onOpenSettings && (
+          <div className="chat-new-row">
+            <button className="chat-new" type="button" onClick={onOpenSettings}>
+              <Settings size={16} strokeWidth={1.75} aria-hidden />{W.tip.settings}</button>
+          </div>
+        )}
         {/* 검색은 창 맨 위 왼쪽의 돋보기로 옮겼다(2026-11-16 그의 말). 같은 것을 두 번 두지 않는다. */}
       </div>
 
@@ -270,7 +318,14 @@ const ChatSidebarList = memo(function ChatSidebarList({
 }, sameSidebar)
 
 /** 줄 끝 "…" 단추가 여는 작은 메뉴. 단추 아래 오른쪽 끝에 맞춰 띄운다. */
-export function RowMenu({ label, children }: { label: string; children: (close: () => void) => ReactNode }) {
+export function RowMenu({ label, children, buttonClassName = 'chat-more', button: face }: {
+  label: string
+  children: (close: () => void) => ReactNode
+  /** 여는 단추의 class(기본: 줄 끝 "…"). */
+  buttonClassName?: string
+  /** 여는 단추 안(기본: … 그림). */
+  button?: ReactNode
+}) {
   const [open, setOpen] = useState(false)
   const button = useRef<HTMLButtonElement>(null)
   const menu = useRef<HTMLDivElement>(null)
@@ -300,7 +355,7 @@ export function RowMenu({ label, children }: { label: string; children: (close: 
     document.addEventListener('mousedown', close)
     document.addEventListener('keydown', escape)
     // 키보드로 열면 메뉴는 문서 맨 끝에 붙어 Tab 으로 닿지 않는다: 첫 항목에 초점을 둔다(2026-11-17 키보드 점검).
-    window.requestAnimationFrame(() => menu.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus())
+    window.requestAnimationFrame(() => menu.current?.querySelector<HTMLElement>('[role^="menuitem"]')?.focus())
     return () => {
       document.removeEventListener('mousedown', close)
       document.removeEventListener('keydown', escape)
@@ -311,14 +366,14 @@ export function RowMenu({ label, children }: { label: string; children: (close: 
     <>
       <button
         ref={button}
-        className="chat-more"
+        className={buttonClassName}
         type="button"
         aria-label={label}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={(event) => { event.stopPropagation(); setOpen((current) => !current) }}
       >
-        <MoreHorizontal size={15} aria-hidden />
+        {face ?? <MoreHorizontal size={15} aria-hidden />}
       </button>
       {open && createPortal(
         <div
@@ -329,7 +384,7 @@ export function RowMenu({ label, children }: { label: string; children: (close: 
           style={{ top: place.top, left: place.left }}
           onKeyDown={(event) => {
             // 위아래 화살표로 항목을 옮기고, Tab 은 메뉴를 닫고 메뉴 단추로 돌아간다.
-            const items = Array.from(menu.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? [])
+            const items = Array.from(menu.current?.querySelectorAll<HTMLElement>('[role^="menuitem"]') ?? [])
             const at = items.indexOf(document.activeElement as HTMLElement)
             if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
               event.preventDefault()

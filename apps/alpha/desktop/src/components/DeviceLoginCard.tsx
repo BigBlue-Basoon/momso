@@ -18,12 +18,18 @@ function left(ms: number) {
  * 남은 시간을 세고, 로그인 페이지가 패널에 아직 안 열렸으면 [로그인 페이지 열기]. 클로드는 기본 브라우저로 연다는 안내만.
  * 뒤쪽이 닫힘을 보내면(provider-login-device-closed) 앱이 이 카드를 거둔다.
  */
-export function DeviceLoginCard({ login, style, onCopy, onOpenPage, onCancel, onDismiss }: {
+export function DeviceLoginCard({ login, style, inline = false, openLabel, onCopy, onOpenPage, onRestart, onCancel, onDismiss }: {
   login: DeviceLogin
   style?: CSSProperties
+  /** 화면 안에 놓는 꼴(momso anywhere 의 AI 연결 화면). 기본은 창 오른쪽 아래에 뜨는 카드. */
+  inline?: boolean
+  /** 여는 단추의 글(기본 "로그인 페이지 열기"). */
+  openLabel?: string
   onCopy: (code: string) => void
   /** 있으면 [로그인 페이지 열기](패널에 아직 안 열렸을 때). */
   onOpenPage?: () => void
+  /** 있으면 코드 시간이 지났을 때 [코드 다시 받기]. */
+  onRestart?: () => void
   onCancel: () => void
   onDismiss: () => void
 }) {
@@ -50,7 +56,7 @@ export function DeviceLoginCard({ login, style, onCopy, onOpenPage, onCancel, on
 
   const expired = expiresAt !== null && expiresAt <= now
   return (
-    <section className="device-login" role="dialog" aria-label={W.deviceLogin.title(name)} style={style}>
+    <section className={inline ? 'device-login is-inline' : 'device-login'} role={inline ? 'group' : 'dialog'} aria-label={W.deviceLogin.title(name)} style={style}>
       <strong className="device-login-title">{W.deviceLogin.title(name)}</strong>
       <p>{expired ? W.deviceLogin.expired : W.deviceLogin.text}</p>
       <div className={expired ? 'device-login-code is-expired' : 'device-login-code'}>
@@ -65,8 +71,11 @@ export function DeviceLoginCard({ login, style, onCopy, onOpenPage, onCancel, on
       <div className="device-login-actions">
         {onOpenPage && !expired && (
           <button className="approval-button is-primary" type="button" onClick={onOpenPage}>
-            <ExternalLink size={13} aria-hidden />{W.deviceLogin.openPage}
+            <ExternalLink size={13} aria-hidden />{openLabel ?? W.deviceLogin.openPage}
           </button>
+        )}
+        {onRestart && expired && (
+          <button className="approval-button is-primary" type="button" onClick={onRestart}>{W.deviceLogin.restart}</button>
         )}
         <button className="approval-button" type="button" onClick={onCancel}>{W.deviceLogin.cancel}</button>
       </div>

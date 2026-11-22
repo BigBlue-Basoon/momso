@@ -103,7 +103,8 @@ export function DeletedSourcesSettings({ onChanged }: { onChanged?: () => void }
           {items.map((item) => {
             const title = nameOf(item)
             // 다 지우지 못해 다시 시도할 줄은 쓰던 곳 수 대신 무엇을 기다리는지 적는다(이 PC 의 것·원격의 사본을 한 글로).
-            const meta = [when(item.deletedAt), isRetry(item.deletionState) ? D.retryPending : D.usedCount(item.referenceCount)].filter(Boolean).join(' · ')
+            // 쓰던 곳 수를 모르면(휴대폰 몸소, null) 수를 적지 않는다.
+            const meta = [when(item.deletedAt), isRetry(item.deletionState) ? D.retryPending : item.referenceCount === null ? null : D.usedCount(item.referenceCount)].filter(Boolean).join(' · ')
             return (
               <li key={item.id} className="archived-row" aria-busy={working === item.id || undefined}>
                 <span className="archived-main">

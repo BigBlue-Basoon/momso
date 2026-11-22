@@ -10,23 +10,10 @@ pub(crate) enum Provider {
     Gemini,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BrowserPermission {
-    Ask,
-    Automatic,
-    Plan,
-    AutoReview,
-}
+pub(crate) use crate::browser_engine::BrowserPermission;
 
 pub(crate) fn browser_permission(provider: &str, mode: &str) -> BrowserPermission {
-    match (provider, mode) {
-        ("codex", "Full access") | ("claude", "bypassPermissions") | ("gemini", "yolo") => {
-            BrowserPermission::Automatic
-        }
-        ("codex", "Approve for me") | ("claude", "auto") => BrowserPermission::AutoReview,
-        (_, "plan") => BrowserPermission::Plan,
-        _ => BrowserPermission::Ask,
-    }
+    BrowserPermission::from_provider_mode(provider, mode)
 }
 impl Provider {
     fn key(self) -> &'static str {

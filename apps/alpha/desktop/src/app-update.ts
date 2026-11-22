@@ -5,10 +5,11 @@
 //     no_release = 공개된 릴리스가 아직 없음(2026-11-19 첫째 줄 M16 D40, 오류가 아님). 화면은 up_to_date 와 같게 "최신 버전입니다"로 본다.
 //   update_install → { state: downloaded | failed | unavailable | busy } (내려받고 서명 검증까지, 설치는 안 함)
 //   update_restart → { state } (화면이 미저장·AI 작업 확인을 마친 뒤)
+//     S69(줄6 cc9e65e79, desktop-update-s69.md): 진행 중인 채팅이 있으면 { state: 'busy', reason: 'active_turn' } 로 설치하지 않는다(화면은 알리고 일이 끝나면 다시 묻는다).
+//     다른 업데이트 작업 중이면 busy(까닭 없음). 실패 까닭은 backup_failed · installation_failed · worker_failed. 정상이면 앱이 꺼져 결과가 오지 않을 수 있다.
 //   이벤트 update-available(update_check 와 같은 모양), update-progress { downloadedBytes, totalBytes },
 //          update-done { state: 'downloaded' }, update-failed { state: 'failed' }
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { invoke, listen } from './host'
 import { isDesktopRuntime } from './runtime'
 
 export type AppVersion = { version: string; buildDate: string | null }
@@ -38,9 +39,21 @@ export async function installUpdate() {
   return invoke<{ state?: string } | null>('update_install')
 }
 
-export async function restartApp() {
+export type RestartResult = { state: string | null; reason: string | null }
+
+export async function restartApp(): Promise<RestartResult> {
   if (!isDesktopRuntime()) throw new Error('update_restart needs the desktop runtime')
-  await invoke<unknown>('update_restart')
+  const result = await invoke<{ state?: unknown; reason?: unknown } | null>('update_restart')
+  return { state: typeof result?.state === 'string' ? result.state : null, reason: typeof result?.reason === 'string' ? result.reason : null }
+}
+
+const RESTART_FAILURES = ['backup_failed', 'installation_failed', 'worker_failed']
+
+/** 다시 시작이 되지 않은 까닭: 진행 중인 채팅(turn), 다른 업데이트 작업(busy), 실패(failed). 그 밖(시작됨 등)은 null. */
+export function restartRefusal(result: RestartResult): 'turn' | 'busy' | 'failed' | null {
+  if (result.state === 'busy') return result.reason === 'active_turn' ? 'turn' : 'busy'
+  if (result.state === 'failed' || (result.reason !== null && RESTART_FAILURES.includes(result.reason))) return 'failed'
+  return null
 }
 
 export async function listenUpdates(handlers: {

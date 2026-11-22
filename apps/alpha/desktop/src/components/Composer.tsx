@@ -63,8 +63,12 @@ type ComposerProps = {
   /** 이 말에 고른 스킬(하나만). 입력 칸 안에 조각으로 보인다. */
   skill?: SkillEntry | null
   onSkillChange?: (skill: SkillEntry | null) => void
-  onStop: () => void
-  onAttach: () => void
+  /** 답 멈추기. 없으면(네트워크 길: server 계약에 멈추기가 없다) 답이 오는 동안 단추가 눌리지 않는다. */
+  onStop?: () => void
+  /** 첨부. 없으면(네트워크 길: 이 컴퓨터의 파일 고르기가 없다) 클립 단추를 그리지 않는다. */
+  onAttach?: () => void
+  /** 말로 입력(마이크). false 면(네트워크 길) 그리지 않는다. */
+  voice?: boolean
   /** 모델 목록. null 이면 읽지 못했다(이때는 설정의 AI 곳만 고를 수 있다). */
   models: ProviderModels[] | null
   /** 모델 목록을 읽지 못했을 때 고를 수 있는 곳(설정의 AI 연결). */
@@ -109,6 +113,7 @@ export function Composer({
   onSkillChange,
   onStop,
   onAttach,
+  voice = true,
   models,
   modelsState = 'ok',
   onRetryModels,
@@ -303,15 +308,17 @@ export function Composer({
         </div>
         <div className="composer-toolbar">
           <div className="composer-toolbar-start">
-            <button
-              className="composer-icon"
-              type="button"
-              aria-label={W.composer.aria1}
-              title={W.composer.aria1}
-              onClick={onAttach}
-            >
-              <Paperclip size={16} aria-hidden />
-            </button>
+            {onAttach && (
+              <button
+                className="composer-icon"
+                type="button"
+                aria-label={W.composer.aria1}
+                title={W.composer.aria1}
+                onClick={onAttach}
+              >
+                <Paperclip size={16} aria-hidden />
+              </button>
+            )}
             {permission && <PermissionPicker permission={permission} onChange={onPermissionChange} />}
           </div>
           <div className="composer-toolbar-end">
@@ -332,23 +339,25 @@ export function Composer({
             <FastToggle models={models} chosen={chosen} refused={fastRefused} onToggle={onToggleFast} />
             {context?.state === 'ok' && <ContextMeter context={context} />}
             {/* 보내기 단추 바로 왼쪽에 마이크. 누르는 동안 입력 칸의 커서를 빼앗지 않는다(mousedown 을 막음). */}
-            <button
-              className="composer-icon composer-mic"
-              type="button"
-              aria-label={W.composer.voice}
-              title={W.composer.voice}
-              disabled={!voiceUsable}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => void startVoice()}
-            >
-              <Mic size={16} aria-hidden />
-            </button>
+            {voice && (
+              <button
+                className="composer-icon composer-mic"
+                type="button"
+                aria-label={W.composer.voice}
+                title={W.composer.voice}
+                disabled={!voiceUsable}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => void startVoice()}
+              >
+                <Mic size={16} aria-hidden />
+              </button>
+            )}
             <button
               className="send-button"
               type="button"
               aria-label={isGenerating ? W.composer.aria3 : W.composer.aria4}
               title={isGenerating ? W.composer.aria3 : W.composer.aria4}
-              disabled={!isGenerating && (!canSend || !sendReady)}
+              disabled={isGenerating ? !onStop : (!canSend || !sendReady)}
               onClick={isGenerating ? onStop : onSend}
             >
               {isGenerating ? <Square size={12} fill="currentColor" aria-hidden /> : <Send size={15} aria-hidden />}
