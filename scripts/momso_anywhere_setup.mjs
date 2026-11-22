@@ -10,6 +10,16 @@ export class SetupError extends Error {
   }
 }
 
+export async function bindCustomRole(action, sleep = ms => new Promise(resolve => setTimeout(resolve, ms))) {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    try { return await action(); }
+    catch (error) {
+      if (!(error instanceof SetupError) || error.step !== 'role_propagating' || attempt === 11) throw error;
+      await sleep(5000);
+    }
+  }
+}
+
 export async function startAnywhere(provider, checkpoint, onProgress = () => {}) {
   if (!provider || STEPS.some((step) => typeof provider[step] !== 'function')) {
     throw new SetupError('provider_not_ready');

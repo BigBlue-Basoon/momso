@@ -409,6 +409,16 @@
       ] },
       notConnected('gemini'),
     ]
+    // ?usage=fable: 그의 경우(2026-11-22). 클로드 주간 전체는 넉넉하고 주간 Fable 은 1% 남음.
+    if (usageMode === 'fable') return [
+      ok('codex', 'Plus', 38, 12),
+      { provider: 'claude', state: 'ok', reason: null, plan: 'max', planLabel: null, checkedAt, windows: [
+        { kind: 'session', usedPercent: 18, resetsAt: soon(3) },
+        { kind: 'weekly_all', usedPercent: 40, resetsAt: soon(70) },
+        { kind: 'weekly_scoped', scope: { model: { display_name: 'Fable' } }, usedPercent: 99, resetsAt: soon(70) },
+      ] },
+      ok('gemini', 'AI Pro', 5, 2),
+    ]
     // ?usage=nominutes: 기간(분)을 받지 못한 창(primary·secondary, 클로드 session)과 받은 창(15_minutes·2_days).
     if (usageMode === 'nominutes') return [
       { provider: 'codex', state: 'ok', reason: null, plan: 'pro', checkedAt, windows: [{ kind: 'primary', usedPercent: 30, resetsAt: null }, { kind: 'secondary', usedPercent: 12, resetsAt: soon(40) }, { kind: '15_minutes', usedPercent: 5, resetsAt: soon(0.2) }, { kind: '2_days', usedPercent: 50, resetsAt: soon(30) }] },
@@ -1027,7 +1037,7 @@
   window.__panelGoogle = (siteUrl, chatId) => emit('panel-browser-google-login', { chatId: chatId === undefined ? window.__panelState.active : chatId, host: 'accounts.google.com', siteUrl: siteUrl ?? null })
   window.__closeSecret = (requestId, reason) => emit('agent-setup-secret-closed', reason ? { requestId, chatId: null, reason } : { requestId, chatId: null })
 
-  // ---- 미디어(화면 확인용 가짜). ?media=ok(기본) / none(명령 없음). 그림은 색 띠 SVG. ----
+  // ---- 미디어(화면 확인용 가짜). ?media=ok(기본) / none(명령 없음) / badposter(동영상 첫 장면 그림을 읽지 못함). 그림은 색 띠 SVG. ----
   const mediaMode = query.get('media') || 'ok'
   function fakePicture(hue, w, h, label) {
     const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='${w}' height='${h}'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='hsl(${hue},45%,72%)'/><stop offset='1' stop-color='hsl(${(hue + 40) % 360},40%,48%)'/></linearGradient></defs><rect width='100%' height='100%' fill='url(%23g)'/><text x='50%' y='52%' font-size='${Math.round(h / 9)}' font-family='sans-serif' fill='white' text-anchor='middle'>${label}</text></svg>`
@@ -1095,7 +1105,7 @@
     return {
       id: `media-${i + 1}`, kind, title: MEDIA_TITLES[i % MEDIA_TITLES.length] + (i >= MEDIA_TITLES.length ? ` ${Math.floor(i / MEDIA_TITLES.length) + 1}` : ''),
       createdAt: day(Math.floor(i / 4), 21 - (i % 4) * 3), width: kind === 'audio' ? null : w, height: kind === 'audio' ? null : h,
-      durationSec: kind === 'image' ? null : 20 + (i * 13) % 200, path: kind === 'image' ? pic : '', posterPath: kind === 'video' ? pic : null,
+      durationSec: kind === 'image' ? null : 20 + (i * 13) % 200, path: kind === 'image' ? pic : '', posterPath: kind === 'video' ? (mediaMode === 'badposter' ? 'data:image/jpeg;base64,AAAA' : pic) : null,
       chatId: chat ? chat.id : null, chats: chat ? [{ id: chat.id, title: chat.title }] : [], by, how: by.kind === 'user' ? 'attached' : 'created',
     }
   }

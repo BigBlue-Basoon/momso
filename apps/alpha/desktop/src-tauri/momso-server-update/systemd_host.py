@@ -7,15 +7,17 @@ import time
 import urllib.request
 
 from data_snapshots import DataSnapshots
+from server_admission import AdmissionError
 from update import _atomic_json
 
 
 class SystemdHost:
-    def __init__(self, root, data_directory, unit, health_url, admission, gateway, progress):
+    def __init__(self, root, data_directory, unit, health_url, admission, gateway, progress, *, proxy_unit=None):
         self.root = Path(root)
         self.current = self.root / "current"
         self.sequence = self.root / "installed.json"
         self.unit = unit
+        self.proxy_unit = proxy_unit
         self.health_url = health_url
         self.admission = admission
         self.gateway = gateway
@@ -28,9 +30,22 @@ class SystemdHost:
     def current_release(self): return str(self.current.resolve(strict=True))
     def current_gateway(self): return self.gateway.current()
     def acquire_maintenance(self): return self.admission.acquire()
+    def acquire_recovery_maintenance(self):
+        if hasattr(self.admission, "reacquire_for_recovery"):
+            try:
+                return self.admission.reacquire_for_recovery()
+            except AdmissionError:
+                # A switching journal exists, but the new server may not start.
+                # Stop restart attempts before taking the lifecycle lock offline.
+                self.stop_server()
+                return self.admission.acquire_offline_for_recovery()
+        return self.admission.acquire()
     def release_maintenance(self): self.admission.release()
     def stop_server(self): self._systemctl("stop")
-    def start_server(self): self._systemctl("start")
+    def start_server(self):
+        self._systemctl("start")
+        if self.proxy_unit:
+            subprocess.run(["systemctl", "start", self.proxy_unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
     def _systemctl(self, operation):
         subprocess.run(["systemctl", operation, self.unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
     def snapshot_data(self): return self.snapshots.snapshot()

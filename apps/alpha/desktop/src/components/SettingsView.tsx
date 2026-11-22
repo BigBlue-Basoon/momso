@@ -15,6 +15,7 @@ import { SavedLoginsSettings } from './SavedLoginsSettings'
 import type { SkillEntry } from '../skills'
 import type { AppUpdateState } from './AppUpdate'
 import { W } from '../words'
+import { isNetworkRuntime } from '../runtime'
 
 // 2026-11-16 김성균 개발자의 지시("방향을 바꾸기 전 옛화면에 남아있는거 그런거는 이제 필요 없는거잖아")로
 // 꺼 두었던 옛 칸(작업공간, 참여자 표기, 채팅방 이력 보관, 응답 밀도, 개인정보 경계, 이전 채팅방 가져오기, 예전 백업 화면,
@@ -167,7 +168,8 @@ export function SettingsView({
             <div className="settings-page">
               <header className="settings-page-heading">
                 <h2>{W.settingsView.text5}</h2>
-                <p>{W.backup.pageIntro}</p>
+                {/* 휴대폰 몸소는 GitHub 칸만 있어 "원자료는 선택한 오브젝트 스토리지에"라는 소개를 두지 않는다. */}
+                {!isNetworkRuntime() && <p>{W.backup.pageIntro}</p>}
               </header>
               <BackupSettings />
             </div>

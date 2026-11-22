@@ -110,6 +110,30 @@ export function remainingPercent(usage: ProviderUsage) {
   return Math.max(0, Math.min(100, 100 - Math.max(...values)))
 }
 
+/** 숫자가 있는 기간 가운데 가장 적게 남은 것과 그 남은 양. 없으면 null. */
+function lowestOf(windows: UsageWindow[]) {
+  let pick: { left: number; window: UsageWindow } | null = null
+  for (const window of windows) {
+    if (typeof window.usedPercent !== 'number' || !Number.isFinite(window.usedPercent)) continue
+    const left = Math.max(0, Math.min(100, 100 - window.usedPercent))
+    if (!pick || left < pick.left) pick = { left, window }
+  }
+  return pick
+}
+
+export type UsageSplit = { all: { left: number; window: UsageWindow }; scoped: { left: number; window: UsageWindow } }
+
+/**
+ * 모든 모델을 함께 세는 한도와 특정 모델만 따로 세는 한도(scope, 예: 클로드의 주간 Fable)가 둘 다 있으면 나눠 준다(2026-11-22 그의 지시).
+ * 띠의 고리(흰 선)는 all, 그 바깥의 가는 고리는 scoped. 한쪽만 있으면 null(지금처럼 고리 하나에 가장 적게 남은 것).
+ */
+export function usageSplit(usage: ProviderUsage): UsageSplit | null {
+  if (usage.state !== 'ok') return null
+  const scoped = lowestOf(usage.windows.filter((window) => scopeName(window.scope) !== null))
+  const all = lowestOf(usage.windows.filter((window) => scopeName(window.scope) === null))
+  return all && scoped ? { all, scoped } : null
+}
+
 /** 다시 차는 때를 Date 로. Unix 초(백엔드), 밀리초, 글자 시각을 모두 받는다. 알 수 없으면 null. */
 export function resetDate(value: number | string | null) {
   if (value === null || value === undefined || value === '') return null

@@ -104,10 +104,15 @@ class FlowTests(unittest.TestCase):
         keys = patch.object(momso_release_keys, 'validate', return_value=b'fixture')
         keys.start(); self.addCleanup(keys.stop)
         image = 'registry.example.test/momso/gateway@sha256:' + 'a' * 64
-        for name, value in [('release', {'gatewayImage': image, 'bundleUrl': 'https://example.test/bundle', 'bundleSha256': 'b' * 64}), ('download', b'fixture'), ('verify_inputs', None)]:
+        for name, value in [('release', {'gatewayImage': image, 'bundleUrl': 'https://example.test/bundle', 'bundleSha256': 'b' * 64, 'sequence': 2}), ('download', b'fixture'), ('verify_inputs', None)]:
             mock = patch.object(momso_release_manifest, name, return_value=value)
             mock.start()
             self.addCleanup(mock.stop)
+        import momso_anywhere_update_install
+        self.update_grant = patch.object(momso_anywhere_update_install, "grant_gateway_update")
+        self.update_install = patch.object(momso_anywhere_update_install, "install")
+        self.update_grant_mock = self.update_grant.start(); self.addCleanup(self.update_grant.stop)
+        self.update_install_mock = self.update_install.start(); self.addCleanup(self.update_install.stop)
 
     def test_success_retry_and_destroy(self):
         provider = FakeProvider()
@@ -167,7 +172,7 @@ class FlowTests(unittest.TestCase):
             self.assertIn("--metadata=enable-oslogin=FALSE,block-project-ssh-keys=TRUE,enable-guest-attributes=TRUE", flags)
         with patch.object(provider, "run", return_value=b"") as run:
             provider.ssh("print('fixture')")
-            flags = run.call_args.args
+            flags = run.call_args_list[0].args
             self.assertIn("--tunnel-through-iap", flags)
             self.assertIn("--strict-host-key-checking=yes", flags)
             self.assertTrue(any(arg.startswith("--ssh-key-file=") for arg in flags))
@@ -181,7 +186,11 @@ class FlowTests(unittest.TestCase):
         def run(*args, **kwargs):
             calls.append(args)
             if args[:2] == ("compute", "scp"):
-                self.assertEqual(Path(args[2]).read_bytes(), payload)
+                package = Path(args[2]).read_bytes()
+                length = int.from_bytes(package[:8], 'big')
+                self.assertEqual(package[8:9], b'1')
+                self.assertEqual(package[9:9+length], b'import sys; print(len(sys.stdin.buffer.read()))')
+                self.assertEqual(package[9+length:], payload)
                 return b""
             return b"done"
 
@@ -194,9 +203,82 @@ class FlowTests(unittest.TestCase):
         command = next(arg for arg in calls[2] if arg.startswith("--command="))
         encoded = command.split("b64decode('", 1)[1].split("'", 1)[0]
         wrapper = base64.b64decode(encoded).decode()
-        self.assertIn(hashlib.sha256(payload).hexdigest(), wrapper)
+        self.assertIn('hashlib.sha256(d).hexdigest()', wrapper)
         self.assertIn("os.unlink(p)", wrapper)
         self.assertNotIn(payload.hex(), command)
+
+    def test_all_ssh_commands_stay_short_with_large_code_and_binary_data(self):
+        with patch.object(installer.shutil, "which", return_value="gcloud"):
+            provider = installer.GoogleProvider("fixture@example.test", "fixture-project", "0123456789ab", self.root / "fixture-key")
+        calls = []
+        def run(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ('compute', 'scp'):
+                package = Path(args[2]).read_bytes()
+                length = int.from_bytes(package[:8], 'big')
+                self.assertGreater(length, 100000)
+                self.assertEqual(package[8:9], b'1')
+                self.assertEqual(package[9+length:], b'fixture-input')
+            return b'ok'
+        with patch.object(provider, 'run', side_effect=run):
+            self.assertEqual(provider.ssh('#' + 'x' * 120000, b'fixture-input'), b'ok')
+        commands = [next(arg for arg in call if arg.startswith('--command=')) for call in calls if call[:2] == ('compute', 'ssh')]
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all(len(subprocess.list2cmdline(list(call))) < 8000 for call in calls))
+
+    def test_actual_windows_ssh_command_guard_checks_the_entire_command(self):
+        with patch.object(installer.shutil, 'which', return_value='gcloud'):
+            provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', self.root / 'fixture-key')
+        with patch.object(installer.subprocess, 'run') as run:
+            with self.assertRaises(installer.InstallError):
+                provider.run('compute', 'ssh', provider.name, '--command=' + 'x' * 9000)
+            run.assert_not_called()
+
+    def test_ssh_without_input_transfers_code_and_cleans_up_after_failure(self):
+        with patch.object(installer.shutil, 'which', return_value='gcloud'):
+            provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', self.root / 'fixture-key')
+        calls, paths = [], []
+        def run(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ('compute', 'scp'):
+                paths.append(Path(args[2]))
+                package = paths[-1].read_bytes()
+                self.assertEqual(package[8:9], b'0')
+                self.assertEqual(package[9:], b'raise RuntimeError()')
+            if len([call for call in calls if call[:2] == ('compute', 'ssh')]) == 2:
+                raise installer.InstallError('fixture remote failure')
+            return b''
+        with patch.object(provider, 'run', side_effect=run):
+            with self.assertRaises(installer.InstallError):
+                provider.ssh('raise RuntimeError()')
+        self.assertEqual([call[1] for call in calls], ['ssh', 'scp', 'ssh', 'ssh'])
+        self.assertFalse(paths[0].exists())
+        cleanup = next(arg for arg in calls[-1] if arg.startswith('--command='))
+        encoded = cleanup.split("b64decode('", 1)[1].split("'", 1)[0]
+        self.assertIn('os.unlink(p)', base64.b64decode(encoded).decode())
+
+    def test_checkpoint_services_and_updater_use_only_short_ssh_commands(self):
+        import momso_anywhere_vm_services
+        import momso_anywhere_update_install
+        self.update_install.stop()
+        with patch.object(installer.shutil, 'which', return_value='gcloud'):
+            provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', self.root / 'fixture-key')
+        commands, packages = [], []
+        def run(*args, **kwargs):
+            if args[:2] == ('compute', 'ssh'):
+                commands.append(args)
+            if args[:2] == ('compute', 'scp'):
+                packages.append(Path(args[2]).read_bytes())
+            return b'momso_checkpoint_ok'
+        public = self.root / 'public.pem'; public.write_bytes(b'fixture public key')
+        with patch.object(provider, 'run', side_effect=run), patch.object(provider, 'health'):
+            provider.upgrade_checkpoint('restore')
+            momso_anywhere_vm_services.install_scripts(provider, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
+            momso_anywhere_update_install.install(provider, 'development', public, 'https://fixture.invalid/release.json')
+        self.assertEqual(len(packages), 3)
+        self.assertEqual(len(commands), 6)
+        self.assertTrue(all(len(subprocess.list2cmdline(list(call))) < 8000 for call in commands))
+        self.assertTrue(any(int.from_bytes(package[:8], 'big') > 8000 for package in packages))
 
     def test_ssh_failed_scp_removes_local_temporary_file(self):
         with patch.object(installer.shutil, "which", return_value="gcloud"):
@@ -383,6 +465,8 @@ class FlowTests(unittest.TestCase):
             code = installer.main(["anywhere", "--account", "fixture@example.test", "--project", "fixture-project", "--state", str(self.path), "--artifact", str(self.artifact), "--sha256", self.digest, "--web-archive", str(web), "--web-sha256", digest, "--google-client-id", "fixture.apps.googleusercontent.com", "--owner-sub", "12345", "--login-origin", "https://login.example.test", "--gateway-image", "registry.example.test/momso/gateway@sha256:" + "a" * 64, '--release-manifest-url', 'https://example.test/release.json', '--release-public-key', str(self.public_key)])
         self.assertEqual(code, 0)
         self.assertEqual(provider.calls, ["network", "vm", "install", "health", "web"])
+        self.update_grant_mock.assert_called_once_with(provider)
+        self.update_install_mock.assert_called_once_with(provider, "production", self.public_key, "https://example.test/release.json")
         install.assert_called_once()
 
     def test_anywhere_wrong_web_digest_creates_no_resources(self):
@@ -444,6 +528,7 @@ class FlowTests(unittest.TestCase):
             def upgrade_checkpoint(self, action): self.calls.append(("checkpoint", action))
             def upgrade_server(self, *args): self.calls.append(("upgrade_server",))
             def install_web(self, *args): self.calls.append(("install_web",))
+            def upgrade_sequence(self, sequence, *, commit=False): self.calls.append(("sequence", sequence, commit))
 
         provider = ExistingProvider()
         state = {"anywhere": {"client_id": "client", "owner_sub": "12345", "login_origin": "https://login.example.test", "url": "https://fixture.a.run.app"}}
@@ -453,7 +538,7 @@ class FlowTests(unittest.TestCase):
                 installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, "client", "12345", "https://login.example.test", "registry.example.test/momso/gateway@sha256:" + "a" * 64)
         with patch.object(momso_anywhere_public_assets, "from_web_archive", return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, "_objects", return_value=({"name": "account"}, {"name": "role"}, {"name": "service"})), patch.object(momso_anywhere_install.GoogleAnywhere, "upgrade_gateway") as upgrade_gateway, patch("momso_anywhere_vm_services.install") as install_services:
             url = installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, "client", "12345", "https://login.example.test", "registry.example.test/momso/gateway@sha256:" + "a" * 64)
-        install_services.assert_called_once_with(provider)
+        install_services.assert_called_once_with(provider, allow_upgrade_gate=True)
         upgrade_gateway.assert_called_once_with(state["anywhere"]["url"], "registry.example.test/momso/gateway@sha256:" + "a" * 64)
         self.assertEqual(url, state["anywhere"]["url"])
         self.assertEqual(data.read_bytes(), b"synthetic chat data")
@@ -462,6 +547,11 @@ class FlowTests(unittest.TestCase):
         self.assertFalse(any("delete" in call or "create" in call for call in provider.calls))
         self.assertEqual([call for call in provider.calls if call[0] == "checkpoint"], [("checkpoint", "begin"), ("checkpoint", "finish")])
         self.assertEqual([call for call in provider.calls if call[0] == "private_proxy"], [("private_proxy",)])
+
+        provider.calls.clear()
+        with patch.object(momso_anywhere_public_assets, "from_web_archive", return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, "_objects", return_value=({"name": "account"}, {"name": "role"}, {"name": "service"})), patch.object(momso_anywhere_install.GoogleAnywhere, "upgrade_gateway"), patch("momso_anywhere_vm_services.install"):
+            installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, "client", "12345", "https://login.example.test", "registry.example.test/momso/gateway@sha256:" + "a" * 64, signed_sequence=3)
+        self.assertEqual([call for call in provider.calls if call[0] == "sequence"], [("sequence", 3, False), ("sequence", 3, True)])
 
         provider.calls.clear()
         health_calls = []
@@ -505,7 +595,7 @@ class FlowTests(unittest.TestCase):
         tree = ast.parse(ssh.call_args_list[1].args[0])
         encoded = next(node.value.value for node in tree.body if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "p")
         payload = base64.b64decode(encoded).decode()
-        self.assertLess(payload.index("shutil.which('git')"), payload.index("run('systemctl','enable'"))
+        self.assertLess(payload.index("('git','ffmpeg')"), payload.index("run('systemctl','enable'"))
 
     def test_server_upgrade_payload_does_not_touch_data_or_configuration(self):
         with patch.object(installer.shutil, "which", return_value="gcloud"):
@@ -520,6 +610,28 @@ class FlowTests(unittest.TestCase):
         self.assertNotIn("/etc/momso", payload)
         self.assertNotIn("useradd", payload)
         self.assertEqual(ssh.call_args.args[1], self.artifact.read_bytes())
+
+    def test_server_upgrade_updates_active_release_instead_of_old_flat_file(self):
+        import io
+        import sys
+        with patch.object(installer.shutil, "which", return_value="gcloud"):
+            provider = installer.GoogleProvider("fixture@example.test", "fixture-project", "0123456789ab", self.root / "fixture-key")
+        flat = self.root / "flat"
+        release = flat / "releases" / "version-1"
+        release.mkdir(parents=True)
+        (flat / "momso-server").write_bytes(b"old flat")
+        (release / "momso-server").write_bytes(b"old active")
+        (flat / "releases" / ".momso-update-active").write_text("momso-update-v1\n")
+        (flat / "releases" / "current").symlink_to(release, target_is_directory=True)
+        with patch.object(provider, "ssh", return_value=b"") as ssh:
+            provider.upgrade_server(self.artifact, self.digest)
+        tree = ast.parse(ssh.call_args.args[0])
+        encoded = next(node.args[0].value for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "b64decode")
+        payload = base64.b64decode(encoded).decode().replace("root='/opt/momso'", "root=" + repr(str(flat)))
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(self.artifact.read_bytes()))), patch.object(subprocess, "run"):
+            exec(compile(payload, "fixture", "exec"), {})
+        self.assertEqual((release / "momso-server").read_bytes(), self.artifact.read_bytes())
+        self.assertEqual((flat / "momso-server").read_bytes(), b"old flat")
 
     def test_upgrade_checkpoint_restores_server_and_screen_without_touching_other_files(self):
         with patch.object(installer.shutil, "which", return_value="gcloud"):

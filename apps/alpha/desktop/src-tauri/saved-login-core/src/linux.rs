@@ -83,6 +83,22 @@ impl LinuxVault {
         self.get(&service_key(name)?)
     }
 
+    /// Serialize a host-only read/modify/write with all other vault users.
+    pub fn update_service_secret<T>(
+        &self,
+        name: &str,
+        update: impl FnOnce(Option<&str>) -> Result<(T, Option<String>), &'static str>,
+    ) -> Result<T, &'static str> {
+        let _lock = self.lock()?;
+        let key = service_key(name)?;
+        let current = self.get(&key)?;
+        let (result, replacement) = update(current.as_deref())?;
+        if let Some(replacement) = replacement {
+            self.put(&key, &replacement)?;
+        }
+        Ok(result)
+    }
+
     pub fn delete_service_secret(&self, name: &str) -> Result<(), &'static str> {
         let _lock = self.lock()?;
         self.remove(&service_key(name)?)

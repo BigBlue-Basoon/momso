@@ -23,6 +23,19 @@ test('VM startup rejects an unverified or non-HTTPS bundle', () => {
   assert.throws(() => vmStartupScript({ project: 'fixture-project', secret: 'momso-transport-aaaaaaaaaaaa', bundleUrl: 'https://example.test/a', bundleSha256: 'bad' }));
 });
 
+test('signed release configuration installs the update worker', () => {
+  const key = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.alloc(32, 7)]).toString('base64');
+  const input = { project: 'fixture-project', secret: 'momso-transport-aaaaaaaaaaaa', bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'a'.repeat(64), update: { manifestUrl: 'https://example.test/release.json', publicKeySpki: key, channel: 'development' } };
+  const source = vmStartupScript(input);
+  const python = source.split("<<'MOMSO_BOOTSTRAP'\n")[1].split('\nMOMSO_BOOTSTRAP')[0];
+  const check = spawnSync(pythonBin, ['-c', 'import ast,sys; ast.parse(sys.stdin.read())'], { input: python, encoding: 'utf8' });
+  assert.equal(check.status, 0, check.stderr);
+  assert(source.includes('install_worker.install('));
+  assert(source.includes('momso-updater/'));
+  assert(source.includes('development'));
+  assert.throws(() => vmStartupScript({ ...input, update: { ...input.update, manifestUrl: 'http://example.test/release.json' } }));
+});
+
 test('VM startup installs missing Git before starting the server', () => {
   const source = vmStartupScript({ project: 'fixture-project', secret: 'momso-transport-aaaaaaaaaaaa', bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'a'.repeat(64) });
   const python = source.split("<<'MOMSO_BOOTSTRAP'\n")[1].split('\nMOMSO_BOOTSTRAP')[0];
@@ -32,7 +45,7 @@ from types import SimpleNamespace
 tree=ast.parse(sys.stdin.read())
 assignment=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='missing' for t in n.targets))
 branch=next(n for n in tree.body if isinstance(n,ast.If) and isinstance(n.test,ast.Name) and n.test.id=='missing')
-for available,expected in [({'bwrap','age-keygen','flock'},['git']),({'git','age-keygen','flock'},['bubblewrap']),(set(),['bubblewrap','git','age','util-linux']),({'bwrap','git','age-keygen','flock'},[])]:
+for available,expected in [({'bwrap','age-keygen','flock','ffmpeg'},['git']),({'git','age-keygen','flock','ffmpeg'},['bubblewrap']),(set(),['bubblewrap','git','ffmpeg','age','util-linux']),({'bwrap','git','ffmpeg','age-keygen','flock'},[])]:
  calls=[]; env={'shutil':SimpleNamespace(which=lambda name:name if name in available else None),'os':SimpleNamespace(environ={}),'run':lambda *args:calls.append(args)}
  exec(compile(ast.Module(body=[assignment,branch],type_ignores=[]),'fixture','exec'),env)
  assert env['missing']==expected

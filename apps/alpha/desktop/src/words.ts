@@ -261,6 +261,8 @@ const ko = {
     createRepo: '저장소 만들기',
     createWhat: (a: unknown) => `GitHub에 ${a} 비공개 저장소를 만들어 연결합니다.`,
     createNeedsName: '사용자 이름이 있어야 저장소를 만들 수 있습니다.',
+    /** 휴대폰 몸소: GitHub 에 로그인하기 전이라 저장소 이름(momso-<GitHub 계정>)을 아직 모를 때 만들기 줄(createWhat 자리). 2026-11-22 새로 씀, 그의 확인 전. */
+    serverCreateWhat: 'GitHub에 로그인하면 내 계정에 비공개 저장소를 만들어 연결합니다.',
     createTitle: (a: unknown) => `GitHub에 ${a} 저장소를 만들까요?`,
     createText: '나만 볼 수 있는 비공개 저장소로 만들고 바로 연결합니다.',
     create: {
@@ -490,6 +492,10 @@ const ko = {
     // (지움) purgedName '완전히 삭제한 원자료': 뒤쪽이 다 지운 것을 목록에서 빼게 되어 걷어 냄(2026-11-17).
     /** 완전히 삭제를 눌렀지만 아직 다 지우지 못한 줄의 둘째 줄(local_retry_pending·remote_retry_pending). 2026-11-17 새로 씀, 그의 확인 전. */
     retryPending: '아직 다 지우지 못했습니다. 완전히 삭제를 다시 눌러 주세요',
+    /** 휴대폰 몸소의 완전히 삭제 묻는 창(S83, 데스크톱 sourceDelete.purgeText 의 "이 컴퓨터" 자리). 2026-11-22 새로 씀, 그의 확인 전. */
+    serverPurgeText: '몸소 서버에서 되살릴 수 없게 지웁니다.',
+    /** 위 글 뒤에 붙는다(server backupCopiesRemain). 이미 올라간 예전 백업에는 남지만 복원해도 되살아나지 않는다. 2026-11-22 새로 씀, 그의 확인 전. */
+    backupCopiesRemain: '이미 만든 예전 백업에는 사본이 남아 있을 수 있지만, 백업에서 복원해도 되살아나지 않습니다.',
   },
   // ---- components/PanelBrowser.tsx: 오른쪽 패널 브라우저(2026-11-17 본부 결정). 새로 씀, 그의 확인 전. ----
   panelBrowser: {

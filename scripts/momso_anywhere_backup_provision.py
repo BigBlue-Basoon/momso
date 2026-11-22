@@ -2,6 +2,30 @@
 import re
 
 from momso_server_install import InstallError, REGION
+from momso_iam_retry import bind_custom_role
+
+
+def bucket_is_owned_and_private(actual, install_id):
+    if not isinstance(actual, dict) or not isinstance(actual.get('labels'), dict):
+        return False
+    if actual['labels'].get('momso-install-id') != install_id:
+        return False
+    containers = [actual]
+    for key in ('iam_config', 'iamConfiguration'):
+        if key in actual:
+            if not isinstance(actual[key], dict):
+                return False
+            containers.append(actual[key])
+    public, uniform = [], []
+    for item in containers:
+        for key in ('public_access_prevention', 'publicAccessPrevention'):
+            if key in item:
+                public.append(item[key])
+        for key in ('uniform_bucket_level_access', 'uniformBucketLevelAccess'):
+            if key in item:
+                value = item[key]
+                uniform.append(value.get('enabled') if isinstance(value, dict) else value)
+    return bool(public and uniform) and all(value == 'enforced' for value in public) and all(value is True for value in uniform)
 
 
 class GoogleBackupProvisioner:
@@ -26,16 +50,14 @@ class GoogleBackupProvisioner:
         found = next((x for x in buckets if x.get("name") == self.bucket), None)
         if found:
             actual = p.run("storage", "buckets", "describe", "gs://" + self.bucket, parse=True)
-            iam = actual.get("iam_config", actual.get("iamConfiguration", {}))
-            labels = actual.get("labels", {})
-            public = iam.get("public_access_prevention", iam.get("publicAccessPrevention"))
-            uniform = iam.get("uniform_bucket_level_access", iam.get("uniformBucketLevelAccess", {}))
-            if labels.get("momso-install-id") != p.install_id or public != "enforced" or not uniform.get("enabled"):
+            if not bucket_is_owned_and_private(actual, p.install_id):
                 raise InstallError("백업 버킷의 소유권이나 비공개 설정이 달라 변경하지 않았습니다.")
         else:
             p.run("storage", "buckets", "create", "gs://" + self.bucket,
                   f"--location={REGION}", "--uniform-bucket-level-access",
-                  "--public-access-prevention", f"--labels=momso-install-id={p.install_id}")
+                  "--public-access-prevention")
+            p.run("storage", "buckets", "update", "gs://" + self.bucket,
+                  f"--update-labels=momso-install-id={p.install_id}")
         accounts = p.run("iam", "service-accounts", "list", parse=True)
         account = next((x for x in accounts if x.get("email") == self.email), None)
         if self.existing_vm_account:
@@ -75,11 +97,11 @@ class GoogleBackupProvisioner:
             p.run("iam", "roles", "create", self.role, f"--title={self.role}",
                   f"--description={p.marker}", "--permissions=" + ",".join(permissions), "--stage=GA")
         member = "serviceAccount:" + self.email
-        p.run("storage", "buckets", "add-iam-policy-binding", "gs://" + self.bucket,
-              f"--member={member}", f"--role={role_name}")
-        p.run("kms", "keys", "add-iam-policy-binding", self.key,
-              f"--location={REGION}", f"--keyring={self.ring}",
-              f"--member={member}", "--role=roles/cloudkms.cryptoKeyEncrypterDecrypter")
+        bind_custom_role(p, "storage", "buckets", "add-iam-policy-binding", "gs://" + self.bucket,
+                         f"--member={member}", f"--role={role_name}")
+        bind_custom_role(p, "kms", "keys", "add-iam-policy-binding", self.key,
+                         f"--location={REGION}", f"--keyring={self.ring}",
+                         f"--member={member}", "--role=roles/cloudkms.cryptoKeyEncrypterDecrypter")
         return {"bucket": self.bucket, "key": key_resource, "service_account": self.email,
                 "bucket_permissions": permissions}
 

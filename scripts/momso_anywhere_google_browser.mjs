@@ -1,4 +1,4 @@
-import { SetupError } from './momso_anywhere_setup.mjs';
+import { SetupError, bindCustomRole } from './momso_anywhere_setup.mjs';
 import { vmStartupScript } from './momso_anywhere_vm_startup.mjs';
 import { prepareBackupResources } from './momso_anywhere_backup_setup.mjs';
 import { activatePinnedRevision } from './momso_anywhere_cloud_run_revision.mjs';
@@ -66,6 +66,13 @@ export class GoogleBrowserProvider {
     } catch { throw new SetupError('network'); }
     if ((allowMissing && response.status === 404) || (missingForbidden && response.status === 403)) return null;
     if (!response.ok) {
+      if (response.status === 400) {
+        let message = '';
+        try { message = (await response.json())?.error?.message ?? ''; } catch { /* preserve generic error */ }
+        if (typeof message === 'string' && /role\s*\([^\r\n]*?\/roles\/[^\r\n)]*\)\s*does not exist in the resource.s hierarchy/i.test(message)) {
+          throw new SetupError('role_propagating');
+        }
+      }
       const reason = response.status === 401 ? 'authorization_expired' : response.status === 403 ? 'permission_denied' : response.status === 402 ? 'billing_setup_required' : response.status === 429 ? 'quota_exceeded' : response.status >= 500 ? 'google_unavailable' : 'google_request';
       throw new SetupError(reason);
     }
@@ -313,7 +320,7 @@ export class GoogleBrowserProvider {
         adder.condition.expression = `request.time < timestamp("${new Date(Date.now() + 15 * 60 * 1000).toISOString()}")`;
         adder.members = [...new Set([...(adder.members ?? []), vmMember])];
       }
-      await this.#retryPropagation(() => this.#request(`${base}:setIamPolicy`, { method: 'POST', body: { policy: { ...policy, version: 3, bindings } } }));
+      await this.#retryPropagation(() => bindCustomRole(() => this.#request(`${base}:setIamPolicy`, { method: 'POST', body: { policy: { ...policy, version: 3, bindings } } }), this.#sleep));
     }
   }
 
@@ -324,12 +331,15 @@ export class GoogleBrowserProvider {
     const short = id.slice(0, 12);
     const name = `momso-${short}`;
     const account = `momso-vm-${short}@${projectId}.iam.gserviceaccount.com`;
-    const script = vmStartupScript({ project: projectId, secret: `momso-transport-${short}`, bundleUrl: this.#release.bundleUrl, bundleSha256: this.#release.bundleSha256 });
+    const update = this.#releaseConfig?.manifestUrl && this.#releaseConfig?.publicKeySpki
+      ? { manifestUrl: this.#releaseConfig.manifestUrl, publicKeySpki: this.#releaseConfig.publicKeySpki, channel: this.#releaseConfig.channel ?? 'production' }
+      : null;
+    const script = vmStartupScript({ project: projectId, secret: `momso-transport-${short}`, bundleUrl: this.#release.bundleUrl, bundleSha256: this.#release.bundleSha256, update });
     let identityPrepared = false;
     try {
     await this.preparePrivateIdentity(id);
     identityPrepared = true;
-    await prepareBackupResources((url, options) => this.#request(url, options), projectId, id);
+    await prepareBackupResources((url, options) => this.#request(url, options), projectId, id, this.#sleep);
     const path = `zones/${ZONE}/instances/${name}`;
     const subnet = `projects/${projectId}/regions/${REGION}/subnetworks/${name}-sub`;
     const metadata = [{ key: 'startup-script', value: script }, { key: 'enable-guest-attributes', value: 'TRUE' }, { key: 'block-project-ssh-keys', value: 'TRUE' }];
@@ -379,7 +389,7 @@ export class GoogleBrowserProvider {
     let binding = bindings.find(value => value.role === roleName && !value.condition);
     if (!binding) { binding = { role: roleName, members: [] }; bindings.push(binding); }
     binding.members = [...new Set([...(binding.members ?? []), `serviceAccount:${account}`])];
-    await this.#retryPropagation(() => this.#request(`${endpoint}/setIamPolicy`, { method: 'POST', body: { policy: { ...policy, version: 3, bindings } } }));
+    await bindCustomRole(() => this.#request(`${endpoint}/setIamPolicy`, { method: 'POST', body: { policy: { ...policy, version: 3, bindings } } }), this.#sleep);
   }
 
   async #revokeVaultAdder(projectId, short, account, requireVersion) {
@@ -392,7 +402,7 @@ export class GoogleBrowserProvider {
     if (!policy.etag) throw new SetupError('policy_unavailable');
     const member = `serviceAccount:${account}`;
     const bindings = (policy.bindings ?? []).map(value => value.role === 'roles/secretmanager.secretVersionAdder' && value.condition?.title === `momso-vault-init-${short}` ? { ...value, members: (value.members ?? []).filter(item => item !== member) } : value).filter(value => value.members?.length);
-    await this.#request(`${base}:setIamPolicy`, { method: 'POST', body: { policy: { ...policy, version: 3, bindings } } });
+    await bindCustomRole(() => this.#request(`${base}:setIamPolicy`, { method: 'POST', body: { policy: { ...policy, version: 3, bindings } } }), this.#sleep);
   }
 
   async #pollRun(projectId, name) {
@@ -436,7 +446,7 @@ export class GoogleBrowserProvider {
     let binding = bindings.find(item => item.role === roleName && !item.condition);
     if (!binding) { binding = { role: roleName, members: [] }; bindings.push(binding); }
     binding.members = [...new Set([...(binding.members ?? []), `serviceAccount:${account}`])];
-    await this.#retryPropagation(() => this.#request(`${instance}/setIamPolicy`, { method: 'POST', body: { policy: { ...policy, version: 3, bindings } } }));
+    await bindCustomRole(() => this.#request(`${instance}/setIamPolicy`, { method: 'POST', body: { policy: { ...policy, version: 3, bindings } } }), this.#sleep);
     const serviceId = `momso-any-${short}`;
     const serviceName = `projects/${projectId}/locations/${REGION}/services/${serviceId}`;
     const endpoint = RUN + serviceName;
@@ -454,6 +464,31 @@ export class GoogleBrowserProvider {
     if (service.labels?.['momso-install-id'] !== id) throw new SetupError('gateway_ownership');
     const gatewayPolicy = await this.#request(`${endpoint}:getIamPolicy?options.requestedPolicyVersion=3`);
     if ((gatewayPolicy.bindings ?? []).some(item => (item.members ?? []).some(member => member === 'allUsers' || member === 'allAuthenticatedUsers'))) throw new SetupError('gateway_policy');
+    const updateRoleId = `momsoUpdate${short}`;
+    const updateRolePath = `${IAM}projects/${projectId}/roles/${updateRoleId}`;
+    const updatePermissions = ['run.operations.get', 'run.revisions.get', 'run.revisions.list', 'run.services.get', 'run.services.update'];
+    let updateRole = await this.#request(updateRolePath, { allowMissing: true });
+    if (!updateRole) {
+      await this.#request(`${IAM}projects/${projectId}/roles`, { method: 'POST', body: { roleId: updateRoleId, role: { title: updateRoleId, description: marker, includedPermissions: updatePermissions, stage: 'GA' } } });
+      updateRole = await this.#request(updateRolePath);
+    }
+    if (updateRole.description !== marker || updateRole.deleted || JSON.stringify([...(updateRole.includedPermissions ?? [])].sort()) !== JSON.stringify(updatePermissions)) throw new SetupError('role_ownership');
+    if (!gatewayPolicy.etag) throw new SetupError('policy_unavailable');
+    const vmMember = `serviceAccount:momso-vm-${short}@${projectId}.iam.gserviceaccount.com`;
+    const gatewayBindings = gatewayPolicy.bindings ?? [];
+    const updateRoleName = `projects/${projectId}/roles/${updateRoleId}`;
+    let updateBinding = gatewayBindings.find(item => item.role === updateRoleName && !item.condition);
+    if (!updateBinding) { updateBinding = { role: updateRoleName, members: [] }; gatewayBindings.push(updateBinding); }
+    updateBinding.members = [...new Set([...(updateBinding.members ?? []), vmMember])];
+    await bindCustomRole(() => this.#request(`${endpoint}:setIamPolicy`, { method: 'POST', body: { policy: { ...gatewayPolicy, version: 3, bindings: gatewayBindings } } }), this.#sleep);
+    const accountPath = `${IAM}projects/${projectId}/serviceAccounts/${account}`;
+    const accountPolicy = await this.#request(`${accountPath}:getIamPolicy?options.requestedPolicyVersion=3`);
+    if (!accountPolicy.etag) throw new SetupError('policy_unavailable');
+    const accountBindings = accountPolicy.bindings ?? [];
+    let accountBinding = accountBindings.find(item => item.role === 'roles/iam.serviceAccountUser' && !item.condition);
+    if (!accountBinding) { accountBinding = { role: 'roles/iam.serviceAccountUser', members: [] }; accountBindings.push(accountBinding); }
+    accountBinding.members = [...new Set([...(accountBinding.members ?? []), vmMember])];
+    await this.#request(`${accountPath}:setIamPolicy`, { method: 'POST', body: { policy: { ...accountPolicy, version: 3, bindings: accountBindings } } });
     let uri;
     try {
       const parsed = new URL(service.uri);
@@ -496,7 +531,7 @@ export class GoogleBrowserProvider {
       { key: 'network', url: `${base}global/networks/${name}-net`, type: 'compute', owns: x => x.name === `${name}-net` && x.description === marker },
       ...['transport', 'session', 'vault'].map(suffix => ({ key: `secret_${suffix}`, url: `${SECRETS}projects/${projectId}/secrets/momso-${suffix}-${short}`, type: 'secret', owns: x => x.labels?.['momso-install-id'] === id && x.name?.endsWith(`/secrets/momso-${suffix}-${short}`) })),
       ...['vm', 'gateway'].map(suffix => ({ key: `account_${suffix}`, url: `${IAM}projects/${projectId}/serviceAccounts/momso-${suffix}-${short}@${projectId}.iam.gserviceaccount.com`, type: 'account', owns: x => x.email === `momso-${suffix}-${short}@${projectId}.iam.gserviceaccount.com` && x.description === marker })),
-      ...[['Stop', ['compute.instances.stop']], ['Anywhere', ['compute.instances.get', 'compute.instances.start']]].map(([suffix, permissions]) => ({ key: `role_${suffix.toLowerCase()}`, url: `${IAM}projects/${projectId}/roles/momso${suffix}${short}`, type: 'role', owns: x => x.name?.endsWith(`/roles/momso${suffix}${short}`) && x.description === marker && JSON.stringify([...(x.includedPermissions ?? [])].sort()) === JSON.stringify(permissions) })),
+      ...[['Stop', ['compute.instances.stop']], ['Anywhere', ['compute.instances.get', 'compute.instances.start']], ['Update', ['run.operations.get', 'run.revisions.get', 'run.revisions.list', 'run.services.get', 'run.services.update']]].map(([suffix, permissions]) => ({ key: `role_${suffix.toLowerCase()}`, url: `${IAM}projects/${projectId}/roles/momso${suffix}${short}`, type: 'role', owns: x => x.name?.endsWith(`/roles/momso${suffix}${short}`) && x.description === marker && JSON.stringify([...(x.includedPermissions ?? [])].sort()) === JSON.stringify(permissions) })),
     ];
     await this.project(id);
     for (const item of items) {

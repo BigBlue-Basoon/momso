@@ -80,8 +80,7 @@ export function ChatImportSettings({ onChanged }: { onChanged: () => void }) {
 
   async function start(source: ChatImportSource, path: string, preview: ChatImportPreview) {
     const requestId = `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    // 휴대폰 몸소: server 가 진행 수를 보내지 않아 "가져오는 중 0/N"에 머물지 않게 수 없이 "가져오는 중"(total 0).
-    setStep({ kind: 'importing', source, requestId, total: isNetworkRuntime() ? 0 : preview.conversations, processed: 0, cancelling: false })
+    setStep({ kind: 'importing', source, requestId, total: preview.conversations, processed: 0, cancelling: false })
     try {
       const counts = await importChatExportWithProgress(requestId, path, source, (processed) => {
         setStep((current) => (current?.kind === 'importing' && current.requestId === requestId ? { ...current, processed } : current))

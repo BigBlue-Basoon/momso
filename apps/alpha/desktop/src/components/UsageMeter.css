@@ -65,6 +65,11 @@
   stroke-linecap: round;
 }
 
+/* 특정 모델만 따로 세는 한도(예: 클로드의 주간 Fable)는 흰 고리 바깥의 가는 고리. 색은 고리와 같다(2026-11-22 그의 지시). */
+.usage-ring .usage-ring-scoped {
+  stroke-width: 1.25;
+}
+
 .usage-logo {
   width: 26px;
   height: 26px;

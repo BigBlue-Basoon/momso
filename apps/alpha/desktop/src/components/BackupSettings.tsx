@@ -32,7 +32,9 @@ import {
   type StoreProvider,
   type StoreStatus,
 } from '../backup'
-import { confirmBackupRecoveryKey, exportBackupRecoveryKey, getUserOwnedBackupOverview, importBackupRecoveryKey } from '../runtime'
+import { confirmBackupRecoveryKey, exportBackupRecoveryKey, getUserOwnedBackupOverview, importBackupRecoveryKey, isNetworkRuntime } from '../runtime'
+import { cancelLogin, listenDeviceLoginAnywhere, type DeviceLogin } from '../device-login'
+import { DeviceLoginCard } from './DeviceLoginCard'
 import { getUsername } from '../first-run'
 import { isMissingCommand } from '../ai-models'
 import { W } from '../words'
@@ -77,7 +79,9 @@ function useAutoSync(connected: boolean, get: () => Promise<AutoBackupStatus>, s
   const lastState = useRef<string | null>(null)
   useEffect(() => {
     const state = auto?.state ?? null
-    if (lastState.current === 'running' && state !== 'running') finishedRef.current()
+    // 올리는 중(running)이 끝났거나, 곧 올림(pending)에서 올리는 중을 거치지 않고 바로 끝났으면(휴대폰 몸소 server 는 짧게 지나가 놓칠 수 있다) 다시 읽는다.
+    const wasBusy = lastState.current === 'running' || lastState.current === 'pending'
+    if (wasBusy && state !== 'running' && state !== 'pending') finishedRef.current()
     lastState.current = state
   }, [auto?.state])
   async function toggle() {
@@ -90,7 +94,7 @@ function useAutoSync(connected: boolean, get: () => Promise<AutoBackupStatus>, s
 }
 
 /** 켜고 끄기(스킬 목록과 같은 단추)와 지금 형편 한 줄, 다시 시도를 기다리면 그 까닭 한 줄. 조용한 때(idle)·연결 안 됨은 형편 줄이 없다. */
-function AutoSyncRow({ label, auto, working, onToggle, reasonText }: { label: string; auto: AutoBackupStatus; working: boolean; onToggle: () => void; reasonText: (reason: string) => string }) {
+function AutoSyncRow({ label, auto, working, onToggle, reasonText, fixed = false }: { label: string; auto: AutoBackupStatus; working: boolean; onToggle: () => void; reasonText: (reason: string) => string; fixed?: boolean }) {
   const line = !auto.enabled ? null
     : auto.state === 'running' ? B.autoRunning
       : auto.state === 'pending' ? B.autoPending
@@ -105,15 +109,18 @@ function AutoSyncRow({ label, auto, working, onToggle, reasonText }: { label: st
         {line && <span className="backup-auto-state" role={auto.state === 'retry_pending' ? 'alert' : 'status'}>{line}</span>}
         {reason && <span className="backup-auto-state">{reason}</span>}
       </span>
-      <button
-        className={auto.enabled ? 'skills-switch is-on' : 'skills-switch'}
-        type="button"
-        role="switch"
-        aria-checked={auto.enabled}
-        aria-label={label}
-        disabled={working}
-        onClick={onToggle}
-      />
+      {/* 휴대폰 몸소의 server 는 늘 자동으로 저장해 끌 수 없다(fixed): 켜고 끄기 없이 형편 줄만. */}
+      {!fixed && (
+        <button
+          className={auto.enabled ? 'skills-switch is-on' : 'skills-switch'}
+          type="button"
+          role="switch"
+          aria-checked={auto.enabled}
+          aria-label={label}
+          disabled={working}
+          onClick={onToggle}
+        />
+      )}
     </div>
   )
 }
@@ -143,6 +150,8 @@ async function preservedMessage(status: RemoteStatus) {
  * 명령이 없으면 그 칸의 단추·입력은 눌리지 않게만 한다. 키는 받아서 바로 넘기고 칸을 비운다.
  */
 export function BackupSettings() {
+  // 휴대폰 몸소: GitHub 칸과, 설치가 원자료 백업을 켰으면 원자료 칸(고객 프로젝트 저장소, 형편만). 복구 키는 데스크톱의 것이라 두지 않는다.
+  if (isNetworkRuntime()) return <><GithubBackup /><StoreBackup /></>
   return (
     <>
       <GithubBackup />
@@ -178,6 +187,26 @@ function GithubBackup() {
   const [working, setWorking] = useState(false)
   const [note, setNote] = useState<string | null>(null)
   const [asking, setAsking] = useState<'disconnect' | 'create' | false>(false)
+  // 휴대폰 몸소(server /github/*): 다운로드는 server 에 같은 길이 없어 두지 않는다. 저장소 만들기는 GitHub 로그인 뒤 server 가 momso-<계정>을 만든다(S97).
+  // 자동 백업은 server 가 늘 하므로 켜고 끄기 없이 형편 줄만.
+  // GitHub 에 로그인하지 않은 채 연결하면 server-client.ts 가 기기 로그인을 시작하고, 그 코드 카드를 여기에 휴대폰 AI 연결(코덱스)과 같은 꼴로 둔다.
+  const network = isNetworkRuntime()
+  const [login, setLogin] = useState<DeviceLogin | null>(null)
+  useEffect(() => {
+    if (!network) return
+    let stop: (() => void) | undefined
+    let disposed = false
+    void listenDeviceLoginAnywhere({
+      onShow: (value) => { if (value.provider === 'github') setLogin(value) },
+      onClose: (provider) => { if (provider === 'github') setLogin(null) },
+    }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten }).catch(() => {})
+    return () => { disposed = true; stop?.() }
+  }, [network])
+  // 휴대폰 몸소: 연결·업로드는 server 가 뒤에서 저장하므로, 나중에 실패 까닭이 오면 "끝났습니다" 대신 그 까닭 줄을 보인다.
+  useEffect(() => { if (network && status?.reason) setNote(null) }, [network, status?.reason])
+  function copyCode(code: string) {
+    void navigator.clipboard.writeText(code).then(() => setNote(W.deviceLogin.copied)).catch(() => setNote(W.deviceLogin.copyFailed))
+  }
   const usernameState = useUsernameState()
   const username = usernameState.name
   // 읽는 데 2초쯤 걸린다(2026-11-17 실제 앱). 그동안 "불러오는 중", 명령은 있는데 읽지 못했으면 그 줄과 다시 시도(명령이 없는 옛 뒤쪽은 글 없이 막기만).
@@ -224,7 +253,8 @@ function GithubBackup() {
   const { auto, working: autoWorking, toggle: toggleAuto, read: readAuto } = useAutoSync(isConnected, autoBackupGet, autoBackupSet, refresh, (error) => setNote(githubMessage(errorState(error))))
   // 저장소 만들기(archive_remote_create)는 username 이 있을 때만 누를 수 있다. 명령이 없으면 눌리지 않는다(누른 뒤 알게 되면 막는다).
   const [createAvailable, setCreateAvailable] = useState(true)
-  const newRepoName = username ? `momso-${username}` : null
+  // 휴대폰 몸소의 저장소 이름은 GitHub 계정 이름에서 온다(로그인 전이면 모른다).
+  const newRepoName = network ? (status?.signedInAs ? `momso-${status.signedInAs}` : null) : username ? `momso-${username}` : null
 
   async function create() {
     setAsking(false)
@@ -236,7 +266,8 @@ function GithubBackup() {
       setNote(B.create[result.state] ?? B.failed)
     } catch (error) {
       if (/not found/i.test(String(error))) setCreateAvailable(false)
-      else setNote(message(errorState(error)))
+      // 휴대폰 몸소에서 GitHub 로그인 코드 카드를 취소했으면 알릴 것이 없다.
+      else if (errorState(error) !== 'cancelled') setNote(message(errorState(error)))
     }
     setWorking(false)
     refresh()
@@ -260,7 +291,11 @@ function GithubBackup() {
       setStatus(next)
       const preserved = await preservedMessage(next)
       setNote([next.reason ? remoteMessage(next) : preserved ? null : B.done, preserved].filter(Boolean).join('. ') || B.done)
-    } catch (error) { setNote(githubMessage(errorState(error))) }
+    } catch (error) {
+      // 휴대폰 몸소에서 GitHub 로그인 코드 카드를 취소했으면 알릴 것이 없다.
+      const code = errorState(error)
+      if (code !== 'cancelled') setNote(githubMessage(code))
+    }
     setWorking(false)
     readAuto()
   }
@@ -282,12 +317,12 @@ function GithubBackup() {
             {when(status?.lastPushedAt ?? null) && <div><dt>{B.lastPushed}</dt><dd>{when(status?.lastPushedAt ?? null)}</dd></div>}
           </dl>
           {/* 자동 백업: 켜고 끄기와 지금 형편 한 줄(원자료 자동 업로드와 같은 AutoSyncRow). */}
-          {auto && <AutoSyncRow label={B.autoBackup} auto={auto} working={autoWorking} onToggle={() => void toggleAuto()} reasonText={(reason) => githubMessage(reason)} />}
+          {auto && <AutoSyncRow label={B.autoBackup} auto={auto} working={autoWorking} onToggle={() => void toggleAuto()} reasonText={(reason) => githubMessage(reason)} fixed={network} />}
           <div className="backup-actions">
             {(status?.ahead ?? 0) > 0 && <span className="backup-count">{B.ahead(status?.ahead)}</span>}
             {(status?.behind ?? 0) > 0 && <span className="backup-count">{B.behind(status?.behind)}</span>}
             {(extraFiles ?? 0) > 0 && <span className="backup-count">{B.additionalFiles(extraFiles)}</span>}
-            <button className="secondary-button" type="button" disabled={working} onClick={() => void run(remotePull)}>{B.pull}</button>
+            {!network && <button className="secondary-button" type="button" disabled={working} onClick={() => void run(remotePull)}>{B.pull}</button>}
             <button className="secondary-button" type="button" disabled={working} onClick={() => void run(remotePush)}>{B.push}</button>
             <button className="secondary-button subtle" type="button" disabled={working} onClick={() => setAsking('disconnect')}>{B.disconnect}</button>
           </div>
@@ -297,15 +332,20 @@ function GithubBackup() {
           <p className="backup-notice"><Info size={14} aria-hidden />{B.githubNotice}</p>
           {/* 저장소를 미리 만들지 않아도 된다: momso-<username> 비공개 저장소를 만들어 연결한다. 이미 있는 저장소는 아래 칸에 적어 연결한다. */}
           <div className="backup-row backup-create">
-            <span className="backup-create-text" role={usernameState.state === 'failed' ? 'alert' : undefined}>
-              {usernameState.state === 'loading' ? B.usernameLoading
-                : usernameState.state === 'failed' ? B.usernameFailed
-                  : newRepoName ? B.createWhat(newRepoName) : B.createNeedsName}
-              {usernameState.state === 'failed' && (
-                <button className="secondary-button backup-inline-retry" type="button" onClick={usernameState.reload}>{W.firstRun.retry}</button>
-              )}
-            </span>
-            <button className="secondary-button" type="button" disabled={!supported || working || !newRepoName || !createAvailable} onClick={() => setAsking('create')}>{B.createRepo}</button>
+            {network ? (
+              // 휴대폰 몸소: 로그인했으면 그 계정의 저장소 이름, 아직이면 로그인하면 만든다는 말. 누르면 로그인 전에는 바로 코드 카드(묻는 창은 이름을 알 때만).
+              <span className="backup-create-text">{newRepoName ? B.createWhat(newRepoName) : B.serverCreateWhat}</span>
+            ) : (
+              <span className="backup-create-text" role={usernameState.state === 'failed' ? 'alert' : undefined}>
+                {usernameState.state === 'loading' ? B.usernameLoading
+                  : usernameState.state === 'failed' ? B.usernameFailed
+                    : newRepoName ? B.createWhat(newRepoName) : B.createNeedsName}
+                {usernameState.state === 'failed' && (
+                  <button className="secondary-button backup-inline-retry" type="button" onClick={usernameState.reload}>{W.firstRun.retry}</button>
+                )}
+              </span>
+            )}
+            <button className="secondary-button" type="button" disabled={!supported || working || (!newRepoName && !network) || !createAvailable} onClick={() => { if (network && !newRepoName) void create(); else setAsking('create') }}>{B.createRepo}</button>
           </div>
           <form className="backup-row" onSubmit={(event) => { event.preventDefault(); if (repo.trim()) void run(() => remoteConnect(repo.trim())) }}>
             <label className="backup-field">
@@ -314,6 +354,22 @@ function GithubBackup() {
             </label>
             <button className="secondary-button" type="submit" disabled={!supported || working || !repo.trim()}>{B.connect}</button>
           </form>
+        </>
+      )}
+      {/* 휴대폰 몸소의 GitHub 로그인 코드 카드: 연결할 때와, 로그인이 풀린 뒤 업로드할 때. */}
+      {login && (
+        <>
+          <DeviceLoginCard
+            inline
+            login={login}
+            openLabel={W.deviceLogin.copyAndOpen}
+            onCopy={copyCode}
+            onOpenPage={() => { if (login.kind !== 'device') return; copyCode(login.code); window.open(login.url, '_blank', 'noopener') }}
+            onRestart={() => { if (connected) void run(remotePush); else if (repo.trim()) void run(() => remoteConnect(repo.trim())); else void create() }}
+            onCancel={() => { setLogin(null); void cancelLogin('github').catch(() => {}) }}
+            onDismiss={() => setLogin(null)}
+          />
+          <p className="backup-note">{W.signIn.browserHint}</p>
         </>
       )}
       {receiving && (
@@ -512,6 +568,8 @@ function StoreBackup() {
   }, [refresh])
   const supported = Boolean(status)
   const connected = status?.state === 'connected'
+  // 휴대폰 몸소: 원자료는 설치가 정한 고객 프로젝트 저장소에 server 가 늘 자동으로 올린다. 형편만 보이고 연결·백업·복원·연결 해제 단추는 두지 않는다(S97·S98).
+  const network = isNetworkRuntime()
   // 원자료 자동 업로드(넷째 줄 D38): GitHub 자동 백업과 같은 줄. 올리기가 끝나면 남은 수·마지막 백업 때를 다시 읽는다.
   const storeAuto = useAutoSync(connected, storeAutoUploadGet, storeAutoUploadSet, refresh, (error) => setNote(message(errorState(error))))
   const needsRegion = provider === 'aws' || provider === 'ncp'
@@ -542,6 +600,8 @@ function StoreBackup() {
     refresh()
   }
 
+  // 휴대폰 몸소에서 원자료 백업이 설정되지 않았으면(연결할 길이 휴대폰에 없음) 칸을 두지 않는다.
+  if (network && !connected) return null
   return (
     <section className="settings-group backup-part" aria-labelledby="backup-store-title">
       <div className="backup-head">
@@ -555,19 +615,21 @@ function StoreBackup() {
         <>
           <dl className="backup-facts">
             <div><dt>{B.provider}</dt><dd>{PROVIDERS.find((item) => item.id === status?.provider)?.label ?? status?.provider}</dd></div>
-            <div><dt>{B.bucket}</dt><dd>{status?.bucket}</dd></div>
+            {status?.bucket && <div><dt>{B.bucket}</dt><dd>{status.bucket}</dd></div>}
             {when(status?.lastBackupAt ?? null) && <div><dt>{B.lastBackup}</dt><dd>{when(status?.lastBackupAt ?? null)}</dd></div>}
           </dl>
-          {storeAuto.auto && <AutoSyncRow label={B.autoUpload} auto={storeAuto.auto} working={storeAuto.working} onToggle={() => void storeAuto.toggle()} reasonText={(reason) => B.storeAutoReason[reason] ?? B.reason[reason] ?? B.storeAutoUnknown} />}
+          {storeAuto.auto && <AutoSyncRow label={B.autoUpload} auto={storeAuto.auto} working={storeAuto.working} onToggle={() => void storeAuto.toggle()} reasonText={(reason) => B.storeAutoReason[reason] ?? B.reason[reason] ?? B.storeAutoUnknown} fixed={network} />}
           {(status?.pendingCount ?? 0) > 0 && <p className="backup-count">{B.pending(status?.pendingCount, size(status?.pendingBytes ?? null))}</p>}
           {working && progress && progress.totalBytes > 0 && (
             <div className="app-update-progress" role="status"><span style={{ width: `${Math.max(4, (progress.completedBytes / progress.totalBytes) * 100)}%` }} /></div>
           )}
-          <div className="backup-actions">
-            <button className="secondary-button" type="button" disabled={working} onClick={() => void act(storeBackup)}>{B.backupNow}</button>
-            <button className="secondary-button" type="button" disabled={working || !APP_STATE_RESTORE_READY} onClick={() => setAsking('restore')}>{B.restore}</button>
-            <button className="secondary-button subtle" type="button" disabled={working} onClick={() => setAsking('disconnect')}>{B.disconnect}</button>
-          </div>
+          {!network && (
+            <div className="backup-actions">
+              <button className="secondary-button" type="button" disabled={working} onClick={() => void act(storeBackup)}>{B.backupNow}</button>
+              <button className="secondary-button" type="button" disabled={working || !APP_STATE_RESTORE_READY} onClick={() => setAsking('restore')}>{B.restore}</button>
+              <button className="secondary-button subtle" type="button" disabled={working} onClick={() => setAsking('disconnect')}>{B.disconnect}</button>
+            </div>
+          )}
         </>
       ) : (
         <form className="backup-form" onSubmit={(event) => { event.preventDefault(); if (ready) void connect() }}>

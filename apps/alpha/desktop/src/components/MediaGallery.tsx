@@ -29,6 +29,43 @@ function ratioOf(item: MediaItem) {
 
 const whenOf = (item: MediaItem) => item.at ?? item.createdAt
 
+/** 휴대폰 몸소 server 가 첫 장면 그림을 만드느라 바빴을 때(thumbnail_busy) 다시 불러 보기까지 기다리는 때. */
+const BUSY_RETRY_MS = 1500
+
+/**
+ * 칸의 그림 주소. 불러오지 못하면 null 을 돌려 칸이 이미 있는 "그림 없음" 모양(가운데 아이콘)이 되게 한다(2026-11-22 본부: 깨진 그림 아이콘은 흠).
+ * 휴대폰 몸소에서 server 가 바쁘다고(thumbnail_busy) 알렸으면 잠시 뒤 한 번만 더 불러 본다. 데스크톱(로컬 파일)은 바로 "그림 없음".
+ */
+function usePicture(path: string | null) {
+  const src = mediaSrc(path)
+  const [state, setState] = useState({ src, failed: false, again: false })
+  if (state.src !== src) setState({ src, failed: false, again: false })
+  const fail = useCallback((at: string) => setState((current) => (current.src === at ? { ...current, failed: true } : current)), [])
+  const onError = useCallback(() => {
+    if (!src) return
+    if (state.again || !src.startsWith('/')) { fail(src); return }
+    // <img> 는 까닭을 알려 주지 않아 같은 주소를 한 번 읽어 server 의 오류 값을 본다.
+    fetch(src)
+      .then(async (response) => (response.ok ? 'now' : ((await response.json().catch(() => null)) as { error?: unknown } | null)?.error === 'thumbnail_busy' ? 'later' : 'no'))
+      .catch(() => 'no' as const)
+      .then((next) => {
+        if (next === 'no') { fail(src); return }
+        const retry = () => setState((current) => (current.src === src ? { ...current, again: true } : current))
+        if (next === 'now') retry()
+        else window.setTimeout(retry, BUSY_RETRY_MS)
+      })
+  }, [src, state.again, fail])
+  if (!src || state.failed) return { src: null, onError }
+  return { src: state.again ? `${src}${src.includes('?') ? '&' : '?'}again=1` : src, onError }
+}
+
+/** 판 단추의 작은 그림. 불러오지 못하면 그림이 없는 판과 같은 표시. */
+function VersionPicture({ picture, kind }: { picture: string | null; kind: MediaItem['kind'] }) {
+  const shown = usePicture(picture)
+  if (shown.src) return <img src={shown.src} alt="" draggable={false} onError={shown.onError} />
+  return kind === 'audio' ? <AudioLines size={16} aria-hidden /> : <span className="media-version-missing" aria-hidden>—</span>
+}
+
 /**
  * 생성물 하나 = 같은 묶음(lineageId)의 버전들(2026-11-18, AI 생성 도구들처럼: 같은 프롬프트로 다시 만든 것·고친 것을 한 칸에).
  * 묶음 값이 없으면 한 장이 한 생성물이다. 버전은 차례(version, 없으면 만든 때)대로, 칸에는 마지막 버전이 보인다.
@@ -185,13 +222,13 @@ function MediaTile({ creation, width, onOpen }: { creation: Creation; width: num
   const chat = mediaChat(item)
   const when = timeFormat.format(new Date(whenOf(item)))
   const label = item.title ?? (item.prompt?.trim() || null) ?? mediaLabel(item)
-  const picture = item.kind === 'video' ? item.posterPath : item.kind === 'image' ? item.path : null
+  const picture = usePicture(item.kind === 'video' ? item.posterPath : item.kind === 'image' ? item.path : null)
   // 목록에는 최신 판 하나와 판 수(versionCount)만 올 수 있다(뒤쪽 C52).
   const count = Math.max(creation.versions.length, item.versionCount ?? 1)
   return (
     <button className={`media-tile is-${item.kind}`} type="button" style={{ width }} onClick={onOpen} aria-label={count > 1 ? `${label}, ${W.mediaView.versions(count)}` : label}>
-      {picture ? (
-        <img src={mediaSrc(picture) ?? undefined} alt="" loading="lazy" decoding="async" draggable={false} />
+      {picture.src ? (
+        <img src={picture.src} alt="" loading="lazy" decoding="async" draggable={false} onError={picture.onError} />
       ) : (
         <span className="media-audio-face" aria-hidden>
           <AudioLines size={22} />
@@ -335,7 +372,7 @@ function MediaDetail({ creations, index, onIndex, onClose, onOpenChat, onDelete,
                     disabled={!version.path}
                     onClick={() => setVersionIndex(at)}
                   >
-                    {picture ? <img src={mediaSrc(picture) ?? undefined} alt="" draggable={false} /> : version.kind === 'audio' ? <AudioLines size={16} aria-hidden /> : <span className="media-version-missing" aria-hidden>—</span>}
+                    <VersionPicture picture={picture} kind={version.kind} />
                     <span>{version.version ?? at + 1}</span>
                   </button>
                 )

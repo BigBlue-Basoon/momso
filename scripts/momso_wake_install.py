@@ -1,9 +1,9 @@
 """Provision an IAP-protected, single-VM Cloud Run wake service."""
 import re
-import time
 from pathlib import Path
 
 from momso_server_install import InstallError, REGION, ZONE, save_state
+from momso_iam_retry import bind_custom_role
 
 
 class GoogleWake:
@@ -41,14 +41,7 @@ class GoogleWake:
             p.run("iam", "service-accounts", "create", self.sa, f"--description={p.marker}")
         if not role:
             p.run("iam", "roles", "create", self.role, f"--title={self.role}", f"--description={p.marker}", "--permissions=compute.instances.get,compute.instances.start", "--stage=GA")
-        for attempt in range(6):
-            try:
-                p.run("compute", "instances", "add-iam-policy-binding", p.name, f"--zone={ZONE}", f"--member=serviceAccount:{self.email}", f"--role=projects/{p.project}/roles/{self.role}")
-                break
-            except InstallError:
-                if role or attempt == 5:
-                    raise
-                time.sleep(5)
+        bind_custom_role(p, "compute", "instances", "add-iam-policy-binding", p.name, f"--zone={ZONE}", f"--member=serviceAccount:{self.email}", f"--role=projects/{p.project}/roles/{self.role}")
         return service
 
     def install(self, hostname, user):
@@ -63,9 +56,9 @@ class GoogleWake:
         number = str(project.get("projectNumber", ""))
         if not re.fullmatch(r"[0-9]+", number):
             raise InstallError("프로젝트 번호를 확인하지 못했습니다.")
-        p.run("services", "identity", "create", "--service=iap.googleapis.com")
-        p.run("run", "services", "add-iam-policy-binding", self.service, f"--region={REGION}", f"--member=serviceAccount:service-{number}@gcp-sa-iap.iam.gserviceaccount.com", "--role=roles/run.invoker")
-        p.run("iap", "web", "add-iam-policy-binding", f"--member=user:{user}", "--role=roles/iap.httpsResourceAccessor", f"--region={REGION}", "--resource-type=cloud-run", f"--service={self.service}")
+        p.run("alpha", "services", "identity", "create", "--service=iap.googleapis.com")
+        bind_custom_role(p, "run", "services", "add-iam-policy-binding", self.service, f"--region={REGION}", f"--member=serviceAccount:service-{number}@gcp-sa-iap.iam.gserviceaccount.com", "--role=roles/run.invoker")
+        bind_custom_role(p, "iap", "web", "add-iam-policy-binding", f"--member=user:{user}", "--role=roles/iap.httpsResourceAccessor", f"--region={REGION}", "--resource-type=cloud-run", f"--service={self.service}")
         details = p.run("run", "services", "describe", self.service, f"--region={REGION}", parse=True)
         url = details.get("status", {}).get("url", "")
         if not re.fullmatch(r"https://[a-z0-9-]+\.[a-z0-9.-]+\.run\.app", url):

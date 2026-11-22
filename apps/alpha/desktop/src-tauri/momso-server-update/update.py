@@ -51,6 +51,8 @@ def _extract(bundle, output):
     for name in ("momso-server", "momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py", "web/index.html"):
         if not (output / name).is_file():
             raise UpdateError("invalid_bundle")
+    # The bootstrap and PC installer use this marker to recognize owned web files.
+    (output / "web" / ".momso-owned").write_text("momso", encoding="utf-8")
     (output / "momso-server").chmod(0o755)
 
 
@@ -80,7 +82,10 @@ class Updater:
         self.host = host
         self.allow_http = allow_http_for_tests
         self.channel = channel
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.root.mkdir(mode=0o755, parents=True, exist_ok=True)
+        # The service runs as the unprivileged momso user and must traverse releases.
+        # Recovery records are atomic mode-0600 files; data snapshots are mode 0700.
+        os.chmod(self.root, 0o755)
         self.state = self.root / "update-state.json"
 
     def _emit(self, state, reason=None):
@@ -129,6 +134,7 @@ class Updater:
         stage = Path(tempfile.mkdtemp(prefix="release-" + str(release["sequence"]) + "-", dir=self.root))
         try:
             _extract(bundle, stage)
+            os.chmod(stage, 0o755)
         except tarfile.TarError:
             shutil.rmtree(stage)
             raise UpdateError("invalid_bundle") from None
@@ -200,7 +206,8 @@ class Updater:
             record = json.loads(self.state.read_text(encoding="utf-8"))
             if record.get("phase") != "switching":
                 return "no_recovery"
-            if not self.host.acquire_maintenance():
+            acquire = getattr(self.host, "acquire_recovery_maintenance", self.host.acquire_maintenance)
+            if not acquire():
                 raise UpdateError("busy")
             try:
                 self._emit("rolling_back")

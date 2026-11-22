@@ -117,7 +117,7 @@ type DirectoryPickerWindow = Window & {
 // 모델 목록을 읽지 못했을 때 고를 수 있는 곳: 설정의 AI 연결에 있는 두 곳.
 const FALLBACK_PROVIDERS: AiProvider[] = ['codex', 'claude']
 // 휴대폰 몸소의 설정(S75): server 로 할 수 있는 쪽만. 셋째 묶음에서 사용자 정보·AI 연결(연결 해제, 다른 AI 채팅 가져오기)·삭제한 원자료를 더했다.
-const NETWORK_SETTINGS: SettingsSection[] = ['profile', 'ai', 'skills', 'dictionary', 'archived', 'deletedSources']
+const NETWORK_SETTINGS: SettingsSection[] = ['profile', 'ai', 'skills', 'dictionary', 'archived', 'deletedSources', 'backup']
 
 // 뒤로·앞으로가 오가는 곳. 'new' 는 새 대화, 'settings' 는 설정, 'chat:번호' 는 그 대화.
 type Place = 'new' | 'settings' | 'documents' | 'media' | `chat:${string}`

@@ -1,11 +1,11 @@
 // Only installation-owned resources are adopted; existing IAM bindings are preserved.
-import { SetupError } from './momso_anywhere_setup.mjs';
+import { SetupError, bindCustomRole } from './momso_anywhere_setup.mjs';
 
 const STORAGE = 'https://storage.googleapis.com/storage/v1/';
 const KMS = 'https://cloudkms.googleapis.com/v1/';
 const REGION = 'asia-northeast3';
 
-export async function prepareBackupResources(request, project, installationId) {
+export async function prepareBackupResources(request, project, installationId, sleep) {
   if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project) || !/^[a-f0-9]{24}$/.test(installationId)) throw new SetupError('invalid_installation');
   const short = installationId.slice(0, 12);
   const bucket = `momso-backup-${short}`;
@@ -43,7 +43,7 @@ export async function prepareBackupResources(request, project, installationId) {
     if (!binding) { binding = { role, members: [] }; bindings.push(binding); }
     binding.members = [...new Set([...binding.members, member])];
     const updated = { ...policy, version: 3, bindings };
-    await request(url + (wrap ? ':setIamPolicy' : '/iam'), { method, body: wrap ? { policy: updated } : updated });
+    await bindCustomRole(() => request(url + (wrap ? ':setIamPolicy' : '/iam'), { method, body: wrap ? { policy: updated } : updated }), sleep);
   }
   await addBinding(bucketUrl, 'roles/storage.objectAdmin', 'PUT', false);
   await addBinding(KMS + key, 'roles/cloudkms.cryptoKeyEncrypterDecrypter', 'POST', true);

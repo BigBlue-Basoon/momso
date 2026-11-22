@@ -826,6 +826,16 @@ export function serverMediaDownloadPath(assetId: string) {
 /** 삭제한 원자료를 한 번에 받는 수(데스크톱과 같은 40개). */
 const TRASH_PAGE = 40
 
+/** 다른 AI 채팅 가져오기의 진행 수를 읽는 간격(S83 GET /chat-imports/{id}/progress). */
+const IMPORT_PROGRESS_MS = 700
+
+/** 휴지통 항목의 사용처 수(S83 references: { chats, documents }). 문서 수를 모르면(null) 전체도 모른다. */
+function referenceTotal(value: unknown) {
+  const refs = value && typeof value === 'object' ? value as { chats?: unknown; documents?: unknown } : null
+  if (!refs || typeof refs.chats !== 'number' || typeof refs.documents !== 'number') return null
+  return refs.chats + refs.documents
+}
+
 /** 원자료 내려받기 주소(S75 둘째: GET /assets/{id}/download, 같은 출처라 로그인 쿠키가 함께 간다). */
 export function serverAssetDownloadPath(assetId: string) {
   return `/assets/${encodeURIComponent(assetId)}/download`
@@ -892,6 +902,94 @@ async function keepChat(chatId: string, action: 'pin' | 'archive', body: Record<
     if (error instanceof ServerError && error.code === 'chat_not_found') return { state: 'not_found' }
     throw error
   }
+}
+
+// ---- GitHub 백업(휴대폰 설정 "연결과 백업", 계약 S17 GitHub 부분·github_bridge.rs). 데스크톱 archive_remote_* 의 꼴로 바꿔 준다. ----
+/** 연결한 저장소와 백업 형편(GET /github/repository)을 데스크톱 archive_remote_status 꼴로. 저장소가 없으면 not_connected. */
+async function githubStatus() {
+  const value = await request<{ repository?: { nameWithOwner?: unknown } | null; account?: unknown; lastSavedAt?: unknown; backupStatus?: unknown; backupReason?: unknown }>('GET', '/github/repository')
+  const repo = str(value?.repository?.nameWithOwner)
+  const failed = value?.backupStatus === 'failed'
+  return {
+    state: repo ? 'connected' : 'not_connected',
+    reason: repo && failed ? str(value?.backupReason) || 'unavailable' : null,
+    // S98: GitHub 계정 이름(로그인했으면 저장소가 없어도 온다, 계정 조회가 실패하면 null)과 마지막으로 성공한 저장 때.
+    repo: repo || null, visibility: repo ? 'private' : null, lastPushedAt: str(value?.lastSavedAt) || null, ahead: null, behind: null, signedInAs: str(value?.account) || null,
+  }
+}
+
+/**
+ * 원자료(고객 프로젝트 저장소의 암호화 백업)를 데스크톱 object_store_status 꼴로(GET /activity 의 objectBackup*, S97·S98).
+ * 설치가 정한 Google Cloud 저장소라 회사는 gcp, 버킷 이름·마지막 백업 때·남은 수는 server 가 알려 주지 않는다(null).
+ */
+async function objectBackup() {
+  const value = await request<{ objectBackupEnabled?: unknown; objectBackupStatus?: unknown; objectBackupReason?: unknown }>('GET', '/activity')
+  return {
+    enabled: value?.objectBackupEnabled === true,
+    status: str(value?.objectBackupStatus),
+    reason: str(value?.objectBackupReason) || null,
+  }
+}
+/**
+ * 백업 형편을 데스크톱 자동 백업 줄(archive_auto_backup_get)의 꼴로. server 는 늘 자동으로 저장한다(끌 수 없음).
+ * 실패(failed)는 다시 시도할 때를 알려 주지 않아 이 줄에 적지 않고, 상태의 까닭 줄 하나로만 보인다(같은 말을 두 번 두지 않게).
+ */
+async function githubAutoBackup() {
+  const value = await request<{ backupStatus?: unknown }>('GET', '/github/repository')
+  const state = value?.backupStatus === 'syncing' ? 'running'
+    : value?.backupStatus === 'pending' || value?.backupStatus === 'queued' ? 'pending' : 'idle'
+  return { enabled: true, state, consecutiveFailures: 0, reason: null, retryInSeconds: null }
+}
+
+/** 이 탭이 시작한 GitHub 기기 로그인 하나(세션 값은 메모리에만). */
+let githubLogin: { session: string; finish: (state: string) => void } | null = null
+/**
+ * GitHub 기기 로그인(POST /github/login → GET /github/login 을 2초마다, X-Momso-Login-Session). 코덱스와 같은 화면 이벤트
+ * provider-login-device { provider: 'github', url, code, expiresInSeconds } 를 보내 설정의 코드 카드가 뜬다.
+ * 연결되면 끝나고, 취소면 cancelled, 시간이 지나거나 실패하면 signed_out 오류로 끝난다("GitHub에 로그인해 주세요").
+ */
+async function githubDeviceLogin() {
+  githubLogin?.finish('cancelled')
+  const started = await request<{ sessionId?: unknown }>('POST', '/github/login')
+  const session = str(started?.sessionId)
+  if (!session) throw new ServerError('unavailable', null)
+  return new Promise<void>((resolve, reject) => {
+    let shown = ''
+    let done = false
+    const header = { 'X-Momso-Login-Session': session }
+    const finish = (state: string) => {
+      if (done) return
+      done = true
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onBack)
+      if (githubLogin?.session === session) githubLogin = null
+      emit('provider-login-device-closed', { provider: 'github', state })
+      if (state === 'connected') resolve()
+      else reject(new ServerError(state === 'cancelled' ? 'cancelled' : 'signed_out', null))
+    }
+    const check = async () => {
+      if (done) return
+      try {
+        const view = await request<{ state?: unknown; url?: unknown; code?: unknown; expiresInSeconds?: unknown }>('GET', '/github/login', undefined, header)
+        const state = str(view?.state)
+        if (state !== 'pending') { finish(state || 'failed'); return }
+        const url = str(view?.url)
+        const code = str(view?.code)
+        if (url && code && code !== shown) {
+          shown = code
+          emit('provider-login-device', { provider: 'github', url, code, expiresInSeconds: typeof view?.expiresInSeconds === 'number' ? view.expiresInSeconds : null })
+        }
+      } catch (error) {
+        if (error instanceof ServerError && error.status === 404) finish('failed')
+      }
+    }
+    // 휴대폰에서 GitHub 페이지에 다녀오면 바로 다시 본다.
+    const onBack = () => { if (document.visibilityState === 'visible') void check() }
+    const timer = window.setInterval(() => void check(), 2000)
+    document.addEventListener('visibilitychange', onBack)
+    githubLogin = { session, finish }
+    void check()
+  })
 }
 
 function missing(cmd: string): never {
@@ -1047,6 +1145,12 @@ export async function networkInvoke<T>(cmd: string, args?: InvokeArgs): Promise<
     }
     case 'provider_login_cancel': {
       const provider = str(input.provider)
+      if (provider === 'github') {
+        const login = githubLogin
+        if (login) await request('POST', '/github/login/cancel', undefined, { 'X-Momso-Login-Session': login.session }).catch(() => {})
+        login?.finish('cancelled')
+        return 'cancelled' as T
+      }
       const login = ownLogin
       if (login && login.provider === provider) {
         login.stop()
@@ -1278,16 +1382,99 @@ export async function networkInvoke<T>(cmd: string, args?: InvokeArgs): Promise<
       emit('provider-auth-changed', { provider, state: 'signedOut', reason: null })
       return (cmd === 'provider_logout' ? 'signedOut' : 'keyCleared') as T
     }
+    // ---- GitHub 백업(휴대폰 설정): 상태·연결·업로드·자동 백업 형편. 저장소 만들기·다운로드·연결 해제는 server 에 없다(화면이 단추를 두지 않음). ----
+    case 'archive_remote_status':
+      return (await githubStatus()) as T
+    case 'archive_remote_connect': {
+      // 저장소를 고른다. GitHub 에 로그인하지 않았으면(not_connected) 기기 로그인을 마친 뒤 다시 고른다.
+      const body = { nameWithOwner: str(input.repo) }
+      // 없거나 비공개가 아닌 저장소(repository_not_found)는 데스크톱의 같은 까닭 값으로("저장소를 찾지 못했습니다").
+      const choose = () => request('POST', '/github/repository', body).catch((error) => {
+        throw error instanceof ServerError && error.code === 'repository_not_found' ? new ServerError('repository_unavailable', error.status) : error
+      })
+      try {
+        await choose()
+      } catch (error) {
+        if (!(error instanceof ServerError) || error.code !== 'not_connected') throw error
+        await githubDeviceLogin()
+        await choose()
+      }
+      return (await githubStatus()) as T
+    }
+    case 'archive_remote_create': {
+      // S97: GitHub 로그인이 승인되면 server 가 momso-<계정> 비공개 저장소를 만들거나 찾아 연결한다. 데스크톱 "저장소 만들기"와 같은 뜻.
+      // 로그인 전이면(not_connected) 기기 로그인부터. 만들기는 같은 경로를 다시 해도 이미 고른 저장소를 그대로 준다.
+      const make = () => request<{ repository?: { nameWithOwner?: unknown } | null }>('POST', '/github/repository/create')
+      let made: { repository?: { nameWithOwner?: unknown } | null } | null
+      try {
+        try {
+          made = await make()
+        } catch (error) {
+          if (!(error instanceof ServerError) || error.code !== 'not_connected') throw error
+          await githubDeviceLogin()
+          made = await make()
+        }
+      } catch (error) {
+        // 데스크톱 저장소 만들기의 결과 값으로(같은 글): 같은 이름의 공개 저장소, 만들지 못함, 비공개인지 확인하지 못함.
+        const known: Record<string, string> = { repository_not_private: 'exists_public', repository_create_failed: 'create_failed', repository_create_unverified: 'created_unverified' }
+        if (error instanceof ServerError && known[error.code]) return { state: known[error.code], repo: null } as T
+        throw error
+      }
+      return { state: 'created', repo: str(made?.repository?.nameWithOwner) || null } as T
+    }
+    case 'archive_remote_disconnect':
+      // S98: server 에 저장된 GitHub 연결과 자격 증명을 지운다(GitHub 의 저장소와 자료는 그대로). 로그인 중이면 409 login_in_progress.
+      await request('POST', '/github/disconnect')
+      return (await githubStatus()) as T
+    case 'object_store_status': {
+      const value = await objectBackup()
+      return { state: value.enabled ? 'connected' : 'not_connected', provider: value.enabled ? 'gcp' : null, bucket: null, lastBackupAt: null, pendingCount: null, pendingBytes: null } as T
+    }
+    case 'object_store_auto_upload_get': {
+      // 원자료 백업은 server 가 늘 자동으로 한다(끌 수 없음). 실패하면 server 가 30초 안에 다시 하므로 데스크톱의 "곧 다시 시도" 줄과 같다.
+      const value = await objectBackup()
+      const state = !value.enabled ? 'not_connected' : value.status === 'syncing' ? 'running' : value.status === 'pending' ? 'pending' : value.status === 'failed' ? 'retry_pending' : 'idle'
+      return { enabled: true, state, consecutiveFailures: state === 'retry_pending' ? 1 : 0, reason: state === 'retry_pending' ? value.reason : null, retryInSeconds: null } as T
+    }
+    case 'archive_remote_push':
+      // GitHub 로그인이 풀렸으면(not_connected, 갱신 토큰도 만료) 먼저 기기 로그인을 다시 한 뒤 저장을 예약한다.
+      try {
+        await request('GET', '/github/repositories')
+      } catch (error) {
+        if (!(error instanceof ServerError) || error.code !== 'not_connected') throw error
+        await githubDeviceLogin()
+      }
+      await request('POST', '/github/sync')
+      return (await githubStatus()) as T
+    case 'archive_auto_backup_get':
+      return (await githubAutoBackup()) as T
     case 'chat_import_export_preview':
       // path 자리에 휴대폰에서 올린 파일의 원자료 번호(ChatImportSettings). 결과는 데스크톱과 같은 판독기의 같은 꼴.
       return (await request('POST', '/chat-imports/preview', { assetId: str(input.path), provider: str(input.provider) })) as T
-    case 'chat_import_export_progress':
-      // server 는 진행 수를 보내지 않는다(대조표 "진행률 조회는 아직 없음"). 끝나면 센 수, 그만두면 409 cancelled.
-      return (await request('POST', '/chat-imports', { assetId: str(input.path), provider: str(input.provider), requestId: str(input.requestId) })) as T
+    case 'chat_import_export_progress': {
+      // 끝나면 센 수, 그만두면 409 cancelled. 가져오는 동안 GET /chat-imports/{id}/progress 의 processed 를 데스크톱처럼
+      // chat-import-progress 로 보낸다(S83). 진행값은 server 를 다시 켜면 없어지므로 읽지 못하면 그냥 넘어간다.
+      const requestId = str(input.requestId)
+      let done = false
+      const watch = (async () => {
+        while (!done) {
+          await new Promise((resolve) => setTimeout(resolve, IMPORT_PROGRESS_MS))
+          if (done) break
+          const value = await request<{ processed?: unknown }>('GET', `/chat-imports/${encodeURIComponent(requestId)}/progress`).catch(() => null)
+          if (!done && typeof value?.processed === 'number') emit('chat-import-progress', { requestId, processed: value.processed })
+        }
+      })()
+      try {
+        return (await request('POST', '/chat-imports', { assetId: str(input.path), provider: str(input.provider), requestId })) as T
+      } finally {
+        done = true
+        void watch
+      }
+    }
     case 'chat_import_export_cancel':
       await request('POST', `/chat-imports/${encodeURIComponent(str(input.requestId))}/cancel`)
       return null as T
-    // ---- S75 셋째: 원자료 휴지통·되돌리기(원본은 지우지 않고 표시만, 완전히 삭제는 없음) ----
+    // ---- S75 셋째·S83: 원자료 휴지통·되돌리기·완전히 삭제 ----
     case 'source_asset_deleted_list': {
       // 데스크톱은 { before } 로 이어 받는다. 여기서는 그 자리에 다음 offset 을 담아 둔다(화면은 받은 값을 그대로 돌려준다).
       const before = input.before && typeof input.before === 'object' ? input.before as Record<string, unknown> : null
@@ -1296,7 +1483,10 @@ export async function networkInvoke<T>(cmd: string, args?: InvokeArgs): Promise<
       const rows = (Array.isArray(value?.items) ? value.items : []) as Array<Record<string, unknown>>
       const items = rows.filter((row) => str(row.assetId)).map((row) => ({
         id: str(row.assetId), originalFileName: str(row.name) || null, deletedAt: str(row.deletedAt) || null,
-        deletionState: 'trashed', canRestore: true, canPurge: false, referenceCount: null,
+        deletionState: 'trashed', canRestore: true, canPurge: row.canPurge === true,
+        // 사용처 = 채팅방 수 + 문서 수(S83 references). 문서를 읽지 못하면 documents 가 null 이라 수를 모른다(null).
+        referenceCount: referenceTotal(row.references),
+        backupCopiesRemain: row.backupCopiesRemain === true,
       }))
       const last = items[items.length - 1]
       const more = rows.length >= TRASH_PAGE && Boolean(last)
@@ -1311,6 +1501,13 @@ export async function networkInvoke<T>(cmd: string, args?: InvokeArgs): Promise<
     case 'source_asset_restore_trashed':
       await request('POST', `/assets/${encodeURIComponent(str(input.assetId))}/restore`)
       return { state: 'active', assetId: str(input.assetId), retainUntil: null } as T
+    case 'source_asset_purge': {
+      // S83: 몸소 서버의 원본을 지우고 다음 백업·복원에서 뺀다. 이미 올라간 예전 백업 세대에는 남을 수 있다(backupCopiesRemain).
+      // 사용 중이면 409 asset_in_use, 백업 작업자가 없으면 backup_purge_unavailable(화면은 "완전히 삭제하지 못했습니다").
+      const value = await request<{ backupCopiesRemain?: unknown }>('POST', `/assets/${encodeURIComponent(str(input.assetId))}/purge`)
+      const remain = value?.backupCopiesRemain === true
+      return { state: remain ? 'partial' : 'purged', localRemaining: [], remoteRemaining: [], removedRemoteKeys: [], backupCopiesRemain: remain } as T
+    }
     // ---- S75 셋째: 사진과 동영상(생성 기록과 판) ----
     case 'media_list': {
       // 데스크톱 media_list 는 전부를 한 번에 준다. server 는 쪽마다 100개라 끝까지(10쪽까지) 이어 받는다. 같은 묶음은 최신 판 하나와 판 수만 온다.
@@ -1326,14 +1523,18 @@ export async function networkInvoke<T>(cmd: string, args?: InvokeArgs): Promise<
       return rows.flatMap((row) => {
         const id = str(row.assetId)
         const kind = row.kind === 'image' || row.kind === 'video' ? row.kind : null
-        // 사람이 올린 사진·동영상은 생성 기록이 없어 날짜(createdAt)가 오지 않는다. 날짜별 갤러리에 놓을 자리가 없어 뺀다(본부에 알림).
+        // 사람이 올린 사진·동영상도 날짜가 온다(S83: 올린 때, 옛 파일은 파일 수정 시각). 그래도 날짜를 읽지 못한 것(null)은 날짜별 갤러리에 놓을 자리가 없어 뺀다.
         const createdAt = str(row.createdAt)
         if (!id || !kind || !createdAt) return []
         const chatId = row.chatAvailable === true ? str(row.chatId) : ''
         const how = row.versionHow === 'regenerated' || row.versionHow === 'edited' ? row.versionHow : null
+        // 이름: 데스크톱처럼 올린 파일은 파일 이름. 생성물은 지금처럼 비워 요청한 말이 보이게 한다.
+        const uploaded = !str(row.lineageId)
+        // 동영상의 첫 장면 그림(S83 thumbnailUrl, 서버가 처음 볼 때 만든다).
+        const poster = kind === 'video' && row.thumbnailState === 'on_demand' ? str(row.thumbnailUrl) : ''
         return [{
-          id, kind, title: null, createdAt, width: null, height: null, durationSec: null,
-          path: serverMediaDownloadPath(id), posterPath: null,
+          id, kind, title: uploaded ? str(row.name) || null : null, createdAt, width: null, height: null, durationSec: null,
+          path: serverMediaDownloadPath(id), posterPath: poster.startsWith('/') ? poster : null,
           chatId: chatId || null, chats: chatId ? [{ id: chatId, title: titles.get(chatId) || null }] : null,
           by: null, how: null, at: null,
           prompt: str(row.prompt) || null, lineageId: str(row.lineageId) || null, version: count(row.version),
