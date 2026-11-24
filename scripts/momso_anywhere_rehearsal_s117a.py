@@ -296,24 +296,63 @@ def collect_inventory(provider):
     return groups, versions
 
 
+_INSTALLER_CODES = frozenset(('gateway_image_permission', 'gateway_image_invalid', 'gateway_image_mismatch',
+    'gateway_traffic_mismatch', 'gateway_probe_failed', 'gateway_rollback_failed', 'gateway_not_ready',
+    'gateway_operation_failed', 'gateway_response_invalid', 'gateway_address_invalid', 'gateway_ownership',
+    'gateway_policy', 'rollback_failed', 'backup_not_connected', 'backup_freshness_unverified', 'vm_unreachable',
+    'cleanup_pending', 'cleanup_incomplete', 'delete_failed'))
+
+
+def installer_result(process, stage):
+    """Extract only known machine codes, never arbitrary subprocess output."""
+    reason = 'installer_failed'
+    try:
+        for line in process.stdout.decode('utf-8', errors='replace').splitlines():
+            try: value = json.loads(line)
+            except ValueError: continue
+            if isinstance(value, dict):
+                for key in ('code', 'reason'):
+                    if value.get(key) in _INSTALLER_CODES: reason = value[key]
+    except (UnicodeError, AttributeError, TypeError):
+        pass
+    return {'ok': process.returncode == 0, 'stage': stage, 'reason': None if process.returncode == 0 else reason}
+
+
 def run_rehearsal(provider, install, verify, destroy, backup_cleanup, inventory, idle=None):
     """Callbacks permit fake-provider tests; cleanup always runs after start."""
     _validate_target(provider)
     result = {'install': 'failed', 'checks': {}, 'destroy': 'failed', 'backup_cleanup': 'unknown', 'inventory': {}, 'kmsVersions': []}
+    stage = 'install'
     try:
-        if install():
+        installed = install()
+        if isinstance(installed, dict):
+            result['installFailure'] = None if installed.get('ok') else {'stage': installed.get('stage'), 'reason': installed.get('reason')}
+            installed = installed.get('ok') is True
+        if installed:
             result['install'] = 'passed'
+            stage = 'verify'
             result['checks'] = verify()
+            failures = [name for name, value in result['checks'].items() if value != 'passed']
+            if failures: result['checkFailures'] = sorted(failures)
             if idle is not None:
                 required = ('traffic_digest', 'public_https', 'vm_services', 'update_status')
                 result['idleWake'] = idle(provider) if all(result['checks'].get(k) == 'passed' for k in required) else {'status': 'failed', 'stage': 'initial_checks'}
     except Exception:
-        pass
+        if stage == 'verify': result['checkFailures'] = ['verification_unavailable']
+        else: result['installFailure'] = {'stage': stage, 'reason': 'rehearsal_operation_failed'}
     finally:
         try:
-            result['destroy'] = 'passed' if destroy() else 'failed'
+            deletion = destroy()
+            if isinstance(deletion, dict):
+                result['deletion'] = deletion
+                result['destroy'] = 'passed' if deletion.get('outcome') in ('deleted', 'deleted_unverified') else 'failed'
+                if result['destroy'] == 'failed':
+                    code = deletion.get('reason')
+                    result['destroyFailure'] = code if code in _INSTALLER_CODES else 'delete_failed'
+            else:
+                result['destroy'] = 'passed' if deletion else 'failed'
         except Exception:
-            pass
+            result['destroyFailure'] = 'delete_failed'
         try:
             result['backup_cleanup'] = backup_cleanup()
         except Exception:
@@ -367,7 +406,21 @@ def main(argv=None):
                    '--owner-sub', args.owner_sub, '--login-origin', args.login_origin, '--release-manifest-url', args.release_manifest_url,
                    '--release-public-key', str(key), '--release-channel', args.channel]
         def run(command):
-            return subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode == 0
+            process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+            try:
+                saved = json.loads(state_path.read_text(encoding='utf-8'))
+                steps = saved.get('steps', {})
+                stage = next((name for name in ('network', 'vm', 'install', 'health') if steps.get(name) != 'ok'), 'after_health')
+            except (OSError, ValueError, AttributeError):
+                stage = 'unknown'
+            return installer_result(process, stage)
+        def run_destroy():
+            process = subprocess.run([sys.executable, installer, 'destroy', *common, '--discard-data'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+            try:
+                value = json.loads(process.stdout.decode('utf-8'))
+                return value if isinstance(value, dict) else False
+            except (ValueError, UnicodeError):
+                return False
         # SSH uses the key directory the existing installer created.
         provider.key_file = directory / ('.momso-ssh-' + state['id']) / 'ssh'
         def verify():
@@ -380,11 +433,16 @@ def main(argv=None):
         if args.check_idle:
             from momso_anywhere_rehearsal_idle_s117b import probe_idle_wake
         result = run_rehearsal(provider, lambda: run(command), verify,
-                               lambda: run([sys.executable, installer, 'destroy', *common]),
+                               run_destroy,
                                cleanup_backup, lambda: collect_inventory(provider),
                                idle=probe_idle_wake if args.check_idle else None)
         print('시험 설치 ID:', state['id'])
         print('설치:', result['install'], '확인:', json.dumps(result['checks'], ensure_ascii=False), '삭제:', result['destroy'])
+        if result.get('installFailure'): print('설치 실패 단계·코드:', json.dumps(result['installFailure'], ensure_ascii=False))
+        if result.get('checkFailures'): print('확인 실패 항목:', ', '.join(result['checkFailures']))
+        if result.get('destroyFailure'): print('삭제 실패 코드:', result['destroyFailure'])
+        if result.get('deletion', {}).get('outcome') == 'deleted_unverified':
+            print('삭제 후 미확인:', ', '.join(result['deletion'].get('unverified', [])))
         if args.check_idle:
             print('유휴 종료·깨우기:', json.dumps(result.get('idleWake', {'status': 'failed', 'stage': 'installation'}), ensure_ascii=False))
         unknown, remaining = [], []
@@ -412,7 +470,9 @@ def main(argv=None):
             print('과금되는 것: 확인한 범위에서 0')
         print('시험용 백업 정리:', result['backup_cleanup'])
         print('재확인용 상태 기록:', state_path)
-        return 0 if result['install'] == 'passed' and result['destroy'] == 'passed' and result['backup_cleanup'] in ('backup_absent,keys_absent', 'backup_absent,keys_scheduled', 'backup_deleted,keys_absent', 'backup_deleted,keys_scheduled') and all(result['checks'].get(k) == 'passed' for k in ('traffic_digest', 'public_https', 'vm_services', 'update_status')) and (not args.check_idle or result.get('idleWake', {}).get('status') == 'passed') else 1
+        unexpected_remaining = [kind for kind in remaining if kind != 'kms']
+        kms_scheduled = bool(result['kmsVersions']) and all(v['billing'] == 'not_billable' or (v['billing'] == 'billable' and v.get('until')) for v in result['kmsVersions'])
+        return 0 if result['install'] == 'passed' and result['destroy'] == 'passed' and not unexpected_remaining and ('kms' not in remaining or kms_scheduled) and result['backup_cleanup'] in ('backup_absent,keys_absent', 'backup_absent,keys_scheduled', 'backup_deleted,keys_absent', 'backup_deleted,keys_scheduled') and all(result['checks'].get(k) == 'passed' for k in ('traffic_digest', 'public_https', 'vm_services', 'update_status')) and (not args.check_idle or result.get('idleWake', {}).get('status') == 'passed') else 1
     except Exception:
         print('실패: 입력 또는 서명·접근 권한을 확인하세요.', file=sys.stderr)
         return 1

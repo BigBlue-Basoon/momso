@@ -11,7 +11,7 @@ import tempfile
 import urllib.request
 from urllib.parse import urlparse
 from release_manifest import ManifestError, verify as verify_manifest
-from cloud_run_gateway import GatewayError
+from cloud_run_gateway import GatewayError, gateway_failure
 
 
 class UpdateError(Exception):
@@ -89,19 +89,28 @@ class Updater:
         os.chmod(self.root, 0o755)
         self.state = self.root / "update-state.json"
 
-    def _emit(self, state, reason=None):
+    def _emit(self, state, reason=None, gateway=None):
         # Only fixed state and reason codes are written to journald.
         import re
         if re.fullmatch(r"[a-z_]{1,80}", state) and (reason is None or re.fullmatch(r"[a-z_]{1,80}", reason)):
             print(f"update stage={state} reason={reason or 'none'}", flush=True)
         # A disconnected screen must never prevent a rollback.
         try:
-            self.host.progress({"state": state, "reason": reason})
+            event = {"state": state, "reason": reason}
+            if gateway is not None: event.update(gateway)
+            self.host.progress(event)
         except Exception:
             pass
 
     def _rollback(self, record):
         errors = []
+        original_data = original_release = None
+        try:
+            if hasattr(self.host, 'recovery_data_identity'):
+                original_data = self.host.recovery_data_identity()
+                original_release = self.host.current_release()
+        except Exception:
+            pass
         def attempt(stage, action):
             try:
                 action()
@@ -109,15 +118,22 @@ class Updater:
                 errors.append(stage)
                 self._emit("rolling_back", stage)
         attempt("server_stop_failed", self.host.stop_server)
-        if record.get("snapshot") is not None:
+        if record.get("snapshot") is not None and "server_stop_failed" not in errors:
             attempt("data_restore_failed", lambda: self.host.restore_data(record["snapshot"]))
         if hasattr(self.host, "rollback_managed"):
             attempt("helper_restore_failed", self.host.rollback_managed)
-        attempt("release_restore_failed", lambda: self.host.activate_release(record["oldRelease"]))
-        if "release_restore_failed" not in errors:
-            attempt("sequence_restore_failed", lambda: self.host.record_sequence(record["oldSequence"]))
-        # Start all local services even if any earlier recovery step failed.
-        attempt("server_start_failed", self.host.start_server)
+        if not any(stage in errors for stage in ("server_stop_failed", "data_restore_failed")):
+            attempt("release_restore_failed", lambda: self.host.activate_release(record["oldRelease"]))
+            if "release_restore_failed" not in errors:
+                attempt("sequence_restore_failed", lambda: self.host.record_sequence(record["oldSequence"]))
+                attempt("server_start_failed", self.host.start_server)
+        elif 'data_restore_failed' in errors and 'server_stop_failed' not in errors and original_data is not None:
+            try:
+                unchanged = self.host.recovery_data_identity() == original_data and self.host.current_release() == original_release
+            except Exception:
+                unchanged = False
+            if unchanged:
+                attempt('server_start_failed', self.host.start_server)
         if hasattr(self.host, "refresh_proxy") and record.get("newRelease"):
             attempt("proxy_restore_failed", lambda: self.host.refresh_proxy(record["newRelease"], record["oldRelease"]))
         try:
@@ -144,7 +160,9 @@ class Updater:
             errors.append("gateway_health_failed")
             self._emit("rolling_back", "gateway_health_failed")
         if errors:
-            raise UpdateError("rollback_failed")
+            error = UpdateError("rollback_failed")
+            error.gateway_restore_failed = any(name in errors for name in ('gateway_restore_failed', 'gateway_unhealthy', 'gateway_health_failed'))
+            raise error
         _atomic_json(self.state, {"phase": "rolled_back", "sequence": record["oldSequence"], "needsRelease": True})
 
     def check(self, manifest_url, signature_url):
@@ -164,7 +182,7 @@ class Updater:
             try:
                 return self._install(manifest_url, signature_url)
             except UpdateError as error:
-                self._emit("failed", str(error))
+                self._emit("failed", str(error), getattr(error, 'gateway_failure', None))
                 raise
             except (OSError, ValueError):
                 self._emit("failed", "update_unavailable")
@@ -183,7 +201,9 @@ class Updater:
             if hasattr(self.host, "preflight_gateway"):
                 self.host.preflight_gateway(release["gatewayImage"])
         except GatewayError as error:
-            raise UpdateError(str(error)) from None
+            detail = gateway_failure(str(error))
+            failure = UpdateError(detail['code']); failure.gateway_failure = detail
+            raise failure from None
         self._emit("downloading")
         bundle = _download(release["bundleUrl"], self.allow_http)
         if hashlib.sha256(bundle).hexdigest() != release["bundleSha256"]:
@@ -244,14 +264,28 @@ class Updater:
             self._emit("completed")
             return "completed"
         except Exception as failure:
-            reason = str(failure) if isinstance(failure, (GatewayError, UpdateError)) and str(failure) in {"gateway_image_permission", "gateway_operation_failed", "gateway_image_mismatch", "gateway_traffic_mismatch", "gateway_not_ready", "gateway_probe_failed", "gateway_unhealthy", "server_unhealthy"} else "update_failed"
-            self._emit("rolling_back", reason)
+            allowed = {'gateway_image_permission', 'gateway_image_invalid', 'gateway_image_mismatch', 'gateway_traffic_mismatch',
+                       'gateway_traffic_unknown', 'gateway_probe_failed', 'gateway_unhealthy', 'gateway_health_failed',
+                       'gateway_rollback_failed', 'gateway_rollback_mismatch', 'gateway_not_ready', 'gateway_operation_failed',
+                       'gateway_response_invalid', 'gateway_address_invalid', 'gateway_address_changed', 'gateway_address',
+                       'gateway_ownership', 'gateway_policy', 'server_unhealthy'}
+            reason = str(failure) if isinstance(failure, (GatewayError, UpdateError)) and str(failure) in allowed else 'update_failed'
+            self._emit("rolling_back", reason, gateway_failure(reason) if reason.startswith('gateway_') else None)
             try:
                 self._rollback({"snapshot": snapshot, "oldRelease": old_release, "oldGateway": old_gateway, "oldSequence": installed, "newRelease": str(stage)})
             except Exception as error:
-                self._emit("recovery_required", "rollback_failed")
+                gateway_detail = gateway_failure('gateway_rollback_failed', False) if getattr(error, 'gateway_restore_failed', False) else (gateway_failure(reason) if reason.startswith('gateway_') else None)
+                recovery_reason = 'gateway_rollback_failed' if getattr(error, 'gateway_restore_failed', False) else 'rollback_failed'
+                self._emit("recovery_required", recovery_reason, gateway_detail)
                 # Never reopen admission after an uncertain recovery.
-                raise UpdateError("rollback_failed") from error
+                failure_error = UpdateError(recovery_reason)
+                if gateway_detail: failure_error.gateway_failure = gateway_detail
+                raise failure_error from error
+            if reason.startswith('gateway_'):
+                detail = gateway_failure(reason, True)
+                self._emit('rolled_back', detail['code'], detail)
+                failure_error = UpdateError(detail['code']); failure_error.gateway_failure = detail
+                raise failure_error from None
             self._emit("rolled_back")
             raise UpdateError(reason if reason != "update_failed" else "update_failed_rolled_back") from None
         finally:

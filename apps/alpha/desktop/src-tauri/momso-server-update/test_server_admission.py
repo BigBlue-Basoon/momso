@@ -19,7 +19,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         assert self.headers["Authorization"] == "Bearer " + self.server.fixture_token
         self.server.maintenance = self.path == "/maintenance"
-        self.reply({"maintenance": self.server.maintenance})
+        self.reply({"maintenance": self.server.maintenance, "closedAt": 123 if self.server.maintenance else None})
 
 
 class AdmissionTests(unittest.TestCase):
@@ -41,7 +41,9 @@ class AdmissionTests(unittest.TestCase):
     def test_ready_gate_is_held_until_release(self):
         self.server.ready = True
         self.assertTrue(self.admission.acquire()); self.assertTrue(self.server.maintenance)
+        self.assertEqual(self.admission.closed_at, 123)
         self.admission.release(); self.assertFalse(self.server.maintenance)
+        self.assertIsNone(self.admission.closed_at)
     def test_existing_maintenance_never_takes_over(self):
         self.server.maintenance = True
         self.assertFalse(self.admission.acquire()); self.assertTrue(self.server.maintenance)

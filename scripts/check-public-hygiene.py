@@ -44,9 +44,22 @@ def files(root):
                     yield path
 
 
+def documentation_files(root):
+    """Also check documentation outside the standard public-file scan."""
+    top = root / "docs"
+    if not top.is_dir():
+        return
+    for directory, dirs, names in os.walk(top, followlinks=False):
+        dirs[:] = [name for name in dirs if name not in SKIP and not (Path(directory) / name).is_symlink()]
+        for name in names:
+            path = Path(directory) / name
+            if path.suffix.lower() in {".md", ".mdx", ".rst", ".txt"} and not path.is_symlink() and path.is_file():
+                yield path
+
+
 def findings(root, terms):
     results = []
-    for path in files(root):
+    for path in (*files(root), *documentation_files(root)):
         try:
             data = path.read_bytes()
             if b"\x00" in data:
@@ -57,6 +70,9 @@ def findings(root, terms):
         relative = path.relative_to(root).as_posix()
         for number, line in enumerate(text.splitlines(), 1):
             kinds = []
+            is_document = path.suffix.lower() in {".md", ".mdx", ".rst", ".txt"}
+            if is_document and ("momso" + "-keys") in line.casefold():
+                kinds.append("private_key_directory")
             if WINDOWS_USER.search(line):
                 kinds.append("user_path")
             if any(m.group().rsplit("@", 1)[1].lower() not in FAKE_DOMAINS

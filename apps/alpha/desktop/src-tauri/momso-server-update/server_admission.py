@@ -21,6 +21,7 @@ class ServerAdmission:
         self.base = f"http://127.0.0.1:{int(port)}"
         self.timeout, self.interval, self.lock = timeout, interval, None
         self.held = False
+        self.closed_at = None
 
     def _request(self, path, method="GET"):
         token = self.token_file.read_text(encoding="utf8").strip()
@@ -51,8 +52,10 @@ class ServerAdmission:
                 self._unlock(); return False
             # Treat lost responses as potentially acquired; keep the lock on errors.
             self.held = True
-            if self._request("/maintenance", "POST").get("maintenance") is not True:
+            response = self._request("/maintenance", "POST")
+            if response.get("maintenance") is not True:
                 raise AdmissionError("maintenance_unconfirmed")
+            self.closed_at = response.get("closedAt")
             deadline = time.monotonic() + self.timeout
             while True:
                 state = self._request("/activity")
@@ -122,6 +125,7 @@ class ServerAdmission:
         if self._request("/maintenance/release", "POST").get("maintenance") is not False:
             raise AdmissionError("release_unconfirmed")
         self.held = False
+        self.closed_at = None
         self._unlock()
 
     def _unlock(self):

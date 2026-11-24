@@ -2,21 +2,22 @@ import { SetupError } from './momso_anywhere_setup.mjs';
 
 const KEY = 'momso.start.oauth.pending.v1';
 const SCOPES = ['openid', 'email', 'https://www.googleapis.com/auth/cloud-platform'];
-const ALLOWED_ACTIONS = new Set(['start', 'find', 'projects', 'billing', 'destroy']);
+const ALLOWED_ACTIONS = new Set(['start', 'find', 'projects', 'billing', 'destroy', 'deletion_preview']);
 
 function encode(bytes) {
   return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 }
 
-export function beginRedirect({ clientId, action, projectId = null, billingAccountName = null, installationId = null, storage, location, cryptoImpl = crypto, now = Date.now() }) {
+export function beginRedirect({ clientId, action, projectId = null, billingAccountName = null, installationId = null, discardData = false, storage, location, cryptoImpl = crypto, now = Date.now() }) {
   if (!/^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$/.test(clientId) || !ALLOWED_ACTIONS.has(action)) throw new SetupError('invalid_authorization');
   if (projectId !== null && !/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId)) throw new SetupError('invalid_project');
   if (billingAccountName !== null && !/^billingAccounts\/[A-Za-z0-9-]+$/.test(billingAccountName)) throw new SetupError('invalid_billing_account');
   if (installationId !== null && !/^[a-f0-9]{24}$/.test(installationId)) throw new SetupError('invalid_checkpoint');
+  if (typeof discardData !== 'boolean' || (discardData && action !== 'destroy')) throw new SetupError('invalid_authorization');
   const page = new URL(location.href);
   if (page.protocol !== 'https:' || page.pathname !== '/start/' || page.search || page.hash) throw new SetupError('invalid_redirect');
   const state = encode(cryptoImpl.getRandomValues(new Uint8Array(32)));
-  try { storage.setItem(KEY, JSON.stringify({ state, action, projectId, billingAccountName, installationId, created: now, origin: page.origin, clientId })); }
+  try { storage.setItem(KEY, JSON.stringify({ state, action, projectId, billingAccountName, installationId, discardData, created: now, origin: page.origin, clientId })); }
   catch { throw new SetupError('checkpoint_unavailable'); }
   const target = new URL('https://accounts.google.com/o/oauth2/v2/auth');
   target.search = new URLSearchParams({ client_id: clientId, redirect_uri: page.origin + '/start/', response_type: 'token', scope: SCOPES.join(' '), state }).toString();

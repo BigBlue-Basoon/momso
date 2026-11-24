@@ -962,15 +962,27 @@ fn github_automatic_backup_saves_chat_to_local_bare_remote() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    request(&address, "POST", "/maintenance", "{}").unwrap();
+    let before = request(&address, "GET", "/activity", "").unwrap();
+    let gate = request(&address, "POST", "/maintenance", "{}").unwrap();
+    let closed = gate["closedAt"].as_i64().expect("gate closure time");
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let status = request(&address, "GET", "/activity", "").unwrap();
         if status["githubBackupReady"] == true
             && status["maintenance"] == true
             && status["shutdownReady"] == true
+            && status["objectBackup"]["lastSuccessAt"]
+                .as_i64()
+                .is_some_and(|at| at > closed)
+            && status["githubBackup"]["lastSuccessAt"]
+                .as_i64()
+                .is_some_and(|at| at > closed)
         {
             assert_eq!(status["maintenanceReady"], true);
+            assert!(
+                status["objectBackup"]["lastSuccessAt"].as_i64()
+                    > before["objectBackup"]["lastSuccessAt"].as_i64()
+            );
             break;
         }
         assert_ne!(

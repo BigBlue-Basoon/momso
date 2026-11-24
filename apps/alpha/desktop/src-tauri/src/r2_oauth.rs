@@ -101,10 +101,13 @@ fn http_client() -> Result<&'static reqwest::Client, &'static str> {
 }
 
 pub(crate) fn configure_resources(resources: &std::path::Path) {
+    #[cfg(debug_assertions)]
     let roots = [
         resources.to_path_buf(),
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("generated"),
     ];
+    #[cfg(not(debug_assertions))]
+    let roots = [resources.to_path_buf()];
     for root in roots {
         let node = root.join("node/node.exe");
         let npx = root.join("node/node_modules/npm/bin/npx-cli.js");

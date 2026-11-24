@@ -5,10 +5,10 @@
 ## 빌드와 서명
 
 1. 데스크톱 앱의 버전을 올리고 `npm run desktop:version:check`와 필요한 전체 검사를 통과한다. 사용 중인 앱보다 높은 버전이어야 업데이트로 보인다.
-2. 공개 저장소의 루트 폴더에서 PowerShell 5.1을 열고 다음 블록을 실행한다. 개인 키는 사용자 폴더의 `momso-keys` 폴더에 둔다. 암호는 질문이 나오면 입력하므로 명령 기록에 남지 않는다. 키 파일 내용은 누구에게도 보내지 않는다.
+2. 공개 저장소의 루트 폴더에서 PowerShell 5.1을 열고 다음 블록을 실행한다. 개인 키 파일을 안전한 폴더에 보관하고 아래에서 그 파일 경로를 입력한다. 암호는 질문이 나오면 입력하므로 명령 기록에 남지 않는다. 키 파일 내용은 누구에게도 보내지 않는다.
 
 ```powershell
-$keyPath = Join-Path $env:USERPROFILE 'momso-keys\momso-updater.key'
+$keyPath = Read-Host '서명 열쇠 파일의 전체 경로'
 $securePassword = Read-Host '개인 키 암호 (없으면 빈 채로 Enter)' -AsSecureString
 $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassword)
 try {

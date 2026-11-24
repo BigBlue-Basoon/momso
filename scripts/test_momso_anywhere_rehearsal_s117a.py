@@ -3,6 +3,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from contextlib import contextmanager, redirect_stdout
 from unittest.mock import patch
 
@@ -139,6 +140,27 @@ class RehearsalReadOnlyTests(unittest.TestCase):
         self.assertEqual(result['destroy'], 'passed')
         self.assertNotIn('sensitive text', repr(result))
 
+    def test_installer_failure_code_is_allowlisted_and_secrets_are_not_returned(self):
+        process = SimpleNamespace(returncode=1, stdout=b'{"code":"gateway_image_mismatch","token":"SECRET"}\n')
+        failure = rehearsal.installer_result(process, 'after_health')
+        self.assertEqual(failure, {'ok': False, 'stage': 'after_health', 'reason': 'gateway_image_mismatch'})
+        result = rehearsal.run_rehearsal(FakeProvider(), lambda: failure, lambda: {}, lambda: {'outcome': 'failed', 'reason': 'vm_unreachable'},
+                                         lambda: 'backup_absent', lambda: ({}, []))
+        self.assertEqual(result['installFailure']['reason'], 'gateway_image_mismatch')
+        self.assertEqual(result['destroyFailure'], 'vm_unreachable')
+        self.assertNotIn('SECRET', repr(result))
+        self.assertEqual(rehearsal.installer_result(SimpleNamespace(returncode=1, stdout=b'{"code":"SECRET"}'), 'vm')['reason'], 'installer_failed')
+
+    def test_failed_verification_and_exception_have_distinct_reasons(self):
+        result = rehearsal.run_rehearsal(FakeProvider(), lambda: True, lambda: {'traffic_digest': 'unverified'}, lambda: True,
+                                         lambda: 'backup_absent', lambda: ({}, []))
+        self.assertEqual(result['checkFailures'], ['traffic_digest'])
+        def failure(): raise ValueError('SECRET')
+        result = rehearsal.run_rehearsal(FakeProvider(), lambda: True, failure, lambda: True,
+                                         lambda: 'backup_absent', lambda: ({}, []))
+        self.assertEqual(result['checkFailures'], ['verification_unavailable'])
+        self.assertNotIn('SECRET', repr(result))
+
     def test_protected_id_stops_orchestration_before_any_callback(self):
         provider = FakeProvider()
         provider.install_id = 'bbbbbbbbbbbb'
@@ -223,6 +245,7 @@ class RehearsalReadOnlyTests(unittest.TestCase):
         calls = []
         class Completed:
             returncode = 0
+            stdout = b'{"outcome":"deleted_unverified","unverified":["iam"]}'
         def fake_run(command, **kwargs):
             calls.append(command)
             return Completed()
@@ -243,6 +266,15 @@ class RehearsalReadOnlyTests(unittest.TestCase):
             self.assertIn('--owner-sub', calls[0])
             self.assertIn('--login-origin', calls[0])
             self.assertIn('미확인', out.getvalue())
+            self.assertIn('삭제 후 미확인: iam', out.getvalue())
+
+    def test_deletion_outcomes_distinguish_unverified_remaining_and_failure(self):
+        for outcome, expected in [('deleted', 'passed'), ('deleted_unverified', 'passed'), ('remaining', 'failed'), ('failed', 'failed')]:
+            deletion = {'outcome': outcome, 'unverified': ['iam'] if outcome == 'deleted_unverified' else []}
+            result = rehearsal.run_rehearsal(FakeProvider(), lambda: True, lambda: {}, lambda: deletion,
+                                             lambda: 'backup_absent,keys_absent', lambda: ({}, []))
+            self.assertEqual(result['destroy'], expected)
+            self.assertEqual(result['deletion'], deletion)
 
     def test_requested_idle_check_runs_before_destroy_and_failure_is_visible(self):
         calls = []

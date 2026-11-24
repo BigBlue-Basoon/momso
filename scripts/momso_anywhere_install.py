@@ -7,6 +7,7 @@ import importlib.util
 import json
 import re
 import secrets
+import subprocess
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -20,6 +21,7 @@ _adapter_module = importlib.util.module_from_spec(_adapter_spec)
 _adapter_spec.loader.exec_module(_adapter_module)
 CloudRunGateway = _adapter_module.CloudRunGateway
 GatewayError = _adapter_module.GatewayError
+gateway_failure = _adapter_module.gateway_failure
 
 
 def cloud_run_gateway(provider, service):
@@ -55,7 +57,8 @@ run('systemctl','restart','momso-server')
 
 def install_private_proxy(provider):
     here = Path(__file__).resolve().parent
-    files = {name: base64.b64encode((here / name).read_bytes()).decode() for name in ("momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py")}
+    files = {name: base64.b64encode((here / name).read_bytes()).decode() for name in ("momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py", "momso_anywhere_vm_pause.py", "momso_anywhere_pause_ticket.py", "momso_anywhere_pause_guard.py")}
+    files['server_admission.py'] = base64.b64encode((here.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/server_admission.py').read_bytes()).decode()
     code = r'''import base64,hashlib,json,os,secrets,subprocess,sys
 data=json.load(sys.stdin); root='/etc/momso-private';os.makedirs(root,mode=0o700,exist_ok=True);os.chmod(root,0o700)
 cert=root+'/certificate.pem'; key=root+'/key.pem'; token=root+'/transport-token'
@@ -114,6 +117,7 @@ class GoogleAnywhere(GoogleWake):
         self.role = "momsoAnywhere" + provider.install_id
         self.transport_secret = "momso-transport-" + provider.install_id
         self.session_secret = "momso-session-" + provider.install_id
+        self._first_attempt_absent = False
 
     def ensure_secret(self, name, value=None):
         p = self.p
@@ -137,9 +141,12 @@ class GoogleAnywhere(GoogleWake):
         p = self.p
         adapter = cloud_run_gateway(p, self.service)
         try:
+            if not previous:
+                previous = self._objects()[2] is not None
+                self._first_attempt_absent = not previous
             before = adapter.current() if previous else None
         except (GatewayError, InstallError, OSError) as error:
-            raise InstallError("기존 입구의 revision을 확인하지 못했습니다.") from error
+            raise InstallError("기존 입구의 revision을 확인하지 못했습니다.", gateway_failure=gateway_failure(str(error) if isinstance(error, GatewayError) else 'gateway_operation_failed')) from error
         try:
             adapter.activate(image, deploy_flags=flags, first_deploy=not previous, probe='--no-allow-unauthenticated' not in flags)
             if not adapter.healthy():
@@ -153,8 +160,9 @@ class GoogleAnywhere(GoogleWake):
                 try:
                     adapter.activate(before)
                 except (GatewayError, InstallError, OSError) as rollback_error:
-                    raise InstallError("입구 갱신과 이전 판 복구에 실패했습니다. 기존 revision을 확인하세요.") from rollback_error
-            raise InstallError("입구 갱신에 실패했습니다. 기존 판을 유지했는지 확인하세요.") from error
+                    raise InstallError("입구 갱신과 이전 판 복구에 실패했습니다. 기존 revision을 확인하세요.", gateway_failure=gateway_failure('gateway_rollback_failed', False)) from rollback_error
+            code = str(error) if isinstance(error, GatewayError) else getattr(error, 'gateway_code', None) or 'gateway_operation_failed'
+            raise InstallError("입구 갱신에 실패했습니다. 기존 판을 유지했는지 확인하세요.", gateway_failure=gateway_failure(code, True if before else None)) from error
 
     def upgrade_gateway(self, expected_url, image):
         self.activate_gateway(image, expected_url=expected_url)
@@ -188,14 +196,23 @@ class GoogleAnywhere(GoogleWake):
         env = f"MOMSO_PRIVATE_HOST={ip},MOMSO_PRIVATE_PORT=8766,MOMSO_PRIVATE_CERT_SHA256={proxy['fingerprint']},MOMSO_PROJECT={p.project},MOMSO_ZONE={ZONE},MOMSO_INSTANCE={p.name},MOMSO_GOOGLE_CLIENT_ID={client_id},MOMSO_OWNER_SUB={owner_sub},MOMSO_LOGIN_ORIGIN={login_origin},MOMSO_SESSION_KEY_FILE=/secrets/session-key"
         secret_flags = f"--set-secrets=MOMSO_PRIVATE_PROXY_TOKEN={self.transport_secret}:latest,/secrets/session-key={self.session_secret}:latest"
         common = (f"--service-account={self.email}", f"--labels=momso-install-id={p.install_id}", f"--network={p.network}", f"--subnet={p.subnet}", "--vpc-egress=private-ranges-only", "--timeout=3600", secret_flags)
-        self.activate_gateway(image, flags=(*common, "--no-allow-unauthenticated", f"--set-env-vars={env},MOMSO_PUBLIC_HOST=pending.invalid"), previous=bool(existing))
-        details = p.run("run", "services", "describe", self.service, f"--region={REGION}", parse=True)
-        url = details.get("status", {}).get("url", "")
-        if not re.fullmatch(r"https://[a-z0-9-]+\.[a-z0-9.-]+\.run\.app", url):
-            raise InstallError("입구 주소를 확인하지 못했습니다.")
-        host = url.removeprefix("https://")
-        self.activate_gateway(image, flags=(*common, "--allow-unauthenticated", f"--set-env-vars={env},MOMSO_PUBLIC_HOST={host}"), expected_url=url)
-        return url
+        try:
+            self.activate_gateway(image, flags=(*common, "--no-allow-unauthenticated", f"--set-env-vars={env},MOMSO_PUBLIC_HOST=pending.invalid"), previous=bool(existing))
+            details = p.run("run", "services", "describe", self.service, f"--region={REGION}", parse=True)
+            url = details.get("status", {}).get("url", "")
+            if not re.fullmatch(r"https://[a-z0-9-]+\.[a-z0-9.-]+\.run\.app", url):
+                raise InstallError("입구 주소를 확인하지 못했습니다.")
+            host = url.removeprefix("https://")
+            self.activate_gateway(image, flags=(*common, "--allow-unauthenticated", f"--set-env-vars={env},MOMSO_PUBLIC_HOST={host}"), expected_url=url)
+            return url
+        except (InstallError, OSError, subprocess.SubprocessError):
+            if not existing and self._first_attempt_absent:
+                try:
+                    service = self._objects()[2]
+                    if service: p.run('run', 'services', 'delete', self.service, f'--region={REGION}')
+                except (InstallError, OSError, subprocess.SubprocessError) as cleanup_error:
+                    raise InstallError('새 입구를 확인하지 못했고 정리도 확인하지 못했습니다.', gateway_failure=gateway_failure('gateway_rollback_failed', False)) from cleanup_error
+            raise
 
     def destroy(self):
         p = self.p

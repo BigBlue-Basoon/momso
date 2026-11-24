@@ -42,6 +42,19 @@ def init_development(directory):
     return public
 
 
+def verify_gateway_manifest(image):
+    if not re.fullmatch(r'[a-zA-Z0-9._/-]+@sha256:[a-f0-9]{64}', image):
+        raise ValueError('gateway_image_invalid')
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0
+    result = subprocess.run(['docker', 'buildx', 'imagetools', 'inspect', image, '--raw'],
+                            stdin=subprocess.DEVNULL, capture_output=True, check=True,
+                            timeout=60, creationflags=flags)
+    manifest = json.loads(result.stdout)
+    if manifest.get('mediaType') not in ('application/vnd.oci.image.manifest.v1+json',
+                                         'application/vnd.docker.distribution.manifest.v2+json'):
+        raise ValueError('gateway_image_not_single_manifest')
+
+
 def sign(bundle, server, web, bundle_url, image, sequence, version, private_key, public_key, output, channel):
     output = Path(output).resolve()
     signature = output.with_name(output.name + '.sig')
@@ -89,11 +102,14 @@ def main():
         make.add_argument('--' + flag, required=True)
     make.add_argument('--sequence', type=int, required=True)
     make.add_argument('--channel', choices=['production', 'development'], required=True)
+    make.add_argument('--verify-gateway-registry', action='store_true')
     args = parser.parse_args()
     try:
         if args.action == 'init-development':
             init_development(args.directory)
         else:
+            if args.verify_gateway_registry:
+                verify_gateway_manifest(args.image)
             sign(args.bundle, args.server, args.web, args.bundle_url, args.image, args.sequence, args.version, args.private_key, args.public_key, args.output, args.channel)
         print('complete')
         return 0

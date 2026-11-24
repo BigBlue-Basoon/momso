@@ -11,6 +11,28 @@ class GatewayError(Exception):
     pass
 
 
+def gateway_failure(code, rolled_back=None):
+    aliases = {'gateway_unhealthy': 'gateway_probe_failed', 'gateway_health_failed': 'gateway_probe_failed',
+               'gateway_traffic_unknown': 'gateway_traffic_mismatch', 'gateway_rollback_mismatch': 'gateway_rollback_failed',
+               'gateway_restore_failed': 'gateway_rollback_failed', 'gateway_address_changed': 'gateway_address_invalid',
+               'gateway_address': 'gateway_address_invalid'}
+    code = aliases.get(code, code)
+    retryable = {'gateway_image_permission': False, 'gateway_image_invalid': False, 'gateway_image_mismatch': False,
+                 'gateway_traffic_mismatch': True, 'gateway_probe_failed': True, 'gateway_rollback_failed': False,
+                 'gateway_not_ready': True, 'gateway_operation_failed': True, 'gateway_response_invalid': True,
+                 'gateway_address_invalid': False, 'gateway_ownership': False, 'gateway_policy': False}.get(code)
+    if code not in {'gateway_image_permission', 'gateway_image_invalid', 'gateway_image_mismatch', 'gateway_traffic_mismatch',
+                    'gateway_probe_failed', 'gateway_rollback_failed', 'gateway_not_ready', 'gateway_operation_failed',
+                    'gateway_response_invalid', 'gateway_address_invalid', 'gateway_ownership', 'gateway_policy'}:
+        code = 'gateway_operation_failed'
+        retryable = None
+    if rolled_back is False:
+        retryable = False
+    elif rolled_back is None:
+        retryable = None
+    return {'code': code, 'rolledBack': rolled_back, 'retryable': retryable}
+
+
 class CloudRunGateway:
     def __init__(self, project, region, service, *, runner=subprocess.run, probe=None):
         if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project): raise ValueError("invalid_project")
@@ -93,9 +115,9 @@ class CloudRunGateway:
         for item in entries:
             percent, revision = item.get("percent", 0), item.get("revisionName")
             if percent and (type(percent) is not int or not revision or not re.fullmatch(r"[a-z0-9-]+", revision)):
-                raise GatewayError("gateway_response_invalid")
+                raise GatewayError("gateway_traffic_mismatch")
             if percent: traffic[revision] = traffic.get(revision, 0) + percent
-        if sum(traffic.values()) != 100: raise GatewayError("gateway_response_invalid")
+        if sum(traffic.values()) != 100: raise GatewayError("gateway_traffic_mismatch")
         return {"traffic": traffic}
 
     def activate(self, release, *, deploy_flags=(), first_deploy=False, probe=True):
@@ -112,7 +134,8 @@ class CloudRunGateway:
                 raise GatewayError("gateway_response_invalid")
             before = None if first_deploy else self._describe().get('status', {}).get('latestCreatedRevisionName')
             if not first_deploy and (not before or not re.fullmatch(r'[a-z0-9-]+', before)): raise GatewayError('gateway_not_ready')
-            self._run("deploy", self.service, "--image", release, "--no-traffic", *deploy_flags)
+            traffic_flags = () if first_deploy else ("--no-traffic",)
+            self._run("deploy", self.service, "--image", release, *traffic_flags, *deploy_flags)
             revision = self._describe().get("status", {}).get("latestCreatedRevisionName")
             if not revision or not re.fullmatch(r"[a-z0-9-]+", revision) or revision == before: raise GatewayError("gateway_not_ready")
             self._verify_revision(revision, release)

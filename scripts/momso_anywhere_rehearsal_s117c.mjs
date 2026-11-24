@@ -10,6 +10,7 @@ import { verifyRelease } from './momso_release_manifest.mjs';
 import { googleBrowserInventory, REQUIRED_RESOURCES } from './momso_anywhere_rehearsal_s117.mjs';
 import { cleanupTestBackup } from './momso_anywhere_test_backup_cleanup_s117.mjs';
 import { temporaryIapDiagnostics } from './momso_anywhere_rehearsal_diagnostics_s117c.mjs';
+import { deletionResult } from './momso_anywhere_deletion_contract.mjs';
 
 const STEPS = ['project', 'billing', 'services', 'privateNetwork', 'server', 'gateway', 'gatewayReady'];
 const SAFE_STEPS = new Set([...STEPS, 'invalid_arguments', 'invalid_account', 'invalid_scope', 'authorization_unavailable', 'gcloud_unavailable', 'authorization_expired', 'permission_denied', 'identity_unavailable', 'release_not_ready', 'network', 'server_not_ready', 'gateway_not_ready', 'gateway_image_mismatch', 'gateway_probe_failed', 'resource_ownership', 'project_unavailable', 'billing_not_ready', 'operation_failed', 'operation_timeout', 'interrupted_for_rehearsal']);
@@ -49,8 +50,16 @@ export async function runBrowserTrial({ projectId, installationId, protectedInst
   } catch (error) {
     result.failure = SAFE_STEPS.has(error?.step) ? error.step : 'operation_failed';
   } finally {
-    try { const value = await destroy(ctx); result.cleanup = Array.isArray(value?.remaining) && !value.remaining.length ? 'passed' : 'incomplete'; } catch { result.cleanup = 'failed'; }
-    try { result.backupCleanup = await backupCleanup(ctx); } catch { result.backupCleanup = 'unknown'; }
+    let deletion = null;
+    try {
+      deletion = await destroy(ctx);
+      if (deletion?.outcome) {
+        result.cleanup = ['deleted', 'deleted_unverified'].includes(deletion.outcome) ? 'passed' : deletion.outcome === 'failed' ? 'failed' : 'incomplete';
+        result.unverified = deletion.unverified ?? [];
+      } else result.cleanup = Array.isArray(deletion?.remaining) && !deletion.remaining.length && (deletion.mode !== 'delete_all' || deletion.status === 'complete') ? 'passed' : 'incomplete';
+    } catch { result.cleanup = 'failed'; }
+    if (deletion?.mode === 'delete_all') result.backupCleanup = deletion;
+    else if (deletion) try { result.backupCleanup = await backupCleanup(ctx); } catch { result.backupCleanup = 'unknown'; }
     try { result.resources = await inventory(ctx); } catch { result.resources = {}; }
   }
   return result;
@@ -193,7 +202,7 @@ export async function verifyBrowserInstallation({ projectId, installationId, pro
   return result;
 }
 
-export async function cleanupBackup({ projectId, installationId, protectedInstallationIds = [] }, token, fetchImpl) {
+export async function cleanupBackup({ projectId, installationId, protectedInstallationIds = [] }, token, fetchImpl, sleep) {
   validateScope(projectId, installationId, protectedInstallationIds);
   const short = installationId.slice(0, 12);
   const bucket = `https://storage.googleapis.com/storage/v1/b/momso-backup-${short}`;
@@ -201,14 +210,28 @@ export async function cleanupBackup({ projectId, installationId, protectedInstal
   const probe = await api(bucket);
   if (probe.status === 404) return 'unknown'; // A 404 can conceal permissions.
   if (!probe.ok) return 'unknown';
-  const request = async (method, url) => {
+  const request = async (method, url, body) => {
     const target = new URL(url);
     if (!['storage.googleapis.com', 'cloudkms.googleapis.com'].includes(target.hostname) || target.protocol !== 'https:' || target.username || target.password || target.hash) throw new Error('invalid_scope');
-    const response = await api(url, { method });
+    const response = await api(url, { method, ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}) });
     if (!response.ok) throw new Error('cleanup_unavailable');
     return response.status === 204 ? {} : response.json();
   };
-  const value = await cleanupTestBackup({ projectId, installationId, protectedIds: protectedInstallationIds, verifyFresh: async ctx => ctx.projectId === projectId && ctx.installationId === installationId, request });
+  const value = await cleanupTestBackup({ projectId, installationId, protectedIds: protectedInstallationIds, verifyFresh: async ctx => ctx.projectId === projectId && ctx.installationId === installationId, request, sleep });
+  // The ordinary pause path deliberately retains the vault identity. Only this
+  // freshly generated disposable trial may remove it after backup deletion.
+  value.vault = 'unverified';
+  try {
+    const secret = `https://secretmanager.googleapis.com/v1/projects/${projectId}/secrets/momso-vault-${short}`;
+    const response = await api(secret);
+    if (response.ok) {
+      const metadata = await response.json();
+      if (metadata.name === `projects/${projectId}/secrets/momso-vault-${short}` && metadata.labels?.['momso-install-id'] === installationId && typeof metadata.etag === 'string' && metadata.etag) {
+        const removed = await api(`${secret}?etag=${encodeURIComponent(metadata.etag)}`, { method: 'DELETE' });
+        if (removed.ok) value.vault = 'delete_requested';
+      }
+    }
+  } catch { /* missing permission is not proof of deletion */ }
   try {
     const path = `https://cloudkms.googleapis.com/v1/projects/${projectId}/locations/asia-northeast3/keyRings/momso-backup-${short}/cryptoKeys/backup/cryptoKeyVersions`;
     const versions = await request('GET', path);
@@ -220,6 +243,11 @@ export async function cleanupBackup({ projectId, installationId, protectedInstal
       return { state: ['ENABLED', 'DISABLED', 'DESTROY_SCHEDULED', 'DESTROYED'].includes(state) ? state : 'unknown', billing, until };
     });
   } catch { value.keyVersions = [{ state: 'unknown', billing: 'unknown', until: null }]; }
+  value.deletion = deletionResult({ mode: 'delete_all', inventoryComplete: false,
+    resources: { bucket: { status: 'unverified', reason: 'soft_delete_not_verified' },
+      kms: { status: 'retained', reason: 'keyring_pending' },
+      secrets: { status: value.vault === 'delete_requested' ? 'unverified' : 'retained', reason: 'vault_delete_not_verified' } },
+    billable: value.keyVersions.filter(item => item.billing === 'billable').map(item => ({ resource: 'kms', endsAt: item.until })) });
   return value;
 }
 
@@ -242,11 +270,11 @@ export async function executeBrowserRehearsal({ account, projectId, installation
     const signed = await verifyRelease(release, { fetchImpl, cryptoImpl: webcrypto });
     const progress = event => { if (STEPS.includes(event?.step) && ['working', 'done', 'failed'].includes(event?.state)) onProgress({ step: event.step, state: event.state }); };
     const start = async (_ctx, inject) => startFromGesture({ ...options, projectId, onProgress: progress, authorize: async () => ({ ownerSub: identity.ownerSub, provider: inject ? interrupted : identity.provider }) });
-    const destroy = async ctx => { validateScope(ctx.projectId, ctx.installationId, protectedInstallationIds); return destroyFromGesture({ ...options, projectId: ctx.projectId, installationId: ctx.installationId }); };
+    const destroy = async ctx => { validateScope(ctx.projectId, ctx.installationId, protectedInstallationIds); return destroyFromGesture({ ...options, projectId: ctx.projectId, installationId: ctx.installationId, discardData: true }); };
     return await runBrowserTrial({ projectId, installationId, protectedInstallationIds, start, destroy,
       verify: ctx => verifyBrowserInstallation({ ...ctx, protectedInstallationIds }, { account, token, signed, fetchImpl }),
       inventory: ctx => googleBrowserInventory(ctx, { token, fetchImpl }),
-      backupCleanup: ctx => cleanupBackup({ ...ctx, protectedInstallationIds }, token, fetchImpl), onProgress: progress });
+      onProgress: progress });
   } finally { clearStartAuthorization(); }
 }
 
@@ -281,9 +309,13 @@ async function main() {
       onProgress: value => console.log(JSON.stringify(value)) });
     console.log('설치 ID:', result.installationId);
     console.log('중단·이어하기:', result.interruption, result.resume, '확인:', JSON.stringify(result.checks), '삭제:', result.cleanup);
+    if (result.unverified?.length) console.log('삭제 후 미확인:', result.unverified.join(', '));
     for (const kind of REQUIRED_RESOURCES) console.log(kind + ':', ({ present: '남음', absent: '없음', unknown: '미확인' })[result.resources?.[kind] ?? 'unknown']);
     console.log('백업:', JSON.stringify(result.backupCleanup));
-    if (result.failure || result.cleanup !== 'passed' || Object.values(result.resources).some(value => value !== 'absent')) process.exitCode = 1;
+    const charges = result.backupCleanup?.billable ?? [];
+    const unscheduled = Object.entries(result.resources).some(([kind, value]) => value === 'present' &&
+      !(['bucket', 'kms'].includes(kind) && charges.some(item => item.resource === kind) && charges.filter(item => item.resource === kind).every(item => typeof item.endsAt === 'string' && Number.isFinite(Date.parse(item.endsAt)))));
+    if (result.failure || result.cleanup !== 'passed' || unscheduled) process.exitCode = 1;
   } catch (error) {
     const reason = SAFE_STEPS.has(error?.step) ? error.step : SAFE_STEPS.has(error?.message) ? error.message : 'unverified';
     process.stderr.write(`실패: ${reason}\n`);

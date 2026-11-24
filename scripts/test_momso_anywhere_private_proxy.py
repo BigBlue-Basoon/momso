@@ -46,6 +46,12 @@ class Tests(unittest.TestCase):
                             self.assertEqual(json.loads(body), {"state": "installing", "reason": None})
                             self.assertEqual(response.getheader("Cache-Control"), "no-store")
                         conn.close()
+                    statusfile.write_text(json.dumps({'state': 'failed', 'reason': 'gateway_probe_failed', 'code': 'gateway_probe_failed', 'rolledBack': True, 'retryable': True}), encoding='utf-8')
+                    conn = http.client.HTTPConnection('127.0.0.1', proxy.server_address[1])
+                    conn.request('GET', '/update/status', headers={'Authorization': 'Bearer fixture-proxy-token'})
+                    response = conn.getresponse()
+                    self.assertEqual(json.loads(response.read()), {'state': 'failed', 'reason': 'gateway_probe_failed', 'code': 'gateway_probe_failed', 'rolledBack': True, 'retryable': True})
+                    conn.close()
             finally:
                 proxy.shutdown(); proxy.server_close(); thread.join(2)
 

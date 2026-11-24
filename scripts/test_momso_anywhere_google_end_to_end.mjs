@@ -144,9 +144,14 @@ for (const [existing, channel] of [[false, 'production'], [true, 'production'], 
     }
   }
   const removal = new GoogleBrowserProvider('fixture-private-token', { fetchImpl, sleep: async () => {}, projectId });
-  assert.deepEqual(await removal.destroy(id), { remaining: [] });
+  assert.deepEqual(await removal.destroy(id), { remaining: [], mode: 'pause', status: 'backup_freshness_unverified', retained: [
+    { resource: 'secret_vault', status: 'retained', reason: 'backup_recovery' },
+    { resource: 'backup_bucket', status: 'unverified', reason: 'not_inspected' },
+    { resource: 'backup_kms', status: 'unverified', reason: 'not_inspected' },
+  ], billingZero: null });
   assert.equal(resources.size, 0);
-  assert.equal(secrets.size, 0);
+  assert.equal(secrets.size, 1);
+  assert(secrets.has(`momso-vault-${short}`), 'pause must retain the vault identity');
   assert.equal(accounts.size, 0);
   assert.equal(roles.size, 0);
   assert.equal(service, null);

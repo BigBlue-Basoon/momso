@@ -10,6 +10,12 @@ from pathlib import Path
 
 SESSION_SECONDS = 30 * 24 * 60 * 60
 
+
+class AuthenticationError(ValueError):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
 def _key():
     value = Path(os.environ["MOMSO_SESSION_KEY_FILE"]).read_bytes().strip()
     if len(value) < 32:
@@ -39,7 +45,7 @@ def _verify(kind, value, max_age, now=None):
             return None
         payload = json.loads(_unb64(encoded))
         now = int(time.time() if now is None else now)
-        if not isinstance(payload, dict) or not isinstance(payload.get("iat"), int) or not 0 <= now - payload["iat"] <= max_age:
+        if not isinstance(payload, dict) or type(payload.get("iat")) is not int or now < payload["iat"] or (max_age is not None and now - payload["iat"] > max_age):
             return None
         return payload
     except (ValueError, TypeError, KeyError, OSError, json.JSONDecodeError):
@@ -64,11 +70,24 @@ def finish(state, cookie_state, credential, origin, verifier=verify_google):
         raise ValueError("invalid challenge")
     claims = verifier(credential, os.environ["MOMSO_GOOGLE_CLIENT_ID"])
     expected_nonce = _b64(hashlib.sha256(state.encode()).digest())
-    if claims.get("sub") != os.environ["MOMSO_OWNER_SUB"] or not hmac.compare_digest(claims.get("nonce", ""), expected_nonce):
-        raise ValueError("identity mismatch")
+    if not hmac.compare_digest(claims.get("nonce", ""), expected_nonce):
+        raise AuthenticationError('login_failed')
+    if claims.get("sub") != os.environ["MOMSO_OWNER_SUB"]:
+        raise AuthenticationError('not_owner')
     return _sign("session", {"iat": int(time.time()), "sub": claims["sub"]})
 
 
 def valid_session(value):
     payload = _verify("session", value, SESSION_SECONDS)
     return bool(payload and payload.get("sub") == os.environ.get("MOMSO_OWNER_SUB"))
+
+
+def session_rejection(value):
+    payload = _verify('session', value, None)
+    if not payload:
+        return 'login_required'
+    if payload.get('sub') != os.environ.get('MOMSO_OWNER_SUB'):
+        return 'not_owner'
+    if int(time.time()) - payload['iat'] > SESSION_SECONDS:
+        return 'session_expired'
+    return 'login_required'

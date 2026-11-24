@@ -58,6 +58,27 @@ test('failure before retry still invokes destruction and inventory', async () =>
   assert(!JSON.stringify(result).includes('fixture-private'));
 });
 
+test('failed destruction never invokes the legacy backup cleanup', async () => {
+  let backupCalled = false;
+  const result = await runBrowserTrial({ projectId, installationId,
+    start: async () => { throw new Error('fixture'); }, verify: async () => ({}),
+    destroy: async () => { throw new Error('vm_unconfirmed'); },
+    backupCleanup: async () => { backupCalled = true; }, inventory: async () => ({}) });
+  assert.equal(result.cleanup, 'failed');
+  assert.equal(backupCalled, false);
+});
+
+test('deletion outcomes preserve unverified evidence and do not pass remaining or failed', async () => {
+  for (const [outcome, expected] of [['deleted', 'passed'], ['deleted_unverified', 'passed'], ['remaining', 'incomplete'], ['failed', 'failed']]) {
+    const result = await runBrowserTrial({ projectId, installationId,
+      start: async (_ctx, interrupt) => { if (interrupt) throw Object.assign(new Error('fixture'), { step: 'gateway' }); },
+      verify: async () => ({ traffic_digest: 'passed', public_https: 'passed', vm_services: 'passed', update_status: 'passed' }),
+      destroy: async () => ({ mode: 'delete_all', outcome, unverified: outcome === 'deleted_unverified' ? ['iam'] : [] }), inventory: async () => ({}) });
+    assert.equal(result.cleanup, expected);
+    if (outcome === 'deleted_unverified') assert.deepEqual(result.unverified, ['iam']);
+  }
+});
+
 test('interruption adapter delegates actual bound methods', async () => {
   const steps = ['project', 'billing', 'services', 'privateNetwork', 'server', 'gateway', 'gatewayReady'];
   const original = { value: 'same', preflight() {}, gatewayUrl() { return this.value; } };
@@ -131,6 +152,7 @@ test('actual gesture modules retry and invoke destroy with a fake provider', asy
     async preflight() {}, gatewayUrl() { return 'https://fixture.run.app'; },
     async projects() { return [{ projectId }]; },
     async destroy(id) { calls.push(['destroy', id]); return { remaining: [] }; },
+    async discardBackup(id) { calls.push(['backup', id]); return { mode: 'delete_all', resources: { bucket: { status: 'deleted' }, kms: { status: 'deleted' }, secret_vault: { status: 'deleted' } }, billable: [], billingZero: null }; },
   };
   for (const step of steps) provider[step] = async id => { calls.push([step, id]); };
   const providerFactory = async () => ({ ownerSub: '123456', provider });
@@ -146,6 +168,34 @@ test('actual gesture modules retry and invoke destroy with a fake provider', asy
   assert.equal(result.failure, 'verification_incomplete');
   assert.equal(calls.filter(([step]) => step === 'project').length, 2);
   assert.equal(calls.filter(([step]) => step === 'gateway').length, 1);
-  assert.deepEqual(calls.at(-1), ['destroy', installationId]);
+  assert.deepEqual(calls.slice(-2), [['destroy', installationId], ['backup', installationId]]);
+  assert.equal(result.backupCleanup.mode, 'delete_all');
   assert(calls.every(([, id]) => id === installationId));
+});
+
+test('disposable rehearsal removes its retained vault only after backup cleanup', async () => {
+  const short = installationId.slice(0, 12), ring = `projects/${projectId}/locations/asia-northeast3/keyRings/momso-backup-${short}`;
+  const version = `${ring}/cryptoKeys/backup/cryptoKeyVersions/1`, calls = [];
+  const reply = value => new Response(JSON.stringify(value), { status: 200 });
+  const fake = async (raw, options = {}) => {
+    const url = new URL(raw), method = options.method ?? 'GET'; calls.push([method, url.pathname]);
+    if (url.hostname === 'secretmanager.googleapis.com') {
+      if (method === 'DELETE') return reply({});
+      return reply({ name: `projects/${projectId}/secrets/momso-vault-${short}`, labels: { 'momso-install-id': installationId }, etag: 'fixture-etag' });
+    }
+    if (method === 'POST') return reply({ name: version, state: 'DESTROY_SCHEDULED' });
+    if (method === 'DELETE') return reply({});
+    if (url.pathname.endsWith('/cryptoKeyVersions')) return reply({ cryptoKeyVersions: [{ name: version, state: 'DESTROY_SCHEDULED', destroyTime: '2026-12-24T00:00:00Z' }] });
+    if (url.pathname.endsWith('/cryptoKeys')) return reply({ cryptoKeys: [{ name: `${ring}/cryptoKeys/backup`, labels: { 'momso-install-id': installationId }, purpose: 'ENCRYPT_DECRYPT' }] });
+    if (url.pathname.endsWith('/o')) return reply({ items: [] });
+    return reply({ name: `momso-backup-${short}`, labels: { 'momso-install-id': installationId }, metageneration: '2', softDeletePolicy: { retentionDurationSeconds: '0' } });
+  };
+  const result = await cleanupBackup({ projectId, installationId }, 'fixture-token', fake, async () => {});
+  assert.equal(result.vault, 'delete_requested');
+  assert.equal(result.keyVersions[0].billing, 'billable');
+  assert.equal(result.deletion.mode, 'delete_all');
+  assert.equal(result.deletion.billingZero, null);
+  const bucketDelete = calls.findIndex(([method, path]) => method === 'DELETE' && path.includes('/storage/v1/b/'));
+  const vaultDelete = calls.findIndex(([method, path]) => method === 'DELETE' && path.includes('/secrets/momso-vault-'));
+  assert(bucketDelete >= 0 && vaultDelete > bucketDelete);
 });

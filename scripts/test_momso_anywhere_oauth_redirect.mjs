@@ -17,6 +17,12 @@ test('capture removes fragment immediately and only retains it in module memory'
   assert.equal(result.status, 0, result.stderr);
 });
 
+test('pause fragment is removed from the address before screen code runs', () => {
+  const source = `globalThis.window={location:{hash:'#pause_ticket=fixture',pathname:'/start/',search:''},history:{replaceState(_a,_b,p){globalThis.cleaned=p}}}; const m=await import('./scripts/momso_anywhere_oauth_capture.mjs'); if(cleaned!=='/start/'||m.takeOAuthFragment()!=='#pause_ticket=fixture'||m.takeOAuthFragment()!=='')process.exit(1);`;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test('whole-page Google redirect validates state and retains token only in memory', () => {
   const storage = memory();
   const location = { href: 'https://login.example.test/start/', assign(url) { this.next = url; } };
@@ -129,16 +135,18 @@ test('the cached token expires before the next gesture and redirects only then',
   assert(!JSON.stringify([...session.data, ...storage.data]).includes('fixture-token'));
 });
 
-test('find and destroy reuse authorization without leaking it to storage', async () => {
+test('destroy is blocked before provider mutation when backup freshness is unverified', async () => {
   const session = memory(), storage = memory();
   const location = { href: 'https://login.example.test/start/', origin: 'https://login.example.test', calls: 0, assign(url) { this.next = url; this.calls++; } };
-  const providerFactory = async () => ({ provider: { projects: async () => [], findExisting: async () => ['https://fixture.run.app'], destroy: async () => ({ remaining: [] }) }, ownerSub: '12345' });
+  let deletions = 0;
+  const providerFactory = async () => ({ provider: { projects: async () => [], findExisting: async () => ['https://fixture.run.app'], destroy: async () => { deletions++; return { remaining: [] }; } }, ownerSub: '12345' });
   const base = { clientId, release: {}, session, storage, location, cryptoImpl: webcrypto, providerFactory };
   await projectsFromGesture(base);
   const fragment = new URLSearchParams({ state: new URL(location.next).searchParams.get('state'), access_token: 'fixture-token', token_type: 'Bearer', expires_in: '60', scope: scopes }).toString();
   await resumeAfterRedirect({ ...base, fragment });
   assert.deepEqual(await findFromGesture(base), ['https://fixture.run.app']);
-  assert.deepEqual(await destroyFromGesture({ ...base, projectId: 'fixture-project', installationId: 'a'.repeat(24) }), { remaining: [] });
+  assert.equal((await destroyFromGesture({ ...base, projectId: 'fixture-project', installationId: 'a'.repeat(24) })).reason, 'pause_requires_app_session');
+  assert.equal(deletions, 0);
   assert.equal(location.calls, 1);
   assert(!JSON.stringify([...session.data, ...storage.data]).includes('fixture-token'));
 });

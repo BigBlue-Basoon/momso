@@ -6,6 +6,8 @@ import io
 import json
 import os
 import pathlib
+import sqlite3
+from contextlib import closing
 import subprocess
 import tarfile
 import tempfile
@@ -113,6 +115,58 @@ class FlowTests(unittest.TestCase):
         self.update_install = patch.object(momso_anywhere_update_install, "install")
         self.update_grant_mock = self.update_grant.start(); self.addCleanup(self.update_grant.stop)
         self.update_install_mock = self.update_install.start(); self.addCleanup(self.update_install.stop)
+
+    def test_anywhere_destroy_stops_before_cloud_calls_when_backup_is_unverified(self):
+        self.state['anywhere'] = {'url': 'https://fixture.example.test'}
+        installer.save_state(self.path, self.state)
+        before = self.path.read_bytes()
+        with patch.object(installer, 'GoogleProvider') as provider, patch('momso_anywhere_pc_pause.guarded_destroy', side_effect=installer.InstallError('backup_freshness_unverified')) as guarded, patch('sys.stderr', new_callable=io.StringIO) as error:
+            result = installer.main(['destroy', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path)])
+        self.assertEqual(result, 1)
+        self.assertIn('backup_freshness_unverified', error.getvalue())
+        provider.assert_called_once()
+        guarded.assert_called_once()
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_gateway_failure_prints_machine_json_and_human_message(self):
+        detail = {'code': 'gateway_probe_failed', 'rolledBack': True, 'retryable': True}
+        error = installer.InstallError('fixture failure', gateway_failure=detail)
+        with patch.object(installer, 'validate_installer_files', side_effect=error), patch('sys.stdout', new_callable=io.StringIO) as out, patch('sys.stderr', new_callable=io.StringIO) as err:
+            result = installer.main(['anywhere', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path)])
+        self.assertEqual(result, 1)
+        self.assertEqual(json.loads(out.getvalue()), detail)
+        self.assertIn('fixture failure', err.getvalue())
+
+    def test_discard_data_skips_pause_guard_and_reports_pending_cleanup(self):
+        import momso_anywhere_install
+        import momso_anywhere_pc_discard
+        self.state['anywhere'] = {'url': 'https://fixture.example.test'}
+        installer.save_state(self.path, self.state)
+        provider = FakeProvider()
+        verdict = {'mode': 'delete_all', 'resources': {'bucket': {'status': 'unverified'}}, 'billable': [], 'billingZero': None, 'estimatedZeroAt': None}
+        with patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch.object(momso_anywhere_pc_discard, 'discard_backup', return_value=verdict) as cleanup, patch('momso_anywhere_pc_pause.guarded_destroy') as guard, patch('sys.stdout', new_callable=io.StringIO) as output:
+            result = installer.main(['destroy', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--discard-data'])
+        self.assertEqual(result, 0)
+        guard.assert_not_called()
+        cleanup.assert_called_once_with(provider, None)
+        gateway.return_value.destroy.assert_called_once()
+        actual = json.loads(output.getvalue())
+        self.assertEqual(actual['outcome'], 'deleted_unverified')
+        self.assertIn('bucket', actual['unverified'])
+        self.assertEqual(json.loads(self.path.read_text(encoding='utf-8'))['steps']['destroy'], 'ok')
+
+    def test_failed_destroy_keeps_previously_known_billing_deadline(self):
+        import momso_anywhere_install
+        self.state['anywhere'] = {'url': 'https://fixture.example.test'}
+        self.state['backup_discard'] = {'billable': [{'resource': 'kms', 'endsAt': '2030-01-01T00:00:00Z'}]}
+        installer.save_state(self.path, self.state)
+        with patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch('sys.stdout', new_callable=io.StringIO) as out, patch('sys.stderr', new_callable=io.StringIO):
+            gateway.return_value.destroy.side_effect = installer.InstallError('vm_unreachable')
+            result = installer.main(['destroy', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--discard-data'])
+        self.assertEqual(result, 1)
+        actual = json.loads(out.getvalue())
+        self.assertEqual(actual['outcome'], 'failed')
+        self.assertEqual(actual['billable'], self.state['backup_discard']['billable'])
 
     def test_success_retry_and_destroy(self):
         provider = FakeProvider()
@@ -563,6 +617,7 @@ class FlowTests(unittest.TestCase):
             with self.assertRaisesRegex(installer.InstallError, "되돌렸습니다"):
                 installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, "client", "12345", "https://login.example.test", "registry.example.test/momso/gateway@sha256:" + "a" * 64)
         self.assertEqual([call for call in provider.calls if call[0] == "checkpoint"], [("checkpoint", "begin"), ("checkpoint", "restore"), ("checkpoint", "finish")])
+
         self.assertEqual(len(health_calls), 2)
         upgrade_gateway.assert_not_called()
         self.assertEqual([call for call in provider.calls if call[0] == "private_proxy"], [("private_proxy",)])
@@ -573,6 +628,13 @@ class FlowTests(unittest.TestCase):
             with self.assertRaisesRegex(installer.InstallError, "되돌렸습니다"):
                 installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, "client", "12345", "https://login.example.test", "registry.example.test/momso/gateway@sha256:" + "a" * 64)
         self.assertEqual([call for call in provider.calls if call[0] == "checkpoint"], [("checkpoint", "begin"), ("checkpoint", "restore"), ("checkpoint", "finish")])
+
+        detail = {'code': 'gateway_probe_failed', 'rolledBack': True, 'retryable': True}
+        provider.ensure_private_proxy = lambda: (_ for _ in ()).throw(installer.InstallError('proxy failure'))
+        with patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, '_objects', return_value=({'name': 'account'}, {'name': 'role'}, {'name': 'service'})), patch.object(momso_anywhere_install.GoogleAnywhere, 'upgrade_gateway', side_effect=installer.InstallError('gateway failure', gateway_failure=detail)), patch('momso_anywhere_vm_services.install'):
+            with self.assertRaises(installer.InstallError) as error:
+                installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, 'client', '12345', 'https://login.example.test', 'registry.example.test/momso/gateway@sha256:' + 'a' * 64)
+        self.assertEqual(error.exception.gateway_failure, {**detail, 'retryable': False})
 
     def test_existing_anywhere_command_uses_upgrade_path(self):
         import momso_anywhere_public_assets
@@ -661,7 +723,10 @@ class FlowTests(unittest.TestCase):
         config = self.root / "server.env"
         data = self.root / "data"
         data.mkdir()
-        (data / "database.sqlite").write_text("old database")
+        with closing(sqlite3.connect(data / "database.sqlite")) as db, db:
+            db.execute('CREATE TABLE lesson (name TEXT)')
+            db.execute("INSERT INTO lesson VALUES ('fixture')")
+            db.execute('PRAGMA user_version = 1')
         (data / "vault.age").write_text("old vault")
         (data / "archive").mkdir()
         (data / "archive" / "lesson.md").write_text("old archive")
@@ -672,16 +737,27 @@ class FlowTests(unittest.TestCase):
             if req.full_url.endswith("/activity"):
                 return BytesIO(json.dumps({"maintenance": False, "quiescent": True, "maintenanceReady": readiness[0], "maintenanceReason": None if readiness[0] else "backup_not_integrated"}).encode())
             return BytesIO(b'{"maintenance":true}' if req.full_url.endswith("/maintenance") else b'{"maintenance":false}')
-        def run(action):
+        commands = []
+        def run(action, fail_restore=False, fail_after_pair=False, fail_helper=False, move_data=False):
             with patch.object(provider, "ssh", return_value=b"momso_checkpoint_ok") as ssh:
                 provider.upgrade_checkpoint(action)
             tree = ast.parse(ssh.call_args.args[0])
             encoded = next(node.args[0].value for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "b64decode")
             payload = base64.b64decode(encoded).decode().replace("root='/opt/momso'", "root=" + repr(str(root))).replace("env='/etc/momso-server.env'", "env=" + repr(str(config)))
+            if fail_restore:
+                failure = "os.rename(data,data+'-moved');raise RuntimeError('fixture restore failure')" if move_data else "raise RuntimeError('fixture restore failure')"
+                payload = payload.replace("DataSnapshots(data,backup+'/snapshots').restore(backup+'/snapshots/'+name)", failure)
+            if fail_after_pair:
+                payload = payload.replace("restored_pair=True", "restored_pair=True\n raise RuntimeError('fixture web restore failure')")
+            if fail_helper:
+                payload = payload.replace("try:managed['rollback'](path,manifest,journal,", "try:(_ for _ in ()).throw(RuntimeError('fixture helper failure')) # ")
             ast.parse(payload, feature_version=(3, 11))
             import sys
             fcntl_stub = SimpleNamespace(LOCK_EX=2, LOCK_NB=4, flock=lambda *_: None)
-            with patch.object(subprocess, "run", return_value=SimpleNamespace(returncode=0)), patch("urllib.request.urlopen", side_effect=response), patch.dict(sys.modules, {"fcntl": fcntl_stub}), patch.object(os, "O_NOFOLLOW", 0, create=True), patch.object(os, "chown", lambda *_, **__: None, create=True), patch.object(os, "fchown", lambda *_: None, create=True):
+            def process(args, **kwargs):
+                commands.append(args)
+                return SimpleNamespace(returncode=0)
+            with patch.object(subprocess, "run", side_effect=process), patch("urllib.request.urlopen", side_effect=response), patch.dict(sys.modules, {"fcntl": fcntl_stub}), patch.object(os, "O_NOFOLLOW", 0, create=True), patch.object(os, "chown", lambda *_, **__: None, create=True), patch.object(os, "fchown", lambda *_: None, create=True):
                 context = {}
                 try:
                     exec(compile(payload, "fixture", "exec"), context)
@@ -692,14 +768,33 @@ class FlowTests(unittest.TestCase):
         run("begin")
         (root / "momso-server").write_text("bad server")
         (web / "index.html").write_text("bad screen")
-        (data / "database.sqlite").write_text("new migrated database")
+        with closing(sqlite3.connect(data / "database.sqlite")) as db, db:
+            db.execute('ALTER TABLE lesson ADD COLUMN new_field TEXT')
+            db.execute('PRAGMA user_version = 2')
         (data / "vault.age").write_text("new vault")
         (data / "archive" / "lesson.md").write_text("new archive")
+        with self.assertRaisesRegex(RuntimeError, 'fixture restore failure'):
+            run('restore', fail_restore=True)
+        self.assertIn(['systemctl', 'start', 'momso-server'], commands[-2:])
+        with self.assertRaisesRegex(RuntimeError, 'fixture restore failure'):
+            run('restore', fail_restore=True, move_data=True)
+        self.assertEqual(commands[-1], ['systemctl', 'stop', 'momso-server'])
+        os.rename(str(data) + '-moved', data)
+        self.assertTrue((root / '.momso-upgrade-backup').exists())
+        with self.assertRaisesRegex(RuntimeError, 'fixture web restore failure'):
+            run('restore', fail_after_pair=True)
+        self.assertIn(['systemctl', 'start', 'momso-server'], commands[-2:])
+        with self.assertRaisesRegex(RuntimeError, 'rollback_failed'):
+            run('restore', fail_helper=True)
+        self.assertIn(['systemctl', 'start', 'momso-server'], commands[-3:])
         run("restore")
         self.assertEqual((root / "momso-server").read_text(), "old server")
         self.assertEqual((web / "index.html").read_text(), "old screen")
         self.assertEqual((root / "other-failed-file").read_text(), "preserve")
-        self.assertEqual((data / "database.sqlite").read_text(), "old database")
+        with closing(sqlite3.connect(data / "database.sqlite")) as db:
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 1)
+            self.assertEqual(db.execute('SELECT name FROM lesson').fetchall(), [('fixture',)])
+            self.assertEqual([row[1] for row in db.execute('PRAGMA table_info(lesson)')], ['name'])
         self.assertEqual((data / "vault.age").read_text(), "old vault")
         self.assertEqual((data / "archive" / "lesson.md").read_text(), "old archive")
         run("finish")

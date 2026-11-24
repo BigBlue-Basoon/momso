@@ -257,6 +257,7 @@ test('gateway provisions pinned image and secrets privately before opening its a
       if (url.includes('/revisions/')) return response({ conditions: [{ type: 'Ready', state: 'CONDITION_SUCCEEDED', revisionReason: 'RETIRED' }], containers: [{ image: service.template.containers[0].image }] });
       if (method === 'POST') {
         const body = JSON.parse(options.body);
+        assert.equal(body.traffic, undefined, 'first create must use Cloud Run default traffic');
         actions.push({ type: 'create', value: body.invokerIamDisabled });
         service = { ...body, name: `projects/${projectId}/locations/asia-northeast3/services/momso-any-${id.slice(0, 12)}`, uri: 'https://fixture.a.run.app', etag: 'fixture', terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'fixture-rev-1', latestCreatedRevision: 'fixture-rev-1', trafficStatuses: [{ revision: 'fixture-rev-1', percent: 100 }] };
         return response({ name: `projects/${projectId}/locations/asia-northeast3/operations/fixture` });

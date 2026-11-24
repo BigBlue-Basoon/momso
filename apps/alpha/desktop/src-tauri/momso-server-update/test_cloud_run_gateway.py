@@ -22,6 +22,19 @@ class FakeCloudRun:
 
 
 class CloudRunTests(unittest.TestCase):
+    def test_first_deploy_does_not_use_no_traffic(self):
+        fake = FakeCloudRun()
+        def fresh(command, **kwargs):
+            if 'deploy' in command and '--no-traffic' in command:
+                return subprocess.CompletedProcess(command, 1, b'', b'--no-traffic not supported when creating a new service')
+            if 'deploy' in command:
+                fake.traffic = {'service-new': 100}
+            return fake(command, **kwargs)
+        gateway = CloudRunGateway('fixture-project', 'asia-northeast3', 'fixture-gateway', runner=fresh, probe=lambda _: None)
+        gateway.activate('ghcr.io/example/gateway@sha256:' + '2' * 64, first_deploy=True)
+        self.assertEqual(fake.traffic, {'service-new': 100})
+        self.assertFalse(any('--no-traffic' in call for call in fake.calls if 'deploy' in call))
+
     def test_stale_latest_created_revision_cannot_be_promoted(self):
         fake = FakeCloudRun()
         def runner(command, **kwargs):
@@ -45,6 +58,19 @@ class CloudRunTests(unittest.TestCase):
             gateway.activate('ghcr.io/example/momso-gateway@sha256:' + '2' * 64)
         self.assertEqual(fake.traffic, {'service-old': 100})
         self.assertFalse(any('update-traffic' in command for command in fake.calls))
+
+    def test_cloud_run_cached_repository_keeps_digest(self):
+        fake = FakeCloudRun()
+        def cached(command, **kwargs):
+            result = fake(command, **kwargs)
+            if 'revisions' in command and 'describe' in command:
+                value = json.loads(result.stdout)
+                value['status']['imageDigest'] = 'cache.region-docker.pkg.dev/' + value['status']['imageDigest']
+                return subprocess.CompletedProcess(command, 0, json.dumps(value).encode(), b'')
+            return result
+        gateway = CloudRunGateway('fixture-project', 'asia-northeast3', 'fixture-gateway', runner=cached, probe=lambda _: None)
+        gateway.activate('ghcr.io/example/gateway@sha256:' + '2' * 64)
+        self.assertEqual(fake.traffic, {'service-new': 100})
 
     def test_stale_pinned_traffic_is_not_reported_as_success(self):
         fake = FakeCloudRun(); fake.ignore_traffic = True

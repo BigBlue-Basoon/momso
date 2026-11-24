@@ -16,3 +16,8 @@ class ProgressStatusTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "invalid_progress"):
                 progress({"state": "failed", "reason": "/private/path"})
             self.assertEqual(json.loads(path.read_text())["state"], "installing")
+            event = {'state': 'failed', 'reason': 'gateway_probe_failed', 'code': 'gateway_probe_failed', 'rolledBack': True, 'retryable': True}
+            progress(event)
+            self.assertEqual(json.loads(path.read_text()), event)
+            with self.assertRaisesRegex(ValueError, 'invalid_progress'):
+                progress({**event, 'rolledBack': 1})

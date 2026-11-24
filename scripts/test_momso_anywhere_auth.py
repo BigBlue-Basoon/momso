@@ -55,6 +55,11 @@ class Tests(unittest.TestCase):
             self.assertTrue(auth.valid_session(session))
         with patch.object(auth.time, "time", return_value=1001 + auth.SESSION_SECONDS):
             self.assertFalse(auth.valid_session(session))
+            self.assertEqual(auth.session_rejection(session), 'session_expired')
+        with patch.object(auth.time, 'time', return_value=1001):
+            other = auth._sign('session', {'iat': 1000, 'sub': 'other'})
+            self.assertEqual(auth.session_rejection(other), 'not_owner')
+            self.assertEqual(auth.session_rejection(session + 'x'), 'login_required')
 
     def test_manifest_and_icons_are_public_but_other_files_are_not(self):
         public = Path(self.tmp.name) / "public"
@@ -107,7 +112,15 @@ class Tests(unittest.TestCase):
                     return client, response, data
                 client, response, _ = request("GET", "/chats")
                 self.assertEqual(response.status, 401)
+                self.assertEqual(response.getheader('X-Momso-Response'), 'gateway')
                 client.close()
+                with patch.object(auth.time, 'time', return_value=1000):
+                    expired = auth._sign('session', {'iat': 1000, 'sub': 'fixture-owner'})
+                with patch.object(auth.time, 'time', return_value=1001 + auth.SESSION_SECONDS):
+                    client, response, data = request('GET', '/chats', headers={'Cookie': '__Host-momso-session=' + expired})
+                    self.assertEqual((response.status, json.loads(data)['error']), (401, 'session_expired'))
+                    self.assertEqual(response.getheader('X-Momso-Response'), 'gateway')
+                    client.close()
                 client, response, data = request("GET", "/__momso/auth/challenge")
                 state = json.loads(data)["state"]
                 challenge_cookie = response.getheader("Set-Cookie").split(";", 1)[0]
@@ -116,6 +129,19 @@ class Tests(unittest.TestCase):
                 fake = lambda *_: {"sub": "fixture-owner", "nonce": nonce}
                 # Defaults bind at definition time; patch finish itself to inject the verifier.
                 real_finish = auth.finish
+                body = json.dumps({'state': state, 'credential': 'fixture'})
+                with patch.object(auth, 'finish', side_effect=lambda *args: real_finish(*args, verifier=lambda *_: {'sub': 'other', 'nonce': nonce})):
+                    client, response, data = request('POST', '/__momso/auth/finish', body, {'Origin': 'https://fixture.run.app', 'Cookie': challenge_cookie})
+                    self.assertEqual((response.status, json.loads(data)['error']), (403, 'not_owner'))
+                    self.assertEqual(response.getheader('X-Momso-Response'), 'gateway')
+                    client.close()
+                client, response, data = request('POST', '/__momso/auth/finish', body, {'Origin': 'https://other.example', 'Cookie': challenge_cookie})
+                self.assertEqual((response.status, json.loads(data)['error']), (403, 'origin_not_allowed'))
+                client.close()
+                client, response, data = request('POST', '/__momso/auth/finish', body, {'Origin': 'https://fixture.run.app'})
+                self.assertEqual((response.status, json.loads(data)['error']), (403, 'login_failed'))
+                self.assertEqual(response.getheader('X-Momso-Response'), 'gateway')
+                client.close()
                 with patch.object(auth, "finish", side_effect=lambda *args: real_finish(*args, verifier=fake)):
                     body = json.dumps({"state": state, "credential": "fixture"})
                     client, response, _ = request("POST", "/__momso/auth/finish", body, {"Origin": "https://fixture.run.app", "Cookie": challenge_cookie})
@@ -123,6 +149,10 @@ class Tests(unittest.TestCase):
                     self.assertIn("Secure; HttpOnly; SameSite=Strict", response.getheader("Set-Cookie"))
                     session_cookie = response.getheader("Set-Cookie").split(";", 1)[0]
                     client.close()
+                client, response, data = request('POST', '/chats', '', {'Origin': 'https://other.example', 'Cookie': session_cookie})
+                self.assertEqual((response.status, json.loads(data)['error']), (403, 'origin_not_allowed'))
+                self.assertEqual(response.getheader('X-Momso-Response'), 'gateway')
+                client.close()
                 client, response, _ = request("POST", "/__momso/auth/logout", "", {"Origin": "https://fixture.run.app", "Cookie": session_cookie})
                 self.assertEqual(response.status, 200)
                 self.assertIn("Max-Age=0", response.getheader("Set-Cookie"))
