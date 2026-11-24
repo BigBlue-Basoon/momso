@@ -65,6 +65,19 @@ class ReleaseDiscoveryTests(UpdateTests):
         self.items = [self.release("2026-01-04T00:00:00Z", True)]
         self.assertIsNone(self.source().discover())
 
+    def test_desktop_stable_release_does_not_hide_anywhere_release(self):
+        desktop = {"published_at": "2026-01-04T00:00:00Z", "prerelease": False,
+                   "draft": False, "assets": [
+                       {"name": "latest.json", "state": "uploaded", "browser_download_url": self.base + "/latest.json"},
+                       {"name": "momso_0.1.1_x64-setup.exe", "state": "uploaded", "browser_download_url": self.base + "/setup.exe"}]}
+        production = self.release("2026-01-01T00:00:00Z", False)
+        development = self.release("2026-01-03T00:00:00Z", True)
+        production["assets"][0]["browser_download_url"] = self.base + "/production.json"
+        development["assets"][0]["browser_download_url"] = self.base + "/development.json"
+        self.items = [desktop, production, development]
+        self.assertEqual(self.source().discover()[0], self.base + "/production.json")
+        self.assertEqual(self.source("development").discover()[0], self.base + "/development.json")
+
     def test_fake_github_signed_update_and_sequence(self):
         self.items = [self.release("2026-01-02T00:00:00Z", False)]
         poller = ReleasePoller(self.source(), self.updater)

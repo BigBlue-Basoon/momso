@@ -6,17 +6,12 @@ import { fileURLToPath } from 'node:url'
 
 const scriptPath = fileURLToPath(import.meta.url)
 const repositoryRoot = dirname(dirname(scriptPath))
-const defaultInstallerDirectory = join(
-  repositoryRoot,
-  'apps',
-  'alpha',
-  'desktop',
-  'src-tauri',
-  'target',
-  'release',
-  'bundle',
-  'nsis',
-)
+export function installerDirectoryFor(targetDirectory, root = repositoryRoot) {
+  const target = targetDirectory ? resolve(targetDirectory) : join(root, 'apps', 'alpha', 'desktop', 'src-tauri', 'target')
+  return join(target, 'release', 'bundle', 'nsis')
+}
+
+const defaultInstallerDirectory = installerDirectoryFor(process.env.CARGO_TARGET_DIR)
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'))
@@ -165,7 +160,7 @@ export function createDesktopArtifactMetadata({
       installerType: 'nsis',
       installScope: 'currentUser',
       signatureStatus: 'unsigned',
-      updaterEnabled: false,
+      updaterEnabled: Boolean(tauriConfig.plugins?.updater?.pubkey && tauriConfig.plugins?.updater?.endpoints?.length),
       intendedUse: 'testing',
     },
     artifact: {

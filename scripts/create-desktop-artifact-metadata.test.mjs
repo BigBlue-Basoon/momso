@@ -6,7 +6,14 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
-import { createDesktopArtifactMetadata } from './create-desktop-artifact-metadata.mjs'
+import { createDesktopArtifactMetadata, installerDirectoryFor } from './create-desktop-artifact-metadata.mjs'
+
+test('uses the configured Cargo target without changing the default layout', () => {
+  const root = join(tmpdir(), 'momso-test-root')
+  const target = join(tmpdir(), 'momso-custom-target')
+  assert.equal(installerDirectoryFor(target, root), join(target, 'release', 'bundle', 'nsis'))
+  assert.equal(installerDirectoryFor(undefined, root), join(root, 'apps', 'alpha', 'desktop', 'src-tauri', 'target', 'release', 'bundle', 'nsis'))
+})
 
 test('writes a checksum and provenance manifest for one unsigned NSIS installer', () => {
   const directory = mkdtempSync(join(tmpdir(), 'momso-artifact-'))
@@ -70,7 +77,7 @@ test('writes a checksum and provenance manifest for one unsigned NSIS installer'
     assert.equal(manifest.source.dirty, false)
     assert.equal(manifest.build.runUrl, 'https://github.com/example/project/actions/runs/1001')
     assert.equal(manifest.distribution.signatureStatus, 'unsigned')
-    assert.equal(manifest.distribution.updaterEnabled, false)
+    assert.equal(manifest.distribution.updaterEnabled, true)
     assert.equal(manifest.artifact.sha256, expectedHash)
     assert.equal(manifest.artifact.sizeBytes, installerBody.length)
   } finally {

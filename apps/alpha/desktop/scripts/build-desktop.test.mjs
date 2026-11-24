@@ -3,8 +3,16 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { longestPath, omitNodeFile, selectStageParent, withStage } from './build-desktop.mjs';
+import { longestPath, omitNodeFile, releaseBuildEnvironment, selectStageParent, withStage } from './build-desktop.mjs';
 import { missingRuntimeImports, runtimeImports, sameBundledExecutable, verifyExtracted } from './verify-desktop-installer.mjs';
+
+test('remaps long and short profile paths in Rust and C builds', () => {
+  const long = 'C:\\Profiles\\fixture person';
+  const short = 'C:\\Profiles\\FIXTUR~1';
+  const env = releaseBuildEnvironment({ RUSTFLAGS: '-C debuginfo=0' }, [long, short]);
+  assert.ok(env.CARGO_ENCODED_RUSTFLAGS.split('\x1f').includes(`${long}=C:\\momso-build`));
+  assert.ok(env.CL.includes(`"/pathmap:${short}=C:\\momso-build"`));
+});
 
 test('accepts only the Tauri NSIS marker change in the app binary', () => {
   const before = Buffer.from('prefix__TAURI_BUNDLE_TYPE_VAR_UNKsuffix');
