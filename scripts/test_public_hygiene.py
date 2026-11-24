@@ -9,6 +9,14 @@ spec.loader.exec_module(hygiene)
 
 
 class PublicHygieneTest(unittest.TestCase):
+    def test_installation_names_report_location_without_printing_identifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'scripts').mkdir()
+            source = root / 'scripts' / 'sample.py'
+            source.write_text('momso-0123456789ab\nmomso-any-' + '123abc456def' + '\n', encoding='utf-8')
+            self.assertEqual(hygiene.findings(root, []), [('scripts/sample.py', 2, 'installation_identifier')])
+
     def test_public_notice_exceptions_are_exact_and_private_terms_still_fail(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

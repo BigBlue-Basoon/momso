@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { findSevenZip } from './verify-desktop-installer.mjs';
 
 const desktop = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tauri = path.join(desktop, 'src-tauri');
@@ -98,6 +99,7 @@ async function main() {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('Windows x64 required');
   const args = process.argv.slice(2);
   if (args.some(arg => arg !== '--updater') || args.length > 1) throw new Error('Supported option: --updater');
+  await findSevenZip();
   await run(process.execPath, [path.join(desktop, 'scripts/prepare-node.mjs')]);
   const tempRoot = await realpath(os.tmpdir());
   const tauriRoot = await realpath(tauri);

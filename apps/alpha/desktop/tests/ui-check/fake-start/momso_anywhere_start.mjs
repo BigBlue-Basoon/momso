@@ -40,14 +40,14 @@ export async function startFromGesture({ clientId, projectId, billingAccountName
     if (fail && step === at && attempts === 1) { onProgress({ step, state: 'failed' }); throw new SetupError(fail) }
     onProgress({ step, state: 'done' })
   }
-  return { url: 'https://momso-any-0123456789ab-du.a.run.app' }
+  return { url: 'https://momso-any-aaaaaaaaaaaa-du.a.run.app' }
 }
 export async function findFromGesture() {
   if (redirect && !authorized) return go('find')
   await wait(600)
   if (q().get('findFail')) throw new SetupError('google_unavailable')
   const n = Number(q().get('found') ?? 1)
-  return ['https://momso-any-0123456789ab-du.a.run.app', 'https://momso-any-abcdef012345-du.a.run.app'].slice(0, n)
+  return ['https://momso-any-aaaaaaaaaaaa-du.a.run.app', 'https://momso-any-bbbbbbbbbbbb-du.a.run.app'].slice(0, n)
 }
 async function projectsFromGesture(input = {}) {
   if (redirect && !authorized) return go('projects', input)
@@ -84,7 +84,7 @@ export async function resumeAfterRedirect({ onProgress }) {
   if (q().get('resumeFail')) throw new SetupError(q().get('resumeFail'))
   if (request.action === 'projects') return { kind: 'projects', projects: PROJECTS.slice(0, Number(q().get('projects') ?? 3)), selection }
   if (request.action === 'billing') return { kind: 'billing', billingAccounts: ACCOUNTS.slice(0, Number(q().get('accounts') ?? 2)), selection }
-  if (request.action === 'find') return { kind: 'find', result: ['https://momso-any-0123456789ab-du.a.run.app'], selection }
+  if (request.action === 'find') return { kind: 'find', result: ['https://momso-any-aaaaaaaaaaaa-du.a.run.app'], selection }
   if (request.action === 'start') {
     window.__startChoice = selection
     for (const step of STEPS) {
@@ -93,7 +93,7 @@ export async function resumeAfterRedirect({ onProgress }) {
       onProgress({ step, state: 'done' })
     }
     sessionStorage.removeItem('fake.retry')
-    return { kind: 'start', result: { url: 'https://momso-any-0123456789ab-du.a.run.app' }, selection }
+    return { kind: 'start', result: { url: 'https://momso-any-aaaaaaaaaaaa-du.a.run.app' }, selection }
   }
   if (request.action === 'destroy') {
     for (const step of ['gateway', 'vm', 'router', 'firewall']) { onProgress({ step, state: 'working' }); await wait(slow); onProgress({ step, state: 'done' }) }

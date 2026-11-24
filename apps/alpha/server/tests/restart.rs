@@ -948,6 +948,20 @@ fn github_automatic_backup_saves_chat_to_local_bare_remote() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let status = request(&address, "GET", "/activity", "").unwrap();
+        if status["shutdownReady"] == true {
+            assert_eq!(status["maintenance"], false);
+            assert_eq!(status["maintenanceReady"], false);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle was not ready before maintenance: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     request(&address, "POST", "/maintenance", "{}").unwrap();
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {

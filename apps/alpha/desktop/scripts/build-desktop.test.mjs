@@ -4,7 +4,12 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { longestPath, omitNodeFile, selectStageParent, withStage } from './build-desktop.mjs';
-import { missingRuntimeImports, runtimeImports, sameBundledExecutable, verifyExtracted } from './verify-desktop-installer.mjs';
+import { missingRuntimeImports, runtimeImports, sameBundledExecutable, supportsNsis, verifyExtracted } from './verify-desktop-installer.mjs';
+
+test('detects whether 7-Zip can inspect NSIS installers', () => {
+  assert.equal(supportsNsis('Formats:\n  K.... NSIS     nsis'), true);
+  assert.equal(supportsNsis('Formats:\n  C.... 7z       7z'), false);
+});
 
 test('accepts only the Tauri NSIS marker change in the app binary', () => {
   const before = Buffer.from('prefix__TAURI_BUNDLE_TYPE_VAR_UNKsuffix');

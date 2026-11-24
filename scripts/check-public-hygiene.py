@@ -14,6 +14,8 @@ SKIP = {".git", "node_modules", "target", "generated", "dist", "build", ".next",
 WINDOWS_USER = re.compile(r"(?i)\b[a-z]:[\\/]{1,2}users[\\/]{1,2}[^\\/\s\"'<>]+")
 EMAIL = re.compile(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b")
 KEY = re.compile(r"\b(?:sk-ant-|sk-proj-|ghp_|github_pat_)[a-zA-Z0-9_\-]{16,}\b")
+INSTALLATION_NAME = re.compile(r"\bmomso-(?:any-)?([0-9a-f]{12})(?![0-9a-f])", re.IGNORECASE)
+FIXTURE_INSTALLATIONS = {'aaaaaaaaaaaa', 'bbbbbbbbbbbb', 'cccccccccccc', '0123456789ab', 'abcdef123456'}
 FAKE_DOMAINS = {"example.com", "example.invalid", "example.test", "momso.local", "2x.png", "evil.test", "attacker.test"}
 # Public copyright notices and one literal Windows Credential Manager target.
 # Match both the exact file and exact value; all other checks still apply.
@@ -63,6 +65,8 @@ def findings(root, terms):
                 kinds.append("email")
             if KEY.search(line):
                 kinds.append("key")
+            if any(match.group(1).lower() not in FIXTURE_INSTALLATIONS for match in INSTALLATION_NAME.finditer(line)):
+                kinds.append("installation_identifier")
             if any(term.casefold() in line.casefold() for term in terms):
                 kinds.append("private_term")
             for kind in kinds:

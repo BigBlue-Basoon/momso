@@ -70,7 +70,7 @@ test('writes a checksum and provenance manifest for one unsigned NSIS installer'
     assert.equal(manifest.source.dirty, false)
     assert.equal(manifest.build.runUrl, 'https://github.com/example/project/actions/runs/1001')
     assert.equal(manifest.distribution.signatureStatus, 'unsigned')
-    assert.equal(manifest.distribution.updaterEnabled, false)
+    assert.equal(manifest.distribution.updaterEnabled, true)
     assert.equal(manifest.artifact.sha256, expectedHash)
     assert.equal(manifest.artifact.sizeBytes, installerBody.length)
   } finally {

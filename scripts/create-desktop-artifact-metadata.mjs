@@ -165,7 +165,7 @@ export function createDesktopArtifactMetadata({
       installerType: 'nsis',
       installScope: 'currentUser',
       signatureStatus: 'unsigned',
-      updaterEnabled: false,
+      updaterEnabled: Boolean(tauriConfig.plugins?.updater?.pubkey && tauriConfig.plugins?.updater?.endpoints?.length),
       intendedUse: 'testing',
     },
     artifact: {

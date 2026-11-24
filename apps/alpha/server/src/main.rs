@@ -872,6 +872,21 @@ async fn health(State(app): State<App>, h: HeaderMap) -> Result<Json<Value>, Api
     auth(&app, &h)?;
     Ok(Json(json!({"state":"ready"})))
 }
+fn lifecycle_readiness(maintenance: bool, busy: bool, backup_ready: bool) -> (bool, bool) {
+    let shutdown_ready = !busy && backup_ready;
+    (shutdown_ready, maintenance && shutdown_ready)
+}
+
+#[cfg(target_os = "linux")]
+fn enabled_backups_ready(
+    github_enabled: bool,
+    github_ready: bool,
+    object_enabled: bool,
+    object_ready: bool,
+) -> bool {
+    (!github_enabled || github_ready) && (!object_enabled || object_ready)
+}
+
 async fn activity(State(app): State<App>, h: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     auth(&app, &h)?;
     let turns = app
@@ -911,6 +926,10 @@ async fn activity(State(app): State<App>, h: HeaderMap) -> Result<impl IntoRespo
     let backup = (false, "not_integrated", None::<&str>, false, false);
     #[cfg(target_os = "linux")]
     let backup = {
+        let github_enabled = github_bridge::read_repository(&app.data)
+            .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "storage_unavailable"))?
+            .is_some();
+        let object_enabled = std::env::var_os("MOMSO_BACKUP_AGENT").is_some();
         let current = maintenance::generation(&app.maintenance)
             .map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "unavailable"))?;
         let ready = matches!(backup.state, "saved" | "saved_partial")
@@ -929,18 +948,18 @@ async fn activity(State(app): State<App>, h: HeaderMap) -> Result<impl IntoRespo
         } else {
             (
                 backup.active || object_backup.active,
-                if ready && !object_ready {
+                if ready && object_enabled && !object_ready {
                     "saved_partial"
                 } else {
                     backup.state
                 },
-                if ready && !object_ready {
+                if ready && object_enabled && !object_ready {
                     Some("object_backup_not_integrated")
                 } else {
                     backup.reason
                 },
                 ready,
-                ready && object_ready,
+                enabled_backups_ready(github_enabled, ready, object_enabled, object_ready),
             )
         }
     };
@@ -953,13 +972,13 @@ async fn activity(State(app): State<App>, h: HeaderMap) -> Result<impl IntoRespo
         || pending_purges > 0
         || backup.0
         || admitted > 0;
-    let fully_ready = maintenance && !busy && backup.4;
+    let (shutdown_ready, fully_ready) = lifecycle_readiness(maintenance, busy, backup.4);
     #[cfg(target_os = "linux")]
     let active_backups =
         usize::from(app.backup.status()?.active) + usize::from(object_backup.active);
     #[cfg(not(target_os = "linux"))]
     let active_backups = usize::from(backup.0);
-    let value = json!({"busy":busy,"activeTurns":turns,"pendingApprovals":approvals,"pendingInputs":inputs,"activeWrites":writes,"pendingPurges":pending_purges,"providerLogin":provider_login,"githubLogins":github_logins,"activeBackups":active_backups,"backupStatus":backup.1,"backupReason":backup.2,"githubBackupReady":backup.3 && !busy,"admittedRequests":admitted,"lastActivityAt":last_activity,"maintenance":maintenance,"quiescent":maintenance && !busy,"maintenanceReady":fully_ready,"maintenanceReason":if fully_ready { None } else { Some("backup_not_ready") },"shutdownReady":fully_ready,"shutdownReason":if fully_ready { None } else { Some("backup_not_ready") }});
+    let value = json!({"busy":busy,"activeTurns":turns,"pendingApprovals":approvals,"pendingInputs":inputs,"activeWrites":writes,"pendingPurges":pending_purges,"providerLogin":provider_login,"githubLogins":github_logins,"activeBackups":active_backups,"backupStatus":backup.1,"backupReason":backup.2,"githubBackupReady":backup.3 && !busy,"admittedRequests":admitted,"lastActivityAt":last_activity,"maintenance":maintenance,"quiescent":maintenance && !busy,"maintenanceReady":fully_ready,"maintenanceReason":if fully_ready { None } else { Some("backup_not_ready") },"shutdownReady":shutdown_ready,"shutdownReason":if shutdown_ready { None } else { Some("backup_not_ready") }});
     #[cfg(target_os = "linux")]
     let value = {
         let mut value = value;
@@ -3082,6 +3101,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn idle_shutdown_ready_before_and_after_maintenance_without_bypassing_backup() {
+        assert_eq!(lifecycle_readiness(false, false, true), (true, false));
+        assert_eq!(lifecycle_readiness(true, false, true), (true, true));
+        assert_eq!(lifecycle_readiness(false, true, true), (false, false));
+        assert_eq!(lifecycle_readiness(true, false, false), (false, false));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn idle_shutdown_requires_every_enabled_backup_only() {
+        assert!(enabled_backups_ready(false, false, true, true));
+        assert!(!enabled_backups_ready(false, false, true, false));
+        assert!(!enabled_backups_ready(true, false, true, true));
+        assert!(enabled_backups_ready(true, true, true, true));
+    }
 
     #[tokio::test]
     async fn fresh_archive_installs_bundles_and_documents_require_auth() {

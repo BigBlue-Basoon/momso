@@ -56,12 +56,24 @@ export function sameBundledExecutable(original, bundled) {
   return expected.equals(bundled);
 }
 
-async function findSevenZip() {
+export function supportsNsis(formats) {
+  return /^\s*[^\r\n]*\bNSIS\b/m.test(formats);
+}
+
+export async function findSevenZip() {
+  const candidates = [];
   for (const base of [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter(Boolean)) {
-    const candidate = path.join(base, '7-Zip', '7z.exe');
-    try { await access(candidate); return candidate; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    candidates.push(path.join(base, '7-Zip', '7z.exe'));
   }
-  return '7z'; // A portable copy can instead be provided on PATH.
+  candidates.push('7z');
+  for (const candidate of candidates) {
+    try {
+      if (candidate !== '7z') await access(candidate);
+      const { stdout } = await exec(candidate, ['i']);
+      if (supportsNsis(stdout)) return candidate;
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  throw new Error('Full 7-Zip with NSIS support is required to inspect the installer');
 }
 
 export async function verifyInstaller(installer, builtExe, stagedNode, stagedCrt) {
