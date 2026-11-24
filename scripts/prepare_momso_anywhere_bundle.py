@@ -22,7 +22,8 @@ def prepare(server, expected, web, output):
         raise ValueError("output overlaps an input")
     entries = [(server, "momso-server")]
     scripts = Path(__file__).resolve().parent
-    entries += [(scripts / name, name) for name in ("momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py")]
+    entries += [(scripts / name, name) for name in ("momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py", "momso_anywhere_vm_pause.py", "momso_anywhere_pause_ticket.py", "momso_anywhere_pause_guard.py")]
+    entries += [(scripts.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/server_admission.py', 'server_admission.py')]
     entries.append((scripts / 'momso_managed_history.json', 'momso-managed-history.json'))
     entries += [(scripts / name, name) for name in ("momso_anywhere_backup.py", "momso_anywhere_backup_agent.py", "momso_anywhere_backup_google.py", "momso_anywhere_vault_identity.py")]
     tauri = scripts.parent / "apps/alpha/desktop/src-tauri"

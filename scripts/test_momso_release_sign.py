@@ -16,6 +16,15 @@ import momso_server_install as installer
 
 
 class SignTests(unittest.TestCase):
+    def test_registry_manifest_check_rejects_image_index(self):
+        image = 'ghcr.io/example/gateway@sha256:' + 'a' * 64
+        for media in ('application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json'):
+            with patch.object(signer.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps({'mediaType': media}).encode(), b'')):
+                with self.assertRaisesRegex(ValueError, 'gateway_image_not_single_manifest'):
+                    signer.verify_gateway_manifest(image)
+        with patch.object(signer.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'{"mediaType":"application/vnd.oci.image.manifest.v1+json"}', b'')):
+            signer.verify_gateway_manifest(image)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)

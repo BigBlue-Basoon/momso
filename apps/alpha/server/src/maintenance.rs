@@ -8,6 +8,7 @@ pub struct Gate {
     purge_pending: bool,
     admitted: usize,
     generation: u64,
+    closed_at_ms: Option<i64>,
     last_activity: chrono::DateTime<chrono::Utc>,
 }
 pub type Shared = Arc<Mutex<Gate>>;
@@ -19,6 +20,7 @@ pub fn new() -> Shared {
         purge_pending: false,
         admitted: 0,
         generation: 0,
+        closed_at_ms: None,
         last_activity: chrono::Utc::now(),
     }))
 }
@@ -240,12 +242,18 @@ pub async fn acquire(State(app): State<App>, h: HeaderMap) -> Result<impl IntoRe
                     "maintenance_state_unavailable",
                 )
             })?;
+        // A maintenance request needs a new backup even when the last saved
+        // generation was current before admission closed.
+        gate.generation = gate.generation.saturating_add(1);
+        gate.closed_at_ms = Some(chrono::Utc::now().timestamp_millis());
     }
     #[cfg(target_os = "linux")]
     app.backup.wake();
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({"maintenance":true,"admittedRequests":gate.admitted})),
+        Json(
+            json!({"maintenance":true,"admittedRequests":gate.admitted,"closedAt":gate.closed_at_ms}),
+        ),
     ))
 }
 pub async fn release(State(app): State<App>, h: HeaderMap) -> Result<impl IntoResponse, ApiError> {

@@ -19,11 +19,17 @@ class ProgressFile:
         if state not in STATES or (reason is not None and
                 (not isinstance(reason, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", reason))):
             raise ValueError("invalid_progress")
+        detail = {}
+        if 'code' in event:
+            if (not isinstance(event['code'], str) or not re.fullmatch(r'gateway_[a-z0-9_]{1,72}', event['code']) or
+                    any(event.get(key) is not None and type(event.get(key)) is not bool for key in ('rolledBack', 'retryable'))):
+                raise ValueError('invalid_progress')
+            detail = {key: event.get(key) for key in ('code', 'rolledBack', 'retryable')}
         self.path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(prefix=".status-", dir=self.path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"state": state, "reason": reason}, stream)
+                json.dump({"state": state, "reason": reason, **detail}, stream)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.chmod(name, 0o644)

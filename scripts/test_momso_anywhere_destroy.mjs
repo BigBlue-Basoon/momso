@@ -2,19 +2,19 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { webcrypto } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { GoogleBrowserProvider } from './momso_anywhere_google_browser.mjs';
-import { runDestroyCommand } from './momso_anywhere_destroy_command.mjs';
 import { executeDestroy } from './momso_anywhere_destroy_cli.mjs';
 import { clearStartAuthorization, destroyFromGesture, resumeFromRedirect } from './momso_anywhere_start.mjs';
+import { beginRedirect } from './momso_anywhere_oauth_redirect.mjs';
 
 const id = 'a'.repeat(24), short = id.slice(0, 12), projectId = 'fixture-project', name = `momso-${short}`;
 const marker = `momso-install-${id}`;
 const ok = (value, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => value });
 
-function fixture() {
+function fixture({ retainVm = false, rejectVm = false, loseVmResponse = false } = {}) {
   const c = `https://compute.googleapis.com/compute/v1/projects/${projectId}/`;
   const i = `https://iam.googleapis.com/v1/projects/${projectId}/`;
   const s = `https://secretmanager.googleapis.com/v1/projects/${projectId}/secrets/`;
@@ -42,8 +42,11 @@ function fixture() {
     if (options.method === 'GET') return resources.has(path) ? ok(resources.get(path)) : ok({}, 404);
     if (options.method === 'PATCH' && path.includes('/routers/')) { resources.get(path).nats = []; return ok({ name: 'fixture-op', region: '/regions/asia-northeast3' }); }
     assert.equal(options.method, 'DELETE');
+    if (path.includes('/instances/') && rejectVm) return ok({}, 403);
+    if (path.includes('/instances/') && loseVmResponse) throw Error('fixture-network');
     if (path.includes('/subnetworks/') && networkHeld) { networkHeld = false; return ok({}, 400); }
-    deleted.push(path); resources.delete(path);
+    deleted.push(path);
+    if (!(retainVm && path.includes('/instances/'))) resources.delete(path);
     if (path.includes('run.googleapis.com')) return ok({ name: `projects/${projectId}/locations/asia-northeast3/operations/fixture` });
     if (path.includes('compute.googleapis.com')) return ok({ name: 'fixture-op', ...(path.includes('/zones/') ? { zone: '/zones/asia-northeast3-a' } : path.includes('/regions/') ? { region: '/regions/asia-northeast3' } : {}) });
     return ok({});
@@ -51,18 +54,36 @@ function fixture() {
   return { provider, resources, deleted, router: `${c}regions/asia-northeast3/routers/${name}-router` };
 }
 
-test('owned cleanup records delayed subnet and safely resumes', async () => {
+test('owned cleanup reports delayed subnet and safely resumes', async () => {
   const f = fixture();
-  let recorded;
-  const first = await runDestroyCommand({ projectId, installationId: id, token: 'fixture-token', providerFactory: () => f.provider, saveState: async value => { recorded = value; } });
+  const first = await f.provider.destroy(id);
+  assert.match(f.deleted[0], /\/instances\//);
+  assert.match(f.deleted.at(-1), /run\.googleapis\.com/);
   assert.deepEqual(first.remaining, ['subnet', 'network']);
-  assert.deepEqual(recorded, { projectId, installationId: id, remaining: ['subnet', 'network'] });
-  assert(!JSON.stringify(recorded).includes('fixture-token'));
-  assert.equal(f.resources.size, 2);
+  assert.equal(f.resources.size, 3);
   const second = await f.provider.destroy(id);
   assert.deepEqual(second.remaining, []);
-  assert.equal(f.resources.size, 0);
+  assert.equal(f.resources.size, 1);
+  assert([...f.resources.keys()].some(value => value.endsWith(`/secrets/momso-vault-${short}`)));
+  assert(!f.deleted.some(value => value.endsWith(`/secrets/momso-vault-${short}`)));
   assert(!f.deleted.some(value => value.includes('cloudresourcemanager.googleapis.com')));
+});
+
+test('VM deletion reports definite rejection separately from a lost response', async () => {
+  for (const [options, expected] of [[{ rejectVm: true }, ['unknown', 'failed']], [{ loseVmResponse: true }, ['unknown']]]) {
+    const f = fixture(options), states = [];
+    await assert.rejects(f.provider.destroy(id, () => {}, { onVmState: value => states.push(value) }));
+    assert.deepEqual(states, expected);
+    assert([...f.resources.keys()].some(value => value.includes('run.googleapis.com')));
+  }
+});
+
+test('unconfirmed VM removal leaves the gateway and all other resources intact', async () => {
+  const f = fixture({ retainVm: true });
+  await assert.rejects(f.provider.destroy(id), { step: 'vm_deletion_unconfirmed' });
+  assert.equal(f.deleted.length, 1);
+  assert.match(f.deleted[0], /\/instances\//);
+  assert([...f.resources.keys()].some(value => value.includes('run.googleapis.com')));
 });
 
 test('foreign resource or additional router attachment aborts before any deletion', async () => {
@@ -77,7 +98,7 @@ test('foreign resource or additional router attachment aborts before any deletio
   }
 });
 
-test('browser records remaining resources and resumes after reauthorization', async () => {
+test('browser rejects resumed deletion before touching resources when backup freshness is unverified', async () => {
   const f = fixture();
   const mem = () => { const values = new Map(); return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key), values }; };
   const session = mem(), storage = mem();
@@ -85,16 +106,32 @@ test('browser records remaining resources and resumes after reauthorization', as
   const location = { href: 'https://login.example.test/start/', origin: 'https://login.example.test', assign(value) { this.next = value; } };
   async function run() {
     clearStartAuthorization();
-    await destroyFromGesture({ clientId, projectId, installationId: id, session, location, cryptoImpl: webcrypto });
-    const state = new URL(location.next).searchParams.get('state');
-    const fragment = new URLSearchParams({ state, access_token: 'fixture-token', token_type: 'Bearer', expires_in: '60', scope: 'openid email https://www.googleapis.com/auth/cloud-platform' }).toString();
-    return resumeFromRedirect({ clientId, release: {}, session, storage, location, fragment, cryptoImpl: webcrypto, providerFactory: async () => ({ provider: f.provider, ownerSub: '12345' }) });
+    return destroyFromGesture({ clientId, projectId, installationId: id, session, location, cryptoImpl: webcrypto });
   }
-  const first = await run();
-  assert.deepEqual(first.value.remaining, ['subnet', 'network']);
+  assert.equal((await run()).reason, 'pause_requires_app_session');
+  beginRedirect({ clientId, action: 'destroy', projectId, installationId: id, storage: session, location, cryptoImpl: webcrypto });
+  const state = new URL(location.next).searchParams.get('state');
+  const fragment = new URLSearchParams({ state, access_token: 'fixture-token', token_type: 'Bearer', expires_in: '60', scope: 'openid email https://www.googleapis.com/auth/cloud-platform' }).toString();
+  assert.equal((await resumeFromRedirect({ clientId, release: {}, session, storage, location, fragment, cryptoImpl: webcrypto, providerFactory: async () => ({ provider: f.provider, ownerSub: '12345' }) })).value.reason, 'pause_requires_app_session');
+  assert.deepEqual(f.deleted, []);
   assert(!JSON.stringify([...storage.values]).includes('fixture-token'));
-  assert.deepEqual((await run()).value.remaining, []);
-  assert.equal(storage.values.size, 0);
+});
+
+test('explicit discard survives authorization and removes only owned fixture resources', async () => {
+  const f = fixture();
+  const mem = () => { const values = new Map(); return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) }; };
+  const session = mem(), storage = mem();
+  const clientId = 'fixture.apps.googleusercontent.com';
+  const location = { href: 'https://login.example.test/start/', origin: 'https://login.example.test', assign(value) { this.next = value; } };
+  clearStartAuthorization();
+  await destroyFromGesture({ clientId, projectId, installationId: id, discardData: true, session, location, cryptoImpl: webcrypto });
+  const state = new URL(location.next).searchParams.get('state');
+  const fragment = new URLSearchParams({ state, access_token: 'fixture-token', token_type: 'Bearer', expires_in: '60', scope: 'openid email https://www.googleapis.com/auth/cloud-platform' }).toString();
+  const result = await resumeFromRedirect({ clientId, release: {}, session, storage, location, fragment, cryptoImpl: webcrypto, providerFactory: async () => ({ provider: f.provider, ownerSub: '12345' }) });
+  assert.equal(result.value.mode, 'delete_all');
+  assert.equal(result.value.status, 'pending');
+  assert(f.deleted.length > 0);
+  assert(!f.deleted.some(value => value.endsWith(`/secrets/momso-vault-${short}`)));
 });
 
 test('PC command rejects invalid project without logging its input token', () => {
@@ -104,21 +141,17 @@ test('PC command rejects invalid project without logging its input token', () =>
   assert(!child.stderr.includes('fixture-private-token'));
 });
 
-test('PC command saves delayed cleanup and resumes without accepting another installation state', async () => {
+test('PC command refuses before touching cloud resources if backup freshness is unverified', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'momso-destroy-test-'));
   try {
     const f = fixture();
     const path = join(dir, 'state.json');
     const options = { projectId, installationId: id, token: 'fixture-private-token', path, providerFactory: () => f.provider };
-    assert.deepEqual((await executeDestroy(options)).remaining, ['subnet', 'network']);
-    const saved = await readFile(path, 'utf8');
-    assert(!saved.includes('fixture-private-token'));
-    assert.deepEqual(JSON.parse(saved).remaining, ['subnet', 'network']);
-    await writeFile(path, JSON.stringify({ projectId, installationId: 'b'.repeat(24) }));
-    await assert.rejects(executeDestroy(options), /state_unavailable/);
-    assert.equal(f.resources.size, 2);
-    await writeFile(path, saved);
-    assert.deepEqual((await executeDestroy(options)).remaining, []);
-    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).remaining, []);
+    await assert.rejects(executeDestroy(options), { step: 'backup_freshness_unverified' });
+    assert.deepEqual(f.deleted, []);
+    await assert.rejects(readFile(path, 'utf8'), { code: 'ENOENT' });
+    const result = await executeDestroy({ ...options, discardData: true });
+    assert.equal(result.mode, 'delete_all');
+    assert(f.deleted.length > 0);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

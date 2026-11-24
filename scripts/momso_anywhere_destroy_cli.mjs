@@ -4,15 +4,17 @@ import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runDestroyCommand } from './momso_anywhere_destroy_command.mjs';
 
-export async function executeDestroy({ projectId, installationId, token, path, providerFactory, onProgress = () => {} }) {
+export async function executeDestroy({ projectId, installationId, token, path, providerFactory, discardData = false, onProgress = () => {} }) {
   const target = resolve(path);
+  let deletion = null;
   try {
     const info = await lstat(target);
     if (!info.isFile() || info.isSymbolicLink()) throw new Error('state_unavailable');
     const previous = JSON.parse(await readFile(target, 'utf8'));
     if (previous.projectId !== projectId || previous.installationId !== installationId) throw new Error('state_unavailable');
+    deletion = previous.deletion ?? null;
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  return runDestroyCommand({ projectId, installationId, token, providerFactory, onProgress, saveState: async value => {
+  return runDestroyCommand({ projectId, installationId, token, providerFactory, discardData, onProgress, previous: deletion, saveState: async value => {
     const directory = await mkdtemp(join(dirname(target), '.momso-destroy-'));
     try { const temporary = join(directory, 'state.json'); await writeFile(temporary, JSON.stringify(value) + '\n', { mode: 0o600 }); await rename(temporary, target); }
     finally { await rm(directory, { recursive: true, force: true }); }
@@ -22,6 +24,9 @@ export async function executeDestroy({ projectId, installationId, token, path, p
 async function main() {
 const names = ['--project', '--installation-id', '--state'];
 const args = process.argv.slice(2);
+const discardIndex = args.indexOf('--discard-data');
+const discardData = discardIndex !== -1;
+if (discardData) args.splice(discardIndex, 1);
 const values = {};
 for (let i = 0; i < args.length; i += 2) {
   if (!names.includes(args[i]) || !args[i + 1] || values[args[i]]) { process.stderr.write('invalid_arguments\n'); process.exit(1); }
@@ -34,7 +39,7 @@ const projectId = values['--project'];
 const installationId = values['--installation-id'];
 const path = values['--state'];
 try {
-  const result = await executeDestroy({ projectId, installationId, token, path, onProgress: progress => process.stdout.write(JSON.stringify(progress) + '\n') });
+  const result = await executeDestroy({ projectId, installationId, token, path, discardData, onProgress: progress => process.stdout.write(JSON.stringify(progress) + '\n') });
   process.stdout.write(JSON.stringify(result) + '\n');
   if (result.remaining.length) process.exitCode = 2;
 } catch (error) {

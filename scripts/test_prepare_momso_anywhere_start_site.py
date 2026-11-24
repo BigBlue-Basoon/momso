@@ -28,6 +28,10 @@ class StartSiteTests(unittest.TestCase):
         site.prepare(self.dist, output, *self.args)
         self.assertEqual(json.loads((output / "config.json").read_text(encoding="utf-8"))["release"]["manifestUrl"], "https://example.test/release.json")
         self.assertTrue(all((output / name).is_file() for name in site.MODULES))
+        for name in ('momso_anywhere_discard_backup.mjs', 'momso_anywhere_test_backup_cleanup_s117.mjs'):
+            source = (output / name).read_text(encoding='utf-8')
+            self.assertNotIn('node:', source)
+        self.assertIn('./momso_anywhere_discard_backup.mjs', (output / 'momso_anywhere_google_browser.mjs').read_text(encoding='utf-8'))
         html = (output / "index.html").read_text(encoding="utf-8")
         self.assertLess(html.index("momso_anywhere_oauth_capture.mjs"), html.index("/start/assets/app.js"))
         self.assertEqual((output / "assets/app.js").read_text(encoding="utf-8"), "fixture resumeAfterRedirect")

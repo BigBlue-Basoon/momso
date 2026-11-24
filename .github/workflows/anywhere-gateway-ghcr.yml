@@ -39,9 +39,20 @@ jobs:
           context: /tmp/momso-gateway
           file: /tmp/momso-gateway/scripts/momso_anywhere_image/Dockerfile
           push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
           tags: ghcr.io/${{ steps.registry.outputs.owner }}/momso-gateway:${{ github.sha }}
       - name: Report digest for release signing
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          OWNER: ${{ steps.registry.outputs.owner }}
         run: |
-          printf 'Published digest: %s\n' "$DIGEST"
+          set -eu
+          IMAGE="ghcr.io/$OWNER/momso-gateway@$DIGEST"
+          TYPE="$(docker buildx imagetools inspect "$IMAGE" --raw | jq -er '.mediaType')"
+          case "$TYPE" in
+            application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json) ;;
+            *) printf 'Refusing non-image manifest: %s\n' "$TYPE" >&2; exit 1 ;;
+          esac
+          printf 'Gateway image for release signing: %s\n' "$IMAGE"

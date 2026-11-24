@@ -3,6 +3,9 @@ import { vmStartupScript } from './momso_anywhere_vm_startup.mjs';
 import { prepareBackupResources } from './momso_anywhere_backup_setup.mjs';
 import { activatePinnedRevision } from './momso_anywhere_cloud_run_revision.mjs';
 import { verifyRelease } from './momso_release_manifest.mjs';
+import { deletionPreview } from './momso_anywhere_deletion_contract.mjs';
+import { discardBackup } from './momso_anywhere_discard_backup.mjs';
+import { inspectProjectExclusivity, INSTALLER_SERVICES } from './momso_anywhere_project_exclusivity.mjs';
 
 const CRM = 'https://cloudresourcemanager.googleapis.com/v3/';
 const BILLING = 'https://cloudbilling.googleapis.com/v1/';
@@ -11,9 +14,10 @@ const COMPUTE = 'https://compute.googleapis.com/compute/v1/';
 const IAM = 'https://iam.googleapis.com/v1/';
 const SECRETS = 'https://secretmanager.googleapis.com/v1/';
 const RUN = 'https://run.googleapis.com/v2/';
+const ASSET = 'https://cloudasset.googleapis.com/v1/';
 const REGION = 'asia-northeast3';
 const ZONE = 'asia-northeast3-a';
-const SERVICES = ['compute.googleapis.com', 'run.googleapis.com', 'secretmanager.googleapis.com', 'iam.googleapis.com', 'serviceusage.googleapis.com', 'storage.googleapis.com', 'cloudkms.googleapis.com'];
+const SERVICES = INSTALLER_SERVICES;
 
 export async function providerFromToken({ token, expiresAt, clientId, release, billingAccountName = null, projectId = null, fetchImpl = fetch }) {
   if (!token || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new SetupError('authorization_expired');
@@ -59,13 +63,18 @@ export class GoogleBrowserProvider {
 
   async #request(url, { method = 'GET', body, allowMissing = false, missingForbidden = false } = {}) {
     if (Date.now() >= this.#expiresAt) throw new SetupError('authorization_expired');
-    if (![CRM, BILLING, USAGE, COMPUTE, IAM, SECRETS, RUN, 'https://storage.googleapis.com/storage/v1/', 'https://cloudkms.googleapis.com/v1/'].some(base => url.startsWith(base))) throw new SetupError('invalid_api');
+    if (![CRM, BILLING, USAGE, COMPUTE, IAM, SECRETS, RUN, ASSET, 'https://storage.googleapis.com/storage/v1/', 'https://cloudkms.googleapis.com/v1/'].some(base => url.startsWith(base))) throw new SetupError('invalid_api');
     let response;
     try {
       response = await this.#fetch(url, { method, headers: { Authorization: `Bearer ${this.#token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}), cache: 'no-store', redirect: 'error' });
     } catch { throw new SetupError('network'); }
     if ((allowMissing && response.status === 404) || (missingForbidden && response.status === 403)) return null;
     if (!response.ok) {
+      if (response.status === 403) {
+        let message = '';
+        try { message = (await response.clone().json())?.error?.message ?? ''; } catch { /* no verified image permission reason */ }
+        if (typeof message === 'string' && /artifactregistry\.repositories\.downloadArtifacts|permission to read the image/i.test(message)) throw new SetupError('gateway_image_permission');
+      }
       if (response.status === 400) {
         let message = '';
         try { message = (await response.json())?.error?.message ?? ''; } catch { /* preserve generic error */ }
@@ -74,7 +83,9 @@ export class GoogleBrowserProvider {
         }
       }
       const reason = response.status === 401 ? 'authorization_expired' : response.status === 403 ? 'permission_denied' : response.status === 402 ? 'billing_setup_required' : response.status === 429 ? 'quota_exceeded' : response.status >= 500 ? 'google_unavailable' : 'google_request';
-      throw new SetupError(reason);
+      const error = new SetupError(reason);
+      error.requestRejected = response.status >= 400 && response.status < 500 && ![408, 429].includes(response.status);
+      throw error;
     }
     if (response.status === 204) return {};
     try { return await response.json(); } catch { throw new SetupError('google_response'); }
@@ -136,6 +147,21 @@ export class GoogleBrowserProvider {
   }
 
   gatewayUrl() { return this.#gatewayUrl ?? null; }
+
+  async pauseGateway(id) {
+    if (!this.#selectedProject) throw new SetupError('project_required');
+    const projectId = this.#projectId(id);
+    const service = await this.#request(`${RUN}projects/${projectId}/locations/${REGION}/services/momso-any-${id.slice(0, 12)}`);
+    const env = Object.fromEntries((service.template?.containers?.[0]?.env ?? []).filter(item => typeof item.value === 'string').map(item => [item.name, item.value]));
+    let uri;
+    try { uri = new URL(service.uri); } catch { throw new SetupError('resource_ownership'); }
+    if (service.name !== `projects/${projectId}/locations/${REGION}/services/momso-any-${id.slice(0, 12)}` ||
+        service.labels?.['momso-install-id'] !== id || uri.protocol !== 'https:' || uri.origin !== service.uri ||
+        !uri.hostname.endsWith('.run.app') || env.MOMSO_PUBLIC_HOST !== uri.hostname ||
+        env.MOMSO_OWNER_SUB !== this.#ownerSub || env.MOMSO_GOOGLE_CLIENT_ID !== this.#clientId ||
+        env.MOMSO_PROJECT !== projectId || env.MOMSO_INSTANCE !== `momso-${id.slice(0, 12)}`) throw new SetupError('resource_ownership');
+    return uri.origin;
+  }
 
   async findExisting() {
     if (!/^[0-9]{1,40}$/.test(this.#ownerSub ?? '') || !/^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$/.test(this.#clientId ?? '')) throw new SetupError('identity_unavailable');
@@ -525,7 +551,93 @@ export class GoogleBrowserProvider {
     if (service.labels?.['momso-install-id'] !== id || service.reconciling || service.terminalCondition?.state !== 'CONDITION_SUCCEEDED' || service.uri !== this.#gatewayUrl || !service.invokerIamDisabled) throw new SetupError('gateway_not_ready');
   }
 
-  async destroy(id, onProgress = () => {}) {
+  async deletionPreview(id) {
+    if (!this.#selectedProject) throw new SetupError('project_required');
+    const projectId = this.#projectId(id);
+    await this.project(id);
+    const short = id.slice(0, 12), bucketName = `momso-backup-${short}`;
+    const storage = `https://storage.googleapis.com/storage/v1/b/${bucketName}`;
+    const key = `https://cloudkms.googleapis.com/v1/projects/${projectId}/locations/${REGION}/keyRings/momso-backup-${short}/cryptoKeys/backup`;
+    let bucket = null, slots = null, versions = null, project = null;
+    try {
+      const info = await this.#request(storage, { allowMissing: true });
+      if (info) {
+        if (info.name !== bucketName || info.labels?.['momso-install-id'] !== id) throw new SetupError('resource_ownership');
+        bucket = { ownership: 'owned', location: info.location };
+        const collect = async query => {
+          let page = '', count = 0, objects = [], seen = new Set();
+          do {
+            if (seen.has(page) || ++count > 1000) throw new SetupError('google_response');
+            seen.add(page);
+            const params = new URLSearchParams(query);
+            if (page) params.set('pageToken', page);
+            const response = await this.#request(`${storage}/o?${params}`);
+            if (response.items !== undefined && !Array.isArray(response.items)) throw new SetupError('google_response');
+            objects.push(...(response.items ?? []).map(item => ({ name: item.name, updated: item.updated, size: item.size, storageClass: item.storageClass })));
+            if (objects.length > 100000) throw new SetupError('google_response');
+            page = response.nextPageToken ?? '';
+          } while (page);
+          return objects;
+        };
+        const live = await collect({ versions: 'true' });
+        slots = { complete: true, items: live, softDeletedComplete: false };
+        try { const soft = await collect({ softDeleted: 'true' }); slots.softDeletedComplete = true; slots.softDeletedCount = soft.length; slots.softDeletedItems = soft; } catch { /* unknown is not empty */ }
+      }
+    } catch (error) { if (error?.step === 'resource_ownership') throw error; }
+    try {
+      const info = await this.#request(key, { allowMissing: true });
+      if (info) {
+        if (info.labels?.['momso-install-id'] !== id || !info.name?.endsWith(`/keyRings/momso-backup-${short}/cryptoKeys/backup`)) throw new SetupError('resource_ownership');
+        const response = await this.#request(`${key}/cryptoKeyVersions`);
+        if (response.nextPageToken || !Array.isArray(response.cryptoKeyVersions)) throw new SetupError('google_response');
+        versions = { complete: true, items: response.cryptoKeyVersions.map(item => ({ state: item.state, protectionLevel: item.protectionLevel })) };
+      }
+    } catch (error) { if (error?.step === 'resource_ownership') throw error; }
+    try {
+      const value = await this.#request(`${CRM}projects/${projectId}`);
+      project = { createdByMomso: value.projectId === `momso-${id}` && value.labels?.['momso-install-id'] === id, exclusive: null };
+    } catch { /* ownership remains unknown */ }
+    const output = deletionPreview({ bucket, slots, versions, project });
+    output.projectExclusivity = await this.projectExclusivity(id);
+    output.projectClosure = output.projectExclusivity.status === 'not_exclusive' ? 'not_suggested' : 'unverified';
+    return output;
+  }
+
+  async projectExclusivity(id) {
+    if (!this.#selectedProject) throw new SetupError('project_required');
+    const projectId = this.#projectId(id);
+    const pages = async (base, field, params) => {
+      let page = '', items = [], seen = new Set();
+      do {
+        if (seen.has(page) || seen.size >= 1000) throw new SetupError('google_response');
+        seen.add(page);
+        const query = new URLSearchParams(params);
+        if (page) query.set('pageToken', page);
+        const value = await this.#request(`${base}?${query}`);
+        if (!value || (value[field] !== undefined && !Array.isArray(value[field]))) throw new SetupError('google_response');
+        items.push(...(value[field] ?? []));
+        if (items.length > 100000) throw new SetupError('google_response');
+        page = value.nextPageToken ?? '';
+        if (typeof page !== 'string') throw new SetupError('google_response');
+      } while (page);
+      return items;
+    };
+    return inspectProjectExclusivity({ projectId, installationId: id,
+      listAssets: () => pages(`${ASSET}projects/${projectId}:searchAllResources`, 'results', { pageSize: '200' }),
+      listServices: async () => (await pages(`${USAGE}projects/${projectId}/services`, 'services', { filter: 'state:ENABLED', pageSize: '200' })).map(item => item?.config?.name ?? item?.name?.split('/').at(-1)) });
+  }
+
+  async discardBackup(id, previous = null) {
+    if (!this.#selectedProject) throw new SetupError('project_required');
+    const projectId = this.#projectId(id);
+    await this.project(id);
+    const vm = `${COMPUTE}projects/${projectId}/zones/${ZONE}/instances/momso-${id.slice(0, 12)}`;
+    if (await this.#request(vm, { allowMissing: true })) throw new SetupError('vm_unconfirmed');
+    return discardBackup({ projectId, installationId: id, previous, sleep: this.#sleep,
+      request: (method, url, body) => this.#request(url, { method, body, allowMissing: method === 'GET' }) });
+  }
+
+  async destroy(id, onProgress = () => {}, { onVmState = () => {} } = {}) {
     if (!this.#selectedProject) throw new SetupError('project_required');
     const projectId = this.#projectId(id);
     const short = id.slice(0, 12);
@@ -534,15 +646,18 @@ export class GoogleBrowserProvider {
     const base = `${COMPUTE}projects/${projectId}/`;
     const runBase = `${RUN}projects/${projectId}/locations/${REGION}/services/momso-any-${short}`;
     const items = [
-      { key: 'gateway', url: runBase, type: 'run', owns: x => x.labels?.['momso-install-id'] === id && x.name === `projects/${projectId}/locations/${REGION}/services/momso-any-${short}` },
       { key: 'vm', url: `${base}zones/${ZONE}/instances/${name}`, type: 'compute', owns: x => x.labels?.['momso-install-id'] === id && x.name === name && x.disks?.length === 1 && x.disks[0].boot === true && x.disks[0].autoDelete === true && x.disks[0].source?.endsWith('/disks/' + name) && x.serviceAccounts?.length === 1 && x.serviceAccounts[0].email === `momso-vm-${short}@${projectId}.iam.gserviceaccount.com` },
       { key: 'router', url: `${base}regions/${REGION}/routers/${name}-router`, type: 'compute', owns: x => x.name === `${name}-router` && x.description === marker && (x.nats ?? []).every(nat => nat.name === `${name}-nat`) && !(x.bgpPeers?.length) && !(x.interfaces?.length) },
       { key: 'firewall', url: `${base}global/firewalls/${name}-private`, type: 'compute', owns: x => x.name === `${name}-private` && x.description === marker && x.network?.endsWith('/' + name + '-net') },
       { key: 'subnet', url: `${base}regions/${REGION}/subnetworks/${name}-sub`, type: 'compute', owns: x => x.name === `${name}-sub` && x.description === marker && x.network?.endsWith('/' + name + '-net') },
       { key: 'network', url: `${base}global/networks/${name}-net`, type: 'compute', owns: x => x.name === `${name}-net` && x.description === marker },
-      ...['transport', 'session', 'vault'].map(suffix => ({ key: `secret_${suffix}`, url: `${SECRETS}projects/${projectId}/secrets/momso-${suffix}-${short}`, type: 'secret', owns: x => x.labels?.['momso-install-id'] === id && x.name?.endsWith(`/secrets/momso-${suffix}-${short}`) })),
+      // The existing deletion path preserves backups; retaining the vault
+      // identity is necessary for the customer's saved credentials to survive.
+      ...['transport', 'session'].map(suffix => ({ key: `secret_${suffix}`, url: `${SECRETS}projects/${projectId}/secrets/momso-${suffix}-${short}`, type: 'secret', owns: x => x.labels?.['momso-install-id'] === id && x.name?.endsWith(`/secrets/momso-${suffix}-${short}`) })),
+      { key: 'secret_vault', preserve: true, url: `${SECRETS}projects/${projectId}/secrets/momso-vault-${short}`, type: 'secret', owns: x => x.labels?.['momso-install-id'] === id && x.name?.endsWith(`/secrets/momso-vault-${short}`) },
       ...['vm', 'gateway'].map(suffix => ({ key: `account_${suffix}`, url: `${IAM}projects/${projectId}/serviceAccounts/momso-${suffix}-${short}@${projectId}.iam.gserviceaccount.com`, type: 'account', owns: x => x.email === `momso-${suffix}-${short}@${projectId}.iam.gserviceaccount.com` && x.description === marker })),
       ...[['Stop', ['compute.instances.stop']], ['Anywhere', ['compute.instances.get', 'compute.instances.start']], ['Update', ['run.operations.get', 'run.revisions.get', 'run.revisions.list', 'run.services.get', 'run.services.update']]].map(([suffix, permissions]) => ({ key: `role_${suffix.toLowerCase()}`, url: `${IAM}projects/${projectId}/roles/momso${suffix}${short}`, type: 'role', owns: x => x.name?.endsWith(`/roles/momso${suffix}${short}`) && x.description === marker && JSON.stringify([...(x.includedPermissions ?? [])].sort()) === JSON.stringify(permissions) })),
+      { key: 'gateway', url: runBase, type: 'run', owns: x => x.labels?.['momso-install-id'] === id && x.name === `projects/${projectId}/locations/${REGION}/services/momso-any-${short}` },
     ];
     await this.project(id);
     for (const item of items) {
@@ -550,10 +665,14 @@ export class GoogleBrowserProvider {
       if (item.type === 'role' && item.before?.deleted) item.before = null;
       if (item.before && !item.owns(item.before)) throw new SetupError('resource_ownership');
     }
-    const remaining = [];
+    const remaining = [], retained = [];
     let networkPending = false;
     for (const item of items) {
-      if (!item.before) continue;
+      if (item.preserve) {
+        retained.push({ resource: item.key, status: item.before ? 'retained' : 'unverified', reason: item.before ? 'backup_recovery' : 'not_found_or_unavailable' });
+        continue;
+      }
+      if (!item.before) { if (item.key === 'vm') onVmState('deleted'); continue; }
       if (networkPending && item.key === 'network') { remaining.push(item.key); continue; }
       const current = await this.#request(item.url, { allowMissing: true });
       if (!current) continue;
@@ -567,9 +686,26 @@ export class GoogleBrowserProvider {
           if (!refreshed || !item.owns(refreshed) || refreshed.nats?.length || (current.id && refreshed.id !== current.id)) throw new SetupError('resource_ownership');
         }
         const etag = current.etag && (item.type === 'run' || item.type === 'secret') ? `?etag=${encodeURIComponent(current.etag)}` : '';
-        const op = await this.#request(item.url + etag, { method: 'DELETE' });
+        if (item.key === 'vm') onVmState('unknown');
+        let op;
+        try { op = await this.#request(item.url + etag, { method: 'DELETE' }); }
+        catch (error) {
+          if (item.key === 'vm' && error?.requestRejected === true) onVmState('failed');
+          throw error;
+        }
         if (item.type === 'run') await this.#pollRun(projectId, op.name);
-        if (item.type === 'compute') await this.#computeOperation(projectId, op);
+        if (item.type === 'compute') {
+          try { await this.#computeOperation(projectId, op); }
+          catch (error) {
+            if (item.key === 'vm' && error?.step === 'operation_failed') {
+              const vm = await this.#request(item.url, { allowMissing: true });
+              if (vm && item.owns(vm) && vm.status === 'RUNNING' && (!item.before.id || vm.id === item.before.id)) onVmState('failed');
+            }
+            throw error;
+          }
+        }
+        if (item.key === 'vm' && await this.#request(item.url, { allowMissing: true })) throw new SetupError('vm_deletion_unconfirmed');
+        if (item.key === 'vm') onVmState('deleted');
         onProgress({ step: item.key, state: 'done' });
       } catch (error) {
         if ((item.key === 'subnet' || item.key === 'network') && error instanceof SetupError && (error.step === 'google_request' || error.step === 'operation_failed')) {
@@ -577,6 +713,32 @@ export class GoogleBrowserProvider {
         } else throw error;
       }
     }
-    return { remaining };
+    retained.push({ resource: 'backup_bucket', status: 'unverified', reason: 'not_inspected' },
+      { resource: 'backup_kms', status: 'unverified', reason: 'not_inspected' });
+    const groups = { vm: ['vm'], gateway: ['gateway'], network: ['router', 'firewall', 'subnet', 'network'],
+      secrets: ['secret_transport', 'secret_session'], iam: ['account_vm', 'account_gateway', 'role_stop', 'role_anywhere', 'role_update'] };
+    const resources = {};
+    for (const [group, keys] of Object.entries(groups)) {
+      let found = false, unknown = false;
+      for (const key of keys) {
+        const item = items.find(value => value.key === key);
+        try {
+          const current = await this.#request(item.url, { allowMissing: true });
+          if (current && !(item.type === 'role' && current.deleted)) {
+            if (!item.owns(current)) unknown = true;
+            else found = true;
+          }
+        } catch { unknown = true; }
+      }
+      const status = found ? 'retained' : unknown ? 'unverified' : 'deleted';
+      resources[group] = { status, reason: status === 'deleted' ? null : status === 'retained' ? 'cleanup_pending' : 'inventory_unavailable' };
+      if (found && unknown) resources[group + '_inventory'] = { status: 'unverified', reason: 'inventory_unavailable' };
+    }
+    try {
+      const disk = await this.#request(`${base}zones/${ZONE}/disks/${name}`, { allowMissing: true });
+      resources.disk = disk ? { status: 'unverified', reason: 'ownership_unconfirmed' } : { status: 'deleted', reason: null };
+    } catch { resources.disk = { status: 'unverified', reason: 'inventory_unavailable' }; }
+    resources.iam_bindings = { status: 'unverified', reason: 'not_inventoried' };
+    return { remaining, mode: 'pause', status: 'backup_freshness_unverified', retained, resources, billingZero: null };
   }
 }

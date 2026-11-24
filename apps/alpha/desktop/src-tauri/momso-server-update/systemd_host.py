@@ -82,6 +82,14 @@ class SystemdHost:
         subprocess.run(["systemctl", operation, self.unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
     def snapshot_data(self): return self.snapshots.snapshot()
     def restore_data(self, snapshot): self.snapshots.restore(snapshot)
+    def recovery_data_identity(self):
+        try:
+            path = self.snapshots.data
+            if path.is_symlink() or not path.is_dir(): return None
+            info = path.stat()
+            return (info.st_dev, info.st_ino)
+        except OSError:
+            return None
     def activate_release(self, release):
         target = Path(release).resolve(strict=True)
         if self.root.resolve() not in target.parents:

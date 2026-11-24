@@ -20,7 +20,7 @@ def wake():
     base = "https://compute.googleapis.com/compute/v1/projects/" + "/zones/".join((urllib.parse.quote(project, safe=""), urllib.parse.quote(zone, safe=""))) + "/instances/" + urllib.parse.quote(instance, safe="")
     token = api_request("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", metadata=True)["access_token"]
     current = api_request(base, token=token).get("status")
-    if current in ("RUNNING", "PROVISIONING", "STAGING"):
+    if current in ("RUNNING", "PROVISIONING", "STAGING", "STARTING"):
         return current
     api_request(base + "/start", method="POST", token=token)
     return "STARTING"

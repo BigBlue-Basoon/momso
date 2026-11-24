@@ -1,4 +1,5 @@
 // The customer-authorized provider owns reconciliation; checkpoints never contain tokens.
+import { gatewayFailure } from './momso_anywhere_gateway_failure.mjs';
 const STEPS = [
   'project', 'billing', 'services', 'privateNetwork', 'server', 'gateway', 'gatewayReady',
 ];
@@ -34,8 +35,11 @@ export async function startAnywhere(provider, checkpoint, onProgress = () => {})
     try {
       await provider[step](checkpoint.installationId);
     } catch (error) {
-      onProgress({ step, state: 'failed' });
-      throw new SetupError(error instanceof SetupError ? error.step : step);
+      const details = error instanceof SetupError && typeof error.code === 'string' ? { code: error.code, rolledBack: error.rolledBack ?? null, retryable: error.retryable ?? null } : error instanceof SetupError && error.step.startsWith('gateway_') ? gatewayFailure(error.step) : {};
+      onProgress({ step, state: 'failed', ...details });
+      const wrapped = new SetupError(details.code ?? (error instanceof SetupError ? error.step : step));
+      Object.assign(wrapped, details);
+      throw wrapped;
     }
     onProgress({ step, state: 'done' });
   }

@@ -11,9 +11,12 @@ import momso_release_keys
 
 
 MODULES = ("momso_anywhere_start.mjs", "momso_anywhere_google_browser.mjs",
-           "momso_anywhere_setup.mjs", "momso_anywhere_vm_startup.mjs", "momso_anywhere_cloud_run_revision.mjs",
+           "momso_anywhere_deletion_contract.mjs", "momso_anywhere_delete_result.mjs",
+           "momso_anywhere_discard_backup.mjs", "momso_anywhere_test_backup_cleanup_s117.mjs",
+           "momso_anywhere_project_exclusivity.mjs",
+           "momso_anywhere_setup.mjs", "momso_anywhere_vm_startup.mjs", "momso_anywhere_cloud_run_revision.mjs", "momso_anywhere_gateway_failure.mjs",
            "momso_release_manifest.mjs",
-           "momso_anywhere_oauth_capture.mjs", "momso_anywhere_oauth_redirect.mjs",
+           "momso_anywhere_oauth_capture.mjs", "momso_anywhere_oauth_redirect.mjs", "momso_anywhere_pause_transfer.mjs",
            "momso_anywhere_backup_setup.mjs")
 
 

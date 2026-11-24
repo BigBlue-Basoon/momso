@@ -17,17 +17,22 @@ import time
 import uuid
 from pathlib import Path
 
+if __name__ == '__main__':
+    sys.modules.setdefault('momso_server_install', sys.modules[__name__])
+
 ZONE = "asia-northeast3-a"
 REGION = "asia-northeast3"
 MACHINE = "e2-small"
 
 
 class InstallError(Exception):
-    def __init__(self, message, *, role_propagating=False, managed_conflict=None, managed_conflicts=None):
+    def __init__(self, message, *, role_propagating=False, managed_conflict=None, managed_conflicts=None, gateway_failure=None, gateway_code=None):
         super().__init__(message)
         self.role_propagating = role_propagating
         self.managed_conflict = managed_conflict
         self.managed_conflicts = managed_conflicts or ([managed_conflict] if managed_conflict else [])
+        self.gateway_failure = gateway_failure
+        self.gateway_code = gateway_code
 
 
 class PendingNetworkCleanup(InstallError):
@@ -153,7 +158,8 @@ class GoogleProvider:
                 if conflicts:
                     raise InstallError('\n'.join(f"관리 파일 충돌: {name}: {reason}" for name, reason in conflicts), managed_conflict=conflicts[0], managed_conflicts=conflicts)
             raise InstallError(f"클라우드 작업 실패: {' '.join(args[:3])}. 권한·연결·자원 상태를 확인하세요.",
-                               role_propagating=role_propagation_failure(stderr))
+                               role_propagating=role_propagation_failure(stderr),
+                               gateway_code='gateway_image_permission' if args[:2] == ('run', 'deploy') and (b'artifactregistry.repositories.downloadArtifacts' in stderr or b'permission to read the image' in stderr.lower()) else None)
         if parse:
             try:
                 return json.loads(result.stdout.decode("utf-8"))
@@ -386,15 +392,21 @@ if action=='begin':
    raise
   finally:
    if os.path.isdir(stage):shutil.rmtree(stage)
-elif action=='restore':
+def restore_checkpoint():
+ global restored_pair
  owned();subprocess.run(['systemctl','stop','momso-server'],check=True)
  managed={};exec(compile(base64.b64decode(MANAGED_CODE),'momso_managed_files.py','exec'),managed)
+ errors=[]
+ def rollback_managed(path,manifest,journal):
+  try:managed['rollback'](path,manifest,journal,INSTALL_OWNER)
+  except Exception:errors.append('helper_restore_failed')
  for group,path in (('overrides','/etc/systemd/system/momso-server.service.d'),('units','/etc/systemd/system'),('helper','/opt/momso')):
-  managed['rollback'](path,'/etc/momso-private/managed-'+group+'.json',backup+'/managed-'+group+'-journal.json',INSTALL_OWNER)
- managed['rollback']('/opt/momso','/etc/momso-private/managed-files.json',backup+'/managed-files.json',INSTALL_OWNER)
+  rollback_managed(path,'/etc/momso-private/managed-'+group+'.json',backup+'/managed-'+group+'-journal.json')
+ rollback_managed('/opt/momso','/etc/momso-private/managed-files.json',backup+'/managed-files.json')
  name=open(backup+'/snapshot-name').read().strip()
  DataSnapshots(data,backup+'/snapshots').restore(backup+'/snapshots/'+name)
  tmp=root+'/.momso-server-restore';shutil.copy2(backup+'/momso-server',tmp);os.replace(tmp,server)
+ restored_pair=True
  staged=tempfile.mkdtemp(prefix='.momso-web-restore-',dir=root);os.rmdir(staged)
  try:
   shutil.copytree(backup+'/web',staged,symlinks=True)
@@ -406,19 +418,38 @@ elif action=='restore':
  if os.path.isfile(backup+'/installed.json'):shutil.copy2(backup+'/installed.json',os.path.dirname(marker)+'/installed.json')
  subprocess.run(['systemctl','reset-failed','momso-server'],check=False)
  subprocess.run(['systemctl','start','momso-server'],check=True)
+ if errors:raise RuntimeError('rollback_failed')
+if action=='restore':
+ restored_pair=False
+ def identity(path):
+  try:
+   stat=os.stat(path,follow_symlinks=False)
+   return (stat.st_dev,stat.st_ino)
+  except OSError:return None
+ original_data=identity(data);original_server=identity(server)
+ try:restore_checkpoint()
+ except Exception:
+  # Never start an old executable against data whose restoration is uncertain.
+  original_pair=(original_data is not None and original_server is not None and identity(data)==original_data and identity(server)==original_server)
+  if restored_pair or original_pair:
+   subprocess.run(['systemctl','reset-failed','momso-server'],check=False)
+   subprocess.run(['systemctl','start','momso-server'],check=False)
+  raise
 elif action=='release':
  owned()
  if open(backup+'/mode').read()=='gated':call('/maintenance/release','POST')
-else:
+elif action=='finish':
  owned()
  if open(backup+'/mode').read()=='gated':call('/maintenance/release','POST')
  shutil.rmtree(backup)
 '''.replace("ACTION", repr(action)).replace("SNAPSHOT_CODE", repr(snapshot_code)).replace("MANAGED_CODE", repr(managed_code)).replace("INSTALL_OWNER", repr(self.install_id))
         encoded = base64.b64encode(code.encode()).decode()
-        wrapper = "import base64,subprocess,sys; r=subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],capture_output=True); print('momso_server_busy' if r.returncode and b'server_busy' in r.stderr else 'momso_checkpoint_failed' if r.returncode else 'momso_checkpoint_ok')"
+        wrapper = "import base64,subprocess,sys; r=subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],capture_output=True); print('momso_server_busy' if r.returncode and b'server_busy' in r.stderr else 'momso_restore_failed' if r.returncode and " + repr(action == 'restore') + " else 'momso_checkpoint_failed' if r.returncode else 'momso_checkpoint_ok')"
         result = self.ssh(wrapper).strip()
         if result == b"momso_server_busy":
             raise InstallError("지금 쓰는 중이라 올리지 못했습니다. 잠시 뒤 다시 시도해 주세요.")
+        if result == b"momso_restore_failed":
+            raise InstallError("복구 중 오류가 발생했습니다. 복구 사본을 보존했습니다.", gateway_failure={'code': 'rollback_failed', 'rolledBack': False, 'retryable': False})
         if result != b"momso_checkpoint_ok":
             raise InstallError("올리기 자료 처리에 실패했습니다. 복구 상태를 확인해 주세요.")
 
@@ -584,7 +615,7 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
     from momso_anywhere_public_assets import from_web_archive
 
     if not re.fullmatch(r"[a-zA-Z0-9._/-]+@sha256:[a-f0-9]{64}", gateway_image or ""):
-        raise InstallError("입구 이미지와 sha256 지문을 지정하세요.")
+        raise InstallError("입구 이미지와 sha256 지문을 지정하세요.", gateway_failure=momso_anywhere_install.gateway_failure('gateway_image_invalid'))
 
     configured = state["anywhere"]
     if any(configured.get(key) != value for key, value in (("client_id", client_id), ("owner_sub", owner_sub), ("login_origin", login_origin))):
@@ -598,12 +629,15 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
     interfaces = vm.get("networkInterfaces", [])
     if vm.get("labels", {}).get("momso-install-id") != provider.install_id or not interfaces or any(item.get("accessConfigs") or item.get("ipv6AccessConfigs") or not item.get("network", "").endswith("/" + provider.network) for item in interfaces):
         raise InstallError("기존 VM의 소유권이나 사설 네트워크를 확인하지 못했습니다.")
-    account, role, service = momso_anywhere_install.GoogleAnywhere(provider)._objects()
+    try:
+        account, role, service = momso_anywhere_install.GoogleAnywhere(provider)._objects()
+    except InstallError as error:
+        raise InstallError('기존 입구의 소유권을 확인하지 못했습니다.', gateway_failure=momso_anywhere_install.gateway_failure('gateway_ownership')) from error
     if not account or not role or not service:
-        raise InstallError("기존 입구의 소유권을 확인하지 못했습니다.")
+        raise InstallError("기존 입구의 소유권을 확인하지 못했습니다.", gateway_failure=momso_anywhere_install.gateway_failure('gateway_ownership'))
     current = provider.run("run", "services", "describe", "momso-any-" + provider.install_id, f"--region={REGION}", parse=True)
     if current.get("status", {}).get("url") != configured.get("url"):
-        raise InstallError("기존 입구 주소가 설치 기록과 달라 변경하지 않았습니다.")
+        raise InstallError("기존 입구 주소가 설치 기록과 달라 변경하지 않았습니다.", gateway_failure=momso_anywhere_install.gateway_failure('gateway_address_invalid'))
     if vm.get("status") in ("TERMINATED", "SUSPENDED"):
         provider.run("compute", "instances", "start", provider.name, f"--zone={ZONE}")
     elif vm.get("status") != "RUNNING":
@@ -623,6 +657,8 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
                 provider.upgrade_sequence(signed_sequence, commit=True)
         except (InstallError, OSError, subprocess.SubprocessError) as error:
             restored = False
+            gateway_detail = getattr(error, 'gateway_failure', None)
+            unsafe_detail = {**gateway_detail, 'retryable': False} if gateway_detail else None
             try:
                 provider.upgrade_checkpoint("restore")
                 restored = True
@@ -632,16 +668,27 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
                     try:
                         provider.upgrade_checkpoint("release")
                     except (InstallError, OSError, subprocess.SubprocessError) as release_error:
-                        raise InstallError("이전 판을 복구했지만 접수 중단을 해제하지 못했습니다. 복구 사본을 보존했습니다.") from release_error
-                raise InstallError("새 판 확인에 실패했고 이전 판의 복구 상태도 확인하지 못했습니다. 복구 사본을 보존했습니다.") from rollback_error
-            provider.upgrade_checkpoint("finish")
+                        raise InstallError("이전 판을 복구했지만 접수 중단을 해제하지 못했습니다. 복구 사본을 보존했습니다.", gateway_failure=unsafe_detail) from release_error
+                rollback_detail = getattr(rollback_error, 'gateway_failure', None) or {'code': 'rollback_failed', 'rolledBack': False, 'retryable': False}
+                raise InstallError("새 판 확인에 실패했고 이전 판의 복구 상태도 확인하지 못했습니다. 복구 사본을 보존했습니다.", gateway_failure=rollback_detail) from rollback_error
+            try:
+                provider.upgrade_checkpoint("finish")
+            except (InstallError, OSError, subprocess.SubprocessError) as finish_error:
+                raise InstallError('이전 판 복구 뒤 정리를 확인하지 못했습니다.', gateway_failure=unsafe_detail) from finish_error
             conflicts = getattr(error, 'managed_conflicts', [])
             suffix = ''.join(f"\n관리 파일 충돌: {name}: {reason}" for name, reason in conflicts)
-            raise InstallError("새 판 확인에 실패해 이전 server와 화면으로 되돌렸습니다." + suffix, managed_conflict=conflicts[0] if conflicts else None, managed_conflicts=conflicts) from error
+            raise InstallError("새 판 확인에 실패해 이전 server와 화면으로 되돌렸습니다." + suffix, managed_conflict=conflicts[0] if conflicts else None, managed_conflicts=conflicts, gateway_failure=getattr(error, 'gateway_failure', None)) from error
         provider.upgrade_checkpoint("finish")
         return configured["url"]
     finally:
-        provider.ensure_private_proxy()
+        previous_error = sys.exc_info()[1]
+        try:
+            provider.ensure_private_proxy()
+        except (InstallError, OSError, subprocess.SubprocessError) as proxy_error:
+            detail = getattr(previous_error, 'gateway_failure', None)
+            if detail:
+                raise InstallError('입구 전환 실패 뒤 프록시 상태를 확인하지 못했습니다.', gateway_failure={**detail, 'retryable': False}) from proxy_error
+            raise
 
 
 # Files distributed with the installer, checked before any customer resources change.
@@ -678,10 +725,11 @@ def validate_installer_files(root=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="momso server 설치 및 제거")
-    parser.add_argument("action", choices=["install", "mobile", "anywhere", "destroy"])
+    parser.add_argument("action", choices=["install", "mobile", "anywhere", "destroy", "delete-preview", "project-exclusivity"])
     parser.add_argument("--account", required=True)
     parser.add_argument("--project", required=True)
     parser.add_argument("--state", type=Path, required=True)
+    parser.add_argument('--discard-data', action='store_true', help='백업 최신성 확인을 건너뛰고 VM 자료를 버립니다')
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--sha256")
     parser.add_argument("--cf-account")
@@ -699,12 +747,13 @@ def main(argv=None):
     parser.add_argument("--release-public-key", type=Path, default=Path(__file__).with_name('momso_release_public_key.pem'), help="설치기에 고정한 Ed25519 공개키")
     parser.add_argument("--release-channel", choices=['production', 'development'], default='production')
     args = parser.parse_args(argv)
+    state = None
     try:
         if args.action == "anywhere":
             validate_installer_files()
         if not re.fullmatch(r"[A-Za-z0-9._%+@-]+", args.account) or not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", args.project):
             raise InstallError("계정 또는 프로젝트 인자가 올바르지 않습니다.")
-        if args.action == "destroy" and not args.state.is_file():
+        if args.action in ("destroy", "delete-preview", "project-exclusivity") and not args.state.is_file():
             raise InstallError("설치 기록이 없어 자원을 삭제하지 않았습니다.")
         if args.action in ("install", "mobile", "anywhere") and (args.artifact is None or args.sha256 is None):
             raise InstallError("설치 파일과 SHA-256을 지정하세요.")
@@ -736,6 +785,16 @@ def main(argv=None):
         if args.action == "mobile" and (not all((args.cf_account, args.cf_zone, args.hostname, args.email)) or not os.environ.get("MOMSO_CLOUDFLARE_API_TOKEN")):
             raise InstallError("Cloudflare 계정·영역·주소·이메일과 API 권한이 필요합니다.")
         state = initialize_state(args.state, args.account, args.project)
+        if args.action == 'project-exclusivity':
+            from momso_anywhere_project_exclusivity import inspect_project
+            provider = GoogleProvider(args.account, args.project, state['id'], args.state.parent / 'unused-ssh-key')
+            print(json.dumps(inspect_project(provider), ensure_ascii=False))
+            return 0
+        if args.action == 'delete-preview':
+            from momso_anywhere_deletion_preview import preview
+            provider = GoogleProvider(args.account, args.project, state['id'], args.state.parent / 'unused-ssh-key')
+            print(json.dumps(preview(provider), ensure_ascii=False))
+            return 0
         if args.action == 'anywhere':
             previous_channel = state.get('anywhere', {}).get('release_channel')
             if previous_channel and previous_channel != args.release_channel:
@@ -746,6 +805,7 @@ def main(argv=None):
         key_file = directory / "ssh"
         provider = GoogleProvider(args.account, args.project, state["id"], key_file)
         if args.action == "destroy":
+          def destroy_resources():
             if state.get("anywhere") and not state["anywhere"].get("destroyed"):
                 import momso_anywhere_install
                 momso_anywhere_install.GoogleAnywhere(provider).destroy()
@@ -770,10 +830,44 @@ def main(argv=None):
                     state["destroy_pending"] = error.resources
                     save_state(args.state, state)
                     raise
-            cleanup_keys(directory, state["id"])
-            state.pop("destroy_pending", None)
-            state["steps"]["destroy"] = "ok"
-            save_state(args.state, state)
+          if state.get('anywhere') and not args.discard_data:
+              from momso_anywhere_pc_pause import guarded_destroy
+              guarded_destroy(provider, destroy_resources)
+          else:
+              destroy_resources()
+          cleanup_keys(directory, state["id"])
+          state.pop("destroy_pending", None)
+          from momso_anywhere_pc_inventory import inspect_destroyed
+          inventory = inspect_destroyed(provider) if state.get('anywhere') else {}
+          if state.get('anywhere') and args.discard_data:
+              from momso_anywhere_pc_discard import discard_backup
+              from momso_anywhere_delete_result import deletion_result
+              deletion = discard_backup(provider, state.get('backup_discard'))
+              deletion.setdefault('resources', {}).update(inventory)
+              for name in ('vm', 'disk', 'gateway', 'network', 'secrets', 'iam', 'iam_bindings'):
+                  deletion.setdefault('resources', {}).setdefault(name, {'status': 'unverified', 'reason': 'not_inventoried'})
+              deletion = deletion_result(deletion)
+              state['backup_discard'] = deletion
+              done = deletion['complete']
+              state['steps']['destroy'] = 'ok' if done else 'pending'
+              save_state(args.state, state)
+              print(json.dumps(deletion, ensure_ascii=False))
+              return 0 if done else 1
+          state["steps"]["destroy"] = "ok"
+          save_state(args.state, state)
+          if state.get('anywhere'):
+                from momso_anywhere_delete_result import deletion_result
+                mode = 'discard' if args.discard_data else 'pause'
+                status = 'backup_retained_unverified' if args.discard_data else 'backup_current_verified'
+                deletion = deletion_result({'mode': mode, 'status': status, 'resources': inventory, 'retained': [
+                    {'resource': 'secret_vault', 'status': 'unverified', 'reason': 'not_inspected'},
+                    {'resource': 'backup_bucket', 'status': 'unverified', 'reason': 'not_inspected'},
+                    {'resource': 'backup_kms', 'status': 'unverified', 'reason': 'not_inspected'},
+                ], 'billingZero': None})
+                state['destroy_result'] = deletion
+                save_state(args.state, state)
+                print(json.dumps(deletion, ensure_ascii=False))
+                return 0 if deletion['complete'] else 1
         else:
             existing = state.get("anywhere", {})
             if args.action == "anywhere" and existing.get("url") and not existing.get("destroyed"):
@@ -801,6 +895,25 @@ def main(argv=None):
         print("완료: " + args.action)
         return 0
     except (InstallError, OSError, subprocess.SubprocessError, ValueError) as error:
+        if isinstance(error, InstallError) and error.gateway_failure:
+            print(json.dumps(error.gateway_failure, ensure_ascii=False))
+        if args.action == 'destroy':
+            from momso_anywhere_delete_result import deletion_result
+            code = str(error)
+            if not re.fullmatch(r'[a-z][a-z0-9_]{0,79}', code):
+                code = 'delete_failed'
+            previous = state.get('backup_discard') if isinstance(state, dict) else None
+            detail = dict(previous) if isinstance(previous, dict) else {}
+            detail['mode'] = 'delete_all' if args.discard_data else 'pause'
+            if isinstance(error, PendingNetworkCleanup):
+                known = [name for name in error.resources if not name.endswith(' (확인 필요)')]
+                unknown = [name.removesuffix(' (확인 필요)') for name in error.resources if name.endswith(' (확인 필요)')]
+                detail.update(remaining=known, resources={name: {'status': 'unverified', 'reason': 'inventory_unavailable'} for name in unknown}, retryable=True)
+                if not known:
+                    detail.update(failed=True, reason='cleanup_incomplete')
+            else:
+                detail.update(failed=True, reason=code)
+            print(json.dumps(deletion_result(detail), ensure_ascii=False))
         print(f"실패: {error}", file=sys.stderr)
         return 1
 

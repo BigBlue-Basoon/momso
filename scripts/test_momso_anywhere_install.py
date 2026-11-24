@@ -71,12 +71,15 @@ class Provider:
         elif args[:3] == ("compute", "firewall-rules", "describe"): return {"description": self.marker, "direction": "INGRESS", "network": "projects/fixture/global/networks/" + self.network, "sourceRanges": ["10.42.0.0/24"], "targetTags": [self.name], "allowed": [{"IPProtocol": "tcp", "ports": ["8766"]}]}
         elif args[:3] == ("compute", "firewall-rules", "delete"): self.rule = None
         elif args[:2] == ("run", "deploy"):
+            if not self.service and '--no-traffic' in args:
+                raise anywhere.InstallError('no-traffic unsupported for first deploy')
             if self.interrupt:
                 self.interrupt = False
                 raise anywhere.InstallError("fixture interruption")
             self.service = {"metadata": {"name": "momso-any-0123456789ab", "labels": {"momso-install-id": self.install_id}}}
             self.deploy_count += 1
             self.created = 'fixture-rev-' + str(self.deploy_count)
+            if '--no-traffic' not in args: self.traffic = self.created
         elif args[:3] == ("run", "services", "update-traffic"):
             self.traffic = args[args.index('--to-revisions') + 1].split('=')[0]
         elif args[:3] == ("run", "services", "describe"):
@@ -131,6 +134,7 @@ class Tests(unittest.TestCase):
     def test_upgrade_redeploys_same_service_without_changing_settings(self):
         p = Provider()
         gateway = anywhere.GoogleAnywhere(p)
+        p.service = {'metadata': {'name': gateway.service, 'labels': {'momso-install-id': p.install_id}}}
         gateway.upgrade_gateway("https://fixture.a.run.app", IMAGE)
         calls = [call for call in p.calls if call[:2] == ("run", "deploy")]
         self.assertEqual(len(calls), 1)
@@ -148,9 +152,10 @@ class Tests(unittest.TestCase):
         def activate(release, **kwargs): calls.append(release)
         adapter.activate = activate
         with patch.object(anywhere, 'cloud_run_gateway', return_value=adapter):
-            with self.assertRaises(anywhere.InstallError):
+            with self.assertRaises(anywhere.InstallError) as raised:
                 gateway.upgrade_gateway('https://fixture.a.run.app', IMAGE)
         self.assertEqual(calls, [IMAGE, previous])
+        self.assertEqual(raised.exception.gateway_failure, {'code': 'gateway_not_ready', 'rolledBack': True, 'retryable': True})
 
     def test_upgrade_traffic_mismatch_restores_old_pinned_revision(self):
         provider = Provider()
@@ -163,9 +168,10 @@ class Tests(unittest.TestCase):
                 raise anywhere.GatewayError('gateway_traffic_mismatch')
         adapter = SimpleNamespace(current=lambda: previous, healthy=lambda: True, activate=activate)
         with patch.object(anywhere, 'cloud_run_gateway', return_value=adapter):
-            with self.assertRaises(anywhere.InstallError):
+            with self.assertRaises(anywhere.InstallError) as raised:
                 gateway.upgrade_gateway('https://fixture.a.run.app', IMAGE)
         self.assertEqual(calls, [IMAGE, previous])
+        self.assertEqual(raised.exception.gateway_failure, {'code': 'gateway_traffic_mismatch', 'rolledBack': True, 'retryable': True})
 
     def test_failed_public_probe_restores_old_revision(self):
         provider = Provider()
@@ -262,6 +268,45 @@ class Tests(unittest.TestCase):
         install = anywhere.GoogleAnywhere(p)
         p.run = lambda *args, **kwargs: [{"name": "projects/fixture/secrets/" + install.transport_secret, "labels": {}}] if args[:2] == ("secrets", "list") else []
         with self.assertRaises(anywhere.InstallError): install.ensure_secret(install.transport_secret, b"fixture")
+
+    def test_new_service_is_removed_when_public_probe_fails(self):
+        p = Provider()
+        gateway = anywhere.GoogleAnywhere(p)
+        with patch.object(anywhere.CloudRunGateway, '_probe', side_effect=anywhere.GatewayError('gateway_probe_failed')):
+            with self.assertRaises(anywhere.InstallError):
+                gateway.install({'fingerprint': 'a' * 64, 'token': 'b' * 64}, 'fixture.apps.googleusercontent.com', '12345', 'https://login.example.test', IMAGE)
+        self.assertIsNone(p.service)
+        self.assertTrue(any(call[:3] == ('run', 'services', 'delete') for call in p.calls))
+
+    def test_first_deploy_checks_for_an_existing_service(self):
+        p = Provider()
+        gateway = anywhere.GoogleAnywhere(p)
+        gateway.prepare_identity()
+        p.service = {'metadata': {'name': gateway.service, 'labels': {'momso-install-id': p.install_id}}}
+        gateway.activate_gateway(IMAGE, previous=False)
+        deploy = next(call for call in p.calls if call[:2] == ('run', 'deploy'))
+        self.assertIn('--no-traffic', deploy)
+
+    def test_new_service_created_before_deploy_error_is_removed(self):
+        p = Provider(); original = p.run
+        def interrupted(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[:2] == ('run', 'deploy'):
+                raise anywhere.InstallError('fixture deploy interrupted')
+            return result
+        p.run = interrupted
+        with self.assertRaises(anywhere.InstallError):
+            anywhere.GoogleAnywhere(p).install({'fingerprint': 'a' * 64, 'token': 'b' * 64}, 'fixture.apps.googleusercontent.com', '12345', 'https://login.example.test', IMAGE)
+        self.assertIsNone(p.service)
+
+    def test_service_seen_on_retry_is_not_deleted_after_failed_update(self):
+        p = Provider(); gateway = anywhere.GoogleAnywhere(p)
+        gateway.prepare_identity()
+        p.service = {'metadata': {'name': gateway.service, 'labels': {'momso-install-id': p.install_id}}}
+        with patch.object(anywhere.CloudRunGateway, '_probe', side_effect=anywhere.GatewayError('gateway_probe_failed')):
+            with self.assertRaises(anywhere.InstallError):
+                gateway.install({'fingerprint': 'a' * 64, 'token': 'b' * 64}, 'fixture.apps.googleusercontent.com', '12345', 'https://login.example.test', IMAGE)
+        self.assertIsNotNone(p.service)
 
     def test_gateway_accepts_cloud_run_static_login_origin(self):
         p = Provider()

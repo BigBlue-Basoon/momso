@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -126,10 +127,47 @@ class UpdateTests(unittest.TestCase):
 
     def test_failed_rollback_keeps_maintenance_closed(self):
         self.host.healthy = False
-        self.host.restore_data = lambda _: (_ for _ in ()).throw(RuntimeError("fixture"))
+        starts = []
+        self.host.start_server = lambda: starts.append(self.host.release)
+        def fail_restore(_):
+            starts.clear()
+            raise RuntimeError("fixture")
+        self.host.restore_data = fail_restore
         with self.assertRaisesRegex(UpdateError, "rollback_failed"): self.install()
         self.assertTrue(self.host.lease)
+        self.assertEqual(starts, [])
+        self.assertNotEqual(self.host.release, 'old')
         self.assertEqual(json.loads(self.updater.state.read_text())["phase"], "switching")
+
+    def test_failed_data_restore_restarts_unchanged_new_pair(self):
+        starts = []
+        self.host.recovery_data_identity = lambda: ('fixture', 1)
+        self.host.start_server = lambda: starts.append(self.host.release)
+        def fail_restore(_):
+            starts.clear()
+            raise RuntimeError('fixture restore failure')
+        self.host.restore_data = fail_restore
+        self.host.activate_gateway = lambda _: (_ for _ in ()).throw(GatewayError('gateway_probe_failed'))
+        with self.assertRaisesRegex(UpdateError, 'rollback_failed'): self.install()
+        self.assertEqual(len(starts), 1)
+        self.assertNotEqual(starts[0], 'old')
+        self.assertTrue(self.host.lease)
+        self.assertEqual(self.host.events[-1]['reason'], 'rollback_failed')
+
+    def test_failed_data_restore_does_not_restart_changed_pair(self):
+        starts = []
+        identity = [1]
+        self.host.recovery_data_identity = lambda: identity[0]
+        self.host.start_server = lambda: starts.append(self.host.release)
+        def fail_restore(_):
+            starts.clear()
+            identity[0] = 2
+            raise RuntimeError('fixture restore failure')
+        self.host.restore_data = fail_restore
+        self.host.activate_gateway = lambda _: (_ for _ in ()).throw(GatewayError('gateway_probe_failed'))
+        with self.assertRaises(UpdateError): self.install()
+        self.assertEqual(starts, [])
+        self.assertTrue(self.host.lease)
 
     def test_busy_and_crash_recovery(self):
         self.host.available = False
@@ -150,7 +188,8 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(starts[-1], "old")
         self.assertEqual(self.host.data, "before")
         self.assertEqual(json.loads(self.updater.state.read_text())["phase"], "rolled_back")
-        self.assertEqual(self.host.events[-1], {"state": "failed", "reason": "gateway_image_permission"})
+        self.assertTrue(next(event for event in self.host.events if event['state'] == 'rolled_back')['rolledBack'])
+        self.assertEqual(self.host.events[-1], {"state": "failed", "reason": "gateway_image_permission", "code": "gateway_image_permission", "rolledBack": True, "retryable": False})
 
     def test_wrong_serving_traffic_rolls_back_and_is_not_completed(self):
         def mismatch(image):
@@ -165,6 +204,37 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(json.loads(self.updater.state.read_text())['phase'], 'rolled_back')
         self.assertNotIn('completed', [event['state'] for event in self.host.events])
 
+    def test_three_gateway_paths_report_same_mismatch_and_verified_rollback(self):
+        root = Path(__file__).resolve().parents[5]
+        sys.path.insert(0, str(root / 'scripts'))
+        try:
+            import momso_anywhere_install as pc
+            previous = {'traffic': {'old-rev': 100}}
+            def activate(release, **_kwargs):
+                if not isinstance(release, dict): raise pc.GatewayError('gateway_image_mismatch')
+            adapter = SimpleNamespace(current=lambda: previous, activate=activate, healthy=lambda: True)
+            gateway = pc.GoogleAnywhere.__new__(pc.GoogleAnywhere)
+            gateway.p, gateway.service = object(), 'fixture'
+            with patch.object(pc, 'cloud_run_gateway', return_value=adapter):
+                with self.assertRaises(pc.InstallError) as failure:
+                    gateway.activate_gateway('registry.example/gateway@sha256:' + '1' * 64)
+            pc_result = failure.exception.gateway_failure
+            def mismatch(image):
+                if image != 'old-gateway': raise GatewayError('gateway_image_mismatch')
+                self.host.gateway = image
+            self.host.activate_gateway = mismatch
+            with self.assertRaises(UpdateError): self.install()
+            worker_result = {key: self.host.events[-1][key] for key in ('code', 'rolledBack', 'retryable')}
+            source = """import {activatePinnedRevision} from './scripts/momso_anywhere_cloud_run_revision.mjs';
+let s={etag:'x',invokerIamDisabled:true,terminalCondition:{state:'CONDITION_SUCCEEDED'},latestCreatedRevision:'old-rev',trafficStatuses:[{revision:'old-rev',percent:100}]};
+try { await activatePinnedRevision({image:'registry.example/gateway@sha256:'+'1'.repeat(64),service:s,template:{},read:async()=>s,revision:async()=>({conditions:[{type:'Ready',state:'CONDITION_SUCCEEDED'}],containers:[{image:'wrong'}]}),probe:async()=>true,patch:async body=>{s={...s,...body,latestCreatedRevision:'new-rev',trafficStatuses:body.traffic??s.trafficStatuses}}}); }
+catch(e){console.log(JSON.stringify({code:e.code,rolledBack:e.rolledBack,retryable:e.retryable}));}"""
+            process = subprocess.run(['node', '--input-type=module', '-e', source], cwd=root, capture_output=True, text=True, check=True)
+            self.assertEqual(pc_result, worker_result)
+            self.assertEqual(pc_result, json.loads(process.stdout))
+        finally:
+            sys.path.remove(str(root / 'scripts'))
+
     def test_failed_gateway_rollback_does_not_leave_server_stopped(self):
         running = []
         self.host.start_server = lambda: running.append(self.host.release)
@@ -172,7 +242,8 @@ class UpdateTests(unittest.TestCase):
             self.host.gateway = "changed"
             raise GatewayError("gateway_operation_failed")
         self.host.activate_gateway = deny
-        with self.assertRaisesRegex(UpdateError, "rollback_failed"): self.install()
+        with self.assertRaisesRegex(UpdateError, "gateway_rollback_failed"): self.install()
+        self.assertEqual(self.host.events[-1]['rolledBack'], False)
         self.assertEqual(running[-1], "old")
         self.assertEqual(json.loads(self.updater.state.read_text())["phase"], "switching")
 

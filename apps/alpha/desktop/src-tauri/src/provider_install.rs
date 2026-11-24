@@ -76,13 +76,15 @@ fn node_paths_in(resources: &Path) -> Option<(std::path::PathBuf, std::path::Pat
 }
 
 fn node_paths(resources: &Path) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    node_paths_in(resources).or_else(|| {
-        if cfg!(debug_assertions) {
-            node_paths_in(&Path::new(env!("CARGO_MANIFEST_DIR")).join("generated"))
-        } else {
-            None
-        }
-    })
+    #[cfg(debug_assertions)]
+    {
+        node_paths_in(resources)
+            .or_else(|| node_paths_in(&Path::new(env!("CARGO_MANIFEST_DIR")).join("generated")))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        node_paths_in(resources)
+    }
 }
 
 #[tauri::command]
