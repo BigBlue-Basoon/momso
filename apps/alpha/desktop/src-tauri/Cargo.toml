@@ -31,7 +31,7 @@ age = "0.12.1"
 chrono = "0.4"
 crx3 = "=2.0.1"
 flate2 = "1"
-hmac = "0.12.1"
+hmac = "0.13.0"
 keyring = { version = "4.1.5", default-features = false, features = ["v1", "windows-native-keyring-store"] }
 log = "0.4"
 quick-xml = { version = "0.41", features = ["serialize"] }
