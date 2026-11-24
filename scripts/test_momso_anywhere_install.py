@@ -37,6 +37,9 @@ class Provider:
         self.rule = None
         self.interrupt = False
         self.ssh_calls = []
+        self.created = 'fixture-old'
+        self.traffic = 'fixture-old'
+        self.deploy_count = 0
 
     def ssh(self, code, data=None):
         self.ssh_calls.append((code, data))
@@ -72,8 +75,15 @@ class Provider:
                 self.interrupt = False
                 raise anywhere.InstallError("fixture interruption")
             self.service = {"metadata": {"name": "momso-any-0123456789ab", "labels": {"momso-install-id": self.install_id}}}
+            self.deploy_count += 1
+            self.created = 'fixture-rev-' + str(self.deploy_count)
+        elif args[:3] == ("run", "services", "update-traffic"):
+            self.traffic = args[args.index('--to-revisions') + 1].split('=')[0]
         elif args[:3] == ("run", "services", "describe"):
-            value = {"status": {"url": "https://fixture.a.run.app", "traffic": [{"revisionName": "fixture-rev", "percent": 100}], "latestReadyRevisionName": "fixture-rev", "conditions": [{"type": "Ready", "status": "True"}]}}
+            value = {"status": {"url": "https://fixture.a.run.app", "traffic": [{"revisionName": self.traffic, "percent": 100}], "latestReadyRevisionName": "fixture-old", "latestCreatedRevisionName": self.created, "conditions": [{"type": "Ready", "status": "True"}]}}
+            return value if parse else json.dumps(value).encode()
+        elif args[:3] == ("run", "revisions", "describe"):
+            value = {"status": {"imageDigest": IMAGE, "conditions": [{"type": "Ready", "status": "True"}]}}
             return value if parse else json.dumps(value).encode()
         elif args[:3] == ("run", "services", "delete"): self.service = None
         elif args[:3] == ("iam", "service-accounts", "delete"): self.account = None
@@ -82,6 +92,10 @@ class Provider:
 
 
 class Tests(unittest.TestCase):
+    def setUp(self):
+        probe = patch.object(anywhere.CloudRunGateway, '_probe', return_value=None)
+        probe.start()
+        self.addCleanup(probe.stop)
     def test_codex_install_also_installs_missing_git(self):
         from types import SimpleNamespace
         import inspect
@@ -137,6 +151,29 @@ class Tests(unittest.TestCase):
             with self.assertRaises(anywhere.InstallError):
                 gateway.upgrade_gateway('https://fixture.a.run.app', IMAGE)
         self.assertEqual(calls, [IMAGE, previous])
+
+    def test_upgrade_traffic_mismatch_restores_old_pinned_revision(self):
+        provider = Provider()
+        gateway = anywhere.GoogleAnywhere(provider)
+        previous = {'traffic': {'fixture-old': 100}}
+        calls = []
+        def activate(release, **kwargs):
+            calls.append(release)
+            if release == IMAGE:
+                raise anywhere.GatewayError('gateway_traffic_mismatch')
+        adapter = SimpleNamespace(current=lambda: previous, healthy=lambda: True, activate=activate)
+        with patch.object(anywhere, 'cloud_run_gateway', return_value=adapter):
+            with self.assertRaises(anywhere.InstallError):
+                gateway.upgrade_gateway('https://fixture.a.run.app', IMAGE)
+        self.assertEqual(calls, [IMAGE, previous])
+
+    def test_failed_public_probe_restores_old_revision(self):
+        provider = Provider()
+        gateway = anywhere.GoogleAnywhere(provider)
+        with patch.object(anywhere.CloudRunGateway, '_probe', side_effect=anywhere.GatewayError('gateway_probe_failed')):
+            with self.assertRaises(anywhere.InstallError):
+                gateway.upgrade_gateway('https://fixture.a.run.app', IMAGE)
+        self.assertEqual(provider.traffic, 'fixture-old')
 
     def test_new_role_iam_retry_is_bounded(self):
         p = Provider()

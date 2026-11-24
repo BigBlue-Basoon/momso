@@ -5,18 +5,20 @@ import { activatePinnedRevision } from './momso_anywhere_cloud_run_revision.mjs'
 const image = 'registry.example.test/momso/gateway@sha256:' + 'a'.repeat(64);
 const traffic = [{ revision: 'old-rev', percent: 100 }];
 
-function fixture({ mismatch = false, failSwitch = false } = {}) {
+function fixture({ mismatch = false, failSwitch = false, ignoreSwitch = false, mismatchAfterSwitch = false, probeFailure = false, staleCreated = false } = {}) {
   let service = { etag: 'v1', invokerIamDisabled: true, terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'old-rev', latestCreatedRevision: 'old-rev', trafficStatuses: traffic };
   const writes = [];
   return {
     get service() { return service; }, writes,
     async run() {
       return activatePinnedRevision({ image, service, template: { containers: [{ image }] }, read: async () => service,
-        revision: async () => ({ containers: [{ image: mismatch ? 'wrong' : image }] }),
+        revision: async () => ({ conditions: [{ type: 'Ready', state: 'CONDITION_SUCCEEDED', revisionReason: 'RETIRED' }], containers: [{ image: mismatch || (mismatchAfterSwitch && service.trafficStatuses[0].revision === 'new-rev') ? 'wrong' : image }] }),
+        probe: async () => !probeFailure,
         patch: async (body, mask) => {
           writes.push({ body, mask });
           if (failSwitch && mask === 'traffic,invokerIamDisabled' && body.traffic[0].revision === 'new-rev') throw new Error('fixture failure');
-          service = { ...service, ...body, etag: 'v2', ...(body.template ? { latestReadyRevision: 'new-rev', latestCreatedRevision: 'new-rev' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) };
+          if (ignoreSwitch && mask === 'traffic,invokerIamDisabled' && body.traffic[0].revision === 'new-rev') return;
+          service = { ...service, ...body, etag: 'v2', ...(body.template && !staleCreated ? { latestCreatedRevision: 'new-rev' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) };
         } });
     },
   };
@@ -30,7 +32,7 @@ test('stages pinned image without moving traffic, then promotes it', async () =>
   assert.equal(result.trafficStatuses[0].revision, 'new-rev');
 });
 
-for (const option of [{ mismatch: true }, { failSwitch: true }]) test(`failure restores prior traffic ${JSON.stringify(option)}`, async () => {
+for (const option of [{ mismatch: true }, { failSwitch: true }, { ignoreSwitch: true }, { mismatchAfterSwitch: true }, { probeFailure: true }, { staleCreated: true }]) test(`failure restores prior traffic ${JSON.stringify(option)}`, async () => {
   const f = fixture(option);
   await assert.rejects(f.run());
   assert.equal(f.service.trafficStatuses[0].revision, 'old-rev');
@@ -41,4 +43,12 @@ test('invalid image is rejected before changing traffic', async () => {
   let writes = 0;
   await assert.rejects(activatePinnedRevision({ image: 'registry.example.test/momso:latest', service: { trafficStatuses: traffic }, patch: async () => writes++ }), { step: 'gateway_image_invalid' });
   assert.equal(writes, 0);
+});
+
+test('reports when previous traffic could not be restored', async () => {
+  let service = { etag: 'v1', invokerIamDisabled: true, terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'old-rev', latestCreatedRevision: 'old-rev', trafficStatuses: traffic };
+  await assert.rejects(activatePinnedRevision({ image, service, template: { containers: [{ image }] }, read: async () => service,
+    revision: async () => ({ conditions: [{ type: 'Ready', state: 'CONDITION_SUCCEEDED' }], containers: [{ image: 'wrong' }] }), probe: async () => true,
+    patch: async body => { service = { ...service, ...body, latestReadyRevision: 'new-rev', latestCreatedRevision: 'new-rev', trafficStatuses: [{ revision: 'foreign-rev', percent: 100 }] }; },
+  }), { step: 'gateway_rollback_failed' });
 });

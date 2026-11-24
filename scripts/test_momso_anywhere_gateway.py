@@ -50,6 +50,17 @@ class Tests(unittest.TestCase):
         client.request("GET", path, headers=headers)
         return client, client.getresponse()
 
+    def test_public_ready_does_not_wake_or_expose_server(self):
+        self.auth.stop()
+        with patch.object(gateway, 'upstream_connection') as upstream, patch.object(gateway, 'start_instance') as wake:
+            client, response = self.get('/__momso/ready', {'Host': 'fixture.run.app', 'Origin': 'https://start.example.test'})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader('Access-Control-Allow-Origin'), '*')
+            self.assertEqual(response.getheader('Cache-Control'), 'no-store')
+            self.assertEqual(response.read(), b'{"ready":true}')
+            client.close()
+            upstream.assert_not_called(); wake.assert_not_called()
+
     def test_html_and_stream_are_forwarded_without_leaking_token(self):
         def connect(): return http.client.HTTPConnection("127.0.0.1", self.upstream.server_address[1])
         with patch.dict(os.environ, {"MOMSO_PRIVATE_PROXY_TOKEN": "fixture-secret"}), patch.object(gateway, "upstream_connection", side_effect=connect):

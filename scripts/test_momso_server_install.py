@@ -587,6 +587,20 @@ class FlowTests(unittest.TestCase):
         upgrade.assert_called_once()
         deploy.assert_not_called()
 
+    def test_existing_install_passes_signed_ghcr_image_to_upgrade(self):
+        import momso_anywhere_public_assets
+        image = 'ghcr.io/example/momso-gateway@sha256:' + 'a' * 64
+        web = self.root / 'web.tar.gz'
+        web.write_bytes(b'fictional web')
+        digest = hashlib.sha256(web.read_bytes()).hexdigest()
+        self.state['anywhere'] = {'client_id': 'fixture.apps.googleusercontent.com', 'owner_sub': '12345', 'login_origin': 'https://login.example.test', 'url': 'https://fixture.a.run.app'}
+        installer.save_state(self.path, self.state)
+        release = {'gatewayImage': image, 'bundleUrl': 'https://example.test/bundle', 'bundleSha256': 'b' * 64, 'sequence': 2}
+        with patch.object(momso_release_manifest, 'release', return_value=release), patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(installer, 'upgrade_anywhere', return_value='https://fixture.a.run.app') as upgrade:
+            result = installer.main(['anywhere', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--artifact', str(self.artifact), '--sha256', self.digest, '--web-archive', str(web), '--web-sha256', digest, '--google-client-id', 'fixture.apps.googleusercontent.com', '--owner-sub', '12345', '--login-origin', 'https://login.example.test', '--gateway-image', image, '--release-manifest-url', 'https://example.test/release.json', '--release-public-key', str(self.public_key)])
+        self.assertEqual(result, 0)
+        self.assertIn(image, upgrade.call_args.args)
+
     def test_first_install_prepares_git_before_server_start(self):
         with patch.object(installer.shutil, "which", return_value="gcloud"):
             provider = installer.GoogleProvider("fixture@example.test", "fixture-project", "0123456789ab", self.root / "fixture-key")

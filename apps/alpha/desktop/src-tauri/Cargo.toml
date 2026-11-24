@@ -36,7 +36,7 @@ keyring = { version = "4.1.5", default-features = false, features = ["v1", "wind
 log = "0.4"
 quick-xml = { version = "0.41", features = ["serialize"] }
 regex = "1"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "rustls"] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup", "bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

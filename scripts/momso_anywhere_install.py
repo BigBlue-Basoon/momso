@@ -141,7 +141,7 @@ class GoogleAnywhere(GoogleWake):
         except (GatewayError, InstallError, OSError) as error:
             raise InstallError("기존 입구의 revision을 확인하지 못했습니다.") from error
         try:
-            adapter.activate(image, deploy_flags=flags)
+            adapter.activate(image, deploy_flags=flags, first_deploy=not previous, probe='--no-allow-unauthenticated' not in flags)
             if not adapter.healthy():
                 raise GatewayError('gateway_not_ready')
             if expected_url:

@@ -434,6 +434,7 @@ fn known_values_with(
             known.push(value);
         }
     }
+    known.extend(crate::github_oauth::known_values_with(&get_secret)?);
     known.extend(crate::saved_logins::passwords_with(&get_secret)?);
     if let Some(config) = crate::object_store::load_config(data_root)? {
         let (access, secret) = get_object_keys(&config)?;

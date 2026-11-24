@@ -77,6 +77,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def authorized(self, host):
+        if self.path == '/__momso/ready' and self.command in ('GET', 'HEAD'):
+            body = b'{"ready":true}'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            if self.command == 'GET': self.wfile.write(body)
+            return False
         if self.command in ("GET", "HEAD") and self.path in PUBLIC_ASSETS:
             name, content_type = PUBLIC_ASSETS[self.path]
             try:

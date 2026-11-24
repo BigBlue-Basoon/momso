@@ -16,6 +16,7 @@ class FakeGoogle {
   }
 
   async fetch(url, options) {
+    if (url === 'https://fixture.a.run.app/__momso/ready') return ok({ ready: true });
     assert.equal(options.headers.Authorization, 'Bearer fixture-oauth');
     const body = options.body ? JSON.parse(options.body) : null;
     const method = options.method;
@@ -79,7 +80,7 @@ class FakeGoogle {
     }
     if (url.includes('run.googleapis.com')) {
       if (url.includes('/operations/')) return ok({ done: true });
-      if (url.includes('/revisions/')) return ok({ containers: [{ image: this.service.template.containers[0].image }] });
+      if (url.includes('/revisions/')) return ok({ conditions: [{ type: 'Ready', state: 'CONDITION_SUCCEEDED', revisionReason: 'RETIRED' }], containers: [{ image: this.service.template.containers[0].image }] });
       if (url.includes(':getIamPolicy')) return ok({ etag: 'fixture', bindings: [] });
       if (url.includes(':setIamPolicy')) return ok(body.policy);
       const operation = { name: `projects/${this.projectId}/locations/asia-northeast3/operations/fixture` };
@@ -87,7 +88,7 @@ class FakeGoogle {
         this.service = { ...body, uri: 'https://fixture.a.run.app', etag: 'fixture', terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'fixture-rev-1', latestCreatedRevision: 'fixture-rev-1', trafficStatuses: [{ revision: 'fixture-rev-1', percent: 100 }] };
         return ok(operation);
       }
-      if (method === 'PATCH') { this.service = { ...this.service, ...body, ...(body.template ? { latestReadyRevision: 'fixture-rev-2', latestCreatedRevision: 'fixture-rev-2' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) }; return ok(operation); }
+      if (method === 'PATCH') { this.service = { ...this.service, ...body, ...(body.template ? { latestCreatedRevision: 'fixture-rev-2' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) }; return ok(operation); }
       return this.service ? ok(this.service) : ok({}, 404);
     }
     assert.fail(`unexpected API request: ${method} ${url}`);
@@ -98,7 +99,7 @@ test('browser setup resumes after VM creation failure using customer-owned resou
   const id = 'd'.repeat(24);
   const checkpoint = { installationId: id };
   const cloud = new FakeGoogle(id);
-  const release = { bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'e'.repeat(64), gatewayImage: `registry.example.test/momso/gateway@sha256:${'f'.repeat(64)}`, loginOrigin: 'https://login.example.test' };
+  const release = { bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'e'.repeat(64), gatewayImage: `ghcr.io/example/momso-gateway@sha256:${'f'.repeat(64)}`, loginOrigin: 'https://login.example.test' };
   const provider = new GoogleBrowserProvider('fixture-oauth', { fetchImpl: cloud.fetch.bind(cloud), sleep: async () => {}, release, releaseVerifier: async value => value, clientId: 'fixture.apps.googleusercontent.com', ownerSub: '12345' });
   const progress = [];
   await assert.rejects(startAnywhere(provider, checkpoint, value => progress.push(value)), { step: 'google_unavailable' });

@@ -217,7 +217,7 @@ export class GoogleBrowserProvider {
     if (current.billingAccountName) throw new SetupError('billing_inactive');
     const open = await this.billingAccounts();
     const selected = this.#billingAccountName ? open.find(item => item.name === this.#billingAccountName) : open.length === 1 ? open[0] : null;
-    if (!selected) throw new SetupError(this.#billingAccountName ? 'billing_account_unavailable' : open.length ? 'billing_selection_required' : 'billing_setup_required');
+    if (!selected) throw new SetupError(this.#billingAccountName ? 'billing_account_unavailable' : open.length ? 'billing_selection_required' : 'billing_account_missing');
     await this.#request(`${BILLING}projects/${projectId}/billingInfo`, { method: 'PUT', body: { billingAccountName: selected.name } });
     if (!(await this.#request(`${BILLING}projects/${projectId}/billingInfo`)).billingEnabled) throw new SetupError('billing_not_ready');
   }
@@ -503,6 +503,17 @@ export class GoogleBrowserProvider {
         await this.#pollRun(projectId, operation.name);
       },
       revision: name => this.#request(`${endpoint}/revisions/${name}`),
+      probe: async () => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            const reply = await this.#fetch(uri.origin + '/__momso/ready', { cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(20000) });
+            const body = await reply.json();
+            if (reply.ok && body?.ready === true && Object.keys(body).length === 1) return true;
+          } catch { /* transient cold start */ }
+          if (attempt < 2) await this.#sleep(2000);
+        }
+        return false;
+      },
     });
     this.#gatewayUrl = uri.origin;
   }

@@ -4,9 +4,30 @@ import { beginRedirect, consumeRedirect } from './momso_anywhere_oauth_redirect.
 import { hasOAuthFragment, takeOAuthFragment } from './momso_anywhere_oauth_capture.mjs';
 
 const RETRY_KEY = 'momso.start.retry.v1';
+const CLOUD_RETURN_KEY = 'momso.start.cloud-return.v1';
+const CLOUD_SETUP_URLS = Object.freeze({
+  cloud: 'https://console.cloud.google.com/',
+  billing: 'https://console.cloud.google.com/billing',
+  trial: 'https://cloud.google.com/free',
+  quota: 'https://console.cloud.google.com/projectcreate',
+});
 let authorization = null;
 export function hasPendingRedirect() { return hasOAuthFragment(); }
 export function clearStartAuthorization() { authorization = null; }
+
+// Only fixed Google URLs are accepted; the saved retry contains no credentials.
+export function openGoogleSetup({ destination, session = sessionStorage, location = window.location }) {
+  const target = CLOUD_SETUP_URLS[destination];
+  if (!target || !Object.hasOwn(CLOUD_SETUP_URLS, destination)) throw new SetupError('invalid_destination');
+  try {
+    if (!session.getItem(RETRY_KEY)) throw new SetupError('checkpoint_unavailable');
+    session.setItem(CLOUD_RETURN_KEY, '1');
+  } catch (error) {
+    if (error instanceof SetupError) throw error;
+    throw new SetupError('checkpoint_unavailable');
+  }
+  location.assign(target);
+}
 
 // User gesture -> Google authorization -> search only this account's owned installations.
 export async function findFromGesture({ google, clientId, release, authorize, session = globalThis.sessionStorage, location = globalThis.window?.location, cryptoImpl = crypto, storage = globalThis.localStorage, fetchImpl = fetch, providerFactory = providerFromToken }) {
@@ -110,7 +131,14 @@ export async function resumeFromRedirect({ clientId, release, onProgress, storag
 // The screen calls this once after loading, including on ordinary visits.
 export async function resumeAfterRedirect(options) {
   const fragment = options.fragment ?? takeOAuthFragment();
-  if (!fragment) return null;
+  if (!fragment) {
+    const session = options.session ?? sessionStorage;
+    try {
+      if (session.getItem(CLOUD_RETURN_KEY) !== '1') return null;
+      session.removeItem(CLOUD_RETURN_KEY);
+    } catch { throw new SetupError('checkpoint_unavailable'); }
+    return retryLastAction(options);
+  }
   try {
     const { action, value, selection } = await resumeFromRedirect({ ...options, fragment, includeSelection: true });
     return screenResult(action, value, selection);

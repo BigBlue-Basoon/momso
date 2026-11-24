@@ -2,6 +2,9 @@
 import json
 import re
 import subprocess
+import time
+import urllib.parse
+import urllib.request
 
 
 class GatewayError(Exception):
@@ -9,11 +12,31 @@ class GatewayError(Exception):
 
 
 class CloudRunGateway:
-    def __init__(self, project, region, service, *, runner=subprocess.run):
+    def __init__(self, project, region, service, *, runner=subprocess.run, probe=None):
         if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", project): raise ValueError("invalid_project")
         if not re.fullmatch(r"[a-z0-9-]+", region): raise ValueError("invalid_region")
         if not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", service): raise ValueError("invalid_service")
         self.project, self.region, self.service, self.runner = project, region, service, runner
+        self.probe = probe or self._probe
+
+    @staticmethod
+    def _probe(url):
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != 'https' or not parsed.hostname or not parsed.hostname.endswith('.run.app') or parsed.netloc != parsed.hostname or parsed.path or parsed.query or parsed.fragment:
+            raise GatewayError('gateway_address_invalid')
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs): return None
+        opener = urllib.request.build_opener(NoRedirect())
+        request = urllib.request.Request(url + '/__momso/ready', headers={'Cache-Control': 'no-store'})
+        for attempt in range(3):
+            try:
+                with opener.open(request, timeout=20) as response:
+                    if response.status == 200 and json.loads(response.read(256)) == {'ready': True}:
+                        return
+            except Exception:
+                pass
+            if attempt < 2: time.sleep(2)
+        raise GatewayError('gateway_probe_failed')
 
     def _run(self, *args):
         command = ["gcloud", "run", *args, "--project", self.project, "--region", self.region, "--quiet"]
@@ -29,6 +52,10 @@ class CloudRunGateway:
     def preflight(self, image):
         if not isinstance(image, str) or not re.fullmatch(r"[a-zA-Z0-9._/-]+@sha256:[a-f0-9]{64}", image):
             raise GatewayError("gateway_image_invalid")
+        # Artifact Registry's describe command cannot inspect public GHCR.
+        # Cloud Run validates availability while staging the pinned revision.
+        if image.startswith("ghcr.io/"):
+            return False
         try:
             result = self.runner(["gcloud", "artifacts", "docker", "images", "describe", image, "--format=json", "--quiet"], capture_output=True, timeout=60, check=False)
         except (OSError, subprocess.TimeoutExpired):
@@ -47,6 +74,18 @@ class CloudRunGateway:
         try: return json.loads(self._run("services", "describe", self.service, "--format=json"))
         except (ValueError, TypeError): raise GatewayError("gateway_response_invalid") from None
 
+    def _verify_revision(self, revision, image):
+        try:
+            data = json.loads(self._run("revisions", "describe", revision, "--format=json"))
+            status = data["status"]
+            ready = any(item.get("type") == "Ready" and item.get("status") == "True" for item in status.get("conditions", []))
+            resolved = status.get("imageDigest", "")
+            expected = image.rsplit("@", 1)[1]
+            if not ready or not isinstance(resolved, str) or resolved.split("@")[-1] != expected:
+                raise GatewayError("gateway_image_mismatch")
+        except (ValueError, TypeError, KeyError):
+            raise GatewayError("gateway_response_invalid") from None
+
     def current(self):
         status = self._describe().get("status", {})
         entries = status.get("traffic", [])
@@ -59,7 +98,7 @@ class CloudRunGateway:
         if sum(traffic.values()) != 100: raise GatewayError("gateway_response_invalid")
         return {"traffic": traffic}
 
-    def activate(self, release, *, deploy_flags=()):
+    def activate(self, release, *, deploy_flags=(), first_deploy=False, probe=True):
         if isinstance(release, dict):
             if deploy_flags: raise GatewayError("gateway_response_invalid")
             traffic = release.get("traffic", {})
@@ -71,11 +110,23 @@ class CloudRunGateway:
                 raise GatewayError("gateway_image_invalid")
             if any(not isinstance(flag, str) or not flag.startswith("--") or flag.startswith(("--source", "--image", "--traffic", "--no-traffic")) for flag in deploy_flags):
                 raise GatewayError("gateway_response_invalid")
+            before = None if first_deploy else self._describe().get('status', {}).get('latestCreatedRevisionName')
+            if not first_deploy and (not before or not re.fullmatch(r'[a-z0-9-]+', before)): raise GatewayError('gateway_not_ready')
             self._run("deploy", self.service, "--image", release, "--no-traffic", *deploy_flags)
-            revision = self._describe().get("status", {}).get("latestReadyRevisionName")
-            if not revision or not re.fullmatch(r"[a-z0-9-]+", revision): raise GatewayError("gateway_not_ready")
+            revision = self._describe().get("status", {}).get("latestCreatedRevisionName")
+            if not revision or not re.fullmatch(r"[a-z0-9-]+", revision) or revision == before: raise GatewayError("gateway_not_ready")
+            self._verify_revision(revision, release)
             target = revision + "=100"
         self._run("services", "update-traffic", self.service, "--to-revisions", target)
+        if isinstance(release, dict):
+            if self.current()["traffic"] != traffic:
+                raise GatewayError("gateway_rollback_mismatch")
+        else:
+            if self.current()["traffic"] != {revision: 100}:
+                raise GatewayError("gateway_traffic_mismatch")
+            self._verify_revision(revision, release)
+            if probe:
+                self.probe(self._describe().get('status', {}).get('url', ''))
 
     def healthy(self):
         status = self._describe().get("status", {})

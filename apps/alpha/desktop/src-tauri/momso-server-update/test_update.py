@@ -152,6 +152,19 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(json.loads(self.updater.state.read_text())["phase"], "rolled_back")
         self.assertEqual(self.host.events[-1], {"state": "failed", "reason": "gateway_image_permission"})
 
+    def test_wrong_serving_traffic_rolls_back_and_is_not_completed(self):
+        def mismatch(image):
+            if image != 'old-gateway':
+                self.host.gateway = 'unexpected-new'
+                raise GatewayError('gateway_traffic_mismatch')
+            self.host.gateway = image
+        self.host.activate_gateway = mismatch
+        with self.assertRaisesRegex(UpdateError, 'gateway_traffic_mismatch'):
+            self.install()
+        self.assertEqual(self.host.gateway, 'old-gateway')
+        self.assertEqual(json.loads(self.updater.state.read_text())['phase'], 'rolled_back')
+        self.assertNotIn('completed', [event['state'] for event in self.host.events])
+
     def test_failed_gateway_rollback_does_not_leave_server_stopped(self):
         running = []
         self.host.start_server = lambda: running.append(self.host.release)

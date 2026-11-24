@@ -32,6 +32,7 @@ for (const [existing, channel] of [[false, 'production'], [true, 'production'], 
     const path = url.pathname;
     const method = options.method;
     const body = options.body ? JSON.parse(options.body) : {};
+    if (url.hostname === 'fixture.a.run.app' && path === '/__momso/ready') return ok({ ready: true });
     if (url.hostname === 'fixture.test') return signed.response(path.endsWith('.sig') ? signed.signature : signed.raw);
     if (method !== 'GET') writes.push(`${method} ${url.hostname}${path}`);
     if (url.hostname === 'cloudresourcemanager.googleapis.com') {
@@ -105,12 +106,12 @@ for (const [existing, channel] of [[false, 'production'], [true, 'production'], 
     }
     if (url.hostname === 'run.googleapis.com') {
       if (path.includes('/operations/')) return ok({ done: true });
-      if (path.includes('/revisions/')) return ok({ containers: [{ image: service.template.containers[0].image }] });
+      if (path.includes('/revisions/')) return ok({ conditions: [{ type: 'Ready', state: 'CONDITION_SUCCEEDED', revisionReason: 'RETIRED' }], containers: [{ image: service.template.containers[0].image }] });
       if (path.endsWith(':getIamPolicy')) return ok({ etag: 'fixture', bindings: [] });
       if (path.endsWith(':setIamPolicy')) return ok(body.policy);
       if (method === 'POST') { service = { ...body, name: `projects/${projectId}/locations/asia-northeast3/services/momso-any-${short}`, uri: 'https://fixture.a.run.app', etag: 'fixture', terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'fixture-rev-1', latestCreatedRevision: 'fixture-rev-1', trafficStatuses: [{ revision: 'fixture-rev-1', percent: 100 }] }; return ok({ name: `projects/${projectId}/locations/asia-northeast3/operations/create` }); }
       if (method === 'DELETE') { service = null; return ok({ name: `projects/${projectId}/locations/asia-northeast3/operations/delete` }); }
-      if (method === 'PATCH') { service = { ...service, ...body, ...(body.template ? { latestReadyRevision: 'fixture-rev-2', latestCreatedRevision: 'fixture-rev-2' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) }; return ok({ name: `projects/${projectId}/locations/asia-northeast3/operations/update` }); }
+      if (method === 'PATCH') { service = { ...service, ...body, ...(body.template ? { latestCreatedRevision: 'fixture-rev-2' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) }; return ok({ name: `projects/${projectId}/locations/asia-northeast3/operations/update` }); }
       return service ? ok(service) : ok({}, 404);
     }
     assert.fail(`unexpected fake request ${method} ${url.hostname}${path}`);

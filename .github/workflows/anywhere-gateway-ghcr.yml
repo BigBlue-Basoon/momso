@@ -1,0 +1,46 @@
+name: Build anywhere gateway image
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install web dependencies
+        run: npm ci
+      - name: Build public web assets
+        run: npm run desktop:ui:build
+        env:
+          VITE_MOMSO_NETWORK: '1'
+      - name: Prepare image context
+        run: python3 scripts/prepare_momso_anywhere_image.py --web apps/alpha/desktop/dist --output /tmp/momso-gateway
+      - name: Sign in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Normalize registry owner
+        id: registry
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: printf 'owner=%s\n' "${OWNER,,}" >> "$GITHUB_OUTPUT"
+      - name: Publish image and show immutable digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: /tmp/momso-gateway
+          file: /tmp/momso-gateway/scripts/momso_anywhere_image/Dockerfile
+          push: true
+          tags: ghcr.io/${{ steps.registry.outputs.owner }}/momso-gateway:${{ github.sha }}
+      - name: Report digest for release signing
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: printf 'Published digest: %s\n' "$DIGEST"
