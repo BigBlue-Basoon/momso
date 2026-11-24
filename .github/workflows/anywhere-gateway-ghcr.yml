@@ -43,4 +43,5 @@ jobs:
       - name: Report digest for release signing
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: printf 'Published digest: %s\n' "$DIGEST"
+        run: |
+          printf 'Published digest: %s\n' "$DIGEST"
