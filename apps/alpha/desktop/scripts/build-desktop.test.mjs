@@ -3,12 +3,15 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { longestPath, omitNodeFile, selectStageParent, withStage } from './build-desktop.mjs';
-import { missingRuntimeImports, runtimeImports, sameBundledExecutable, supportsNsis, verifyExtracted } from './verify-desktop-installer.mjs';
+import { longestPath, omitNodeFile, releaseBuildEnvironment, selectStageParent, withStage } from './build-desktop.mjs';
+import { missingRuntimeImports, runtimeImports, sameBundledExecutable, verifyExtracted } from './verify-desktop-installer.mjs';
 
-test('detects whether 7-Zip can inspect NSIS installers', () => {
-  assert.equal(supportsNsis('Formats:\n  K.... NSIS     nsis'), true);
-  assert.equal(supportsNsis('Formats:\n  C.... 7z       7z'), false);
+test('remaps long and short profile paths in Rust and C builds', () => {
+  const long = 'C:\\Profiles\\fixture person';
+  const short = 'C:\\Profiles\\FIXTUR~1';
+  const env = releaseBuildEnvironment({ RUSTFLAGS: '-C debuginfo=0' }, [long, short]);
+  assert.ok(env.CARGO_ENCODED_RUSTFLAGS.split('\x1f').includes(`${long}=C:\\momso-build`));
+  assert.ok(env.CL.includes(`"/pathmap:${short}=C:\\momso-build"`));
 });
 
 test('accepts only the Tauri NSIS marker change in the app binary', () => {

@@ -1,11 +1,10 @@
 import { createHash } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises';
+import { access, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { findSevenZip } from './verify-desktop-installer.mjs';
 
 const desktop = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tauri = path.join(desktop, 'src-tauri');
@@ -13,6 +12,26 @@ const nodeSource = path.join(tauri, 'generated', 'node');
 const noticeSource = path.join(desktop, 'third-party');
 const cli = path.resolve(desktop, '../../../node_modules/@tauri-apps/cli/tauri.js');
 const MAX_SOURCE_PATH = 259;
+
+export function releaseBuildEnvironment(base, homes) {
+  const paths = [...new Set(homes.filter(Boolean))];
+  if (!paths.length) throw new Error('The build profile path is required for path privacy');
+  const rust = base.CARGO_ENCODED_RUSTFLAGS ? base.CARGO_ENCODED_RUSTFLAGS.split('\x1f') : (base.RUSTFLAGS || '').split(/\s+/).filter(Boolean);
+  const cl = [base.CL || '', '/experimental:deterministic'];
+  for (const home of paths) {
+    rust.push('--remap-path-prefix', `${home}=C:\\momso-build`);
+    cl.push(`"/pathmap:${home}=C:\\momso-build"`);
+  }
+  return { ...base, CARGO_ENCODED_RUSTFLAGS: rust.join('\x1f'), CL: cl.filter(Boolean).join(' ') };
+}
+
+async function buildProfilePaths() {
+  const home = process.env.USERPROFILE;
+  if (!home) throw new Error('Windows profile path is unavailable');
+  const source = "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; using System.Text; public static class PathShort { [DllImport(\"kernel32.dll\", CharSet=CharSet.Unicode, SetLastError=true)] public static extern uint GetShortPathName(string p, StringBuilder b, uint n); }'; $b=New-Object System.Text.StringBuilder 32768; if([PathShort]::GetShortPathName($env:USERPROFILE,$b,$b.Capacity) -eq 0){exit 1}; $b.ToString()";
+  const { stdout } = await promisify(execFile)('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', source], { windowsHide: true });
+  return [home, stdout.trim()];
+}
 
 export function omitNodeFile(relative) {
   const parts = relative.replaceAll('\\', '/').split('/');
@@ -99,7 +118,8 @@ async function main() {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw new Error('Windows x64 required');
   const args = process.argv.slice(2);
   if (args.some(arg => arg !== '--updater') || args.length > 1) throw new Error('Supported option: --updater');
-  await findSevenZip();
+  const profilePaths = await buildProfilePaths();
+  const buildEnv = releaseBuildEnvironment(process.env, profilePaths);
   await run(process.execPath, [path.join(desktop, 'scripts/prepare-node.mjs')]);
   const tempRoot = await realpath(os.tmpdir());
   const tauriRoot = await realpath(tauri);
@@ -145,12 +165,13 @@ async function main() {
     for (const name of crt.names) resources[path.join(crtStage, name).replaceAll('\\', '/')] = name;
     const config = { build: { beforeBuildCommand: 'npm run build' }, bundle: { resources } };
     if (args.includes('--updater')) config.bundle.createUpdaterArtifacts = true;
-    await run(process.execPath, [cli, 'build', '--bundles', 'nsis', '--config', JSON.stringify(config)]);
+    await run(process.execPath, [cli, 'build', '--bundles', 'nsis', '--config', JSON.stringify(config)], { env: buildEnv });
     const { version } = JSON.parse(await readFile(path.join(tauri, 'tauri.conf.json'), 'utf8'));
     const target = process.env.CARGO_TARGET_DIR ? path.resolve(process.env.CARGO_TARGET_DIR) : path.join(tauri, 'target');
     const release = path.join(target, 'release');
     const installer = path.join(release, 'bundle', 'nsis', `momso_${version}_x64-setup.exe`);
-    await run(process.execPath, [path.join(desktop, 'scripts/verify-desktop-installer.mjs'), installer, path.join(release, 'momso-desktop.exe'), path.join(node, 'node.exe'), crtStage]);
+    await access(installer);
+    process.stdout.write('Installer built; release preparation performs the installed-file inspection.\n');
   });
 }
 

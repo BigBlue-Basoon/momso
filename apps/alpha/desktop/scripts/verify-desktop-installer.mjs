@@ -1,10 +1,11 @@
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { cp, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { locateMsvcCrt } from './build-desktop.mjs';
 
 const exec = promisify(execFile);
 
@@ -30,6 +31,8 @@ async function filesBelow(root) {
   return files;
 }
 
+async function hash(file) { return createHash('sha256').update(await readFile(file)).digest('hex'); }
+
 async function findDumpbin() {
   const vswhere = path.join(process.env['ProgramFiles(x86)'], 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
   const { stdout } = await exec(vswhere, ['-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath']);
@@ -42,8 +45,6 @@ async function findDumpbin() {
   throw new Error('MSVC dumpbin is required to verify installer dependencies');
 }
 
-async function hash(file) { return createHash('sha256').update(await readFile(file)).digest('hex'); }
-
 export function sameBundledExecutable(original, bundled) {
   if (original.equals(bundled)) return true;
   // Tauri patches this marker while bundling NSIS and restores the build file.
@@ -54,43 +55,6 @@ export function sameBundledExecutable(original, bundled) {
   const expected = Buffer.from(original);
   nsis.copy(expected, at);
   return expected.equals(bundled);
-}
-
-export function supportsNsis(formats) {
-  return /^\s*[^\r\n]*\bNSIS\b/m.test(formats);
-}
-
-export async function findSevenZip() {
-  const candidates = [];
-  for (const base of [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter(Boolean)) {
-    candidates.push(path.join(base, '7-Zip', '7z.exe'));
-  }
-  candidates.push('7z');
-  for (const candidate of candidates) {
-    try {
-      if (candidate !== '7z') await access(candidate);
-      const { stdout } = await exec(candidate, ['i']);
-      if (supportsNsis(stdout)) return candidate;
-    } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  }
-  throw new Error('Full 7-Zip with NSIS support is required to inspect the installer');
-}
-
-export async function verifyInstaller(installer, builtExe, stagedNode, stagedCrt) {
-  const tmp = await mkdtemp(path.join(os.tmpdir(), 'momso-installer-verify-'));
-  try {
-    // Windows GitHub runners provide 7-Zip. Extraction verifies the bytes in
-    // the actual NSIS artifact, not only the input resource configuration.
-    await exec(await findSevenZip(), ['x', '-y', `-o${tmp}`, installer], { maxBuffer: 8 * 1024 * 1024 });
-    const dumpbin = await findDumpbin();
-    await verifyExtracted(tmp, builtExe, stagedNode, stagedCrt, async binary => {
-      const { stdout } = await exec(dumpbin, ['/DEPENDENTS', binary], { maxBuffer: 8 * 1024 * 1024 });
-      return runtimeImports(stdout);
-    });
-    const { stdout } = await exec(dumpbin, ['/DEPENDENTS', installer], { maxBuffer: 8 * 1024 * 1024 });
-    const missing = runtimeImports(stdout);
-    if (missing.length) throw new Error(`Installer needs runtime DLLs before installation: ${missing.join(', ')}`);
-  } finally { await rm(tmp, { recursive: true, force: true }); }
 }
 
 export async function verifyExtracted(tmp, builtExe, stagedNode, stagedCrt, inspectImports) {
@@ -119,8 +83,25 @@ export async function verifyExtracted(tmp, builtExe, stagedNode, stagedCrt, insp
   process.stdout.write(`Verified ${binaries.length} installer executables and runtime DLLs\n`);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [installer, builtExe, stagedNode, stagedCrt] = process.argv.slice(2);
-  if (!installer || !builtExe || !stagedNode || !stagedCrt) throw new Error('Expected installer, built executable, bundled Node, and runtime paths');
-  verifyInstaller(installer, builtExe, stagedNode, stagedCrt).catch(error => { console.error(error.message); process.exitCode = 1; });
+export async function verifyInstalled(installed, builtExe, stagedNode, installer) {
+  const tmp = await mkdtemp(path.join(os.tmpdir(), 'momso-release-crt-'));
+  try {
+    const crt = await locateMsvcCrt();
+    for (const name of crt.names) await cp(path.join(crt.folder, name), path.join(tmp, name));
+    const dumpbin = await findDumpbin();
+    await verifyExtracted(installed, builtExe, stagedNode, tmp, async binary => {
+      const { stdout } = await exec(dumpbin, ['/DEPENDENTS', binary], { maxBuffer: 8 * 1024 * 1024 });
+      return runtimeImports(stdout);
+    });
+    const { stdout } = await exec(dumpbin, ['/DEPENDENTS', installer], { maxBuffer: 8 * 1024 * 1024 });
+    const missing = runtimeImports(stdout);
+    if (missing.length) throw new Error(`Installer needs runtime DLLs before installation: ${missing.join(', ')}`);
+  } finally { await rm(tmp, { recursive: true, force: true }); }
 }
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const [installed, builtExe, stagedNode, installer] = process.argv.slice(2);
+  if (!installed || !builtExe || !stagedNode || !installer) throw new Error('Expected installed directory, built executable, bundled Node, and installer');
+  verifyInstalled(installed, builtExe, stagedNode, installer).catch(error => { console.error(error.message); process.exitCode = 1; });
+}
+
