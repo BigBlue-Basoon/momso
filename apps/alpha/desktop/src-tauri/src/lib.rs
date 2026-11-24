@@ -66,6 +66,7 @@ mod gemini_api_relay;
 mod generated_output;
 mod gh_owned;
 mod git_tool;
+mod github_oauth;
 mod hidden_process;
 #[cfg(test)]
 mod instagram_preview_contract_tests;

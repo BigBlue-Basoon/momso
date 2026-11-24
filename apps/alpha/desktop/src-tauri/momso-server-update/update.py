@@ -244,7 +244,7 @@ class Updater:
             self._emit("completed")
             return "completed"
         except Exception as failure:
-            reason = str(failure) if isinstance(failure, (GatewayError, UpdateError)) and str(failure) in {"gateway_image_permission", "gateway_operation_failed", "gateway_unhealthy", "server_unhealthy"} else "update_failed"
+            reason = str(failure) if isinstance(failure, (GatewayError, UpdateError)) and str(failure) in {"gateway_image_permission", "gateway_operation_failed", "gateway_image_mismatch", "gateway_traffic_mismatch", "gateway_not_ready", "gateway_probe_failed", "gateway_unhealthy", "server_unhealthy"} else "update_failed"
             self._emit("rolling_back", reason)
             try:
                 self._rollback({"snapshot": snapshot, "oldRelease": old_release, "oldGateway": old_gateway, "oldSequence": installed, "newRelease": str(stage)})

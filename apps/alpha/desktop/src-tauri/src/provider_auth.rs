@@ -18,8 +18,6 @@ static PENDING: OnceLock<Pending> = OnceLock::new();
 type NoticeSenders = Mutex<HashMap<String, (uuid::Uuid, tokio::sync::oneshot::Sender<()>)>>;
 static BROWSER_NOTICES: OnceLock<NoticeSenders> = OnceLock::new();
 static GH_LOGIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static GH_RECOVERY_NOTICE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 fn browser_notices() -> &'static NoticeSenders {
     BROWSER_NOTICES.get_or_init(|| Mutex::new(HashMap::new()))
@@ -497,26 +495,6 @@ fn notify_github_storage(app: &AppHandle, reason: &str) {
     }
 }
 
-pub(crate) fn recover_gh_owned(app: &AppHandle) -> Result<(), &'static str> {
-    let root = crate::gh_owned::directory().ok_or("github_storage_unknown")?;
-    match crate::gh_owned::recover(root) {
-        Ok(true) => {
-            GH_RECOVERY_NOTICE.store(true, std::sync::atomic::Ordering::SeqCst);
-            notify_github_storage(app, "github_insecure_storage");
-            Err("github_insecure_storage")
-        }
-        Ok(false) => Ok(()),
-        Err(crate::gh_owned::RecoveryError::Unknown) => {
-            notify_github_storage(app, "github_storage_unknown");
-            Err("github_storage_unknown")
-        }
-        Err(crate::gh_owned::RecoveryError::CleanupFailed) => {
-            notify_github_storage(app, "github_cleanup_failed");
-            Err("github_cleanup_failed")
-        }
-    }
-}
-
 pub(crate) fn start_gh_owned_recovery(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let _guard = GH_LOGIN_LOCK.lock().await;
@@ -529,39 +507,31 @@ pub(crate) async fn refresh_gh_owned(app: &AppHandle) -> Result<(), &'static str
         return Err("inProgress");
     };
     let result = refresh_gh_owned_locked(app).await;
-    if GH_RECOVERY_NOTICE.swap(false, std::sync::atomic::Ordering::SeqCst) {
-        notify_github_storage(app, "github_insecure_storage");
-    }
     if result == Err("github_storage_unknown") {
         notify_github_storage(app, "github_storage_unknown");
     }
     result
 }
 
-async fn refresh_gh_owned_locked(app: &AppHandle) -> Result<(), &'static str> {
-    crate::gh_owned::select(0);
-    match recover_gh_owned(app) {
-        Ok(()) | Err("github_insecure_storage") => {}
-        Err(reason) => return Err(reason),
-    }
-    let default = github_authenticated(None).await;
-    if default == Ok(true) {
-        crate::gh_owned::select(1);
-        return Ok(());
-    }
-    let owned = match crate::gh_owned::directory() {
-        Some(directory) => github_authenticated(Some(directory)).await,
-        None => Err(()),
-    };
-    match select_gh_source(default, owned)? {
-        Some(source) => {
-            crate::gh_owned::select(source);
+async fn refresh_gh_owned_locked(_app: &AppHandle) -> Result<(), &'static str> {
+    match tokio::task::spawn_blocking(crate::github_oauth::token)
+        .await
+        .map_err(|_| "unavailable")?
+    {
+        Ok(_) => {
+            crate::gh_owned::select(3);
             Ok(())
         }
-        None => Err("signed_out"),
+        Err(reason) => {
+            if reason == "signed_out" {
+                crate::gh_owned::select(0);
+            }
+            Err(reason)
+        }
     }
 }
 
+#[cfg(test)]
 fn select_gh_source(
     default: Result<bool, ()>,
     owned: Result<bool, ()>,
@@ -698,15 +668,6 @@ impl DevicePrompt {
             self.url = true;
         } else if self.provider == "codex" && line.starts_with("2. Enter this one-time code") {
             self.expecting_code = true;
-        } else if self.provider == "github"
-            && line
-                == "Open this URL to continue in your web browser: https://github.com/login/device"
-        {
-            self.url = true;
-        } else if self.provider == "github" && line.contains("First copy your one-time code: ") {
-            self.code = line
-                .split_once("First copy your one-time code: ")
-                .and_then(|(_, code)| valid_device_code(code.trim()));
         } else if self.provider == "codex" && self.expecting_code && !line.is_empty() {
             self.expecting_code = false;
             self.code = valid_device_code(line);
@@ -759,37 +720,16 @@ async fn run_device_process<F, Fut, Guard>(
     mut command: tokio::process::Command,
     provider: &'static str,
     cancel: CancellationToken,
-    owned_directory: Option<&std::path::Path>,
     open: F,
 ) -> Result<(), &'static str>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<Guard, &'static str>>,
 {
-    if let Some(directory) = owned_directory {
-        crate::gh_owned::begin_login(directory).map_err(|_| "github_storage_unknown")?;
-    }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => {
-            if let Some(directory) = owned_directory {
-                let _ = crate::gh_owned::finish_login(directory);
-            }
-            return Err("unavailable");
-        }
+        Err(_) => return Err("unavailable"),
     };
-    if let Some(directory) = owned_directory {
-        if child
-            .id()
-            .is_none_or(|pid| crate::gh_owned::record_login_pid(directory, pid).is_err())
-        {
-            let _ = child.kill().await;
-            if child.wait().await.is_ok() {
-                let _ = crate::gh_owned::finish_login(directory);
-            }
-            return Err("github_storage_unknown");
-        }
-    }
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     let stdout = child.stdout.take().ok_or("unavailable")?;
     let stderr = child.stderr.take().ok_or("unavailable")?;
@@ -824,12 +764,88 @@ where
     a.abort();
     b.abort();
     drop(guard);
-    if let Some(directory) = owned_directory {
-        let _ = child.kill().await;
-        if child.wait().await.is_ok() && crate::gh_owned::finish_login(directory).is_err() {
-            return Err("github_storage_unknown");
-        }
+    result
+}
+
+struct GithubDeviceClose(AppHandle);
+
+impl Drop for GithubDeviceClose {
+    fn drop(&mut self) {
+        let _ = self.0.emit_to(
+            "main",
+            "provider-login-device-closed",
+            serde_json::json!({"provider":"github"}),
+        );
     }
+}
+
+async fn run_github_device_login(
+    app: &AppHandle,
+    cancel: CancellationToken,
+) -> Result<(), &'static str> {
+    let grant = tokio::select! {
+        _ = cancel.cancelled() => return Err("cancelled"),
+        result = tokio::task::spawn_blocking(crate::github_oauth::begin) => result.map_err(|_| "unavailable")??,
+    };
+    let code = valid_device_code(&grant.user_code).ok_or("unavailable")?;
+    let url = reqwest::Url::parse(&grant.verification_uri).map_err(|_| "unavailable")?;
+    app.emit_to("main", "provider-login-device", serde_json::json!({"provider":"github","url":url.as_str(),"code":code,"expiresInSeconds":grant.expires_in})).map_err(|_| "unavailable")?;
+    let _close = GithubDeviceClose(app.clone());
+    let guard = match crate::panel_browser::open_device_login_panel(
+        app.clone(),
+        url.clone(),
+        cancel.clone(),
+    )
+    .await
+    {
+        Ok(guard) => Some(guard),
+        Err("cancelled") => return Err("cancelled"),
+        Err(_) => {
+            crate::panel_browser::panel_browser_open_human(app.clone(), url.to_string())
+                .await
+                .map_err(|_| "unavailable")?;
+            None
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(grant.expires_in);
+    let mut interval = grant.interval;
+    let result = loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break Err("cancelled"),
+            _ = tokio::time::sleep_until(deadline) => break Err("timeout"),
+            _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+        }
+        let code = grant.device_code.clone();
+        let response = tokio::select! {
+            _ = cancel.cancelled() => break Err("cancelled"),
+            _ = tokio::time::sleep_until(deadline) => break Err("timeout"),
+            response = tokio::task::spawn_blocking(move || crate::github_oauth::poll(&code)) => match response {
+                Ok(Ok(response)) => response,
+                _ => break Err("unavailable"),
+            }
+        };
+        if crate::github_oauth::has_access(&response) {
+            let cancel2 = cancel.clone();
+            break tokio::task::spawn_blocking(move || {
+                crate::github_oauth::save(response, &cancel2)
+            })
+            .await
+            .map_err(|_| "unavailable")?;
+        }
+        match response.error.as_deref() {
+            Some("authorization_pending") => {}
+            Some("slow_down") => {
+                interval = response
+                    .interval
+                    .unwrap_or(interval.saturating_add(5))
+                    .max(interval.saturating_add(5))
+            }
+            Some("expired_token") => break Err("timeout"),
+            Some("access_denied") => break Err("cancelled"),
+            _ => break Err("unavailable"),
+        }
+    };
+    drop(guard);
     result
 }
 
@@ -838,62 +854,24 @@ async fn run_device_login(
     provider: &'static str,
     cancel: CancellationToken,
 ) -> Result<(), &'static str> {
-    use std::process::Stdio;
-    let tool = if provider == "github" { "gh" } else { "codex" };
-    let executable = process::resolve_interactive_tool(tool).ok_or("unavailable")?;
-    if cfg!(windows)
-        && provider == "github"
-        && !executable
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("gh.exe"))
-    {
-        return Err("github_storage_unknown");
+    if provider == "github" {
+        return run_github_device_login(app, cancel).await;
     }
+    use std::process::Stdio;
+    let executable = process::resolve_interactive_tool("codex").ok_or("unavailable")?;
     let mut command = process::hidden_async_command(executable);
     process::remove_inherited_ai_secrets(&mut command);
-    if provider == "github" {
-        let directory = crate::gh_owned::directory().ok_or("unavailable")?;
-        std::fs::create_dir_all(directory).map_err(|_| "unavailable")?;
-        crate::gh_owned::recover(directory).map_err(|_| "github_storage_unknown")?;
-        command
-            .env("GH_CONFIG_DIR", directory)
-            .args([
-                "auth",
-                "login",
-                "--hostname",
-                "github.com",
-                "--git-protocol",
-                "https",
-                "--web",
-                "--skip-ssh-key",
-            ])
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
-            .env_remove("GH_ENTERPRISE_TOKEN")
-            .env_remove("GITHUB_ENTERPRISE_TOKEN");
-    } else {
-        command.args(["login", "--device-auth"]);
-    }
+    command.args(["login", "--device-auth"]);
     command
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let url = if provider == "github" {
-        "https://github.com/login/device"
-    } else {
-        "https://auth.openai.com/codex/device"
-    };
+    let url = "https://auth.openai.com/codex/device";
     let app2 = app.clone();
     let panel_cancel = cancel.clone();
-    let owned_directory = if provider == "github" {
-        crate::gh_owned::directory()
-    } else {
-        None
-    };
-    let result = run_device_process(command, provider, cancel, owned_directory, move |code| async move {
+    let result = run_device_process(command, provider, cancel, move |code| async move {
         let url = reqwest::Url::parse(url).map_err(|_| "unavailable")?;
         let expires = if provider == "codex" { Some(900) } else { None };
         app2.emit_to("main", "provider-login-device", serde_json::json!({"provider":provider,"url":url.as_str(),"code":code,"expiresInSeconds":expires})).map_err(|_| "unavailable")?;
@@ -914,47 +892,7 @@ async fn run_device_login(
     result
 }
 
-async fn github_authenticated(config: Option<&std::path::Path>) -> Result<bool, ()> {
-    use std::process::Stdio;
-    let Some(executable) = process::resolve_interactive_tool("gh") else {
-        return Err(());
-    };
-    let mut command = process::hidden_async_command(executable);
-    process::remove_inherited_ai_secrets(&mut command);
-    if let Some(config) = config {
-        command.env("GH_CONFIG_DIR", config);
-    }
-    command
-        .args([
-            "auth",
-            "status",
-            "--hostname",
-            "github.com",
-            "--active",
-            "--json",
-            "hosts",
-        ])
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_ENTERPRISE_TOKEN")
-        .env_remove("GITHUB_ENTERPRISE_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(15), command.output()).await
-    else {
-        return Err(());
-    };
-    if !output.status.success() {
-        return Err(());
-    }
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-        return Err(());
-    };
-    parse_gh_status(&json)
-}
-
+#[cfg(test)]
 fn parse_gh_status(json: &serde_json::Value) -> Result<bool, ()> {
     let hosts = json.get("hosts").and_then(|v| v.as_object()).ok_or(())?;
     let Some(entries) = hosts.get("github.com") else {
@@ -1246,15 +1184,12 @@ pub(crate) async fn provider_login_start(app: AppHandle, provider: String) -> &'
     if !matches!(provider.as_str(), "codex" | "claude" | "github" | "gemini") {
         return "unavailable";
     }
-    let installed = if provider == "gemini" {
+    let installed = if provider == "github" {
+        true
+    } else if provider == "gemini" {
         gemini_access::executable().is_some()
     } else {
-        process::resolve_interactive_tool(if provider == "github" {
-            "gh"
-        } else {
-            &provider
-        })
-        .is_some()
+        process::resolve_interactive_tool(&provider).is_some()
     };
     if !installed {
         return "unavailable";
@@ -1280,9 +1215,19 @@ pub(crate) async fn provider_login_start(app: AppHandle, provider: String) -> &'
             if which == "github" {
                 match refresh_gh_owned_locked(&app).await {
                     Ok(()) => {
-                        drop(reservation);
-                        notify(&app, &provider, "account");
-                        return;
+                        match tokio::task::spawn_blocking(crate::github_oauth::verify).await {
+                            Ok(Ok(())) => {
+                                drop(reservation);
+                                notify(&app, &provider, "account");
+                                return;
+                            }
+                            Ok(Err("signed_out")) => {}
+                            _ => {
+                                drop(reservation);
+                                notify(&app, &provider, "unavailable");
+                                return;
+                            }
+                        }
                     }
                     Err("signed_out") => {}
                     Err(reason) => {
@@ -1294,17 +1239,11 @@ pub(crate) async fn provider_login_start(app: AppHandle, provider: String) -> &'
                 }
             }
             let result = run_device_login(&app, which, token.clone()).await;
-            let storage_check = if which == "github" {
-                recover_gh_owned(&app)
-            } else {
-                Ok(())
-            };
+            let storage_check: Result<(), &'static str> = Ok(());
             let state = match result {
                 Ok(()) if which == "github" => {
-                    if storage_check.is_ok()
-                        && github_authenticated(crate::gh_owned::directory()).await == Ok(true)
-                    {
-                        crate::gh_owned::select(2);
+                    if storage_check.is_ok() {
+                        crate::gh_owned::select(3);
                         "account"
                     } else {
                         "unavailable"
@@ -1708,23 +1647,15 @@ mod tests {
     #[test]
     fn fake_device_login_child() {
         use std::io::Write;
-        let Some(provider) = std::env::var_os("MOMSO_TEST_DEVICE_PROVIDER") else {
+        if std::env::var_os("MOMSO_TEST_DEVICE_PROVIDER").is_none() {
             return;
-        };
-        let marker = std::env::var_os("MOMSO_TEST_DEVICE_MARKER").unwrap();
-        if provider == "github" {
-            eprintln!("\n! First copy your one-time code: ABCD-1234");
-            eprintln!(
-                "Open this URL to continue in your web browser: https://github.com/login/device"
-            );
-            std::io::stderr().flush().unwrap();
-        } else {
-            println!("\n1. Open this link in your browser and sign in to your account");
-            println!("   \u{1b}[34mhttps://auth.openai.com/codex/device\u{1b}[0m");
-            println!("2. Enter this one-time code (expires in 15 minutes)");
-            println!("   \u{1b}[34mABCD-1234\u{1b}[0m");
-            std::io::stdout().flush().unwrap();
         }
+        let marker = std::env::var_os("MOMSO_TEST_DEVICE_MARKER").unwrap();
+        println!("\n1. Open this link in your browser and sign in to your account");
+        println!("   \u{1b}[34mhttps://auth.openai.com/codex/device\u{1b}[0m");
+        println!("2. Enter this one-time code (expires in 15 minutes)");
+        println!("   \u{1b}[34mABCD-1234\u{1b}[0m");
+        std::io::stdout().flush().unwrap();
         for _ in 0..200 {
             if std::path::Path::new(&marker).is_file() {
                 return;
@@ -1809,45 +1740,39 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn fake_device_cli_routes_github_and_codex_codes_without_default_browser() {
+    async fn fake_codex_device_cli_routes_code_without_default_browser() {
         use std::process::Stdio;
-        for provider in ["github", "codex"] {
-            let temp = tempfile::tempdir().unwrap();
-            let marker = temp.path().join("opened");
-            let mut command =
-                crate::process::hidden_async_command(std::env::current_exe().unwrap());
-            command
-                .args([
-                    "--exact",
-                    "provider_auth::tests::fake_device_login_child",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env("MOMSO_TEST_DEVICE_PROVIDER", provider)
-                .env("MOMSO_TEST_DEVICE_MARKER", &marker)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
-            let opened = marker.clone();
-            run_device_process(
-                command,
-                provider,
-                CancellationToken::new(),
-                (provider == "github").then_some(temp.path()),
-                move |code| async move {
-                    assert_eq!(code, "ABCD-1234");
-                    std::fs::write(opened, b"opened").unwrap();
-                    Ok(())
-                },
-            )
-            .await
-            .unwrap();
-            assert!(marker.is_file());
-            if provider == "github" {
-                assert_eq!(crate::gh_owned::recover(temp.path()), Ok(false));
-            }
-        }
+        let provider = "codex";
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("opened");
+        let mut command = crate::process::hidden_async_command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "provider_auth::tests::fake_device_login_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOMSO_TEST_DEVICE_PROVIDER", provider)
+            .env("MOMSO_TEST_DEVICE_MARKER", &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let opened = marker.clone();
+        run_device_process(
+            command,
+            provider,
+            CancellationToken::new(),
+            move |code| async move {
+                assert_eq!(code, "ABCD-1234");
+                std::fs::write(opened, b"opened").unwrap();
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(marker.is_file());
     }
 
     #[test]
@@ -1862,14 +1787,6 @@ mod tests {
         assert_eq!(
             codex.accept("https://auth.openai.com/codex/device"),
             Some("ABCD-1234".into())
-        );
-        let mut github = DevicePrompt::new("github");
-        assert_eq!(github.accept("! First copy your one-time code: A B"), None);
-        assert_eq!(
-            github.accept(
-                "Open this URL to continue in your web browser: https://github.com/login/device"
-            ),
-            None
         );
     }
 
@@ -2215,6 +2132,31 @@ mod tests {
         ));
         drop(logout);
         assert!(reserve(&provider, PendingOperation::Logout).is_ok());
+    }
+
+    #[test]
+    fn github_device_login_cancel_command_cancels_pending_request() {
+        if std::env::var_os("MOMSO_TEST_S110_CANCEL_CHILD").is_none() {
+            let output = crate::process::hidden_command(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "provider_auth::tests::github_device_login_cancel_command_cancels_pending_request",
+                    "--test-threads=1",
+                ])
+                .env("MOMSO_TEST_S110_CANCEL_CHILD", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "isolated cancel command failed");
+            return;
+        }
+        let cancellation = CancellationToken::new();
+        let reservation = reserve("github", PendingOperation::Login(cancellation.clone()))
+            .ok()
+            .unwrap();
+        assert_eq!(provider_login_cancel("github".into()), "cancelled");
+        assert!(cancellation.is_cancelled());
+        drop(reservation);
+        assert_eq!(provider_login_cancel("github".into()), "notInProgress");
     }
 
     #[test]

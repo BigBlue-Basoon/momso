@@ -70,6 +70,21 @@ test('billing never silently changes an existing account or picks between severa
   assert.equal(writes, 0);
 });
 
+test('no accessible open billing account has a distinct reason without creating one', async () => {
+  const methods = [];
+  const provider = new GoogleBrowserProvider('fixture', { fetchImpl: async (url, options) => {
+    methods.push(options.method);
+    return url.endsWith('/billingInfo') ? response({ billingEnabled: false }) : response({ billingAccounts: [] });
+  } });
+  await assert.rejects(provider.billing(id), { step: 'billing_account_missing' });
+  assert.deepEqual(methods, ['GET', 'GET']);
+});
+
+test('a 403 is not misrepresented as terms or card failure', async () => {
+  const provider = new GoogleBrowserProvider('fixture', { fetchImpl: async () => response({ error: { message: 'fixture' } }, 403) });
+  await assert.rejects(provider.billingAccounts(), { step: 'permission_denied' });
+});
+
 test('billing lists pages and connects only the selected open account', async () => {
   let enabled = false;
   const writes = [];
@@ -225,6 +240,7 @@ test('gateway provisions pinned image and secrets privately before opening its a
   const actions = [];
   const updatePolicies = [];
   const provider = new GoogleBrowserProvider('fixture', { release, releaseVerifier: async value => value, clientId: 'fixture.apps.googleusercontent.com', ownerSub: '12345', sleep: async () => {}, fetchImpl: async (url, options) => {
+    if (url === 'https://fixture.a.run.app/__momso/ready') return response({ ready: true });
     const method = options.method;
     if (url.includes('/getGuestAttributes')) return response({ queryValue: { items: [{ namespace: 'momso', key: 'fingerprint', value: 'b'.repeat(64) }] } });
     if (url.includes('iam.googleapis.com') && url.includes('/roles')) {
@@ -238,7 +254,7 @@ test('gateway provisions pinned image and secrets privately before opening its a
     if (url.endsWith(':getIamPolicy?options.requestedPolicyVersion=3')) return response({ etag: 'fixture', bindings: publicBindings ? [{ role: 'roles/run.invoker', members: ['allUsers'] }] : [] });
     if (url.endsWith(':setIamPolicy')) { updatePolicies.push({ url, policy: JSON.parse(options.body).policy }); return response({}); }
     if (url.includes('run.googleapis.com')) {
-      if (url.includes('/revisions/')) return response({ containers: [{ image: service.template.containers[0].image }] });
+      if (url.includes('/revisions/')) return response({ conditions: [{ type: 'Ready', state: 'CONDITION_SUCCEEDED', revisionReason: 'RETIRED' }], containers: [{ image: service.template.containers[0].image }] });
       if (method === 'POST') {
         const body = JSON.parse(options.body);
         actions.push({ type: 'create', value: body.invokerIamDisabled });
@@ -248,7 +264,7 @@ test('gateway provisions pinned image and secrets privately before opening its a
       if (method === 'PATCH') {
         const body = JSON.parse(options.body);
         actions.push({ type: 'patch', value: body.invokerIamDisabled });
-        service = { ...service, ...body, ...(body.template ? { latestReadyRevision: 'fixture-rev-2', latestCreatedRevision: 'fixture-rev-2' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) };
+        service = { ...service, ...body, ...(body.template ? { latestCreatedRevision: 'fixture-rev-2' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) };
         return response({ name: `projects/${projectId}/locations/asia-northeast3/operations/fixture` });
       }
       return service ? response(service) : response({}, 404);

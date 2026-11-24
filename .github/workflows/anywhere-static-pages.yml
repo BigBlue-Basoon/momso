@@ -1,0 +1,53 @@
+name: Prepare and deploy anywhere static site
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: anywhere-production
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Check required reviewed inputs
+        run: |
+          test -f scripts/momso_release_public_key.pem
+          test -f apps/alpha/desktop/login-page/index.html
+          test -f apps/alpha/desktop/src/start/StartScreen.tsx
+          test -n "$CLIENT_ID"
+          test -n "$MANIFEST_URL"
+        env:
+          CLIENT_ID: ${{ vars.MOMSO_OAUTH_CLIENT_ID }}
+          MANIFEST_URL: ${{ vars.MOMSO_RELEASE_MANIFEST_URL }}
+      - run: npm ci
+      - name: Build reviewed public PWA assets
+        run: |
+          VITE_MOMSO_NETWORK=1 npm run build --workspace @momso/alpha-desktop
+          cp -R apps/alpha/desktop/dist "$RUNNER_TEMP/momso-web"
+      - name: Build start screen
+        run: VITE_MOMSO_START=1 npm run build --workspace @momso/alpha-desktop -- --base=/start/
+      - name: Prepare production-only static bundle
+        env:
+          CLIENT_ID: ${{ vars.MOMSO_OAUTH_CLIENT_ID }}
+          MANIFEST_URL: ${{ vars.MOMSO_RELEASE_MANIFEST_URL }}
+          OLD_IMAGE: ${{ vars.MOMSO_TRUSTED_GATEWAY_IMAGE }}
+        run: |
+          args=()
+          if [ -n "$OLD_IMAGE" ]; then args+=(--trusted-gateway-image "$OLD_IMAGE"); fi
+          python3 scripts/prepare_momso_anywhere_static_site.py \
+            --output "$RUNNER_TEMP/momso-static" --login-page apps/alpha/desktop/login-page \
+            --web "$RUNNER_TEMP/momso-web" --start-dist apps/alpha/desktop/dist \
+            --client-id "$CLIENT_ID" --manifest-url "$MANIFEST_URL" \
+            --public-key scripts/momso_release_public_key.pem --login-origin https://anywhere.momso.yoga "${args[@]}"
+      - name: Deploy static files to Cloudflare Pages
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.167.0'
+          command: pages deploy ${{ runner.temp }}/momso-static --project-name=momso-anywhere --branch=main

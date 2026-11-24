@@ -444,6 +444,9 @@ pub(crate) fn setup_candidate(db: &Path) -> Result<(String, String), &'static st
     if !valid_username(&username) {
         return Err("invalid_username");
     }
+    if crate::gh_owned::directory().is_some() {
+        crate::github_oauth::token()?;
+    }
     let auth = run_gh(&["auth", "status", "--active", "--hostname", "github.com"])
         .map_err(|_| "gh_missing")?;
     if auth.code != Some(0) {
@@ -716,6 +719,21 @@ async fn create_internal(
             Ok(value) => value,
             Err(()) => return auto_result("unavailable", None),
         };
+        let authentication = if crate::gh_owned::directory().is_some() {
+            crate::github_oauth::token().map(|_| ())
+        } else {
+            Ok(())
+        };
+        if let Err(reason) = authentication {
+            return auto_result(
+                if reason == "signed_out" {
+                    "signed_out"
+                } else {
+                    "unavailable"
+                },
+                None,
+            );
+        }
         if run_gh(&["--version"]).is_err() {
             return auto_result("gh_missing", None);
         }
@@ -904,11 +922,14 @@ fn git_path(_resources: &Path) -> Option<PathBuf> {
 }
 fn git_output(tool: &Path, root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     let mut command = crate::process::hidden_command(tool);
-    let verified = crate::gh_owned::apply(&mut command).is_ok();
+    let needs_credentials = args.first().is_some_and(|operation| {
+        matches!(
+            *operation,
+            "fetch" | "push" | "pull" | "clone" | "ls-remote"
+        )
+    });
+    let verified = needs_credentials && crate::gh_owned::apply(&mut command).is_ok();
     if !verified {
-        if let Some(dir) = crate::gh_owned::directory() {
-            command.env("GH_CONFIG_DIR", dir);
-        }
         command.env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");
     }
     hidden(&mut command)
@@ -1271,6 +1292,9 @@ fn gh_output(args: &[&str]) -> std::io::Result<std::process::Output> {
         .output()
 }
 fn signed_in() -> Result<String, &'static str> {
+    if crate::gh_owned::directory().is_some() {
+        crate::github_oauth::token()?;
+    }
     if hidden(&mut crate::process::hidden_command("gh"))
         .arg("--version")
         .stdin(Stdio::null())
@@ -1280,27 +1304,6 @@ fn signed_in() -> Result<String, &'static str> {
         .is_err()
     {
         return Err("gh_missing");
-    }
-    let auth = gh_output(&["auth", "status", "--active", "--hostname", "github.com"])
-        .map_err(|_| "gh_missing")?;
-    if !auth.status.success() {
-        let message = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&auth.stdout),
-            String::from_utf8_lossy(&auth.stderr)
-        )
-        .to_ascii_lowercase();
-        let classified = classify_remote_error(&message);
-        return Err(if classified == "connection_failed" {
-            classified
-        } else if message.contains("not logged into")
-            || message.contains("failed to log in")
-            || message.contains("token is invalid")
-        {
-            "signed_out"
-        } else {
-            "authentication_unavailable"
-        });
     }
     let user = gh_output(&["api", "--hostname", "github.com", "user", "--jq", ".login"])
         .map_err(|_| "gh_missing")?;
@@ -4480,6 +4483,97 @@ pub(crate) async fn archive_remote_disconnect(
     state: State<'_, crate::AppState>,
 ) -> Result<RemoteStatus, String> {
     Ok(disconnect_impl(app, state).await)
+}
+
+#[cfg(test)]
+pub(crate) fn s110_fake_create_and_backup(expected_token: &str, directory: &Path) -> bool {
+    use std::ffi::OsStr;
+    let tool = Path::new("git");
+    let root = directory.join("archive");
+    let remote = directory.join("remote.git");
+    if std::fs::create_dir(&root).is_err()
+        || !crate::process::hidden_command(tool)
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .is_ok_and(|s| s.success())
+        || !crate::process::hidden_command(tool)
+            .args(["init", "-q"])
+            .arg(&root)
+            .status()
+            .is_ok_and(|s| s.success())
+        || std::fs::write(root.join("document.md"), "fixture document\n").is_err()
+        || git(tool, &root, &["add", "document.md"]).is_err()
+        || git(
+            tool,
+            &root,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let mut views = 0;
+    let result = create_auto_checked(
+        Some("fixture".into()),
+        None,
+        || false,
+        |args| {
+            let mut command = crate::process::hidden_command("gh");
+            command.env("GH_DEBUG", "api").env("GIT_TRACE_CURL", "1");
+            crate::gh_owned::apply(&mut command).map_err(|_| ())?;
+            let token_matches = command.get_envs().any(|(key, value)| {
+                key == OsStr::new("GH_TOKEN") && value == Some(OsStr::new(expected_token))
+            });
+            let tracing_disabled = ["GH_DEBUG", "GIT_TRACE_CURL"].iter().all(|name| {
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == OsStr::new(name) && value.is_none())
+            });
+            if !token_matches || !tracing_disabled {
+                return Err(());
+            }
+            let (code, stdout) = if args == ["--version"] || args.starts_with(&["auth", "status"]) {
+                (0, "ok")
+            } else if args.ends_with(&[".login"]) {
+                (0, "owner")
+            } else if args.starts_with(&["repo", "view"]) {
+                views += 1;
+                if views == 1 {
+                    (1, "")
+                } else {
+                    (
+                        0,
+                        r#"{"nameWithOwner":"owner/momso-fixture","isPrivate":true,"isEmpty":true,"defaultBranchRef":null}"#,
+                    )
+                }
+            } else if args.starts_with(&["api", "--hostname", "github.com", "--include"]) {
+                (1, "HTTP/2.0 404 Not Found\r\n")
+            } else if args.starts_with(&["repo", "create"]) {
+                (0, "created")
+            } else {
+                return Err(());
+            };
+            Ok(GhReply {
+                code: Some(code),
+                stdout: stdout.into(),
+            })
+        },
+        || false,
+        |_| "exists_private_unknown",
+        |_| connect_local(tool, &root, remote.to_str().unwrap()).is_ok(),
+    );
+    result.state == "created"
+        && git(tool, &root, &["push", REMOTE, "HEAD:refs/heads/main"]).is_ok()
+        && git(tool, &remote, &["show", "main:document.md"]).as_deref() == Ok("fixture document")
 }
 
 #[cfg(test)]

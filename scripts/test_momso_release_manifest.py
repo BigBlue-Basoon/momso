@@ -34,7 +34,7 @@ class SignedReleaseTests(unittest.TestCase):
             archive.add(self.server, arcname='momso-server')
             item = tarfile.TarInfo('web/index.html'); item.size = 7
             archive.addfile(item, io.BytesIO(b'fixture'))
-        self.image = 'registry.example.test/momso/gateway@sha256:' + 'a' * 64
+        self.image = 'ghcr.io/example/momso-gateway@sha256:' + 'a' * 64
         self.manifest = self.root / 'release.json'
         self.manifest.write_text(json.dumps({'sequence': 1, 'version': '0.1.1', 'bundleUrl': 'https://fixture.test/bundle', 'bundleSha256': hashlib.sha256(self.bundle.read_bytes()).hexdigest(), 'gatewayImage': self.image}), encoding='utf-8')
         self.signature = self.root / 'release.json.sig'
@@ -68,6 +68,7 @@ class SignedReleaseTests(unittest.TestCase):
     def test_valid_signature_passes_only_the_signed_image_to_the_installer(self):
         import momso_anywhere_install
         import momso_anywhere_public_assets
+        import momso_anywhere_update_install
         url = 'https://fixture.test/release.json'
         args = ['anywhere', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.root / 'state.json'), '--artifact', str(self.server), '--sha256', hashlib.sha256(self.server.read_bytes()).hexdigest(), '--web-archive', str(self.web), '--web-sha256', hashlib.sha256(self.web.read_bytes()).hexdigest(), '--google-client-id', 'fixture.apps.googleusercontent.com', '--owner-sub', '12345', '--login-origin', 'https://login.example.test', '--release-manifest-url', url, '--release-public-key', str(self.public)]
         def fake_download(request, limit, **kwargs):
@@ -79,7 +80,7 @@ class SignedReleaseTests(unittest.TestCase):
             def install(self, artifact, digest): pass
             def health(self): pass
             def install_web(self, archive, digest): pass
-        with patch.object(release, 'download', side_effect=fake_download), patch.object(installer, 'GoogleProvider', return_value=Provider()), patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install, 'install', return_value='https://fixture.run.app') as install:
+        with patch.object(release, 'download', side_effect=fake_download), patch.object(installer, 'GoogleProvider', return_value=Provider()), patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install, 'install', return_value='https://fixture.run.app') as install, patch.object(momso_anywhere_update_install, 'grant_gateway_update'), patch.object(momso_anywhere_update_install, 'install'):
             self.assertEqual(installer.main(args), 0)
         self.assertEqual(install.call_args.args[-1], self.image)
 
