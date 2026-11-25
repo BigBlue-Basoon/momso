@@ -9,6 +9,21 @@ SOCKET = "/run/momso-mobile/proxy.sock"
 HOP = {"connection", "transfer-encoding", "keep-alive", "proxy-connection", "upgrade", "te", "trailer"}
 
 
+class LimitedBody:
+    def __init__(self, source, length):
+        self.source = source
+        self.remaining = length
+
+    def read(self, size=-1):
+        if not self.remaining:
+            return b''
+        block = self.source.read(min(self.remaining, size if size >= 0 else 65536))
+        if not block:
+            raise OSError('incomplete request body')
+        self.remaining -= len(block)
+        return block
+
+
 def read_token(path=None):
     if path is None:
         path = Path(os.environ["CREDENTIALS_DIRECTORY"]) / "server-env"
@@ -45,7 +60,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             headers = {key: value for key, value in self.headers.items() if key.lower() not in HOP | {"authorization", "cookie", "cf-access-jwt-assertion", "host"}}
             headers["Authorization"] = "Bearer " + token
             upstream = http.client.HTTPConnection("127.0.0.1", 8765)
-            upstream.request(self.command, self.path, body=self.rfile.read(length) if length else None, headers=headers)
+            upstream.request(self.command, self.path, body=LimitedBody(self.rfile, length) if length else None, headers=headers)
             response = upstream.getresponse()
             self.send_response(response.status)
             for key, value in response.getheaders():

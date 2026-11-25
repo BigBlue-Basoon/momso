@@ -10,7 +10,8 @@ def deletion_result(value):
             resources[item['resource']] = {'status': item.get('status'), 'reason': item.get('reason')}
     remaining = result.get('remaining') or []
     for name in remaining:
-        resources[name] = {'status': 'retained', 'reason': 'cleanup_pending'}
+        if not isinstance(resources.get(name), dict) or resources[name].get('status') != 'retained':
+            resources[name] = {'status': 'retained', 'reason': 'cleanup_pending'}
     unverified = sorted(name for name, item in resources.items() if not isinstance(item, dict) or item.get('status') not in ('deleted', 'retained'))
     if not resources and not result.get('failed'):
         unverified.append('resources')

@@ -170,6 +170,11 @@ class ReleasePoller:
                 host = getattr(self.updater, "host", None)
                 if getattr(host, "worker_restart_required", False):
                     host.restart_worker()
+                pending = getattr(host, "admission_pending", None)
+                # A gate left closed by a failed attempt blocks people and the
+                # idle stop; recover it soon instead of after the full interval.
+                if pending is not None and pending() is True:
+                    delay = min(delay, 60)
             except OSError:
                 self.updater._emit("failed", "update_unavailable")
             if stop.wait(delay):

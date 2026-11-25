@@ -11,6 +11,8 @@ mod chat_groups;
 #[cfg(target_os = "linux")]
 mod chat_import_bridge;
 #[cfg(target_os = "linux")]
+mod disk_space;
+#[cfg(target_os = "linux")]
 mod chat {
     pub(crate) fn canonical_provider(value: Option<&str>) -> Option<&str> {
         match value {
@@ -887,6 +889,25 @@ fn enabled_backups_ready(
     (!github_enabled || github_ready) && (!object_enabled || object_ready)
 }
 
+#[cfg(target_os = "linux")]
+fn idle_stop_status(data: &std::path::Path) -> Option<Value> {
+    std::fs::read(data.join("lifecycle/idle-stop-status.json"))
+        .ok()
+        .filter(|raw| raw.len() <= 512)
+        .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+        .and_then(|status| {
+            let at = status["attemptedAt"].as_str()?;
+            let result = status["result"].as_str()?;
+            (at.len() <= 64
+                && chrono::DateTime::parse_from_rfc3339(at).is_ok()
+                && result.len() <= 128
+                && result
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_:".contains(&b)))
+            .then(|| json!({"attemptedAt": at, "result": result}))
+        })
+}
+
 async fn activity(State(app): State<App>, h: HeaderMap) -> Result<impl IntoResponse, ApiError> {
     auth(&app, &h)?;
     let turns = app
@@ -985,6 +1006,9 @@ async fn activity(State(app): State<App>, h: HeaderMap) -> Result<impl IntoRespo
         let github = app.backup.status()?;
         value["githubBackup"] = json!({"state": github.state, "reason": github.reason, "lastSuccessAt": github.last_success_at});
         value["objectBackup"] = json!({"state": object_backup.state, "reason": object_backup.reason, "lastSuccessAt": object_backup.last_success_at});
+        if let Some(status) = idle_stop_status(&app.data) {
+            value["idleStop"] = status;
+        }
         value
     };
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(value)))
@@ -2160,6 +2184,13 @@ async fn dispatch_server_tool(
     cancel: watch::Receiver<bool>,
 ) -> Value {
     let (permission_mode, provider) = source;
+    if matches!(
+        name,
+        "momso_document_create" | "momso_crm_upsert" | "momso_crm_mark_read"
+    ) && !disk_space::can_grow(&app.data, 0)
+    {
+        return json!({"status":"disk_low"});
+    }
     if momso_server_crm::TOOL_NAMES.contains(&name) {
         let app = app.clone();
         let chat = chat.to_owned();
@@ -2932,7 +2963,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     initialize(&app).map_err(|_| "storage_error")?;
     #[cfg(target_os = "linux")]
+    disk_space::initialize(&app.data).map_err(|_| "reservation_unavailable")?;
+    #[cfg(target_os = "linux")]
     purge_worker::start(app.clone());
+    #[cfg(target_os = "linux")]
+    attachment_bridge::start_upload_cleanup(app.clone());
     #[cfg(all(
         target_os = "linux",
         not(all(debug_assertions, feature = "test-fixtures"))
@@ -3033,6 +3068,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback(web_file);
     #[cfg(target_os = "linux")]
     let router = router
+        .route(
+            "/diagnostics/memory",
+            get(browser_bridge::memory_diagnostics),
+        )
         .route("/assets/search", get(attachment_bridge::search_assets))
         .route("/assets/trash", get(attachment_bridge::trash_list))
         .route("/chat-imports/preview", post(chat_import_bridge::preview))

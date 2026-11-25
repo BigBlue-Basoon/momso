@@ -3,18 +3,18 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read, Write},
     net::{IpAddr, ToSocketAddrs},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::process::CommandExt,
+        unix::{fs::OpenOptionsExt, process::CommandExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use zeroize::Zeroize;
 
@@ -145,8 +145,97 @@ fn dup_high(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(result) })
 }
 
+fn open_directory(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+fn fd_path(file: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+fn profile_guard(profile: &File) -> std::io::Result<File> {
+    let guard = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(fd_path(profile).join(".momso-profile.lock"))?;
+    if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(guard)
+}
+
+/// Delete only old Chromium caches in inactive, app-named profiles. Cookie and
+/// local storage paths are deliberately not visited. A pinned directory fd and
+/// no-follow opens prevent parent symlinks from redirecting deletion.
+pub fn prune_inactive_caches(root: &Path, now: SystemTime) -> usize {
+    let Ok(root) = open_directory(root) else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(fd_path(&root)) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.len() != 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            continue;
+        }
+        let Ok(profile) = open_directory(&entry.path()) else {
+            continue;
+        };
+        let Ok(_guard) = profile_guard(&profile) else {
+            continue;
+        };
+        let inactive = _guard
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= Duration::from_secs(30 * 24 * 60 * 60));
+        if !inactive {
+            continue;
+        }
+        if std::fs::symlink_metadata(fd_path(&profile).join("SingletonLock")).is_ok() {
+            continue;
+        }
+        let Ok(default) = open_directory(&fd_path(&profile).join("Default")) else {
+            continue;
+        };
+        for name in ["Cache", "Code Cache", "GPUCache"] {
+            let cache = fd_path(&default).join(name);
+            let Ok(meta) = std::fs::symlink_metadata(&cache) else {
+                continue;
+            };
+            if !meta.file_type().is_dir() {
+                continue;
+            }
+            let old = meta
+                .modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= Duration::from_secs(30 * 24 * 60 * 60));
+            if old && std::fs::remove_dir_all(cache).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
 pub struct HeadlessBrowser {
     child: Child,
+    _profile_guard: File,
     writer: Arc<Mutex<File>>,
     receiver: mpsc::Receiver<Vec<u8>>,
     sequence: u64,
@@ -171,6 +260,11 @@ impl HeadlessBrowser {
         }
         std::fs::set_permissions(profile, std::fs::Permissions::from_mode(0o700))
             .map_err(|_| DriverError::Unavailable)?;
+        let directory = open_directory(profile).map_err(|_| DriverError::Unavailable)?;
+        let guard = profile_guard(&directory).map_err(|_| DriverError::Unavailable)?;
+        guard
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
+            .map_err(|_| DriverError::Unavailable)?;
         let (child_read, parent_write) = pipe().map_err(|_| DriverError::Unavailable)?;
         let (parent_read, child_write) = pipe().map_err(|_| DriverError::Unavailable)?;
         let child_read_high = dup_high(&child_read).map_err(|_| DriverError::Unavailable)?;
@@ -186,6 +280,7 @@ impl HeadlessBrowser {
             .arg("--headless=new")
             .arg("--remote-debugging-pipe")
             .arg(format!("--user-data-dir={}", profile.display()))
+            .arg("--disk-cache-size=104857600")
             .args([
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -213,6 +308,19 @@ impl HeadlessBrowser {
                 }
                 libc::close(r);
                 libc::close(w);
+                // The browser is expendable; do not inherit the server's OOM preference.
+                let fd = libc::open(
+                    c"/proc/self/oom_score_adj".as_ptr(),
+                    libc::O_WRONLY | libc::O_CLOEXEC,
+                );
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let result = libc::write(fd, b"500".as_ptr().cast(), 3);
+                libc::close(fd);
+                if result != 3 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -367,6 +475,7 @@ impl HeadlessBrowser {
         });
         let mut browser = Self {
             child,
+            _profile_guard: guard,
             writer,
             receiver,
             sequence: 0,
@@ -402,6 +511,13 @@ impl HeadlessBrowser {
             "Target.setAutoAttach",
             json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}),
         )?;
+        // Chromium can reset its inherited score during startup; set it again
+        // after CDP has finished initializing the browser process.
+        std::fs::write(
+            format!("/proc/{}/oom_score_adj", browser.child.id()),
+            b"500",
+        )
+        .map_err(|_| DriverError::Unavailable)?;
         Ok(browser)
     }
 
@@ -785,6 +901,16 @@ impl BrowserEngine for HeadlessBrowser {
         }
         let response = self.call("Page.navigate", json!({"url":url}))?;
         if response.get("errorText").is_some() {
+            #[cfg(test)]
+            if std::env::var_os("MOMSO_S159_URL").is_some() {
+                let reason = response["errorText"].as_str().unwrap_or("unknown");
+                if reason
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b":_-".contains(&c))
+                {
+                    eprintln!("S159 navigation_error={reason}");
+                }
+            }
             return Err(DriverError::Unavailable);
         }
         let expected = response
@@ -895,6 +1021,9 @@ impl BrowserEngine for HeadlessBrowser {
 
 impl Drop for HeadlessBrowser {
     fn drop(&mut self) {
+        let _ = self
+            ._profile_guard
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()));
         let _ = self.send("Browser.close", json!({}), false);
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
@@ -945,6 +1074,13 @@ impl ServerBrowsers {
         }
         self.chats.get_mut(chat_id).ok_or(DriverError::Unavailable)
     }
+    pub fn is_open(&self, chat_id: &str) -> bool {
+        self.chats.contains_key(chat_id)
+    }
+    pub fn process_identity(&self, chat_id: &str) -> Option<(u32, u64)> {
+        let pid = self.chats.get(chat_id)?.child.id();
+        Some((pid, process_start_ticks(pid)?))
+    }
     pub fn close(&mut self, chat_id: &str) {
         if let Some(mut browser) = self.chats.remove(chat_id) {
             self.closed_decisions
@@ -967,8 +1103,411 @@ impl ServerBrowsers {
     }
 }
 
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// Returns no value if a process disappears or its accounting is inaccessible.
+pub fn process_tree_pss_kib((root, start): (u32, u64)) -> Option<u64> {
+    if process_start_ticks(root)? != start {
+        return None;
+    }
+    let mut processes = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let Some(parent) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:")?.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        processes.push((pid, parent));
+    }
+    let mut ids = std::collections::HashSet::from([root]);
+    loop {
+        let before = ids.len();
+        for (pid, parent) in &processes {
+            if ids.contains(parent) {
+                ids.insert(*pid);
+            }
+        }
+        if ids.len() == before {
+            break;
+        }
+    }
+    let mut total = 0u64;
+    for pid in ids {
+        let data = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+        let amount = data.lines().find_map(|line| {
+            line.strip_prefix("Pss:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })?;
+        total = total.checked_add(amount)?;
+    }
+    if process_start_ticks(root)? != start {
+        return None;
+    }
+    Some(total)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stale_cache_cleanup_preserves_login_and_skips_active_profile() {
+        use super::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("a".repeat(64));
+        let default = profile.join("Default");
+        let cache = default.join("Cache");
+        let local = default.join("Local Storage");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(cache.join("cache"), b"temporary").unwrap();
+        std::fs::write(default.join("Cookies"), b"login fixture").unwrap();
+        std::fs::write(local.join("state"), b"local fixture").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60);
+        File::open(&cache)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let dir = open_directory(&profile).unwrap();
+        let active = profile_guard(&dir).unwrap();
+        active
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        assert_eq!(prune_inactive_caches(tmp.path(), SystemTime::now()), 0);
+        assert!(cache.exists());
+        drop(active);
+        let recent = profile_guard(&dir).unwrap();
+        recent
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
+            .unwrap();
+        drop(recent);
+        assert_eq!(prune_inactive_caches(tmp.path(), SystemTime::now()), 0);
+        let inactive = profile_guard(&dir).unwrap();
+        inactive
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        drop(inactive);
+        std::fs::write(profile.join("SingletonLock"), b"active").unwrap();
+        assert_eq!(prune_inactive_caches(tmp.path(), SystemTime::now()), 0);
+        std::fs::remove_file(profile.join("SingletonLock")).unwrap();
+        assert_eq!(prune_inactive_caches(tmp.path(), SystemTime::now()), 1);
+        assert!(!cache.exists());
+        assert_eq!(
+            std::fs::read(default.join("Cookies")).unwrap(),
+            b"login fixture"
+        );
+        assert_eq!(
+            std::fs::read(local.join("state")).unwrap(),
+            b"local fixture"
+        );
+    }
+
+    #[test]
+    fn stale_cache_cleanup_never_follows_profile_symlink() {
+        use super::*;
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("Default/Cache")).unwrap();
+        std::fs::write(outside.path().join("Default/Cache/file"), b"untouched").unwrap();
+        symlink(outside.path(), tmp.path().join("b".repeat(64))).unwrap();
+        assert_eq!(prune_inactive_caches(tmp.path(), SystemTime::now()), 0);
+        assert!(outside.path().join("Default/Cache/file").exists());
+    }
+
+    #[test]
+    #[ignore = "resource measurement needs an isolated Chromium and loopback fixture"]
+    fn s155_browser_pss_measurement() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = std::env::var("MOMSO_S159_URL")
+            .unwrap_or_else(|_| format!("http://{}/", listener.local_addr().unwrap()));
+        let count_limit = if std::env::var_os("MOMSO_S159_URL").is_some() {
+            1
+        } else {
+            3
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let heavy = std::env::var_os("MOMSO_S155_HEAVY").is_some();
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut input = [0u8; 4096];
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let _ = stream.read(&mut input);
+                    let mut body =
+                        String::from("<html><title>Fixture</title><body>resource fixture");
+                    if heavy {
+                        body.push_str("<table>");
+                        for row in 0..3000 {
+                            body.push_str(&format!(
+                                "<tr><td>{row}</td><td>예약 수업 시간표</td><td>08:00</td></tr>"
+                            ));
+                        }
+                        body.push_str("</table>");
+                    }
+                    body.push_str("</body></html>");
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+        let executable = std::env::var_os("MOMSO_TEST_CHROMIUM").expect("isolated browser");
+        let root = tempfile::tempdir().unwrap();
+        let mut browsers =
+            super::ServerBrowsers::new(executable.into(), root.path().join("profiles"));
+        let started = Instant::now();
+        let mut completed = 0;
+        for count in 1..=count_limit {
+            let mem = std::fs::read_to_string("/proc/meminfo").unwrap();
+            let available = mem
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("MemAvailable:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap();
+            if available < 300_000 {
+                println!(
+                    "S155 scenario={} count={count} status=memory_low available_kib={available}",
+                    if heavy { "heavy" } else { "light" }
+                );
+                break;
+            }
+            let browser = match browsers.open(&format!("fixture-{count}")) {
+                Ok(browser) => browser,
+                Err(error) => {
+                    println!("S155 scenario={} count={count} status=launch_failed error={error:?} available_kib={available}", if heavy {"heavy"} else {"light"});
+                    break;
+                }
+            };
+            let oom_score =
+                std::fs::read_to_string(format!("/proc/{}/oom_score_adj", browser.child.id()))
+                    .unwrap();
+            assert_eq!(oom_score.trim(), "500");
+            let page_status = match super::BrowserEngine::navigate(browser, &url) {
+                Ok(page) => {
+                    if count_limit == 1 {
+                        println!(
+                            "S159 page_title={} text_chars={}",
+                            serde_json::to_string(&page.title).unwrap(),
+                            page.text.chars().count()
+                        );
+                    }
+                    "opened"
+                }
+                Err(DriverError::HumanRequired(_)) if count_limit == 1 => "human_required",
+                Err(error) => {
+                    println!(
+                        "S155 scenario={} count={count} status=navigate_failed error={error:?}",
+                        if heavy { "heavy" } else { "light" }
+                    );
+                    break;
+                }
+            };
+            std::thread::sleep(Duration::from_secs(if count_limit == 1 { 10 } else { 1 }));
+            if count_limit == 1 {
+                match super::BrowserEngine::read(
+                    browsers.chats.get_mut(&format!("fixture-{count}")).unwrap(),
+                ) {
+                    Ok(page) => println!(
+                        "S159 settled_title={} text_chars={}",
+                        serde_json::to_string(&page.title).unwrap(),
+                        page.text.chars().count()
+                    ),
+                    Err(error) => println!("S159 settled_read={error:?}"),
+                }
+            }
+            let browser_pid = browsers.chats[&format!("fixture-{count}")].child.id();
+            assert_eq!(
+                std::fs::read_to_string(format!("/proc/{browser_pid}/oom_score_adj"))
+                    .unwrap()
+                    .trim(),
+                "500"
+            );
+            let output = std::process::Command::new("ps")
+                .args(["-eo", "pid=,ppid="])
+                .output()
+                .unwrap();
+            let processes: Vec<(u32, u32)> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+                })
+                .collect();
+            let mut ids: std::collections::HashSet<u32> = browsers
+                .chats
+                .values()
+                .map(|browser| browser.child.id())
+                .collect();
+            loop {
+                let before = ids.len();
+                for (id, parent) in &processes {
+                    if ids.contains(parent) {
+                        ids.insert(*id);
+                    }
+                }
+                if ids.len() == before {
+                    break;
+                }
+            }
+            let mut pss = 0u64;
+            let mut read_count = 0;
+            for id in &ids {
+                if let Ok(rollup) = std::fs::read_to_string(format!("/proc/{id}/smaps_rollup")) {
+                    if let Some(value) = rollup.lines().find_map(|line| {
+                        line.strip_prefix("Pss:")?
+                            .split_whitespace()
+                            .next()?
+                            .parse::<u64>()
+                            .ok()
+                    }) {
+                        pss += value;
+                        read_count += 1;
+                    }
+                }
+            }
+            let mem = std::fs::read_to_string("/proc/meminfo").unwrap();
+            let available = mem
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("MemAvailable:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap();
+            println!("S155 scenario={} count={count} status={page_status} processes={} pss_read={} pss_kib={pss} available_kib={available} elapsed_ms={}", if heavy {"heavy"} else {"light"}, ids.len(), read_count, started.elapsed().as_millis());
+            completed = count;
+        }
+        drop(browsers);
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        assert_eq!(
+            completed, count_limit,
+            "browser measurement did not finish all cases"
+        );
+    }
+    #[test]
+    #[ignore = "requires isolated headless Chromium and a loopback fixture"]
+    fn browser_resource_usage_one_and_three_chats() {
+        use std::io::{Read, Write};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::SeqCst) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                    let mut input = [0u8; 4096];
+                    let _ = stream.read(&mut input);
+                    let body = "<html><title>Fixture</title><body>resource fixture</body></html>";
+                    let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        });
+        let executable = std::env::var_os("MOMSO_TEST_CHROMIUM").expect("isolated test browser");
+        let root = tempfile::tempdir().unwrap();
+        let mut browsers =
+            super::ServerBrowsers::new(executable.into(), root.path().join("profiles"));
+        let started = std::time::Instant::now();
+        for count in 1..=3 {
+            let browser = browsers.open(&format!("fixture-{count}")).unwrap();
+            let page = super::BrowserEngine::navigate(browser, &url).unwrap();
+            assert!(page.text.contains("resource fixture"));
+            if count == 1 || count == 3 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let output = std::process::Command::new("ps")
+                    .args(["-eo", "pid=,ppid=,rss="])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                let processes: Vec<(u32, u32, u64)> = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        Some((
+                            fields.next()?.parse().ok()?,
+                            fields.next()?.parse().ok()?,
+                            fields.next()?.parse().ok()?,
+                        ))
+                    })
+                    .collect();
+                let mut ids: std::collections::HashSet<u32> = browsers
+                    .chats
+                    .values()
+                    .map(|browser| browser.child.id())
+                    .collect();
+                loop {
+                    let before = ids.len();
+                    for (id, parent, _) in &processes {
+                        if ids.contains(parent) {
+                            ids.insert(*id);
+                        }
+                    }
+                    if ids.len() == before {
+                        break;
+                    }
+                }
+                let rss_kib: u64 = processes
+                    .iter()
+                    .filter(|(id, _, _)| ids.contains(id))
+                    .map(|(_, _, rss)| rss)
+                    .sum();
+                assert!(rss_kib > 0);
+                println!(
+                    "S144 chats={count} processes={} rss_kib={rss_kib} elapsed_ms={}",
+                    ids.len(),
+                    started.elapsed().as_millis()
+                );
+            }
+        }
+        drop(browsers);
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+    }
     use super::*;
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1627,6 +2166,16 @@ mod tests {
             thread::sleep(Duration::from_millis(30));
         }
         assert!(vault_login_seen);
+        assert!(real.browser_is_open("vault-room"));
+        assert!(real.close_idle_browser("vault-room"));
+        assert!(!real.browser_is_open("vault-room"));
+        let restored = real.dispatch(
+            "vault-room",
+            Permission::Ask,
+            "browser_navigate",
+            json!({"url":base}),
+        );
+        assert_eq!(restored["title"], "Remembered");
         assert_eq!(
             real.dispatch(
                 "vault-room",
@@ -1668,6 +2217,21 @@ mod tests {
         assert!(verified_seen);
         assert_eq!(real.approval.login_calls, 1);
         real.browsers.close("vault-room");
+        let digest = Sha256::digest(b"vault-room");
+        let name: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let profiles = temp.path().join("vault-browser");
+        let cache = profiles.join(&name).join("Default/Cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60);
+        File::open(&cache)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        File::open(profiles.join(&name).join(".momso-profile.lock"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        assert!(prune_inactive_caches(&profiles, SystemTime::now()) >= 1);
         let remembered = real.dispatch(
             "vault-room",
             Permission::Ask,

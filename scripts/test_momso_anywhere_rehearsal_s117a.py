@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import momso_anywhere_rehearsal_s117a as rehearsal
 from momso_anywhere_rehearsal_s117a import gateway_evidence, vm_evidence, inventory_basic_resources, inventory_regional_backup_keys
+from momso_server_install import InstallError
 
 
 class FakeProvider:
@@ -92,15 +93,81 @@ class RehearsalReadOnlyTests(unittest.TestCase):
                     return [{'name': 'momso-' + self.install_id, 'labels': {}}]
                 if args[:3] == ('compute', 'disks', 'list'):
                     raise RuntimeError('token must not appear in output')
+                if args[:3] == ('storage', 'buckets', 'describe'):
+                    raise InstallError('absent', http_status=404)
+                if args[:2] == ('storage', 'ls'): return b'[]'
                 return []
         result = inventory_basic_resources(InventoryProvider())
         self.assertEqual(result['vm']['items'], ['momso-' + 'a' * 12])
         self.assertTrue(result['network']['complete'])
         self.assertFalse(result['disk']['complete'])
-        self.assertFalse(result['gateway']['complete'])
+        self.assertTrue(result['gateway']['complete'])
+        self.assertTrue(result['nat']['complete'])
         self.assertFalse(result['iam']['complete'])
         self.assertFalse(result['kms']['complete'])
         self.assertNotIn('token', repr(result))
+
+    def test_nat_and_gateway_absent_present_and_query_failure(self):
+        class InventoryProvider(FakeProvider):
+            def __init__(self, state):
+                super().__init__(); self.state = state
+            def run(self, *args, **kwargs):
+                if args[:3] == ('compute', 'routers', 'list'):
+                    if self.state == 'failed': raise OSError('denied')
+                    return [{'name': 'momso-' + self.install_id + '-router'}] if self.state in ('present', 'malformed') else []
+                if args[:3] == ('compute', 'routers', 'describe'):
+                    if self.state == 'malformed': return {'nats': []}
+                    return {'name': 'momso-' + self.install_id + '-router', 'nats': [{'name': 'momso-' + self.install_id + '-nat'}]}
+                if args[:3] == ('run', 'services', 'list'):
+                    if self.state == 'failed': raise OSError('denied')
+                    return [{'metadata': {'name': 'momso-any-' + self.install_id, 'labels': {}}}] if self.state == 'present' else []
+                if args[:3] == ('storage', 'buckets', 'describe'):
+                    raise InstallError('absent', http_status=404)
+                if args[:2] == ('storage', 'ls'): return b'[]'
+                return []
+        for state in ('absent', 'present', 'failed'):
+            result = inventory_basic_resources(InventoryProvider(state))
+            for name in ('nat', 'gateway'):
+                self.assertEqual(result[name]['complete'], state != 'failed')
+                self.assertEqual(bool(result[name]['items']), state == 'present')
+        self.assertFalse(inventory_basic_resources(InventoryProvider('malformed'))['nat']['complete'])
+
+    def test_bucket_includes_soft_deleted_and_distinguishes_denied(self):
+        class InventoryProvider(FakeProvider):
+            def __init__(self, state): super().__init__(); self.state = state
+            def run(self, *args, **kwargs):
+                if args[:3] == ('storage', 'buckets', 'list'):
+                    if self.state == 'denied': raise OSError('denied')
+                    return [{'name': 'momso-backup-' + self.install_id}] if self.state == 'present' else []
+                if args[:3] == ('storage', 'buckets', 'describe'):
+                    if self.state == 'present':
+                        return {'name': 'momso-backup-' + self.install_id, 'labels': {'momso-install-id': self.install_id}}
+                    raise InstallError('denied' if self.state in ('denied', 'denied-description') else 'absent',
+                                       http_status=403 if self.state in ('denied', 'denied-description') else 404)
+                if args[:2] == ('storage', 'ls'):
+                    if self.state == 'soft':
+                        return json.dumps([{'metadata': {'name': 'momso-backup-' + self.install_id, 'hardDeleteTime': '2026-12-01T00:00:00Z'}}]).encode()
+                    return b'[]'
+                return []
+        for state in ('absent', 'present', 'soft', 'denied', 'denied-description'):
+            value = inventory_basic_resources(InventoryProvider(state))['bucket']
+            self.assertEqual(value['complete'], state not in ('denied', 'denied-description'))
+            self.assertEqual(bool(value['items']), state in ('present', 'soft'))
+            if state == 'denied-description': self.assertEqual(value['reason'], 'bucket_access_denied')
+
+    def test_iam_absent_present_and_query_failure(self):
+        class InventoryProvider(FakeProvider):
+            def run(self, *_args, **_kwargs): return []
+        provider = InventoryProvider()
+        for found in ([], ['project']):
+            with patch('momso_anywhere_iam_pc.inspect_installation_bindings', return_value=found):
+                result = inventory_basic_resources(provider)['iam']
+                self.assertTrue(result['complete'])
+                self.assertEqual(result['items'], found)
+        with patch('momso_anywhere_iam_pc.inspect_installation_bindings', side_effect=OSError('denied')):
+            result = inventory_basic_resources(provider)['iam']
+            self.assertFalse(result['complete'])
+            self.assertEqual(result['reason'], 'iam_inventory_failed')
 
     def test_scheduled_key_version_is_reported_and_missing_permission_is_unknown(self):
         class KeyProvider(FakeProvider):
@@ -195,6 +262,10 @@ class RehearsalReadOnlyTests(unittest.TestCase):
             def run(self, *args, **kwargs):
                 if self.failed:
                     raise RuntimeError('unavailable')
+                if args[:2] == ('storage', 'ls'):
+                    return b'[]'
+                if args[:3] == ('storage', 'buckets', 'describe'):
+                    raise InstallError('absent', http_status=404)
                 if args[:3] == ('run', 'services', 'list') and self.collision:
                     return [{'metadata': {'name': 'momso-any-' + self.install_id, 'labels': {}}}]
                 return []
@@ -274,15 +345,17 @@ class RehearsalReadOnlyTests(unittest.TestCase):
             argv = ['--account', 'fake@example.test', '--project', 'fake-project', '--release-manifest-url', 'https://example.test/release', '--bundle', str(bundle), '--public-key', str(key), '--channel', 'development', '--google-client-id', 'fake.apps.googleusercontent.com', '--owner-sub', '12345', '--login-origin', 'https://example.test', '--protect-installation-id', 'bbbbbbbbbbbb']
             signed = {'bundleUrl': 'https://example.test/bundle', 'bundleSha256': '0' * 64, 'gatewayImage': 'example/gateway@sha256:' + '1' * 64}
             checks = {'traffic_digest': 'passed', 'public_https': 'passed', 'vm_services': 'passed', 'update_status': 'passed'}
-            with patch.object(momso_release_keys, 'validate'), patch.object(momso_release_manifest, 'release', return_value=signed), patch.object(momso_release_manifest, 'download', return_value=b'fake'), patch.object(momso_release_manifest, 'verify_inputs'), patch.object(rehearsal, 'GoogleProvider', Provider), patch.object(rehearsal, 'preflight_new_id', return_value=True), patch.object(rehearsal, 'gateway_evidence', return_value=checks), patch.object(rehearsal, 'vm_evidence', return_value={}), patch.object(rehearsal, 'collect_inventory', return_value=({}, [])), patch.object(rehearsal, 'schedule_owned_backup_keys', return_value='keys_absent'), patch.object(rehearsal.subprocess, 'run', side_effect=fake_run), patch.object(momso_anywhere_backup_provision, 'GoogleBackupProvisioner', Backup), patch.object(rehearsal.tempfile, 'tempdir', tmp), redirect_stdout(io.StringIO()) as out:
+            names = ('vm', 'disk', 'network', 'subnet', 'firewall', 'router', 'nat', 'addresses', 'gateway', 'accounts', 'roles', 'secrets', 'iam', 'bucket', 'kms')
+            inventory = {name: {'complete': True, 'items': []} for name in names}
+            with patch.object(momso_release_keys, 'validate'), patch.object(momso_release_manifest, 'release', return_value=signed), patch.object(momso_release_manifest, 'download', return_value=b'fake'), patch.object(momso_release_manifest, 'verify_inputs'), patch.object(rehearsal, 'GoogleProvider', Provider), patch.object(rehearsal, 'preflight_new_id', return_value=True), patch.object(rehearsal, 'gateway_evidence', return_value=checks), patch.object(rehearsal, 'vm_evidence', return_value={}), patch.object(rehearsal, 'collect_inventory', return_value=(inventory, [])), patch.object(rehearsal, 'schedule_owned_backup_keys', return_value='keys_absent'), patch.object(rehearsal.subprocess, 'run', side_effect=fake_run), patch.object(momso_anywhere_backup_provision, 'GoogleBackupProvisioner', Backup), patch.object(rehearsal.tempfile, 'tempdir', tmp), redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(rehearsal.main(argv), 0)
             self.assertEqual([call[2] for call in calls], ['anywhere', 'destroy'])
             self.assertIn('--google-client-id', calls[0])
             self.assertIn('fake.apps.googleusercontent.com', calls[0])
             self.assertIn('--owner-sub', calls[0])
             self.assertIn('--login-origin', calls[0])
-            self.assertIn('미확인', out.getvalue())
-            self.assertIn('삭제 후 미확인: iam', out.getvalue())
+            self.assertNotIn('삭제 후 미확인: iam', out.getvalue())
+            self.assertIn('과금되는 것: 확인한 범위에서 0', out.getvalue())
 
     def test_deletion_outcomes_distinguish_unverified_remaining_and_failure(self):
         for outcome, expected in [('deleted', 'passed'), ('deleted_unverified', 'passed'), ('remaining', 'failed'), ('failed', 'failed')]:
@@ -291,6 +364,40 @@ class RehearsalReadOnlyTests(unittest.TestCase):
                                              lambda: 'backup_absent,keys_absent', lambda: ({}, []))
             self.assertEqual(result['destroy'], expected)
             self.assertEqual(result['deletion'], deletion)
+
+    def test_serverless_cleanup_reason_survives_rehearsal(self):
+        deletion = {'outcome': 'remaining', 'reason': 'serverless_address_release_pending',
+                    'retryCommand': 'fixture retry'}
+        result = rehearsal.run_rehearsal(FakeProvider(), lambda: True, lambda: {}, lambda: deletion,
+                                         lambda: 'backup_absent,keys_absent', lambda: ({}, []))
+        self.assertEqual(result['destroyFailure'], 'serverless_address_release_pending')
+        self.assertEqual(result['deletion']['retryCommand'], 'fixture retry')
+
+    def test_final_iam_recheck_reconciles_unverified_outcome(self):
+        for complete, items, expected in ((True, [], 'deleted'), (True, ['binding'], 'remaining'),
+                                          (False, [], 'deleted_unverified')):
+            deletion = {'outcome': 'deleted_unverified', 'unverified': ['iam_bindings']}
+            groups = {'iam': {'complete': complete, 'items': items}}
+            result = rehearsal.run_rehearsal(FakeProvider(), lambda: True, lambda: {}, lambda: deletion,
+                lambda: 'backup_absent,keys_absent', lambda: (groups, []))
+            self.assertEqual(result['deletion']['outcome'], expected)
+
+    def test_final_inventory_can_identify_network_delay_after_backup_cleanup(self):
+        provider = FakeProvider()
+        provider.subnet, provider.network = 'fixture-sub', 'fixture-net'
+        names = ('vm', 'disk', 'firewall', 'router', 'nat', 'gateway', 'accounts', 'roles', 'secrets', 'iam', 'bucket', 'kms', 'network', 'subnet', 'addresses')
+        groups = {name: {'complete': True, 'items': []} for name in names}
+        groups['subnet']['items'] = [provider.subnet]
+        groups['network']['items'] = [provider.network]
+        groups['addresses']['items'] = ['serverless-fixture']
+        pending = {'reason': 'serverless_address_release_pending', 'addressCount': 1, 'billing': 'no_charge', 'retryable': True}
+        with patch('momso_anywhere_network_cleanup.pending_serverless', return_value=pending):
+            result = rehearsal.run_rehearsal(provider, lambda: True, lambda: {},
+                lambda: {'outcome': 'remaining', 'reason': 'cleanup_pending'},
+                lambda: 'backup_deleted,keys_absent', lambda: (groups, []),
+                network_retry=lambda: {'retryCommand': 'fixture retry'})
+        self.assertEqual(result['destroyFailure'], 'serverless_address_release_pending')
+        self.assertEqual(result['deletion']['retryCommand'], 'fixture retry')
 
     def test_requested_idle_check_runs_before_destroy_and_failure_is_visible(self):
         calls = []

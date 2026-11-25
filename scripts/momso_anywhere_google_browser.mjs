@@ -7,6 +7,7 @@ import { deletionPreview } from './momso_anywhere_deletion_contract.mjs';
 import { discardBackup } from './momso_anywhere_discard_backup.mjs';
 import { inspectProjectExclusivity, INSTALLER_SERVICES } from './momso_anywhere_project_exclusivity.mjs';
 import { removeAndVerify } from './momso_anywhere_iam_policy.mjs';
+import { restorePlan } from './momso_anywhere_restore_plan.mjs';
 
 const CRM = 'https://cloudresourcemanager.googleapis.com/v3/';
 const BILLING = 'https://cloudbilling.googleapis.com/v1/';
@@ -46,6 +47,8 @@ export class GoogleBrowserProvider {
   #releaseConfig;
   #releaseVerifier;
   #trustStorage;
+  #restorePlan = null;
+  #restoreResult = null;
   constructor(accessToken, { fetchImpl = fetch, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), release = null, clientId = null, ownerSub = null, billingAccountName = null, projectId = null, expiresAt = Infinity, releaseVerifier = verifyRelease, trustStorage = globalThis.localStorage } = {}) {
     if (!accessToken) throw new SetupError('invalid_authorization');
     this.#token = accessToken;
@@ -119,7 +122,7 @@ export class GoogleBrowserProvider {
   }
 
   #projectId(id) {
-    if (!/^[a-f0-9]{24}$/.test(id)) throw new SetupError('invalid_checkpoint');
+    if (!/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(id)) throw new SetupError('invalid_checkpoint');
     return this.#selectedProject ?? `momso-${id}`;
   }
 
@@ -190,7 +193,7 @@ export class GoogleBrowserProvider {
         const found = await this.#request(`${RUN}projects/${project.projectId}/locations/${REGION}/services?${query}`, { allowMissing: true, missingForbidden: true });
         for (const service of found?.services ?? []) {
         const id = service.labels?.['momso-install-id'];
-        if (!/^[a-f0-9]{24}$/.test(id ?? '') || service.name !== `projects/${project.projectId}/locations/${REGION}/services/momso-any-${id.slice(0, 12)}`) continue;
+        if (!/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(id ?? '') || service.name !== `projects/${project.projectId}/locations/${REGION}/services/momso-any-${id.slice(0, 12)}`) continue;
         if (!service || service.labels?.['momso-install-id'] !== id || service.reconciling || service.terminalCondition?.state !== 'CONDITION_SUCCEEDED' || !service.invokerIamDisabled || service.iapEnabled || !service.latestReadyRevision || service.latestReadyRevision !== service.latestCreatedRevision || service.generation == null || service.observedGeneration == null || String(service.observedGeneration) !== String(service.generation)) continue;
         const traffic = service.trafficStatuses ?? [];
         if (traffic.length !== 1 || traffic[0].percent !== 100 || traffic[0].revision !== service.latestReadyRevision) continue;
@@ -206,6 +209,123 @@ export class GoogleBrowserProvider {
       } while (page);
     }
     return [...results].sort();
+  }
+
+  async restorePlan(id) {
+    if (!/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(id ?? '')) throw new SetupError('invalid_installation');
+    const project = this.#projectId(id), short = id.slice(0, 12);
+    const instance = await this.#request(`${COMPUTE}projects/${project}/zones/${ZONE}/instances/momso-${short}`, { allowMissing: true });
+    if (instance) {
+      if (instance.labels?.['momso-install-id'] !== id) throw new SetupError('resource_ownership');
+      return { restoreAvailable: null, lastBackupAt: null, requiresRestore: false, existingVm: true };
+    }
+    const instances = await this.#projectInstances(project);
+    if (instances.some(item => item.labels?.['momso-install-id'] === id)) throw new SetupError('restore_vm_exists');
+    const secretUrl = `${SECRETS}projects/${project}/secrets/momso-vault-${short}`;
+    const bucketUrl = `https://storage.googleapis.com/storage/v1/b/momso-backup-${short}`;
+    const keyUrl = `https://cloudkms.googleapis.com/v1/projects/${project}/locations/${REGION}/keyRings/momso-backup-${short}/cryptoKeys/backup`;
+    const [secret, bucket, key] = await Promise.all([secretUrl, bucketUrl, keyUrl].map(url => this.#request(url, { allowMissing: true })));
+    for (const item of [secret, bucket, key]) if (item && item.labels?.['momso-install-id'] !== id) throw new SetupError('resource_ownership');
+    if (![secret, bucket, key].some(Boolean)) return restorePlan({ vault: 'absent', bucket: 'absent', key: 'absent', slots: null });
+    if (![secret, bucket, key].every(Boolean)) throw new SetupError('restore_assets_incomplete');
+    const [secretVersions, keyVersions] = await Promise.all([this.#request(secretUrl + '/versions?pageSize=100'), this.#request(keyUrl + '/cryptoKeyVersions?pageSize=100')]);
+    if (secretVersions.nextPageToken || keyVersions.nextPageToken || !Array.isArray(secretVersions.versions) || !Array.isArray(keyVersions.cryptoKeyVersions)) throw new SetupError('restore_assets_unverified');
+    if (!secretVersions.versions.some(item => item.state === 'ENABLED' && item.name?.endsWith('/versions/1')) || !keyVersions.cryptoKeyVersions.some(item => item.state === 'ENABLED')) throw new SetupError('restore_assets_incomplete');
+    const slots = [], seen = new Set(); let page = '';
+    do {
+      if (seen.has(page)) throw new SetupError('restore_assets_unverified');
+      seen.add(page);
+      const query = new URLSearchParams({ prefix: 'momso-backup/', maxResults: '100' });
+      if (page) query.set('pageToken', page);
+      const result = await this.#request(bucketUrl + '/o?' + query);
+      if (result.items !== undefined && !Array.isArray(result.items)) throw new SetupError('restore_assets_unverified');
+      slots.push(...(result.items ?? []));
+      page = result.nextPageToken ?? '';
+    } while (page);
+    return restorePlan({ vault: 'ready', bucket: 'ready', key: 'ready', slots });
+  }
+
+  enableRestore(id, plan) {
+    if (!/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(id) || plan?.requiresRestore !== true) throw new SetupError('restore_assets_unverified');
+    this.#restorePlan = { id, plan };
+  }
+
+  restoreResult() { return this.#restoreResult ?? {}; }
+
+  async #projectInstances(project) {
+    const instances = [], seen = new Set(); let page = '';
+    do {
+      if (seen.has(page)) throw new SetupError('restore_assets_unverified');
+      seen.add(page);
+      const query = new URLSearchParams({ maxResults: '500' });
+      if (page) query.set('pageToken', page);
+      const result = await this.#request(`${COMPUTE}projects/${project}/aggregated/instances?${query}`);
+      if (!result.items || typeof result.items !== 'object' || Array.isArray(result.items)) throw new SetupError('restore_assets_unverified');
+      for (const scope of Object.values(result.items)) {
+        if (!scope || typeof scope !== 'object' || (scope.warning && scope.warning.code !== 'NO_RESULTS_ON_PAGE')) throw new SetupError('restore_assets_unverified');
+        if (scope.instances !== undefined && !Array.isArray(scope.instances)) throw new SetupError('restore_assets_unverified');
+        instances.push(...(scope.instances ?? []));
+      }
+      page = result.nextPageToken ?? '';
+    } while (page);
+    return instances;
+  }
+
+  async discoverPaused() {
+    if (!this.#selectedProject) throw new SetupError('project_required');
+    const project = this.#selectedProject;
+    const projectInfo = await this.#request(`${CRM}projects/${project}`);
+    const projectNumber = /^projects\/(\d+)$/.exec(projectInfo.name ?? '')?.[1];
+    if (!projectNumber) throw new SetupError('restore_assets_unverified');
+    const list = async (url, field) => {
+      const items = [], seen = new Set(); let page = '';
+      do {
+        if (seen.has(page)) throw new SetupError('restore_assets_unverified');
+        seen.add(page);
+        const target = new URL(url);
+        target.searchParams.set(target.hostname === 'storage.googleapis.com' ? 'maxResults' : 'pageSize', '100');
+        if (page) target.searchParams.set('pageToken', page);
+        const result = await this.#request(target.href);
+        if (result[field] !== undefined && !Array.isArray(result[field])) throw new SetupError('restore_assets_unverified');
+        items.push(...(result[field] ?? []));
+        page = result.nextPageToken ?? '';
+      } while (page);
+      return items;
+    };
+    const [buckets, secrets, rings, instances] = await Promise.all([
+      list(`https://storage.googleapis.com/storage/v1/b?project=${project}`, 'items'),
+      list(`${SECRETS}projects/${project}/secrets`, 'secrets'),
+      list(`https://cloudkms.googleapis.com/v1/projects/${project}/locations/${REGION}/keyRings`, 'keyRings'),
+      this.#projectInstances(project),
+    ]);
+    const keys = [];
+    for (const ring of rings) {
+      if (!new RegExp(`^projects/(?:${project}|${projectNumber})/locations/${REGION}/keyRings/momso-backup-[a-f0-9]{12}$`).test(ring.name ?? '')) continue;
+      keys.push(...await list(`https://cloudkms.googleapis.com/v1/${ring.name}/cryptoKeys`, 'cryptoKeys'));
+    }
+    const found = new Map();
+    for (const [kind, items] of [['bucket', buckets], ['vault', secrets], ['key', keys]]) for (const item of items) {
+      const id = item?.labels?.['momso-install-id'];
+      if (!/^(?:[a-f0-9]{12}|[a-f0-9]{24})$/.test(id ?? '')) continue;
+      const short = id.slice(0, 12), name = item.name ?? '';
+      const expected = kind === 'bucket' ? [`momso-backup-${short}`] : kind === 'vault' ? [project, projectNumber].map(p => `projects/${p}/secrets/momso-vault-${short}`) : [project, projectNumber].map(p => `projects/${p}/locations/${REGION}/keyRings/momso-backup-${short}/cryptoKeys/backup`);
+      if (!expected.includes(name)) continue;
+      if (!found.has(id)) found.set(id, new Set());
+      found.get(id).add(kind);
+    }
+    const result = [];
+    for (const [id, kinds] of found) {
+      if (instances.some(item => item.labels?.['momso-install-id'] === id)) continue;
+      const instance = instances.find(item => item.name === `momso-${id.slice(0, 12)}`);
+      if (instance && instance.labels?.['momso-install-id'] !== id) throw new SetupError('resource_ownership');
+      if (!instance) {
+        const candidate = { installationId: id, assets: kinds.size === 3 ? 'complete' : 'incomplete', browserIdCompatible: true };
+        if (candidate.assets === 'complete') Object.assign(candidate, await this.restorePlan(id));
+        else Object.assign(candidate, { restoreAvailable: null, lastBackupAt: null });
+        result.push(candidate);
+      }
+    }
+    return result.sort((a, b) => a.installationId.localeCompare(b.installationId));
   }
 
   async project(id) {
@@ -298,7 +418,7 @@ export class GoogleBrowserProvider {
     await this.#ensure(projectId, `regions/${REGION}/routers/${router}`, `regions/${REGION}/routers`, { name: router, description: marker, network: netUrl, nats: [{ name: `${name}-nat`, natIpAllocateOption: 'AUTO_ONLY', sourceSubnetworkIpRangesToNat: 'ALL_SUBNETWORKS_ALL_IP_RANGES' }] }, x => x.description === marker && x.network?.endsWith('/' + network) && x.nats?.length === 1 && x.nats[0].name === `${name}-nat` && x.nats[0].natIpAllocateOption === 'AUTO_ONLY' && x.nats[0].sourceSubnetworkIpRangesToNat === 'ALL_SUBNETWORKS_ALL_IP_RANGES');
   }
 
-  async preparePrivateIdentity(id) {
+  async preparePrivateIdentity(id, { preservedOnly = false } = {}) {
     const projectId = this.#projectId(id);
     const project = await this.#request(`${CRM}projects/${projectId}`);
     if (project.projectId !== projectId || (!this.#selectedProject && project.labels?.['momso-install-id'] !== id) || project.state !== 'ACTIVE') throw new SetupError('project_ownership');
@@ -320,12 +440,14 @@ export class GoogleBrowserProvider {
       const base = `${SECRETS}projects/${projectId}/secrets/${secret}`;
       let item = await this.#request(base, { allowMissing: true });
       if (!item) {
+        if (preservedOnly && suffix === 'vault') throw new SetupError('restore_assets_incomplete');
         await this.#request(`${SECRETS}projects/${projectId}/secrets?secretId=${secret}`, { method: 'POST', body: { replication: { automatic: {} }, labels: { 'momso-install-id': id } } });
         item = await this.#request(base);
       }
       if (item.labels?.['momso-install-id'] !== id) throw new SetupError('secret_ownership');
       const versions = await this.#request(`${base}/versions`);
       if (versions.nextPageToken) throw new SetupError('secret_versions');
+      if (preservedOnly && suffix === 'vault' && !(versions.versions ?? []).some(version => version.state === 'ENABLED' && version.name?.endsWith('/versions/1'))) throw new SetupError('restore_assets_incomplete');
       if (!(versions.versions ?? []).length && suffix !== 'vault') {
         const random = crypto.getRandomValues(new Uint8Array(48));
         const value = btoa(String.fromCharCode(...random)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
@@ -364,13 +486,27 @@ export class GoogleBrowserProvider {
     const update = this.#releaseConfig?.manifestUrl && this.#releaseConfig?.publicKeySpki
       ? { manifestUrl: this.#releaseConfig.manifestUrl, publicKeySpki: this.#releaseConfig.publicKeySpki, channel: this.#releaseConfig.channel ?? 'production', ...(this.#releaseConfig.channel === 'development' ? {} : { trustBootstrap: this.#releaseConfig.trustBootstrap }) }
       : null;
-    const script = vmStartupScript({ project: projectId, secret: `momso-transport-${short}`, bundleUrl: this.#release.bundleUrl, bundleSha256: this.#release.bundleSha256, update });
+    const path = `zones/${ZONE}/instances/${name}`;
+    const prior = await this.#request(`${COMPUTE}projects/${projectId}/${path}`, { allowMissing: true });
+    if (prior && prior.labels?.['momso-install-id'] !== id) throw new SetupError('resource_ownership');
+    if (!prior && this.#restorePlan?.id !== id) {
+      const plan = await this.restorePlan(id);
+      if (plan.requiresRestore) this.enableRestore(id, plan);
+    }
+    let restoring = this.#restorePlan?.id === id;
+    const startup = restore => vmStartupScript({ project: projectId, secret: `momso-transport-${short}`, bundleUrl: this.#release.bundleUrl, bundleSha256: this.#release.bundleSha256, update, restore: restore ? { installationId: id } : null });
+    if (prior) {
+      const existing = prior.metadata?.items?.find(item => item.key === 'startup-script')?.value;
+      if (existing === startup(true)) restoring = true;
+      else if (existing === startup(false)) restoring = false;
+      else throw new SetupError('resource_ownership');
+    }
+    const script = startup(restoring);
     let identityPrepared = false;
     try {
-    await this.preparePrivateIdentity(id);
+    await this.preparePrivateIdentity(id, { preservedOnly: restoring });
     identityPrepared = true;
-    await prepareBackupResources((url, options) => this.#request(url, options), projectId, id, this.#sleep);
-    const path = `zones/${ZONE}/instances/${name}`;
+    await prepareBackupResources((url, options) => this.#request(url, options), projectId, id, this.#sleep, { preservedOnly: restoring });
     const subnet = `projects/${projectId}/regions/${REGION}/subnetworks/${name}-sub`;
     const metadata = [{ key: 'startup-script', value: script }, { key: 'enable-guest-attributes', value: 'TRUE' }, { key: 'block-project-ssh-keys', value: 'TRUE' }];
     const desired = { name, machineType: `zones/${ZONE}/machineTypes/e2-small`, labels: { 'momso-install-id': id }, tags: { items: [name] }, metadata: { items: metadata }, networkInterfaces: [{ subnetwork: subnet, networkIP: '10.42.0.10' }], serviceAccounts: [{ email: account, scopes: ['https://www.googleapis.com/auth/cloud-platform'] }], disks: [{ boot: true, autoDelete: true, initializeParams: { sourceImage: 'projects/debian-cloud/global/images/family/debian-12', diskSizeGb: '20' } }] };
@@ -383,18 +519,31 @@ export class GoogleBrowserProvider {
     }
     for (let i = 0; i < 180; i++) {
       try {
+        if (restoring) {
+          const restoreAttrs = await this.#request(`${COMPUTE}projects/${projectId}/${path}/getGuestAttributes?queryPath=momso%2Frestore`);
+          const value = restoreAttrs.queryValue?.items?.find(item => item.namespace === 'momso' && item.key === 'restore')?.value;
+          if (value) {
+            let result;
+            try { result = JSON.parse(value); } catch { throw new SetupError('restore_failed'); }
+            if (result.ok === false) { const error = new SetupError('restore_failed'); error.detail = result.detail; throw error; }
+            if (typeof result.restored !== 'boolean') throw new SetupError('restore_failed');
+            this.#restoreResult = { restored: result.restored, restoredBackupId: result.restoredBackupId ?? null, restoredAt: result.restoredAt ?? null };
+          }
+        }
         const attrs = await this.#request(`${COMPUTE}projects/${projectId}/${path}/getGuestAttributes?queryPath=momso%2Ffingerprint`);
         const fingerprint = attrs.queryValue?.items?.find(item => item.namespace === 'momso' && item.key === 'fingerprint')?.value;
-        if (/^[a-f0-9]{64}$/.test(fingerprint ?? '')) {
+        if (/^[a-f0-9]{64}$/.test(fingerprint ?? '') && (!restoring || this.#restoreResult)) {
           await this.#revokeVaultAdder(projectId, short, account, true);
           identityPrepared = false;
           return;
         }
       } catch (error) {
+        if (error instanceof SetupError && error.step === 'restore_failed') throw error;
         if (!(error instanceof SetupError)) throw error;
       }
       await this.#sleep(1000);
     }
+    if (restoring) { const error = new SetupError('restore_failed'); error.detail = 'backup_unreadable'; throw error; }
     throw new SetupError('server_not_ready');
     } finally {
       if (identityPrepared) await this.#revokeVaultAdder(projectId, short, account, false);
@@ -496,7 +645,7 @@ export class GoogleBrowserProvider {
     const previousPin = service?.template?.containers?.[0]?.env?.find(item => item.name === 'MOMSO_PRIVATE_CERT_SHA256')?.value;
     if (previousPin && previousPin !== pin) throw new SetupError('certificate_changed');
     if (!service) {
-      const operation = await this.#request(`${RUN}projects/${projectId}/locations/${REGION}/services?serviceId=${serviceId}`, { method: 'POST', body: { labels: { 'momso-install-id': id }, invokerIamDisabled: false, template: template('pending.invalid') } });
+      const operation = await this.#request(`${RUN}projects/${projectId}/locations/${REGION}/services?serviceId=${serviceId}`, { method: 'POST', body: { labels: { 'momso-install-id': id }, scaling: { maxInstanceCount: 1 }, invokerIamDisabled: false, template: template('pending.invalid') } });
       created = true;
       await this.#pollRun(projectId, operation.name);
       service = await this.#request(endpoint);
@@ -792,9 +941,16 @@ export class GoogleBrowserProvider {
         if (item.key === 'vm') onVmState('deleted');
         onProgress({ step: item.key, state: 'done' });
       } catch (error) {
-        if ((item.key === 'subnet' || item.key === 'network') && error instanceof SetupError && (error.step === 'google_request' || error.step === 'operation_failed')) {
-          remaining.push(item.key); networkPending = true; onProgress({ step: item.key, state: 'pending' });
-        } else throw error;
+        // Stop only when continuing could be unsafe: the VM may still run,
+        // ownership is unproven, or the session ended. Any other Google
+        // failure leaves just that resource for the retry, so the gateway,
+        // secrets and accounts after it are still deleted (S173).
+        const stop = item.key === 'vm' || !(error instanceof SetupError)
+          || ['resource_ownership', 'authorization_expired', 'vm_deletion_unconfirmed', 'pause_cancelled', 'project_required'].includes(error.step);
+        if (stop) throw error;
+        remaining.push(item.key); onProgress({ step: item.key, state: 'pending' });
+        // The network can be deleted only after its router, firewall and subnet.
+        if (['router', 'firewall', 'subnet', 'network'].includes(item.key)) networkPending = true;
       }
     }
     retained.push({ resource: 'backup_bucket', status: 'unverified', reason: 'not_inspected' },

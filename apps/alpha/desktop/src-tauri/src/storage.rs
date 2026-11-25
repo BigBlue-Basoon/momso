@@ -395,6 +395,10 @@ pub(crate) fn sanitize_user_owned_backup_snapshot(path: &Path) -> Result<(), Sto
     connection.execute("DELETE FROM momso_operation_runs", [])?;
     connection.execute("DELETE FROM ai_usage_events", [])?;
     connection.execute(
+        "DELETE FROM app_runtime_meta WHERE key='paired_first_receive_head'",
+        [],
+    )?;
+    connection.execute(
         "DELETE FROM app_runtime_meta WHERE key=?1",
         [crate::archive_remote::FIRST_RECEIVE_JOURNAL],
     )?;
@@ -621,6 +625,23 @@ pub(crate) fn restore_snapshot_file_with_hook(
     drop(source);
     drop(migrated_dir);
     Ok(safety_backup)
+}
+
+/// Recover a pre-operation safety copy exactly, without merging changes from
+/// the interrupted replacement into that copy. The safety file is retained.
+pub(crate) fn recover_exact_safety_snapshot(
+    safety: &Path,
+    database_path: &Path,
+) -> Result<(), StorageError> {
+    validate_snapshot_file(safety)?;
+    let source = open_connection(safety)?;
+    let mut destination = open_connection(database_path)?;
+    configure_writable_storage(&destination)?;
+    {
+        let backup = Backup::new(&source, &mut destination)?;
+        backup.run_to_completion(128, Duration::from_millis(10), None)?;
+    }
+    check_integrity(&destination)
 }
 
 fn open_connection(database_path: &Path) -> Result<Connection, StorageError> {

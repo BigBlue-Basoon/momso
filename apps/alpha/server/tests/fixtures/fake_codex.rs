@@ -13,6 +13,8 @@ fn emit(value: Value) {
 fn main() {
     let mut crm_url = String::new();
     let mut public_reads = 0;
+    let mut reschedule = false;
+    let mut fixture_list_first = String::new();
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("logout") {
         assert!(std::env::var_os("MOMSO_SERVER_TOKEN").is_none());
@@ -197,6 +199,32 @@ fn main() {
                 if let Some(url) = value
                     .pointer("/params/input/0/text")
                     .and_then(Value::as_str)
+                    .and_then(|s| s.strip_prefix("schedule-list fixture "))
+                    .and_then(|s| s.split_whitespace().next())
+                {
+                    emit(
+                        json!({"id":501,"method":"item/tool/call","params":{"tool":"browser_navigate","arguments":{"url":url}}}),
+                    );
+                    continue;
+                }
+                if let Some(url) = value
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.strip_prefix("reschedule fixture "))
+                    .and_then(|s| s.split_whitespace().next())
+                {
+                    reschedule = true;
+                    emit(
+                        json!({"method":"item/agentMessage/delta","params":{"delta":"가상 회원의 예약을 10:00에서 11:30으로 바꿔도 될까요?"}}),
+                    );
+                    emit(
+                        json!({"id":201,"method":"item/tool/call","params":{"tool":"browser_navigate","arguments":{"url":url}}}),
+                    );
+                    continue;
+                }
+                if let Some(url) = value
+                    .pointer("/params/input/0/text")
+                    .and_then(Value::as_str)
                     .and_then(|s| s.strip_prefix("crm fixture "))
                 {
                     crm_url = url.to_owned();
@@ -348,7 +376,7 @@ fn main() {
                     );
                 } else {
                     emit(
-                        json!({"method":"item/agentMessage/delta","params":{"delta":"login unavailable"}}),
+                        json!({"method":"item/agentMessage/delta","params":{"delta":format!("login unavailable: {}", value.pointer("/result/contentItems/0/text").and_then(Value::as_str).unwrap_or("no detail"))}}),
                     );
                     emit(
                         json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}),
@@ -455,10 +483,22 @@ fn main() {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let page: Value = serde_json::from_str(text).unwrap_or(json!({}));
-                if let Some(element) = page["elements"]
-                    .as_array()
-                    .and_then(|v| v.iter().find(|e| e["name"] == "등록"))
-                {
+                if reschedule {
+                    let element = page["elements"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e["name"] == "시간")
+                        .unwrap();
+                    emit(
+                        json!({"id":204,"method":"item/tool/call","params":{"tool":"browser_fill","arguments":{"elementId":element["id"],"text":"11:30"}}}),
+                    );
+                    continue;
+                }
+                if let Some(element) = page["elements"].as_array().and_then(|v| {
+                    v.iter()
+                        .find(|e| e["name"] == if reschedule { "저장" } else { "등록" })
+                }) {
                     emit(
                         json!({"id":202,"method":"item/tool/call","params":{"tool":"browser_click","arguments":{"elementId":element["id"]}}}),
                     );
@@ -472,6 +512,15 @@ fn main() {
                 }
             }
             Some(202) => {
+                if reschedule
+                    && value.pointer("/result/success").and_then(Value::as_bool) == Some(true)
+                {
+                    thread::sleep(Duration::from_millis(300));
+                    emit(
+                        json!({"id":203,"method":"item/tool/call","params":{"tool":"browser_read","arguments":{}}}),
+                    );
+                    continue;
+                }
                 let result =
                     if value.pointer("/result/success").and_then(Value::as_bool) == Some(true) {
                         "게시됨"
@@ -479,6 +528,101 @@ fn main() {
                         "거절됨"
                     };
                 emit(json!({"method":"item/agentMessage/delta","params":{"delta":result}}));
+                emit(json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}));
+            }
+            Some(203) => {
+                let text = value
+                    .pointer("/result/contentItems/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let page: Value = serde_json::from_str(text).unwrap_or(json!({}));
+                let result = if page["text"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("변경 완료 11:30"))
+                {
+                    "변경 확인 11:30"
+                } else {
+                    "변경 확인 실패"
+                };
+                emit(json!({"method":"item/agentMessage/delta","params":{"delta":result}}));
+                emit(json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}));
+            }
+            Some(204) => {
+                if value.pointer("/result/success").and_then(Value::as_bool) != Some(true) {
+                    emit(json!({"method":"item/agentMessage/delta","params":{"delta":"거절됨"}}));
+                    emit(
+                        json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}),
+                    );
+                } else {
+                    emit(
+                        json!({"id":205,"method":"item/tool/call","params":{"tool":"browser_read","arguments":{}}}),
+                    );
+                }
+            }
+            Some(205) | Some(207) => {
+                let text = value
+                    .pointer("/result/contentItems/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let page: Value = serde_json::from_str(text).unwrap_or(json!({}));
+                let confirming = value["id"] == 205;
+                let name = if confirming { "확인" } else { "저장" };
+                let element = page["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["name"] == name)
+                    .unwrap();
+                emit(
+                    json!({"id":if confirming {206} else {202},"method":"item/tool/call","params":{"tool":"browser_click","arguments":{"elementId":element["id"]}}}),
+                );
+            }
+            Some(206) => emit(
+                json!({"id":207,"method":"item/tool/call","params":{"tool":"browser_read","arguments":{}}}),
+            ),
+            Some(501) => {
+                let text = value
+                    .pointer("/result/contentItems/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let page: Value = serde_json::from_str(text).unwrap_or(json!({}));
+                fixture_list_first = page["text"].as_str().unwrap_or("").to_owned();
+                let next = page["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|element| element["name"] == "다음")
+                    .unwrap();
+                emit(
+                    json!({"id":503,"method":"item/tool/call","params":{"tool":"browser_click","arguments":{"elementId":next["id"]}}}),
+                );
+            }
+            Some(503) => {
+                thread::sleep(Duration::from_millis(300));
+                emit(
+                    json!({"id":502,"method":"item/tool/call","params":{"tool":"browser_read","arguments":{}}}),
+                );
+            }
+            Some(502) => {
+                let text = value
+                    .pointer("/result/contentItems/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let page: Value = serde_json::from_str(text).unwrap_or(json!({}));
+                let all = format!(
+                    "{} {}",
+                    fixture_list_first,
+                    page["text"].as_str().unwrap_or("")
+                );
+                let response = if all.contains("010-0000-1001")
+                    && all.contains("010-0000-1002")
+                    && all.contains("마지막 쪽")
+                {
+                    "전체 명단: 가상 회원 010-0000-1001, 가상 회원 010-0000-1002. 같은 이름입니다. 어느 분인가요?"
+                } else {
+                    "일부 명단만 확인됨"
+                };
+                emit(json!({"method":"item/agentMessage/delta","params":{"delta":response}}));
                 emit(json!({"method":"turn/completed","params":{"turn":{"status":"completed"}}}));
             }
             Some(100) => {

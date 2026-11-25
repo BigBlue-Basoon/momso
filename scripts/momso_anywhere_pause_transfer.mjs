@@ -4,7 +4,7 @@ const KEY = 'momso.start.pause.v1';
 
 function valid(value, now) {
   if (!value || typeof value !== 'object' || !/^[A-Za-z0-9_-]{32,128}$/.test(value.ticket ?? '') ||
-      !/^[a-f0-9]{24}$/.test(value.installationId ?? '') || !/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(value.projectId ?? '') ||
+      !/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(value.installationId ?? '') || !/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(value.projectId ?? '') ||
       !Number.isSafeInteger(value.createdAt) || !Number.isSafeInteger(value.expiresAt) ||
       value.createdAt > now || value.expiresAt <= now || value.expiresAt <= value.createdAt || value.expiresAt - value.createdAt > 300000) return false;
   try {

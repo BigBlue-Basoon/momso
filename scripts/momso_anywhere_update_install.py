@@ -47,6 +47,8 @@ def refresh_worker(provider):
     payload['momso_managed_files.py'] = base64.b64encode((Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()).decode('ascii')
     payload['momso_anywhere_proxy_files.py'] = base64.b64encode((Path(__file__).resolve().parent / 'momso_anywhere_proxy_files.py').read_bytes()).decode('ascii')
     payload['momso_anywhere_proxy_files.json'] = base64.b64encode((Path(__file__).resolve().parent / 'momso_anywhere_proxy_files.json').read_bytes()).decode('ascii')
+    for name in ('momso_anywhere_restore_files.py', 'momso_anywhere_restore_files.json'):
+        payload[name] = base64.b64encode((Path(__file__).resolve().parent / name).read_bytes()).decode('ascii')
     module = (Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()
     code = r'''import base64,json,os,pathlib,subprocess,sys
 data=json.load(sys.stdin)
@@ -117,7 +119,7 @@ def install(provider, channel, public_key, manifest_url, *, gate_already_held=Fa
               "statusFile": "/run/momso-update/status.json", "publicKey": "/etc/momso-update-public.pem",
               "serverTokenFile": "/run/momso-vault/server-token", "lifecycleDir": "/var/lib/momso/lifecycle",
               "serverUnit": "momso-server.service", "proxyUnit": "momso-private-proxy.service",
-              "project": provider.project, "region": REGION, "gatewayService": "momso-any-" + provider.install_id}
+              "project": provider.project, "region": REGION, "gatewayService": "momso-any-" + provider.install_id[:12]}
     if channel == 'production':
         config['trustBootstrap'] = base64.b64encode(production_bootstrap(public_key)).decode('ascii')
         config['trustState'] = '/var/lib/momso-update-trust'
@@ -130,6 +132,8 @@ def install(provider, channel, public_key, manifest_url, *, gate_already_held=Fa
     payload['files']['momso_managed_files.py'] = base64.b64encode((Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()).decode('ascii')
     payload['files']['momso_anywhere_proxy_files.py'] = base64.b64encode((Path(__file__).resolve().parent / 'momso_anywhere_proxy_files.py').read_bytes()).decode('ascii')
     payload['files']['momso_anywhere_proxy_files.json'] = base64.b64encode((Path(__file__).resolve().parent / 'momso_anywhere_proxy_files.json').read_bytes()).decode('ascii')
+    for name in ('momso_anywhere_restore_files.py', 'momso_anywhere_restore_files.json'):
+        payload['files'][name] = base64.b64encode((Path(__file__).resolve().parent / name).read_bytes()).decode('ascii')
     code = r'''data=json.load(sys.stdin);folder=pathlib.Path('/opt/momso-updater');folder.mkdir(mode=0o755,parents=True,exist_ok=True)
 install_group(folder,'update-worker',{name:base64.b64decode(value,validate=True) for name,value in data['files'].items()},WORKER_LEGACY)
 flat=pathlib.Path('/opt/momso');marker=flat/'releases/.momso-update-active';current=flat/'releases/current';override=pathlib.Path('/etc/systemd/system/momso-server.service.d/momso-update.conf')

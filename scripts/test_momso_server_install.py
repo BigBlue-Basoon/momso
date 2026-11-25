@@ -124,18 +124,188 @@ class FlowTests(unittest.TestCase):
         self.update_refresh_mock = refresh.start(); self.addCleanup(refresh.stop)
         self.update_grant_mock = self.update_grant.start(); self.addCleanup(self.update_grant.stop)
         self.update_install_mock = self.update_install.start(); self.addCleanup(self.update_install.stop)
+        lease = patch('momso_anywhere_pc_vm.VmLease')
+        existing = patch('momso_anywhere_pc_vm.existing_vm', return_value=False)
+        self.vm_lease_mock = lease.start(); self.addCleanup(lease.stop)
+        self.existing_vm_mock = existing.start(); self.addCleanup(existing.stop)
 
     def test_anywhere_destroy_stops_before_cloud_calls_when_backup_is_unverified(self):
         self.state['anywhere'] = {'url': 'https://fixture.example.test'}
         installer.save_state(self.path, self.state)
         before = self.path.read_bytes()
-        with patch.object(installer, 'GoogleProvider') as provider, patch('momso_anywhere_pc_pause.guarded_destroy', side_effect=installer.InstallError('backup_freshness_unverified')) as guarded, patch('sys.stderr', new_callable=io.StringIO) as error:
+        with patch.object(installer, 'GoogleProvider') as provider, patch('momso_anywhere_pc_vm.VmLease') as lease, patch('momso_anywhere_pc_pause.guarded_destroy', side_effect=installer.InstallError('backup_freshness_unverified')) as guarded, patch('sys.stderr', new_callable=io.StringIO) as error:
             result = installer.main(['destroy', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path)])
         self.assertEqual(result, 1)
         self.assertIn('backup_freshness_unverified', error.getvalue())
         provider.assert_called_once()
         guarded.assert_called_once()
+        lease.assert_called_once()
+        lease.return_value.__exit__.assert_called_once()
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_retry_network_command_calls_only_scoped_network_cleanup(self):
+        with patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), \
+             patch('momso_anywhere_network_cleanup.retry_network_only', return_value=[]) as retry, \
+             patch('sys.stdout', new_callable=io.StringIO) as out:
+            result = installer.main(['retry-network', '--account', 'fixture@example.test',
+                                     '--project', 'fixture-project', '--state', str(self.path)])
+        self.assertEqual(result, 0)
+        retry.assert_called_once()
+        value = json.loads(out.getvalue())
+        self.assertEqual(value['scope'], 'network_only')
+        self.assertEqual(value['outcome'], 'deleted')
+        self.assertIsNone(value['billingZero'])
+        self.assertEqual(value['mode'], 'pause')
+
+    def test_retry_command_keeps_original_discard_mode(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace(account='fixture@example.test', project='fixture-project', state=self.path, discard_data=True)
+        self.assertIn('--discard-data', installer.network_retry_command(args)['retryArgs'])
+        args.discard_data = False
+        self.assertNotIn('--discard-data', installer.network_retry_command(args)['retryArgs'])
+
+    def test_pending_serverless_reason_and_retry_are_returned(self):
+        provider = FakeProvider()
+        provider.subnet, provider.network = 'fixture-sub', 'fixture-net'
+        provider.destroy = lambda: (_ for _ in ()).throw(installer.PendingNetworkCleanup(
+            ['networks subnets:fixture-sub', 'networks:fixture-net']))
+        detail = {'reason': 'serverless_address_release_pending', 'addressCount': 1,
+                  'billing': 'no_charge', 'retryable': True}
+        with patch.object(installer, 'GoogleProvider', return_value=provider), \
+             patch('momso_anywhere_network_cleanup.pending_serverless', return_value=detail), \
+             patch('momso_anywhere_network_cleanup.other_inventory', return_value=({'bucket': {'status': 'deleted', 'reason': None}}, [])), \
+             patch('sys.stdout', new_callable=io.StringIO) as out, \
+             patch('sys.stderr', new_callable=io.StringIO):
+            result = installer.main(['destroy', '--account', 'fixture@example.test',
+                                     '--project', 'fixture-project', '--state', str(self.path)])
+        self.assertEqual(result, 1)
+        value = json.loads(out.getvalue())
+        self.assertEqual(value['outcome'], 'remaining')
+        self.assertEqual(value['reason'], 'serverless_address_release_pending')
+        self.assertIn('retry-network', value['retryArgs'])
+        self.assertIsNone(value['billingZero'])
+
+    def test_network_pending_does_not_skip_identity_and_backup_cleanup(self):
+        import momso_anywhere_install
+        self.state['anywhere'] = {'url': 'https://fixture.example.test'}
+        installer.save_state(self.path, self.state)
+        provider = FakeProvider()
+        provider.name, provider.subnet, provider.network = 'fixture-vm', 'fixture-sub', 'fixture-net'
+        provider.run = lambda *_args, **_kwargs: []
+        provider.destroy = lambda: (_ for _ in ()).throw(installer.PendingNetworkCleanup(
+            ['networks subnets:fixture-sub', 'networks:fixture-net']))
+        inventory = {name: {'status': 'deleted', 'reason': None} for name in
+                     ('vm', 'disk', 'gateway', 'secrets', 'iam', 'iam_bindings', 'nat')}
+        inventory['network'] = {'status': 'retained', 'reason': 'cleanup_pending'}
+        backup_result = {'mode': 'delete_all', 'resources': {'bucket': {'status': 'deleted'},
+                         'kms': {'status': 'deleted'}, 'secret_vault': {'status': 'deleted'}}, 'billable': [], 'billingZero': None}
+        extra = {'bucket': {'status': 'deleted'}, 'kms': {'status': 'deleted'}, 'iam': {'status': 'deleted'}}
+        pending = {'reason': 'serverless_address_release_pending', 'addressCount': 1, 'billing': 'no_charge', 'retryable': True}
+        with patch.object(installer, 'GoogleProvider', return_value=provider), \
+             patch.object(momso_anywhere_install, 'GoogleAnywhere'), \
+             patch('momso_anywhere_iam_pc.remove_installation_bindings'), \
+             patch('momso_anywhere_vm_resources.destroy_identity') as identity, \
+             patch('momso_anywhere_pc_discard.discard_backup', return_value=backup_result) as backup, \
+             patch('momso_anywhere_pc_inventory.inspect_destroyed', return_value=inventory), \
+             patch('momso_anywhere_rehearsal_s117a.collect_inventory', side_effect=OSError('fixture')), \
+             patch('momso_anywhere_network_cleanup.other_inventory', return_value=(extra, [])), \
+             patch('momso_anywhere_network_cleanup.pending_serverless', return_value=pending), \
+             patch('sys.stdout', new_callable=io.StringIO) as out:
+            result = installer.main(['destroy', '--account', 'fixture@example.test', '--project',
+                                     'fixture-project', '--state', str(self.path), '--discard-data'])
+        self.assertEqual(result, 1)
+        identity.assert_called_once_with(provider, discard_data=True)
+        backup.assert_called_once()
+        value = json.loads(out.getvalue())
+        self.assertEqual(value['outcome'], 'remaining')
+        self.assertEqual(value['reason'], 'serverless_address_release_pending')
+        self.assertEqual(value['resources']['bucket']['status'], 'deleted')
+        self.assertIn('retry-network', value['retryArgs'])
+
+    def test_pending_result_reports_surviving_bucket_as_billable(self):
+        from momso_anywhere_pending_result import pending_result
+        from types import SimpleNamespace
+        args = SimpleNamespace(account='fixture@example.test', project='fixture-project', state=self.path, discard_data=True)
+        initial = {'mode': 'delete_all', 'resources': {'bucket': {'status': 'retained', 'reason': 'bucket_still_exists'}}, 'billable': []}
+        with patch('momso_anywhere_network_cleanup.other_inventory', return_value=({'bucket': {'status': 'retained', 'reason': 'cleanup_pending'}}, [])):
+            value = pending_result(FakeProvider(), args, ['networks:fixture'], initial)
+        self.assertIn('bucket', value['remaining'])
+        self.assertEqual(value['resources']['bucket']['reason'], 'bucket_still_exists')
+        self.assertEqual(value['billable'], [{'resource': 'bucket', 'endsAt': None}])
+        self.assertIsNone(value['billingZero'])
+
+    def test_pending_result_lists_other_remaining_resources(self):
+        from momso_anywhere_pending_result import pending_result
+        from types import SimpleNamespace
+        args = SimpleNamespace(account='fixture@example.test', project='fixture-project', state=self.path, discard_data=True)
+        extra = {name: {'status': 'retained', 'reason': 'cleanup_pending'} for name in ('bucket', 'accounts', 'roles', 'secrets')}
+        with patch('momso_anywhere_network_cleanup.other_inventory', return_value=(extra, [])):
+            value = pending_result(FakeProvider(), args, ['networks:fixture'], {'mode': 'delete_all', 'resources': {}, 'billable': []})
+        self.assertTrue({'bucket', 'accounts', 'roles', 'secrets'}.issubset(set(value['remaining'])))
+        self.assertEqual(value['billable'], [{'resource': 'bucket', 'endsAt': None}])
+        self.assertNotIn('retryCommand', value)
+
+    def test_pause_continues_identity_cleanup_without_discarding_backup(self):
+        import momso_anywhere_install
+        self.state['anywhere'] = {'url': 'https://fixture.example.test'}
+        installer.save_state(self.path, self.state)
+        provider = FakeProvider()
+        provider.name = 'fixture-vm'
+        provider.run = lambda *_args, **_kwargs: []
+        provider.destroy = lambda: (_ for _ in ()).throw(installer.PendingNetworkCleanup(['networks:fixture']))
+        with patch.object(installer, 'GoogleProvider', return_value=provider), \
+             patch.object(momso_anywhere_install, 'GoogleAnywhere'), \
+             patch('momso_anywhere_iam_pc.remove_installation_bindings'), \
+             patch('momso_anywhere_pc_pause.guarded_destroy', side_effect=lambda _provider, action: action()), \
+             patch('momso_anywhere_vm_resources.destroy_identity') as identity, \
+             patch('momso_anywhere_pc_discard.discard_backup') as backup, \
+             patch('momso_anywhere_pc_inventory.inspect_destroyed', return_value={}), \
+             patch('momso_anywhere_network_cleanup.other_inventory', side_effect=OSError('fixture')), \
+             patch('sys.stdout', new_callable=io.StringIO) as out:
+            result = installer.main(['destroy', '--account', 'fixture@example.test', '--project',
+                                     'fixture-project', '--state', str(self.path)])
+        self.assertEqual(result, 1)
+        identity.assert_called_once_with(provider, discard_data=False)
+        backup.assert_not_called()
+        self.assertEqual(json.loads(out.getvalue())['outcome'], 'remaining')
+
+    def test_vm_not_confirmed_gone_stops_following_cleanup(self):
+        import momso_anywhere_install
+        self.state['anywhere'] = {'url': 'https://fixture.example.test'}
+        installer.save_state(self.path, self.state)
+        provider = FakeProvider()
+        provider.name = 'fixture-vm'
+        provider.run = lambda *_args, **_kwargs: [{'name': provider.name}]
+        provider.destroy = lambda: (_ for _ in ()).throw(installer.PendingNetworkCleanup(['networks:fixture']))
+        with patch.object(installer, 'GoogleProvider', return_value=provider), \
+             patch.object(momso_anywhere_install, 'GoogleAnywhere'), \
+             patch('momso_anywhere_iam_pc.remove_installation_bindings'), \
+             patch('momso_anywhere_vm_resources.destroy_identity') as identity, \
+             patch('momso_anywhere_pc_discard.discard_backup') as backup, \
+             patch('sys.stdout', new_callable=io.StringIO), patch('sys.stderr', new_callable=io.StringIO):
+            self.assertEqual(installer.main(['destroy', '--account', 'fixture@example.test', '--project',
+                                             'fixture-project', '--state', str(self.path), '--discard-data']), 1)
+        identity.assert_not_called()
+        backup.assert_not_called()
+
+    def test_pending_network_does_not_claim_no_charge_with_other_resources(self):
+        provider = FakeProvider()
+        provider.subnet, provider.network = 'fixture-sub', 'fixture-net'
+        provider.destroy = lambda: (_ for _ in ()).throw(installer.PendingNetworkCleanup(
+            ['networks subnets:fixture-sub', 'networks:fixture-net']))
+        with patch.object(installer, 'GoogleProvider', return_value=provider), \
+             patch('momso_anywhere_network_cleanup.other_inventory', return_value=({'bucket': {'status': 'retained', 'reason': 'cleanup_pending'}}, [])), \
+             patch('momso_anywhere_network_cleanup.pending_serverless') as pending, \
+             patch('sys.stdout', new_callable=io.StringIO) as out, \
+             patch('sys.stderr', new_callable=io.StringIO):
+            self.assertEqual(installer.main(['destroy', '--account', 'fixture@example.test',
+                                            '--project', 'fixture-project', '--state', str(self.path)]), 1)
+        pending.assert_not_called()
+        value = json.loads(out.getvalue())
+        self.assertEqual(value['reason'], 'cleanup_pending')
+        self.assertNotIn('billing', value)
+        self.assertNotIn('retryCommand', value)
+        self.assertEqual(value['resources']['bucket']['status'], 'retained')
 
     def test_gateway_failure_prints_machine_json_and_human_message(self):
         detail = {'code': 'gateway_probe_failed', 'rolledBack': True, 'retryable': True}
@@ -153,10 +323,11 @@ class FlowTests(unittest.TestCase):
         installer.save_state(self.path, self.state)
         provider = FakeProvider()
         verdict = {'mode': 'delete_all', 'resources': {'bucket': {'status': 'unverified'}}, 'billable': [], 'billingZero': None, 'estimatedZeroAt': None}
-        with patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch.object(momso_anywhere_pc_discard, 'discard_backup', return_value=verdict) as cleanup, patch('momso_anywhere_iam_pc.remove_installation_bindings') as iam_cleanup, patch('momso_anywhere_vm_resources.destroy_identity') as vm_cleanup, patch('momso_anywhere_pc_pause.guarded_destroy') as guard, patch('sys.stdout', new_callable=io.StringIO) as output:
+        with patch.object(installer, 'GoogleProvider', return_value=provider), patch('momso_anywhere_pc_vm.VmLease') as lease, patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch.object(momso_anywhere_pc_discard, 'discard_backup', return_value=verdict) as cleanup, patch('momso_anywhere_iam_pc.remove_installation_bindings') as iam_cleanup, patch('momso_anywhere_vm_resources.destroy_identity') as vm_cleanup, patch('momso_anywhere_pc_pause.guarded_destroy') as guard, patch('sys.stdout', new_callable=io.StringIO) as output:
             result = installer.main(['destroy', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--discard-data'])
         self.assertEqual(result, 0)
         guard.assert_not_called()
+        lease.assert_not_called()
         vm_cleanup.assert_called_once_with(provider, discard_data=True)
         iam_cleanup.assert_called_once_with(provider)
         cleanup.assert_called_once_with(provider, None)
@@ -165,6 +336,31 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(actual['outcome'], 'deleted_unverified')
         self.assertIn('bucket', actual['unverified'])
         self.assertEqual(json.loads(self.path.read_text(encoding='utf-8'))['steps']['destroy'], 'ok')
+
+    def test_destroy_confirms_zero_only_after_post_cleanup_inventory(self):
+        import momso_anywhere_install
+        self.state['anywhere'] = {'url': 'https://fixture.example.test'}
+        installer.save_state(self.path, self.state)
+        names = ('vm', 'disk', 'network', 'subnet', 'firewall', 'router', 'nat', 'addresses',
+                 'gateway', 'accounts', 'roles', 'secrets', 'iam', 'bucket', 'kms')
+        groups = {name: {'complete': True, 'items': []} for name in names}
+        inventory = {name: {'status': 'deleted', 'reason': None} for name in
+                     ('vm', 'disk', 'gateway', 'network', 'secrets', 'iam', 'iam_bindings', 'nat')}
+        deletion = {'mode': 'delete_all', 'resources': {'bucket': {'status': 'deleted'}, 'kms': {'status': 'deleted'},
+                     'secret_vault': {'status': 'deleted'}}, 'billable': [], 'billingZero': None}
+        with patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), \
+             patch.object(momso_anywhere_install, 'GoogleAnywhere'), \
+             patch('momso_anywhere_iam_pc.remove_installation_bindings'), \
+             patch('momso_anywhere_vm_resources.destroy_identity'), \
+             patch('momso_anywhere_pc_inventory.inspect_destroyed', return_value=inventory), \
+             patch('momso_anywhere_pc_discard.discard_backup', return_value=deletion), \
+             patch('momso_anywhere_rehearsal_s117a.collect_inventory', return_value=(groups, [])), \
+             patch('sys.stdout', new_callable=io.StringIO) as out:
+            self.assertEqual(installer.main(['destroy', '--account', 'fixture@example.test', '--project',
+                                             'fixture-project', '--state', str(self.path), '--discard-data']), 0)
+        result = json.loads(out.getvalue())
+        self.assertIs(result['billingZero'], True)
+        self.assertEqual(result['billingScope'], 'installation')
 
     def test_unreadable_iam_stops_before_any_account_or_gateway_deletion(self):
         import momso_anywhere_install
@@ -208,6 +404,19 @@ class FlowTests(unittest.TestCase):
         installer.deploy(provider, self.artifact, self.digest, self.path, state)
         self.assertEqual(len(provider.resources), 4)
 
+    def test_existing_plain_install_gets_lease_before_deploy(self):
+        self.state['steps']['vm'] = 'ok'
+        installer.save_state(self.path, self.state)
+        provider = FakeProvider()
+        self.existing_vm_mock.return_value = True
+        with patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(installer, 'deploy') as deploy:
+            result = installer.main(['install', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--artifact', str(self.artifact), '--sha256', self.digest])
+        self.assertEqual(result, 0)
+        self.vm_lease_mock.assert_called_once_with(provider)
+        self.vm_lease_mock.return_value.__enter__.assert_called_once()
+        self.vm_lease_mock.return_value.release.assert_called_once()
+        deploy.assert_called_once()
+
     def test_wrong_hash_stops_before_creating_resources(self):
         provider = FakeProvider()
         with self.assertRaises(installer.InstallError):
@@ -231,6 +440,17 @@ class FlowTests(unittest.TestCase):
             args = run.call_args.args[0]
             self.assertIn("--account=fixture@example.test", args)
             self.assertIn("--project=fixture-project", args)
+
+    def test_bucket_denied_and_not_found_are_distinct_without_exposing_output(self):
+        with patch.object(installer.shutil, 'which', return_value='gcloud'):
+            provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', self.root / 'fixture-key')
+        for status in (403, 404):
+            result = subprocess.CompletedProcess([], 1, stdout=b'', stderr=f'HTTPError {status}: private fixture'.encode())
+            with patch.object(installer.subprocess, 'run', return_value=result):
+                with self.assertRaises(installer.InstallError) as caught:
+                    provider.run('storage', 'buckets', 'describe', 'gs://fixture', parse=True)
+            self.assertEqual(caught.exception.http_status, status)
+            self.assertNotIn('private fixture', str(caught.exception))
 
     def test_wrong_account_cannot_reuse_state(self):
         with self.assertRaises(installer.InstallError):
@@ -727,10 +947,11 @@ class FlowTests(unittest.TestCase):
         digest = hashlib.sha256(web.read_bytes()).hexdigest()
         self.state["anywhere"] = {"client_id": "fixture.apps.googleusercontent.com", "owner_sub": "12345", "login_origin": "https://login.example.test", "url": "https://fixture.a.run.app"}
         installer.save_state(self.path, self.state)
-        with patch.object(installer, "GoogleProvider", return_value=FakeProvider()), patch.object(momso_anywhere_public_assets, "from_web_archive", return_value={}), patch.object(installer, "deploy") as deploy, patch.object(installer, "upgrade_anywhere", return_value="https://fixture.a.run.app") as upgrade:
+        with patch.object(installer, "GoogleProvider", return_value=FakeProvider()), patch('momso_anywhere_pc_vm.VmLease') as lease, patch.object(momso_anywhere_public_assets, "from_web_archive", return_value={}), patch.object(installer, "deploy") as deploy, patch.object(installer, "upgrade_anywhere", return_value="https://fixture.a.run.app") as upgrade:
             result = installer.main(["anywhere", "--account", "fixture@example.test", "--project", "fixture-project", "--state", str(self.path), "--artifact", str(self.artifact), "--sha256", self.digest, "--web-archive", str(web), "--web-sha256", digest, "--google-client-id", "fixture.apps.googleusercontent.com", "--owner-sub", "12345", "--login-origin", "https://login.example.test", "--gateway-image", "registry.example.test/momso/gateway@sha256:" + "a" * 64, '--release-manifest-url', 'https://example.test/release.json', '--release-public-key', str(self.public_key)])
         self.assertEqual(result, 0)
         upgrade.assert_called_once()
+        lease.assert_called_once()
         self.update_refresh_mock.assert_not_called()
         self.update_install_mock.assert_not_called()
         deploy.assert_not_called()
@@ -744,10 +965,11 @@ class FlowTests(unittest.TestCase):
         self.state['anywhere'] = {'client_id': 'fixture.apps.googleusercontent.com', 'owner_sub': '12345', 'login_origin': 'https://login.example.test', 'url': 'https://fixture.a.run.app'}
         installer.save_state(self.path, self.state)
         release = {'gatewayImage': image, 'bundleUrl': 'https://example.test/bundle', 'bundleSha256': 'b' * 64, 'sequence': 2}
-        with patch.object(momso_release_manifest, 'release', return_value=release), patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(installer, 'upgrade_anywhere', return_value='https://fixture.a.run.app') as upgrade:
+        with patch.object(momso_release_manifest, 'release', return_value=release), patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), patch('momso_anywhere_pc_vm.VmLease') as lease, patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(installer, 'upgrade_anywhere', return_value='https://fixture.a.run.app') as upgrade:
             result = installer.main(['anywhere', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--artifact', str(self.artifact), '--sha256', self.digest, '--web-archive', str(web), '--web-sha256', digest, '--google-client-id', 'fixture.apps.googleusercontent.com', '--owner-sub', '12345', '--login-origin', 'https://login.example.test', '--gateway-image', image, '--release-manifest-url', 'https://example.test/release.json', '--release-public-key', str(self.public_key)])
         self.assertEqual(result, 0)
         self.assertIn(image, upgrade.call_args.args)
+        lease.assert_called_once()
 
     def test_first_install_prepares_git_before_server_start(self):
         with patch.object(installer.shutil, "which", return_value="gcloud"):
@@ -758,6 +980,7 @@ class FlowTests(unittest.TestCase):
         encoded = next(node.value.value for node in tree.body if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "p")
         payload = base64.b64decode(encoded).decode()
         self.assertLess(payload.index("('git','ffmpeg')"), payload.index("run('systemctl','enable'"))
+        self.assertIn("OOMScoreAdjust=-500", payload)
 
     def test_first_install_installs_chromium_only_when_no_browser_exists(self):
         with patch.object(installer.shutil, "which", return_value="gcloud"):

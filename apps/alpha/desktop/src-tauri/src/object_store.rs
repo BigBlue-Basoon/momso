@@ -102,7 +102,7 @@ fn test_configs() -> &'static std::sync::Mutex<std::collections::HashMap<std::pa
 #[cfg(test)]
 pub(crate) fn register_test_config(root: &Path, config: Config) {
     assert!(config.endpoint.starts_with("http://127.0.0.1:"));
-    assert!(crate::r2_oauth::uses_oauth(&config));
+    assert!(crate::r2_oauth::uses_oauth(&config) || config.provider == "s3_compatible");
     test_configs()
         .lock()
         .unwrap()

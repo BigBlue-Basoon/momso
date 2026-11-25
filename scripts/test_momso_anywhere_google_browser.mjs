@@ -208,7 +208,11 @@ test('VM is private, verifies its release, and retries the same instance', async
     }
     if (url.includes('/getIamPolicy')) return response({ etag: 'fixture', bindings: [{ role: 'roles/reader', members: ['user:fixture@example.test'] }] });
     if (url.includes('/setIamPolicy')) return response({});
-    if (url.includes('secretmanager.googleapis.com')) return response(url.includes(':getIamPolicy') ? { etag: 'fixture', bindings: [] } : url.endsWith('/versions/1') ? { state: 'ENABLED' } : {});
+    if (url.includes('/aggregated/instances')) return response({ items: {} });
+    if (url.includes('secretmanager.googleapis.com')) {
+      if (!instance && url.endsWith(`/secrets/momso-vault-${id.slice(0, 12)}`)) return response({}, 404);
+      return response(url.includes(':getIamPolicy') ? { etag: 'fixture', bindings: [] } : url.endsWith('/versions/1') ? { state: 'ENABLED' } : {});
+    }
     if (url.includes('/operations/')) return response({ status: 'DONE' });
     if (url.includes('/getGuestAttributes')) return response({ queryValue: { items: [{ namespace: 'momso', key: 'fingerprint', value: 'b'.repeat(64) }] } });
     if (options.method === 'POST') {
@@ -228,6 +232,40 @@ test('VM is private, verifies its release, and retries the same instance', async
   assert(instance.metadata.items.find(item => item.key === 'startup-script').value.includes(release.bundleSha256));
   instance.networkInterfaces[0].accessConfigs = [{ natIP: '203.0.113.1' }];
   await assert.rejects(provider.server(id), { step: 'resource_ownership' });
+});
+
+test('restored VM keeps backup resources and returns the restore result', async () => {
+  let instance = null, role = null;
+  const backup = fakeBackupCloud(projectId, id, response);
+  const short = id.slice(0, 12), bucket = `momso-backup-${short}`;
+  const location = `projects/${projectId}/locations/asia-northeast3`;
+  backup(`https://storage.googleapis.com/storage/v1/b?project=${projectId}`, { method: 'POST', body: JSON.stringify({ name: bucket, labels: { 'momso-install-id': id }, iamConfiguration: { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: 'enforced' } }) });
+  backup(`https://cloudkms.googleapis.com/v1/${location}/keyRings?keyRingId=${bucket}`, { method: 'POST', body: '{}' });
+  backup(`https://cloudkms.googleapis.com/v1/${location}/keyRings/${bucket}/cryptoKeys?cryptoKeyId=backup`, { method: 'POST', body: JSON.stringify({ purpose: 'ENCRYPT_DECRYPT', labels: { 'momso-install-id': id } }) });
+  const release = { bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'f'.repeat(64), gatewayImage: `registry.example.test/team/gateway@sha256:${'c'.repeat(64)}`, loginOrigin: 'https://login.example.test' };
+  let backupCreates = 0;
+  const provider = new GoogleBrowserProvider('fixture', { release, releaseVerifier: async value => value, clientId: 'fixture.apps.googleusercontent.com', ownerSub: '12345', sleep: async () => {}, fetchImpl: async (url, options) => {
+    const backupResponse = backup(url, options);
+    if (backupResponse) { if (options.method === 'POST' && (url.includes('/keyRings?') || url.includes('/cryptoKeys?'))) backupCreates++; return backupResponse; }
+    if (url.includes('iam.googleapis.com') && url.includes('/roles')) {
+      if (options.method === 'POST') { role = JSON.parse(options.body).role; return response(role); }
+      return role ? response(role) : response({}, 404);
+    }
+    if (url.includes('/getIamPolicy') || url.includes(':getIamPolicy')) return response({ etag: 'fixture', bindings: [] });
+    if (url.includes('/setIamPolicy') || url.includes(':setIamPolicy')) return response({});
+    if (url.includes('secretmanager.googleapis.com')) return response(url.endsWith('/versions/1') ? { state: 'ENABLED' } : {});
+    if (url.includes('/operations/')) return response({ status: 'DONE' });
+    if (url.includes('queryPath=momso%2Frestore')) return response({ queryValue: { items: [{ namespace: 'momso', key: 'restore', value: JSON.stringify({ restored: true, restoredBackupId: 'slot-0@1', restoredAt: '2026-11-20T00:00:00Z' }) }] } });
+    if (url.includes('/getGuestAttributes')) return response({ queryValue: { items: [{ namespace: 'momso', key: 'fingerprint', value: 'b'.repeat(64) }] } });
+    if (options.method === 'POST') { instance = { ...JSON.parse(options.body), status: 'RUNNING' }; return response({ name: 'fixture-op', zone: 'https://compute.googleapis.com/compute/v1/projects/fixture/zones/asia-northeast3-a' }); }
+    return instance ? response(instance) : response({}, 404);
+  } });
+  provider.preparePrivateIdentity = async (_id, options) => assert.equal(options.preservedOnly, true);
+  provider.enableRestore(id, { requiresRestore: true });
+  await provider.server(id);
+  assert.equal(backupCreates, 0);
+  assert.equal(provider.restoreResult().restoredBackupId, 'slot-0@1');
+  assert(instance.metadata.items.find(item => item.key === 'startup-script').value.includes(id));
 });
 
 test('gateway provisions pinned image and secrets privately before opening its authenticated entry', async () => {
@@ -266,6 +304,7 @@ test('gateway provisions pinned image and secrets privately before opening its a
       if (method === 'POST') {
         const body = JSON.parse(options.body);
         assert.equal(body.traffic, undefined, 'first create must use Cloud Run default traffic');
+        assert.equal(body.scaling.maxInstanceCount, 1);
         actions.push({ type: 'create', value: body.invokerIamDisabled });
         service = { ...body, name: `projects/${projectId}/locations/asia-northeast3/services/momso-any-${id.slice(0, 12)}`, uri: 'https://fixture.a.run.app', etag: 'fixture', terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'fixture-rev-1', latestCreatedRevision: 'fixture-rev-1', trafficStatuses: [{ revision: 'fixture-rev-1', percent: 100 }] };
         return response({ name: `projects/${projectId}/locations/asia-northeast3/operations/fixture` });
@@ -273,6 +312,11 @@ test('gateway provisions pinned image and secrets privately before opening its a
       if (method === 'DELETE') { service = null; return response({ name: `projects/${projectId}/locations/asia-northeast3/operations/fixture` }); }
       if (method === 'PATCH') {
         const body = JSON.parse(options.body);
+        if (body.template) {
+          assert.equal(body.scaling.maxInstanceCount, 1);
+          assert.equal(body.template.timeout, '3600s');
+          assert(url.includes('scaling'));
+        }
         actions.push({ type: 'patch', value: body.invokerIamDisabled });
         service = { ...service, ...body, ...(body.template ? { latestCreatedRevision: 'fixture-rev-2' } : {}), ...(body.traffic ? { trafficStatuses: body.traffic } : {}) };
         return response({ name: `projects/${projectId}/locations/asia-northeast3/operations/fixture` });

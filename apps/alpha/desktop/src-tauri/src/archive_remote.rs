@@ -1028,6 +1028,14 @@ pub(crate) fn git(tool: &Path, root: &Path, args: &[&str]) -> Result<String, ()>
     git_raw(tool, root, args).map(|s| s.trim().to_owned())
 }
 
+pub(crate) fn git_bytes(tool: &Path, root: &Path, args: &[&str]) -> Result<Vec<u8>, ()> {
+    let output = git_output(tool, root, args).map_err(|_| ())?;
+    if !output.status.success() {
+        return Err(());
+    }
+    Ok(output.stdout)
+}
+
 fn git_index(tool: &Path, root: &Path, index: &Path, args: &[&str]) -> Result<String, ()> {
     let output = hidden(&mut crate::process::hidden_command(tool))
         .current_dir(root)
@@ -1589,6 +1597,13 @@ fn receive_first_locked(
         report(receive_progress("failed", 2, false));
         return Err(error);
     }
+    let received_head =
+        git(tool, root, &["rev-parse", "--verify", "HEAD"]).map_err(|_| "git_unavailable")?;
+    let connection =
+        crate::storage::open_writable_connection(db).map_err(|_| "local_state_unavailable")?;
+    connection.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES('paired_first_receive_head',?1,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP", [&received_head])
+        .map_err(|_| "local_state_unavailable")?;
+    drop(connection);
     finish_receive_journal(db)?;
     report(receive_progress("complete", 3, true));
     Ok(())
@@ -1862,7 +1877,7 @@ pub(crate) fn start_first_receive_recovery<R: tauri::Runtime>(
         }
     });
 }
-fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static str> {
+pub(crate) fn safe_history(tool: &Path, root: &Path, revision: &str) -> Result<(), &'static str> {
     if git(tool, root, &["rev-parse", "--is-shallow-repository"]).as_deref() != Ok("false") {
         return Err("unsafe_history");
     }
@@ -4134,6 +4149,112 @@ async fn connect_impl(
 pub(crate) struct TestRemote {
     pub(crate) tool: PathBuf,
     pub(crate) target: String,
+}
+
+/// Resolve an already-uploaded, unchanged Git state while the caller holds the
+/// exclusive archive lease. No credentials or paths are returned to the UI.
+pub(crate) fn paired_git_context<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    root: &Path,
+    database: &Path,
+    require_clean: bool,
+) -> Result<(PathBuf, String, String), &'static str> {
+    paired_git_context_inner(app, root, database, require_clean, true)
+}
+
+/// Restore validates the selected snapshot after matching the remote Git head.
+/// The currently received DB may intentionally differ from that Git head.
+pub(crate) fn paired_git_context_for_restore<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    root: &Path,
+    database: &Path,
+    require_clean: bool,
+) -> Result<(PathBuf, String, String), &'static str> {
+    paired_git_context_inner(app, root, database, require_clean, false)
+}
+
+fn paired_git_context_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    root: &Path,
+    database: &Path,
+    require_clean: bool,
+    validate_database: bool,
+) -> Result<(PathBuf, String, String), &'static str> {
+    let resources = app
+        .path()
+        .resource_dir()
+        .map_err(|_| "local_state_unavailable")?;
+    #[cfg(test)]
+    let fixture = app
+        .try_state::<TestRemote>()
+        .map(|remote| remote.inner().clone());
+    #[cfg(test)]
+    let tool = fixture
+        .as_ref()
+        .map(|remote| remote.tool.clone())
+        .or_else(|| git_path(&resources));
+    #[cfg(not(test))]
+    let tool = git_path(&resources);
+    let tool = tool.ok_or("git_missing")?;
+    #[cfg(test)]
+    let (target, branch) = if let Some(fixture) = fixture {
+        (fixture.target, "main".to_owned())
+    } else {
+        let repo = configured(&tool, root).ok_or("not_connected")?;
+        let (remote, _) = github(&repo)?;
+        (url(&remote.name_with_owner), remote.branch().to_owned())
+    };
+    #[cfg(not(test))]
+    let (target, branch) = {
+        let repo = configured(&tool, root).ok_or("not_connected")?;
+        let (remote, _) = github(&repo)?;
+        (url(&remote.name_with_owner), remote.branch().to_owned())
+    };
+    let head = git(&tool, root, &["rev-parse", "--verify", "HEAD"]).map_err(|_| "nothing_saved")?;
+    if require_clean
+        && !git(
+            &tool,
+            root,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .map_err(|_| "git_unavailable")?
+        .is_empty()
+    {
+        return Err("backup_pending_git");
+    }
+    let reference = format!("refs/heads/{branch}");
+    let remote_head = git(&tool, root, &["ls-remote", "--heads", &target, &reference])
+        .map_err(|_| "remote_unavailable")?;
+    let mut parts = remote_head.split_whitespace();
+    let remote_revision = parts.next();
+    if remote_revision.is_none()
+        || parts.next() != Some(reference.as_str())
+        || parts.next().is_some()
+        || ((require_clean || validate_database) && remote_revision != Some(head.as_str()))
+    {
+        return Err("backup_pending_git");
+    }
+    if !require_clean || !validate_database {
+        return Ok((tool, target, head));
+    }
+    crate::chat_archive_store::validate(root, database).map_err(|_| "backup_pending_git")?;
+    let db =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|_| "local_state_unavailable")?;
+    let mut chats = db.prepare("SELECT id FROM chats c WHERE title<>'' OR group_id IS NOT NULL OR pinned_order IS NOT NULL OR archived_at IS NOT NULL OR EXISTS(SELECT 1 FROM chat_messages m WHERE m.chat_id=c.id)")
+        .map_err(|_| "local_state_unavailable")?;
+    let ids = chats
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| "local_state_unavailable")?;
+    for id in ids {
+        let id = id.map_err(|_| "local_state_unavailable")?;
+        if !crate::archive_receipt::valid_chat_id(&id)
+            || !root.join("chats").join(format!("{id}.json")).is_file()
+        {
+            return Err("backup_pending_git");
+        }
+    }
+    Ok((tool, target, head))
 }
 
 pub(crate) async fn run_transfer<R: tauri::Runtime>(

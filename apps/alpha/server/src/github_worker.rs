@@ -125,6 +125,11 @@ fn checkpoint_idle(app: &App) -> Result<bool, &'static str> {
 
 fn object_backup(app: &App) -> Result<bool, &'static str> {
     use std::io::BufRead;
+    // The agent stages and verifies temporary copies on the data filesystem.
+    // Preserve a reserve for the database rather than starting an unsafe copy.
+    if !disk_space::can_grow(&app.data, 0) {
+        return Err("backup_disk_low");
+    }
     let Some(checkpoint) = maintenance::begin_checkpoint(&app.maintenance)? else {
         return Ok(false);
     };
@@ -152,6 +157,12 @@ fn object_backup(app: &App) -> Result<bool, &'static str> {
         drop(checkpoint);
     }
     let status = child.wait().map_err(|_| "object_backup_failed")?;
+    if !status.success() && line == "momso-backup-v3:backup_disk_low\n" {
+        return Err("backup_disk_low");
+    }
+    if !status.success() && line == "momso-backup-v3:reservation_busy\n" {
+        return Err("reservation_busy");
+    }
     if !status.success()
         || !matches!(
             line.as_str(),
@@ -301,6 +312,11 @@ fn sync(app: &App) -> Result<Option<bool>, &'static str> {
     let Some(repository) = github_bridge::read_repository(&app.data)? else {
         return Ok(None);
     };
+    let amount = disk_space::github_backup_reservation(&app.data).ok_or("backup_unavailable")?;
+    let _reservation = disk_space::reserve(&app.data, amount).map_err(|reason| match reason {
+        "disk_low" => "backup_disk_low",
+        other => other,
+    })?;
     let client = github_bridge::handle(app).map_err(|_| "github_unavailable")?;
     let _vault_guard = app
         .vault_lock

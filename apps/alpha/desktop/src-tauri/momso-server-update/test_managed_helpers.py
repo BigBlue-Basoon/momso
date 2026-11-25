@@ -70,6 +70,26 @@ class ManagedHelperTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'invalid_release_helpers'): self.mgr.apply(stage)
         self.assertEqual((self.flat / 'idle-stop.py').read_bytes(), b'old idle')
 
+    def test_signed_restore_workers_are_installed_together(self):
+        from momso_anywhere_restore_files import RESTORE_FILES
+        scripts = Path(__file__).resolve().parents[5] / 'scripts'
+        stage = self.release('restore')
+        history = json.loads((stage / 'momso-managed-history.json').read_text())
+        for name in RESTORE_FILES:
+            data = (scripts / name).read_bytes()
+            (stage / name).write_bytes(data)
+            history['files'][name] = [hashlib.sha256(data).hexdigest()]
+        for name in ('momso_anywhere_restore_files.py', 'momso_anywhere_restore_files.json'):
+            data = (scripts / name).read_bytes()
+            (stage / 'momso-updater' / name).write_bytes(data)
+            history['worker'][name] = [hashlib.sha256(data).hexdigest()]
+        (stage / 'momso-managed-history.json').write_text(json.dumps(history))
+        self.mgr.apply(stage)
+        self.assertTrue(all((self.flat / name).is_file() for name in RESTORE_FILES))
+        if sys.platform != 'win32':
+            code = "import sys; sys.path.insert(0,sys.argv[1]); import momso_anywhere_prestart_restore, momso_anywhere_backup_agent"
+            subprocess.run([sys.executable, '-I', '-c', code, str(self.flat)], check=True)
+
     def test_signed_vault_override_updates_without_touching_customer_backup_override(self):
         directory = self.units / 'momso-server.service.d'; directory.mkdir(mode=0o700)
         root, manifest, journal = self.mgr._groups()[3]

@@ -1,10 +1,12 @@
 import PROXY_FILES from './momso_anywhere_proxy_files.json' with { type: 'json' };
+import RESTORE_FILES from './momso_anywhere_restore_files.json' with { type: 'json' };
 // This is public VM metadata: never include an OAuth token or proxy secret here.
-export function vmStartupScript({ project, secret, bundleUrl, bundleSha256, update = null }) {
+export function vmStartupScript({ project, secret, bundleUrl, bundleSha256, update = null, restore = null }) {
   if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project) || !/^momso-transport-[a-f0-9]{12}$/.test(secret) || !/^https:\/\/[a-zA-Z0-9.-]+(?::443)?\//.test(bundleUrl) || !/^[a-f0-9]{64}$/.test(bundleSha256)) throw new Error('invalid_vm_release');
   if (update !== null && (!['development', 'production'].includes(update.channel) || !/^https:\/\/[a-zA-Z0-9.-]+(?::443)?\//.test(update.manifestUrl ?? '') || !/^[A-Za-z0-9+/]{58,60}={0,2}$/.test(update.publicKeySpki ?? ''))) throw new Error('invalid_vm_release');
   if (update?.channel === 'production' && !/^[A-Za-z0-9+/]+={0,2}$/.test(update.trustBootstrap ?? '')) throw new Error('invalid_vm_release');
-  const config = JSON.stringify({ project, secret, bundleUrl, bundleSha256, update });
+  if (restore !== null && (!/^(?:[a-f0-9]{12}|[a-f0-9]{24})$/.test(restore.installationId ?? '') || secret !== `momso-transport-${restore.installationId.slice(0, 12)}`)) throw new Error('invalid_vm_release');
+  const config = JSON.stringify({ project, secret, bundleUrl, bundleSha256, update, restore });
   return `#!/bin/sh
 set -eu
 install -d -m 0755 /opt/momso
@@ -26,12 +28,21 @@ if not (os.path.isfile(codex) and os.path.isfile(codex_marker) and hashlib.sha25
  os.chmod(codex+'.new',0o755);os.replace(codex+'.new',codex)
  with open(codex_marker,'w') as f:f.write(hashlib.sha256(open(codex,'rb').read()).hexdigest())
 missing=[pkg for executable,pkg in (('bwrap','bubblewrap'),('git','git'),('ffmpeg','ffmpeg'),('age-keygen','age'),('flock','util-linux')) if not shutil.which(executable)]
+if not any(shutil.which(name) for name in ('google-chrome','google-chrome-stable','chromium','chromium-browser')):missing.append('chromium')
 if subprocess.run(['/usr/bin/python3','-c','import cryptography'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:missing.append('python3-cryptography')
 if missing:
  os.environ['DEBIAN_FRONTEND']='noninteractive';run('apt-get','update','-qq');run('apt-get','install','-y','-qq',*missing)
 web=os.path.join(base,'web'); marker=base+'/.bootstrap-release-installed'
-backup_files=('momso_anywhere_backup.py','momso_anywhere_backup_agent.py','momso_anywhere_backup_google.py','momso_anywhere_vault_identity.py')
+backup_files=tuple(json.loads(${JSON.stringify(JSON.stringify(RESTORE_FILES))}))
 installed=all(os.path.isfile(os.path.join(base,name)) for name in ('momso-server','vault-provision.py','idle-stop.py','web/index.html','web/.momso-owned')+proxy_files)
+if cfg['restore'] is not None:
+ os.makedirs('/etc/momso-private',mode=0o700,exist_ok=True)
+ attempt='/etc/momso-private/prestart-restore-attempt';complete='/etc/momso-private/prestart-restore-complete';restore_id=cfg['restore']['installationId']
+ if os.path.lexists(attempt):
+  assert not os.path.islink(attempt) and open(attempt).read().strip()==restore_id
+ elif not os.path.lexists(complete):
+  if os.path.exists(marker) or installed:raise RuntimeError('restore_existing_disk')
+  with open(attempt,'x') as f:f.write(restore_id);f.flush();os.fsync(f.fileno())
 if os.path.exists(marker) and not installed:raise RuntimeError('installed_release_incomplete')
 if not os.path.exists(marker) and not installed:
  data=fetch(cfg['bundleUrl']);assert hashlib.sha256(data).hexdigest()==cfg['bundleSha256']
@@ -77,7 +88,7 @@ if not all(os.path.isfile(os.path.join(base,name)) and not os.path.islink(os.pat
     with tar.extractfile(member) as src,os.fdopen(fd,'wb') as dst:shutil.copyfileobj(src,dst);dst.flush();os.fsync(dst.fileno())
     os.chmod(temporary,0o644);os.link(temporary,dest)
    finally:os.unlink(temporary)
-update_files=('update.py','release_manifest.py','server_admission.py','systemd_host.py','data_snapshots.py','cloud_run_gateway.py','github_releases.py','progress_status.py','layout_migration.py','install_worker.py','worker.py','ensure_gcloud.py','managed_helpers.py','momso_managed_files.py','momso_anywhere_proxy_files.py','momso_anywhere_proxy_files.json','trust_rotation.py')
+update_files=('update.py','release_manifest.py','server_admission.py','systemd_host.py','data_snapshots.py','cloud_run_gateway.py','github_releases.py','progress_status.py','layout_migration.py','install_worker.py','worker.py','ensure_gcloud.py','managed_helpers.py','momso_managed_files.py','momso_anywhere_proxy_files.py','momso_anywhere_proxy_files.json','momso_anywhere_restore_files.py','momso_anywhere_restore_files.json','trust_rotation.py')
 update_dir='/opt/momso-updater'
 if cfg.get('update') and not all(os.path.isfile(os.path.join(update_dir,name)) and not os.path.islink(os.path.join(update_dir,name)) for name in update_files):
  data=fetch(cfg['bundleUrl']);assert hashlib.sha256(data).hexdigest()==cfg['bundleSha256']
@@ -114,7 +125,13 @@ elif not any(line.startswith('MOMSO_CODEX_PATH=') for line in open(env)):
  with open(env,'a') as f:f.write('MOMSO_CODEX_PATH=/opt/momso/codex\\n')
 vault_secret='momso-vault-'+cfg['secret'].removeprefix('momso-transport-')
 os.makedirs('/run/momso-vault',mode=0o700,exist_ok=True);os.chmod('/run/momso-vault',0o700)
-run('/usr/bin/flock','-x','/run/momso-vault/provision.lock','/usr/bin/python3',base+'/vault-provision.py','--project',cfg['project'],'--secret',vault_secret,'--vault-dir','/var/lib/momso','--create-initial')
+vault_args=['/usr/bin/flock','-x','/run/momso-vault/provision.lock','/usr/bin/python3',base+'/vault-provision.py','--project',cfg['project'],'--secret',vault_secret,'--vault-dir','/var/lib/momso']
+if cfg['restore'] is None:vault_args.append('--create-initial')
+if cfg['restore'] is None:run(*vault_args)
+elif subprocess.run(vault_args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
+ request=urllib.request.Request(metadata+'instance/guest-attributes/momso/restore',data=json.dumps({'ok':False,'code':'restore_failed','detail':'key_unavailable'}).encode(),headers={'Metadata-Flavor':'Google'},method='PUT')
+ urllib.request.urlopen(request,timeout=5).close()
+ raise RuntimeError('restore_failed')
 helper="""import os,tempfile
 with open('/etc/momso-server.env') as f:token=next(line.split('=',1)[1].strip() for line in f if line.startswith('MOMSO_SERVER_TOKEN='))
 assert token and chr(10) not in token
@@ -143,6 +160,43 @@ write_once('/etc/systemd/system/momso-server.service.d/vault.conf','[Unit]\\nReq
 backup_id=cfg['secret'].removeprefix('momso-transport-')
 backup_bucket='momso-backup-'+backup_id
 backup_key='projects/'+cfg['project']+'/locations/asia-northeast3/keyRings/momso-backup-'+backup_id+'/cryptoKeys/backup'
+if cfg['restore'] is not None:
+ restore_id=cfg['restore']['installationId']
+ restore_marker=private+'/prestart-restore-complete'
+ restore_attempt=private+'/prestart-restore-attempt'
+ report='/var/lib/momso/.momso-prestart-restore.json'
+ if os.path.lexists(restore_marker):
+  assert not os.path.islink(restore_marker) and open(restore_marker).read().strip()==restore_id
+  assert os.path.isfile(report) and not os.path.islink(report)
+  result=json.load(open(report));assert result.get('ok') is True and isinstance(result.get('restored'),bool)
+ else:
+  if os.path.lexists(restore_attempt):
+   assert not os.path.islink(restore_attempt) and open(restore_attempt).read().strip()==restore_id
+  else:
+   with open(restore_attempt,'x') as f:f.write(restore_id);f.flush();os.fsync(f.fileno())
+  completion="import os\\np="+repr(restore_marker)+"\\nwith open(p,'x') as f:f.write("+repr(restore_id)+");f.flush();os.fsync(f.fileno())\\nfd=os.open(os.path.dirname(p),os.O_RDONLY|os.O_DIRECTORY);os.fsync(fd);os.close(fd)\\n"
+  write_once(base+'/restore-complete.py',completion)
+  assert not os.path.islink(base+'/restore-complete.py') and open(base+'/restore-complete.py').read()==completion
+  unit='[Unit]\\nDescription=momso pre-start restore\\n[Service]\\nType=oneshot\\nUser=momso\\nLoadCredential=momso-vault-identity:/run/momso-vault/momso-vault-identity\\nExecStart=/usr/bin/python3 /opt/momso/momso_anywhere_prestart_restore.py --installation-id '+restore_id+' --data-dir /var/lib/momso --bucket '+backup_bucket+' --kms-key '+backup_key+' --vault-identity /run/credentials/momso-restore.service/momso-vault-identity --report '+report+'\\nExecStartPost=+/usr/bin/python3 /opt/momso/restore-complete.py\\n'
+  write_once('/etc/systemd/system/momso-restore.service',unit)
+  assert open('/etc/systemd/system/momso-restore.service').read()==unit
+  run('systemctl','daemon-reload')
+  result=None
+  if os.path.isfile(report) and not os.path.islink(report):
+   try:result=json.load(open(report))
+   except (OSError,ValueError):pass
+  if isinstance(result,dict) and result.get('ok') is True:raise RuntimeError('restore_interrupted')
+  status=subprocess.run(['systemctl','start','momso-restore.service'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  try:result=json.load(open(report))
+  except (OSError,ValueError):result={'ok':False,'code':'restore_failed','detail':'backup_unreadable'}
+  if status.returncode!=0 or result.get('ok') is not True or not os.path.isfile(restore_marker) or os.path.islink(restore_marker) or open(restore_marker).read().strip()!=restore_id:
+   detail=result.get('detail','backup_unreadable')
+   if detail not in ('backup_unreadable','key_unavailable','checksum_mismatch','restore_conflict','backup_changed','backup_busy','ownership_unverified','services_not_stopped','unsafe_configuration','unsafe_user'):detail='backup_unreadable'
+   request=urllib.request.Request(metadata+'instance/guest-attributes/momso/restore',data=json.dumps({'ok':False,'code':'restore_failed','detail':detail}).encode(),headers={'Metadata-Flavor':'Google'},method='PUT')
+   urllib.request.urlopen(request,timeout=5).close()
+   raise RuntimeError('restore_failed')
+ request=urllib.request.Request(metadata+'instance/guest-attributes/momso/restore',data=json.dumps({key:result.get(key) for key in ('restored','restoredBackupId','restoredAt')}).encode(),headers={'Metadata-Flavor':'Google'},method='PUT')
+ urllib.request.urlopen(request,timeout=5).close()
 backup_conf='/etc/systemd/system/momso-server.service.d/backup.conf'
 backup_contents='[Service]\\nEnvironment=MOMSO_BACKUP_AGENT=/opt/momso/momso_anywhere_backup_agent.py\\nEnvironment=MOMSO_BACKUP_BUCKET='+backup_bucket+'\\nEnvironment=MOMSO_BACKUP_KMS_KEY='+backup_key+'\\n'
 write_once(backup_conf,backup_contents)

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 import momso_anywhere_rehearsal_s147 as rehearsal
 
@@ -98,14 +99,33 @@ class RehearsalTest(unittest.TestCase):
         self.assertEqual(result['outcome'], 'failed')
         self.assertEqual(result['leftovers']['status'], 'unverified')
 
-    def test_cli_fails_before_any_cloud_action_until_restore_is_integrated(self):
+    def test_deleted_unverified_is_reported_without_claiming_confirmation(self):
+        fake = FakeGoogle(self.root)
+        fake.inventory = lambda _identity: {'complete': False, 'remaining': [], 'deletionOutcome': 'deleted_unverified', 'unverified': ['bucket']}
+        result = rehearsal.run_rehearsal(self.identity, self.protected, fake)
+        self.assertEqual(result['outcome'], 'ok')
+        self.assertEqual(result['leftovers']['unverified'], ['bucket'])
+        self.assertFalse(result['leftovers']['complete'])
+
+    def test_cli_uses_rehearsal_adapter_and_protects_other_installations(self):
+        argv = ['--account', 'fixture@example.test', '--project', 'fixture-project', '--release-manifest-url', 'https://example.test/release.json', '--bundle', 'fixture', '--public-key', 'fixture', '--channel', 'development', '--google-client-id', 'fixture.apps.googleusercontent.com', '--owner-sub', '123', '--login-origin', 'https://login.example.test']
+        fake = FakeGoogle(self.root)
+        fake.state_path = self.root / 'install-state.json'
+        with patch('momso_anywhere_rehearsal_s147_real.make_adapter', return_value=(fake, self.identity, self.protected)), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(rehearsal.main(argv), 0)
+        result = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(result['outcome'], 'ok')
+        self.assertEqual(result['installationId'], self.identity)
+        self.assertEqual(fake.calls()[-1][0], 'inventory')
+
+    def test_cli_rejects_invalid_inputs_before_cloud_action(self):
         argv = []
         for name in ('account', 'project', 'release-manifest-url', 'bundle', 'public-key', 'channel', 'google-client-id', 'owner-sub', 'login-origin'):
             argv.extend(['--' + name, 'fixture'])
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(rehearsal.main(argv), 1)
         result = json.loads(output.getvalue().splitlines()[-1])
-        self.assertEqual(result['steps']['preflight']['reason'], 'restore_not_integrated')
+        self.assertEqual(result['steps']['preflight']['reason'], 'invalid_arguments')
         self.assertEqual(result['leftovers']['status'], 'not_created')
 
 

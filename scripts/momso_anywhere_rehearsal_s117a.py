@@ -172,6 +172,7 @@ def inventory_basic_resources(provider):
         'subnet': ('compute', 'networks', 'subnets', 'list'),
         'firewall': ('compute', 'firewall-rules', 'list'),
         'router': ('compute', 'routers', 'list'),
+        'addresses': ('compute', 'addresses', 'list', f'--regions={REGION}'),
         'gateway': ('run', 'services', 'list', '--platform=managed', f'--region={REGION}'),
         'accounts': ('iam', 'service-accounts', 'list'),
         'roles': ('iam', 'roles', 'list'),
@@ -196,13 +197,62 @@ def inventory_basic_resources(provider):
                 labels = row.get('labels', metadata.get('labels', {}))
                 if not names or not isinstance(labels, dict):
                     raise ValueError('invalid_resource')
-                if any(provider.install_id in value for value in names) or labels.get('momso-install-id') == provider.install_id:
+                matches = (('momso-backup-' + provider.install_id) in names if kind == 'bucket'
+                           else any(provider.install_id in value for value in names) or labels.get('momso-install-id') == provider.install_id)
+                if kind == 'addresses':
+                    subnet = row.get('subnetwork', '')
+                    if not isinstance(subnet, str): raise ValueError('invalid_resource')
+                    matches = matches or subnet.endswith('/subnetworks/momso-' + provider.install_id + '-sub')
+                if matches:
                     found.append(next((value for value in names if provider.install_id in value), names[0]))
-            # This only proves the installation's region, not all regions.
-            result[kind] = {'complete': kind != 'gateway', 'items': found}
-        except Exception:
+            # The installer creates its Cloud Run services in REGION only.
+            result[kind] = {'complete': True, 'items': found}
+        except Exception as error:
             # An incomplete listing is never represented as an empty complete list.
+            if kind == 'bucket' and getattr(error, 'http_status', None) == 403:
+                result[kind]['reason'] = 'bucket_access_denied'
             continue
+    try:
+        from momso_anywhere_network_cleanup import installation_nats
+        result['nat'] = {'complete': True, 'items': installation_nats(provider)}
+    except Exception:
+        result['nat']['reason'] = 'nat_inventory_failed'
+    try:
+        from momso_anywhere_iam_pc import inspect_installation_bindings
+        result['iam'] = {'complete': True, 'items': inspect_installation_bindings(provider)}
+    except Exception as error:
+        result['iam']['items'] = getattr(error, 'found', [])
+        result['iam']['reason'] = ('soft_deleted_bucket_policy_unavailable'
+                                   if str(error) == 'soft_deleted_bucket_policy_unavailable' else 'iam_inventory_failed')
+    try:
+        if not result['bucket']['complete']:
+            if result['bucket'].get('reason') == 'bucket_access_denied':
+                raise PermissionError('bucket_access_denied')
+            raise ValueError('bucket_inventory_failed')
+        expected = 'momso-backup-' + provider.install_id
+        try:
+            bucket = provider.run('storage', 'buckets', 'describe', 'gs://' + expected, parse=True)
+        except Exception as error:
+            if getattr(error, 'http_status', None) == 403:
+                raise PermissionError('bucket_access_denied') from None
+            if getattr(error, 'http_status', None) != 404 or result['bucket']['items']:
+                raise ValueError('bucket_inventory_failed') from None
+            bucket = None
+        if bucket is not None:
+            if not isinstance(bucket, dict) or bucket.get('name') != expected:
+                raise ValueError('bucket_inventory_failed')
+            if bucket.get('labels', {}).get('momso-install-id') != provider.install_id:
+                raise ValueError('bucket_ownership_unverified')
+            if expected not in result['bucket']['items']:
+                raise ValueError('bucket_inventory_inconsistent')
+        from momso_anywhere_iam_pc import soft_deleted_buckets
+        soft = soft_deleted_buckets(provider)
+        result['bucket']['softDeleted'] = soft
+        result['bucket']['items'].extend(item['name'] + ' (soft-deleted)' for item in soft)
+    except Exception as error:
+        result['bucket']['complete'] = False
+        result['bucket']['reason'] = ('bucket_access_denied' if isinstance(error, PermissionError)
+                                      or getattr(error, 'http_status', None) == 403 else 'bucket_inventory_failed')
     return result
 
 
@@ -280,9 +330,6 @@ def schedule_owned_backup_keys(provider):
 
 def collect_inventory(provider):
     groups = inventory_basic_resources(provider)
-    # Standard bucket listings do not prove that soft-deleted generations or
-    # retention-locked objects no longer exist or incur storage charges.
-    groups['bucket']['complete'] = False
     keys = inventory_regional_backup_keys(provider)
     # The installer only creates the expected keyring in REGION. The billing
     # verdict is separate from whether resource names remain.
@@ -299,7 +346,7 @@ def collect_inventory(provider):
 _INSTALLER_CODES = frozenset(('gateway_image_permission', 'gateway_image_invalid', 'gateway_image_mismatch',
     'gateway_traffic_mismatch', 'gateway_probe_failed', 'gateway_rollback_failed', 'gateway_not_ready',
     'gateway_operation_failed', 'gateway_response_invalid', 'gateway_address_invalid', 'gateway_ownership',
-    'gateway_policy', 'rollback_failed', 'backup_not_connected', 'backup_freshness_unverified', 'vm_unreachable',
+    'gateway_policy', 'rollback_failed', 'backup_not_connected', 'backup_freshness_unverified', 'vm_unreachable', 'vm_state_unknown', 'vm_start_failed', 'vm_busy',
     'cleanup_pending', 'cleanup_incomplete', 'delete_failed', 'proxy_not_running', 'proxy_cleanup_failed'))
 
 
@@ -325,7 +372,7 @@ def installer_result(process, stage):
     return result
 
 
-def run_rehearsal(provider, install, verify, destroy, backup_cleanup, inventory, idle=None):
+def run_rehearsal(provider, install, verify, destroy, backup_cleanup, inventory, idle=None, network_retry=None):
     """Callbacks permit fake-provider tests; cleanup always runs after start."""
     _validate_target(provider)
     result = {'install': 'failed', 'checks': {}, 'destroy': 'failed', 'backup_cleanup': 'unknown', 'inventory': {}, 'kmsVersions': []}
@@ -355,7 +402,7 @@ def run_rehearsal(provider, install, verify, destroy, backup_cleanup, inventory,
                 result['destroy'] = 'passed' if deletion.get('outcome') in ('deleted', 'deleted_unverified') else 'failed'
                 if result['destroy'] == 'failed':
                     code = deletion.get('reason')
-                    result['destroyFailure'] = code if code in _INSTALLER_CODES else 'delete_failed'
+                    result['destroyFailure'] = code if code in _INSTALLER_CODES or code == 'serverless_address_release_pending' else 'delete_failed'
             else:
                 result['destroy'] = 'passed' if deletion else 'failed'
         except Exception:
@@ -371,6 +418,41 @@ def run_rehearsal(provider, install, verify, destroy, backup_cleanup, inventory,
             if remaining:
                 result['destroy'] = 'failed'
                 result['remainingKinds'] = sorted(remaining)
+            deletion = result.get('deletion')
+            groups = result['inventory']
+            if isinstance(deletion, dict) and deletion.get('outcome') == 'deleted_unverified':
+                unresolved = []
+                resources = deletion.setdefault('resources', {})
+                for name in deletion.get('unverified', []):
+                    group = groups.get('iam' if name == 'iam_bindings' else name, {})
+                    if group.get('complete') is not True:
+                        unresolved.append(name)
+                    else:
+                        retained = bool(group.get('items'))
+                        resources[name] = {'status': 'retained' if retained else 'deleted',
+                                           'reason': 'cleanup_pending' if retained else None}
+                deletion['unverified'] = unresolved
+                if not unresolved:
+                    for kind in remaining:
+                        resources[kind] = {'status': 'retained', 'reason': 'cleanup_pending'}
+                    retained = any(item.get('status') == 'retained' for item in resources.values() if isinstance(item, dict))
+                    deletion.update(outcome='remaining' if retained else 'deleted', complete=not retained,
+                                    status='pending' if retained else 'complete')
+                    result['destroy'] = 'failed' if retained else 'passed'
+            other = ('vm', 'disk', 'firewall', 'router', 'nat', 'gateway', 'accounts', 'roles', 'secrets', 'iam', 'bucket', 'kms')
+            if (isinstance(deletion, dict) and deletion.get('outcome') == 'remaining'
+                    and remaining and set(remaining).issubset({'network', 'subnet', 'addresses'})
+                    and all(groups.get(kind, {}).get('complete') is True for kind in ('network', 'subnet', 'addresses'))
+                    and all(groups.get(kind, {}).get('complete') is True and not groups[kind].get('items') for kind in other)
+                    and not result['kmsVersions']):
+                from momso_anywhere_network_cleanup import pending_serverless
+                expected = (['networks subnets:' + provider.subnet] if 'subnet' in remaining else []) + (['networks:' + provider.network] if 'network' in remaining else [])
+                pending = pending_serverless(provider, expected)
+                if pending and pending['addressCount'] == len(groups['addresses'].get('items', [])):
+                    retry = network_retry() if network_retry is not None else {}
+                    deletion.update(pending)
+                    deletion.update(retry)
+                    result['destroyFailure'] = pending['reason']
         except Exception:
             pass
     return result
@@ -444,25 +526,35 @@ def main(argv=None):
             return bucket_result + ',' + key_result
         if args.check_idle:
             from momso_anywhere_rehearsal_idle_s117b import probe_idle_wake
+        from momso_server_install import network_retry_command
+        retry_args = argparse.Namespace(account=args.account, project=args.project, state=state_path, discard_data=True)
         result = run_rehearsal(provider, lambda: run(command), verify,
                                run_destroy,
                                cleanup_backup, lambda: collect_inventory(provider),
-                               idle=probe_idle_wake if args.check_idle else None)
+                               idle=probe_idle_wake if args.check_idle else None,
+                               network_retry=lambda: network_retry_command(retry_args))
         print('시험 설치 ID:', state['id'])
         print('설치:', result['install'], '확인:', json.dumps(result['checks'], ensure_ascii=False), '삭제:', result['destroy'])
         if result.get('installFailure'): print('설치 실패 단계·코드:', json.dumps(result['installFailure'], ensure_ascii=False))
         if result.get('checkFailures'): print('확인 실패 항목:', ', '.join(result['checkFailures']))
         if result.get('destroyFailure'): print('삭제 실패 코드:', result['destroyFailure'])
+        deletion = result.get('deletion', {})
+        if deletion.get('reason') == 'serverless_address_release_pending':
+            print('Cloud Run 내부 주소 회수 대기: 해당 내부 주소와 일반 서브넷은 과금 없음')
+            if deletion.get('retryCommand'): print('남은 네트워크 재확인:', deletion['retryCommand'])
         if result.get('deletion', {}).get('outcome') == 'deleted_unverified':
             print('삭제 후 미확인:', ', '.join(result['deletion'].get('unverified', [])))
         if args.check_idle:
             print('유휴 종료·깨우기:', json.dumps(result.get('idleWake', {'status': 'failed', 'stage': 'installation'}), ensure_ascii=False))
         unknown, remaining = [], []
-        for kind in ('vm', 'disk', 'network', 'subnet', 'firewall', 'router', 'nat', 'gateway', 'accounts', 'roles', 'secrets', 'iam', 'bucket', 'kms'):
+        for kind in ('vm', 'disk', 'network', 'subnet', 'firewall', 'router', 'nat', 'addresses', 'gateway', 'accounts', 'roles', 'secrets', 'iam', 'bucket', 'kms'):
             group = result['inventory'].get(kind, {})
             items = group.get('items', [])
             status = '남음' if items else '없음' if group.get('complete') is True else '미확인'
-            print(kind + ':', status, str(len(items)) + '개', ', '.join(items), '(일부 미확인)' if items and group.get('complete') is not True else '')
+            if status == '미확인':
+                print(kind + ':', status, '(' + group.get('reason', '조회 실패') + ')')
+            else:
+                print(kind + ':', status, str(len(items)) + '개', ', '.join(items), '(일부 미확인)' if items and group.get('complete') is not True else '')
             if group.get('complete') is not True:
                 unknown.append(kind)
             if items:
@@ -473,10 +565,11 @@ def main(argv=None):
         chargeable = [v for v in result['kmsVersions'] if v['billing'] == 'billable']
         if chargeable:
             print('아직 과금 대상: KMS 키 버전', len(chargeable), '개 (위 파기 시각 참조)')
-        for kind in ('vm', 'disk', 'bucket'):
+        billable_kinds = ('vm', 'disk', 'bucket', 'gateway', 'nat') + (() if deletion.get('reason') == 'serverless_address_release_pending' else ('addresses',))
+        for kind in billable_kinds:
             if kind in remaining:
                 print('과금 가능 자원 남음:', kind)
-        if unknown or any(v['billing'] == 'unknown' for v in result['kmsVersions']) or any(kind in remaining for kind in ('vm', 'disk', 'bucket')):
+        if unknown or any(v['billing'] == 'unknown' for v in result['kmsVersions']) or any(kind in remaining for kind in billable_kinds):
             print('과금되는 것 0 확인: 미확인; 남은 자원 또는 확인하지 못한 종류를 확인하세요.')
         elif not chargeable:
             print('과금되는 것: 확인한 범위에서 0')
@@ -484,7 +577,7 @@ def main(argv=None):
         print('재확인용 상태 기록:', state_path)
         unexpected_remaining = [kind for kind in remaining if kind != 'kms']
         kms_scheduled = bool(result['kmsVersions']) and all(v['billing'] == 'not_billable' or (v['billing'] == 'billable' and v.get('until')) for v in result['kmsVersions'])
-        return 0 if result['install'] == 'passed' and result['destroy'] == 'passed' and not unexpected_remaining and ('kms' not in remaining or kms_scheduled) and result['backup_cleanup'] in ('backup_absent,keys_absent', 'backup_absent,keys_scheduled', 'backup_deleted,keys_absent', 'backup_deleted,keys_scheduled') and all(result['checks'].get(k) == 'passed' for k in ('traffic_digest', 'public_https', 'vm_services', 'update_status')) and (not args.check_idle or result.get('idleWake', {}).get('status') == 'passed') else 1
+        return 0 if result['install'] == 'passed' and result['destroy'] == 'passed' and not unknown and not unexpected_remaining and ('kms' not in remaining or kms_scheduled) and result['backup_cleanup'] in ('backup_absent,keys_absent', 'backup_absent,keys_scheduled', 'backup_deleted,keys_absent', 'backup_deleted,keys_scheduled') and all(result['checks'].get(k) == 'passed' for k in ('traffic_digest', 'public_https', 'vm_services', 'update_status')) and (not args.check_idle or result.get('idleWake', {}).get('status') == 'passed') else 1
     except Exception:
         print('실패: 입력 또는 서명·접근 권한을 확인하세요.', file=sys.stderr)
         return 1

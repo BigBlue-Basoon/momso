@@ -16,6 +16,13 @@ class Upstream(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_args): pass
 
+    def do_POST(self):
+        data = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        self.seen.append((self.path, dict(self.headers), len(data)))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(str(len(data)).encode())
+
     def do_GET(self):
         self.seen.append((self.path, dict(self.headers)))
         if self.path == '/upstream-forbidden':
@@ -109,6 +116,19 @@ class Tests(unittest.TestCase):
             client.close()
             upstream.assert_not_called(); wake.assert_not_called()
 
+    def test_repeated_anonymous_requests_do_not_contact_or_wake_vm(self):
+        self.auth.stop()
+        with patch.dict(os.environ, {'MOMSO_PRIVATE_PROXY_TOKEN': 'fixture-secret'}), \
+             patch.object(gateway, 'upstream_connection') as upstream, \
+             patch.object(gateway, 'start_instance') as wake:
+            for _ in range(50):
+                for path, status in (('/__momso/ready', 200), ('/health', 401),
+                                     ('/chats', 401), ('/__momso/proxy-health', 403)):
+                    client, response = self.get(path, {'Host': 'fixture.run.app'})
+                    self.assertEqual(response.status, status)
+                    response.read(); client.close()
+            upstream.assert_not_called(); wake.assert_not_called()
+
     def test_invalid_host_is_json_with_gateway_marker(self):
         client, response = self.get('/__momso/ready', {'Host': 'other.example'})
         self.assertEqual(response.status, 403)
@@ -152,6 +172,16 @@ class Tests(unittest.TestCase):
             client.close()
         self.assertEqual(Upstream.seen[0][1]["Authorization"], "Bearer fixture-secret")
         self.assertNotIn("Cookie", Upstream.seen[0][1])
+
+    def test_owner_upload_passes_through(self):
+        def connect(): return http.client.HTTPConnection('127.0.0.1', self.upstream.server_address[1])
+        with patch.dict(os.environ, {'MOMSO_PRIVATE_PROXY_TOKEN': 'fixture-secret'}), patch.object(gateway, 'upstream_connection', side_effect=connect):
+            client = http.client.HTTPConnection('127.0.0.1', self.gateway.server_address[1])
+            client.request('POST', '/uploads', body=b'x' * (1024 * 1024), headers={'Host': 'fixture.run.app', 'Origin': 'https://fixture.run.app'})
+            response = client.getresponse()
+            self.assertEqual((response.status, response.read()), (200, b'1048576'))
+            self.assertEqual(Upstream.seen[-1][2], 1024 * 1024)
+            client.close()
 
     def test_navigation_wakes_unavailable_vm_and_retries(self):
         calls = []

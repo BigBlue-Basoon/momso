@@ -14,7 +14,10 @@ pub mod tools;
 pub mod vault;
 
 #[cfg(target_os = "linux")]
-pub use linux::{HeadlessBrowser, LoginRequest, LoginSecret, Permission, ServerBrowsers};
+pub use linux::{
+    process_tree_pss_kib, prune_inactive_caches, HeadlessBrowser, LoginRequest, LoginSecret,
+    Permission, ServerBrowsers,
+};
 
 #[cfg(all(test, target_os = "linux"))]
 mod s31_fixture;

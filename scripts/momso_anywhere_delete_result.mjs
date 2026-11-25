@@ -6,7 +6,7 @@ export function deletionResult(input = {}) {
     if (item?.resource && !resources[item.resource]) resources[item.resource] = { status: item.status, reason: item.reason ?? null };
   }
   for (const name of input.remaining ?? []) {
-    resources[name] = { status: 'retained', reason: 'cleanup_pending' };
+    if (resources[name]?.status !== 'retained') resources[name] = { status: 'retained', reason: 'cleanup_pending' };
   }
   const unverified = Object.entries(resources).filter(([, item]) => !item || !['deleted', 'retained'].includes(item.status)).map(([name]) => name).sort();
   if (!Object.keys(resources).length && !input.failed) unverified.push('resources');

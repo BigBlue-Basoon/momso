@@ -260,18 +260,22 @@ class GoogleAnywhere(GoogleWake):
             p.run("compute", "firewall-rules", "delete", rule)
 
 
-def install(provider, state_path, state, client_id, owner_sub, login_origin, image):
+def install(provider, state_path, state, client_id, owner_sub, login_origin, image, *, signed_files=None, preserve_destroyed=False):
     setup = state.setdefault("anywhere", {"client_id": client_id, "owner_sub": owner_sub, "login_origin": login_origin})
     if setup.get("client_id") != client_id or setup.get("owner_sub") != owner_sub or setup.get("login_origin") != login_origin:
         raise InstallError("기존 설치의 Google 로그인 정보가 다릅니다.")
-    setup.pop("destroyed", None)
     save_state(state_path, state)
     install_codex(provider)
     import momso_anywhere_vm_services
-    momso_anywhere_vm_services.install(provider)
+    if signed_files is None:
+        momso_anywhere_vm_services.install(provider)
+    else:
+        momso_anywhere_vm_services.install(provider, signed_files=signed_files)
     proxy = install_private_proxy(provider)
     gateway = GoogleAnywhere(provider)
     setup["url"] = gateway.install(proxy, client_id, owner_sub, login_origin, image)
+    if not preserve_destroyed:
+        setup.pop("destroyed", None)
     setup['gatewayCreatedInAttempt'] = gateway._first_attempt_absent
     save_state(state_path, state)
     return setup["url"]

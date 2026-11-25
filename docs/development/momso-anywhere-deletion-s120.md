@@ -84,3 +84,19 @@ Cloud Asset Inventory 검색으로 실제 반환된 자원 종류와 라벨·이
 설치 시 소유한 삭제 역할은 복구하고 권한을 맞춘다. Google은 삭제 후 7일 안에만 역할 복구를 허용하며, 그 뒤 완전 삭제까지 최대 44일 동안 같은 ID를 새로 만들 수 없는 기간이 있다. 그 기간에는 재설치가 실패할 수 있다. 삭제된 서비스 계정을 같은 이름으로 새로 만들면 다른 식별자다. 가짜 시험으로 확인했으며 실제 고객 프로젝트 삭제·재설치는 별도 검증이다.
 
 출처: [Google Cloud 맞춤 역할 생성·삭제·복원](https://docs.cloud.google.com/iam/docs/creating-custom-roles), [서비스 계정 삭제·복원](https://docs.cloud.google.com/iam/docs/service-accounts-delete-undelete).
+
+# S158: 삭제 뒤 재확인
+
+PC 삭제 결과와 S117a 연습은 설치에 해당하는 NAT, Cloud Run 입구, IAM 정책, 버킷을 다시 조회한다. 버킷은 이름을 직접 조회하고 같은 프로젝트의 삭제 보관 중인 버킷도 확인한다. 접근 거부나 응답 이상은 없음으로 바꾸지 않고 미확인 사유를 남긴다. IAM은 프로젝트와 남아 있는 해당 설치의 버킷·KMS·비밀값 등의 정책에서 설치 계정과 맞춤 역할을 찾는다. 예전 IAM 제거 성공만으로 삭제 후 정책이 비었다고 단정하지 않는다.
+
+전체 삭제 결과의 `billingZero: true`는 백업 정리 뒤 VM·디스크·네트워크·주소·입구·IAM·버킷·KMS 등을 모두 다시 조회해 없고, 알려진 과금 항목도 없을 때만 나온다. 이때 `billingScope: installation`은 해당 설치에 한정된다는 뜻으로, 프로젝트의 다른 자원이나 이전 사용분의 청구액을 뜻하지 않는다. 일부를 확인하지 못하거나 남은 과금 항목이 있으면 `null`이다. 연습 명령도 조회 실패가 있으면 성공 종료하지 않는다.
+
+확인된 다른 자원은 없고 해당 서브넷에 내부 `SERVERLESS` 예약 주소가 남아 있으면 삭제 결과는 `outcome: remaining`, `reason: serverless_address_release_pending`, `retryable: true`다. `noChargeResources`는 확인된 네트워크·일반 서브넷·예약 내부 주소의 범위만 뜻하며 전체 청구가 0이라는 뜻은 아니다. `retryCommand`는 PC에서 실행할 명령이고 `retryArgs`는 같은 인자의 배열이다. 이 명령은 VM·입구가 없고 네트워크 소유권이 맞는지 다시 확인한 뒤 해당 서브넷과 네트워크만 정리한다. 보호된 주소를 직접 삭제하지 않는다.
+
+Google은 Cloud Run 리소스 삭제 또는 이동 뒤 주소 회수에 **1~2시간**을 기다리라고 안내하며, 서비스 에이전트 권한을 먼저 없애거나 서비스 프로젝트를 지우면 더 늦어질 수 있다고 설명한다: [Direct VPC egress](https://docs.cloud.google.com/run/docs/configuring/vpc-direct-vpc). [네트워크 가격표](https://cloud.google.com/vpc/network-pricing)는 내부 IP 주소에 요금이 없다고 명시한다. [VPC 가격표](https://cloud.google.com/vpc/pricing)는 하이브리드 서브넷 등 별도 요금 항목을 구분하므로 무료 표시는 일반 서브넷으로 확인된 경우에만 쓴다. VM·버킷·KMS 등 다른 과금 자원은 각각 별도로 확인해야 한다.
+
+네트워크가 남았더라도 VM 삭제가 확인되면 계정·역할 정리를 이어 간다. 전부 지우기는 백업 버킷·KMS·금고 정리도 이어 간다. 쉬기는 마지막 백업을 확인한 뒤 같은 방식으로 계정을 정리하고 백업은 보존한다. VM 삭제를 확인하지 못하면 뒤의 정리는 시작하지 않는다. 네트워크 대기 중에도 다른 남은 자원을 `remaining`에, 확인된 과금 가능 버킷은 `billable`에 넣는다.
+
+일반 VPC 네트워크와 일반 서브넷의 단독 보유에 대한 별도 요금 항목은 확인한 가격표에서 찾지 못했다. 이 둘의 무료 표시는 그 가격표와 일반 서브넷이라는 조건에 근거한 판단이며, 내부 주소의 무료 명시와는 구분한다.
+
+Google은 소프트 삭제된 버킷은 되살리기 전에는 객체를 열거할 수 없다고 안내한다. 정책을 복원 없이 읽을 수 있다는 공식 근거는 확인하지 못해 IAM 결과를 `soft_deleted_bucket_policy_unavailable`로 남긴다. 확인만을 위해 버킷을 되살리지는 않는다. [Google의 소프트 삭제 버킷 안내](https://docs.cloud.google.com/storage/docs/use-soft-deleted-buckets).

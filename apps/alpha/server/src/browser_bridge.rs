@@ -253,9 +253,127 @@ fn browser_executable_with(
         .unwrap_or_else(|| PathBuf::from("/usr/bin/google-chrome"))
     })
 }
-pub type Sessions = Arc<Mutex<HashMap<String, Arc<Mutex<ToolSession>>>>>;
+pub struct SessionEntry {
+    tools: Arc<Mutex<ToolSession>>,
+    last_used: std::time::Instant,
+    process_identity: Option<(u32, u64)>,
+}
+#[derive(Default)]
+pub struct SessionRegistry {
+    entries: HashMap<String, SessionEntry>,
+    evictions: u64,
+    last_eviction_at: Option<String>,
+    memory_low: u64,
+}
+pub type Sessions = Arc<Mutex<SessionRegistry>>;
+
+fn mem_available_kib(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != "MemAvailable:" {
+            return None;
+        }
+        let amount = fields.next()?.parse().ok()?;
+        (fields.next()? == "kB").then_some(amount)
+    })
+}
+
+fn browser_memory_threshold_kib() -> u64 {
+    std::env::var("MOMSO_BROWSER_MIN_AVAILABLE_MIB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (128..=1_048_576).contains(value))
+        .unwrap_or(768)
+        * 1024
+}
+
+fn reclaim_until_ready<T>(
+    threshold: u64,
+    mut candidates: Vec<(std::time::Instant, T)>,
+    mut available: impl FnMut() -> Option<u64>,
+    mut evict: impl FnMut(T),
+) -> bool {
+    let Some(mut amount) = available() else {
+        return false;
+    };
+    candidates.sort_by_key(|(last_used, _)| *last_used);
+    for (_, candidate) in candidates {
+        if amount >= threshold {
+            break;
+        }
+        evict(candidate);
+        let Some(next) = available() else {
+            return false;
+        };
+        amount = next;
+    }
+    amount >= threshold
+}
 pub fn sessions() -> Sessions {
-    Arc::new(Mutex::new(HashMap::new()))
+    Arc::new(Mutex::new(SessionRegistry::default()))
+}
+
+pub async fn memory_diagnostics(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    auth(&app, &headers)?;
+    let mem = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "memory_unavailable"))?;
+    let field = |name: &str| {
+        mem.lines().find_map(|line| {
+            let mut words = line.split_whitespace();
+            if words.next()? != name {
+                return None;
+            }
+            let value = words.next()?.parse::<u64>().ok()?;
+            (words.next()? == "kB").then_some(value)
+        })
+    };
+    let total = field("MemTotal:")
+        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "memory_unavailable"))?;
+    let available = mem_available_kib(&mem)
+        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "memory_unavailable"))?;
+    let registry = app
+        .browsers
+        .lock()
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "memory_unavailable"))?;
+    let browsers: Vec<_> = registry
+        .entries
+        .iter()
+        .filter_map(|(chat, entry)| match (entry.process_identity, entry.tools.try_lock()) {
+            (Some(identity), lock) => {
+                let state = if lock.is_err() { "busy" } else { "open" };
+                Some(json!({"chatId":chat,"state":state,"pssKiB":momso_server_browser::process_tree_pss_kib(identity)}))
+            }
+            (None, Ok(_)) => None,
+            (None, Err(_)) => Some(json!({"chatId":chat,"state":"busy","pssKiB":null})),
+        })
+        .collect();
+    let mut response = json!({
+        "memTotalKiB":total,
+        "memAvailableKiB":available,
+        "minAvailableKiB":browser_memory_threshold_kib(),
+        "browsers":browsers,
+        "evictionCount":registry.evictions,
+        "lastEvictionAt":registry.last_eviction_at,
+        "memoryLowCount":registry.memory_low,
+    });
+    if let Some(status) = idle_stop_status(&app.data) {
+        response["idleStop"] = status;
+    }
+    if let Some((total, free)) = disk_space::usage(&app.data) {
+        response["disk"] = json!({"totalBytes": total, "freeBytes": free,
+        "legacyCopies": disk_space::legacy_copies(std::path::Path::new("/opt/momso")),
+            "lastCleanupAt": disk_space::last_cleanup(std::path::Path::new("/opt/momso/releases")),
+        "bytesByArea": {
+            "archive": disk_space::directory_bytes(&app.data.join("archive")),
+            "browserProfiles": disk_space::directory_bytes(&app.data.join("browser-profiles")),
+            "releases": disk_space::directory_bytes(std::path::Path::new("/opt/momso/releases")),
+            "codex": disk_space::directory_bytes(std::path::Path::new("/opt/momso/codex"))
+        }});
+    }
+    Ok(Json(response))
 }
 pub async fn dispatch(
     app: &App,
@@ -271,33 +389,37 @@ pub async fn dispatch(
         let Ok(mut sessions) = app.browsers.lock() else {
             return json!({"status":"unavailable"});
         };
-        sessions
-            .entry(chat.to_owned())
-            .or_insert_with(|| {
-                let binary = browser_executable_with(
-                    std::env::var_os("MOMSO_CHROMIUM_PATH").map(PathBuf::from),
-                    |path| path.is_file(),
-                );
-                Arc::new(Mutex::new(BrowserTools::new(
-                    ServerBrowsers::new(binary, app.data.join("browser-profiles")),
-                    HostApproval {
-                        data: app.data.clone(),
-                        turn: turn.to_owned(),
-                        cancel: cancel.clone(),
-                        requests: app.human_inputs.clone(),
-                    },
-                    Credentials {
-                        data: app.data.clone(),
-                        requests: app.human_inputs.clone(),
-                        chat: chat.to_owned(),
-                        turn: turn.to_owned(),
-                        cancel: cancel.clone(),
-                        credential_file: None,
-                        vault_lock: app.vault_lock.clone(),
-                    },
-                )))
-            })
-            .clone()
+        let entry = sessions.entries.entry(chat.to_owned()).or_insert_with(|| {
+            let binary = browser_executable_with(
+                std::env::var_os("MOMSO_CHROMIUM_PATH").map(PathBuf::from),
+                |path| path.is_file(),
+            );
+            let tools = Arc::new(Mutex::new(BrowserTools::new(
+                ServerBrowsers::new(binary, app.data.join("browser-profiles")),
+                HostApproval {
+                    data: app.data.clone(),
+                    turn: turn.to_owned(),
+                    cancel: cancel.clone(),
+                    requests: app.human_inputs.clone(),
+                },
+                Credentials {
+                    data: app.data.clone(),
+                    requests: app.human_inputs.clone(),
+                    chat: chat.to_owned(),
+                    turn: turn.to_owned(),
+                    cancel: cancel.clone(),
+                    credential_file: None,
+                    vault_lock: app.vault_lock.clone(),
+                },
+            )));
+            SessionEntry {
+                tools,
+                last_used: std::time::Instant::now(),
+                process_identity: None,
+            }
+        });
+        entry.last_used = std::time::Instant::now();
+        entry.tools.clone()
     };
     let chat = chat.to_owned();
     let turn = turn.to_owned();
@@ -306,18 +428,73 @@ pub async fn dispatch(
     let provider = provider.to_owned();
     let redact_app = app.clone();
     match tokio::task::spawn_blocking(move || {
+        if !ToolSession::valid_call(&name, &args) {
+            return json!({"status":"invalid_arguments"});
+        }
         let Ok(mut tools) = session.lock() else {
             return json!({"status":"unavailable"});
         };
+        let mut check = json!("");
+        if otp_redaction::redact(&redact_app, &mut check).is_err() {
+            return json!({"status":"redaction_unavailable"});
+        }
+        if !tools.browser_is_open(&chat) {
+            // Holding the registry during admission prevents two launches from both
+            // spending the same available memory. Active sessions cannot be evicted.
+            let Ok(mut registry) = redact_app.browsers.lock() else {
+                return json!({"status":"unavailable"});
+            };
+            momso_server_browser::prune_inactive_caches(
+                &redact_app.data.join("browser-profiles"),
+                std::time::SystemTime::now(),
+            );
+            if !disk_space::can_grow(&redact_app.data, 0) {
+                return json!({"status":"disk_low"});
+            }
+            let available = || {
+                std::fs::read_to_string("/proc/meminfo")
+                    .ok()
+                    .and_then(|contents| mem_available_kib(&contents))
+            };
+            let threshold = browser_memory_threshold_kib();
+            let candidates: Vec<_> = registry
+                .entries
+                .iter()
+                .filter(|(id, _)| *id != &chat)
+                .map(|(id, entry)| (entry.last_used, (id.clone(), entry.tools.clone())))
+                .collect();
+            if !reclaim_until_ready(threshold, candidates, available, |(id, candidate)| {
+                if let Ok(mut idle) = candidate.try_lock() {
+                    if idle.close_idle_browser(&id) {
+                        if let Some(entry) = registry.entries.get_mut(&id) {
+                            entry.process_identity = None;
+                        }
+                        registry.evictions = registry.evictions.saturating_add(1);
+                        registry.last_eviction_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                }
+            }) {
+                registry.memory_low = registry.memory_low.saturating_add(1);
+                return json!({"status":"browser_memory_low"});
+            }
+            if let Err(error) = tools.prepare_browser(&chat) {
+                return match error {
+                    momso_server_browser::engine::DriverError::Refused(reason) => {
+                        json!({"status":reason})
+                    }
+                    _ => json!({"status":"unavailable"}),
+                };
+            }
+            let identity = tools.browser_process_identity(&chat);
+            if let Some(entry) = registry.entries.get_mut(&chat) {
+                entry.process_identity = identity;
+            }
+        }
         tools.approval.turn = turn.clone();
         tools.approval.cancel = cancel.clone();
         tools.credentials.chat = chat.clone();
         tools.credentials.turn = turn;
         tools.credentials.cancel = cancel;
-        let mut check = json!("");
-        if otp_redaction::redact(&redact_app, &mut check).is_err() {
-            return json!({"status":"redaction_unavailable"});
-        }
         let mut result = tools.dispatch(&chat, mode, &name, args);
         if otp_redaction::redact(&redact_app, &mut result).is_err() {
             return json!({"status":"redaction_unavailable"});
@@ -492,6 +669,93 @@ pub async fn delete_login(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_guard_allows_three_rooms_when_memory_is_available() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut evicted = Vec::new();
+        for count in 0..3 {
+            let rooms = (0..count)
+                .map(|i| (now + Duration::from_secs(i), i))
+                .collect();
+            assert!(super::reclaim_until_ready(
+                768,
+                rooms,
+                || Some(1024),
+                |id| evicted.push(id)
+            ));
+        }
+        assert!(evicted.is_empty());
+    }
+
+    #[test]
+    fn memory_guard_only_reclaims_idle_room_after_memory_drops() {
+        use std::cell::{Cell, RefCell};
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let available = Cell::new(Some(500));
+        let evicted = RefCell::new(Vec::new());
+        let rooms = vec![(now, "idle"), (now - Duration::from_secs(2), "busy")];
+        assert!(super::reclaim_until_ready(
+            768,
+            rooms,
+            || available.get(),
+            |room| {
+                if room != "busy" {
+                    evicted.borrow_mut().push(room);
+                    available.set(Some(900));
+                }
+            }
+        ));
+        assert_eq!(*evicted.borrow(), vec!["idle"]);
+    }
+
+    #[test]
+    fn memory_guard_reclaims_oldest_and_fails_closed() {
+        use std::cell::{Cell, RefCell};
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let memory = Cell::new(Some(100));
+        let evicted = RefCell::new(Vec::new());
+        let candidates = vec![(now, "newer"), (now - Duration::from_secs(10), "oldest")];
+        assert!(super::reclaim_until_ready(
+            200,
+            candidates,
+            || memory.get(),
+            |name| {
+                evicted.borrow_mut().push(name);
+                memory.set(Some(300));
+            }
+        ));
+        assert_eq!(*evicted.borrow(), vec!["oldest"]);
+        memory.set(None);
+        assert!(!super::reclaim_until_ready(
+            200,
+            vec![(now, "kept")],
+            || memory.get(),
+            |name| {
+                evicted.borrow_mut().push(name);
+            }
+        ));
+        assert_eq!(*evicted.borrow(), vec!["oldest"]);
+        memory.set(Some(100));
+        assert!(!super::reclaim_until_ready(
+            200,
+            vec![(now, "busy")],
+            || memory.get(),
+            |_| {}
+        ));
+    }
+
+    #[test]
+    fn memory_guard_reads_only_memavailable_kib() {
+        assert_eq!(
+            super::mem_available_kib("MemFree: 20 kB\nMemAvailable: 1234 kB\n"),
+            Some(1234)
+        );
+        assert_eq!(super::mem_available_kib("MemAvailable: 12 MB\n"), None);
+        assert_eq!(super::mem_available_kib("MemFree: 20 kB\n"), None);
+    }
     #[test]
     fn installed_chromium_and_explicit_browser_are_selected() {
         use super::browser_executable_with;

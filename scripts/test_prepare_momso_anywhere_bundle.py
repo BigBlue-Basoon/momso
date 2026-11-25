@@ -38,6 +38,7 @@ class Tests(unittest.TestCase):
                 expected.update({"momso_anywhere_vm_pause.py", "momso_anywhere_pause_ticket.py", "momso_anywhere_pause_guard.py", "server_admission.py"})
                 expected.add('momso-updater/momso_anywhere_proxy_files.py')
                 expected.add('momso-updater/momso_anywhere_proxy_files.json')
+                expected.update({'momso-updater/momso_anywhere_restore_files.py', 'momso-updater/momso_anywhere_restore_files.json'})
                 expected.add('momso-managed-history.json')
                 expected.update("momso-updater/" + name for name in ("update.py", "release_manifest.py", "server_admission.py", "systemd_host.py", "data_snapshots.py", "cloud_run_gateway.py", "github_releases.py", "progress_status.py", "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py"))
                 expected.update({"momso-updater/managed_helpers.py", "momso-updater/momso_managed_files.py", "momso-updater/trust_rotation.py", "momso-units/momso-idle-stop.service", "momso-overrides/vault.conf"})

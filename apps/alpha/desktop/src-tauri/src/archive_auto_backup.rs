@@ -341,9 +341,17 @@ async fn attempt_once<R: tauri::Runtime>(app: tauri::AppHandle<R>, closing: bool
         app: app.clone(),
         armed: true,
     };
-    let result = archive_remote::run_transfer(app.clone(), state.clone(), "auto_push")
+    let git_result = archive_remote::run_transfer(app.clone(), state.clone(), "auto_push")
         .await
         .automatic_result();
+    let result = if git_result.is_ok() {
+        crate::object_store_auto_upload::schedule_pair(&app);
+        crate::paired_backup::capture_git_only(app.clone())
+            .await
+            .map(|_| ())
+    } else {
+        git_result
+    };
     let after = if result.is_ok() {
         let root = state.paths.archive.current.read().await.clone();
         let db = state.paths.database_path.clone();
@@ -408,17 +416,32 @@ pub(crate) async fn close_backup<R: tauri::Runtime>(
     paths: crate::runtime::RuntimePaths,
     resources: PathBuf,
 ) -> CloseResult {
+    close_backup_with_timeout(app, paths, resources, CLOSE_TIMEOUT).await
+}
+
+async fn close_backup_with_timeout<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    paths: crate::runtime::RuntimePaths,
+    resources: PathBuf,
+    timeout: Duration,
+) -> CloseResult {
     let work = async move {
+        let database = paths.database_path.clone();
         let root = paths.archive.current.clone().read_owned().await;
         let result = tauri::async_runtime::spawn_blocking(move || {
             crate::chat_archive_store::save_pending(&root, &resources, &paths)
         })
         .await
         .unwrap_or(Err("unavailable"));
-        flush(app).await;
-        result.err()
+        flush(app.clone()).await;
+        let git_only_error = if enabled(&database).unwrap_or(false) {
+            crate::paired_backup::capture_git_only(app).await.err()
+        } else {
+            None
+        };
+        result.err().or(git_only_error)
     };
-    match tokio::time::timeout(CLOSE_TIMEOUT, work).await {
+    match tokio::time::timeout(timeout, work).await {
         Ok(error) => CloseResult::Finished(error),
         Err(_) => CloseResult::TimedOut,
     }
@@ -430,10 +453,17 @@ pub(crate) async fn close_all<R: tauri::Runtime>(
     resources: PathBuf,
 ) -> Result<(CloseResult, bool), tokio::time::error::Elapsed> {
     tokio::time::timeout(CLOSE_TIMEOUT, async {
-        tokio::join!(
+        // Upload files in parallel; retry pair creation after Git has finished.
+        let (git, first_object) = tokio::join!(
             close_backup(app.clone(), paths, resources),
-            crate::object_store_auto_upload::close_upload(app)
-        )
+            crate::object_store_auto_upload::close_upload(app.clone())
+        );
+        let object = if matches!(&git, CloseResult::Finished(None)) {
+            crate::object_store_auto_upload::close_upload(app).await
+        } else {
+            first_object
+        };
+        (git, object)
     })
     .await
 }
@@ -441,6 +471,24 @@ pub(crate) async fn close_all<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These Git-specific fixtures do not exercise object uploads or the Git-only
+    // recovery-key path. The local-only override keeps them independent of any
+    // credentials installed on the developer's PC.
+    fn register_object_fixture(root: &Path) {
+        crate::object_store::register_test_config(
+            root,
+            crate::object_store::Config {
+                provider: "s3_compatible".into(),
+                endpoint: "http://127.0.0.1:1".into(),
+                region: "auto".into(),
+                bucket: "fixture".into(),
+                credential_id: uuid::Uuid::new_v4().to_string(),
+                last_backup_at: None,
+                write_safety: Some(crate::object_store::WriteSafety::Conditional),
+            },
+        );
+    }
 
     #[test]
     fn extra_files_survive_save_automatic_backup_and_first_receive() {
@@ -452,6 +500,7 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path();
+        register_object_fixture(base);
         let root = base.join("old");
         let bare = base.join("remote.git");
         let db = base.join("old.db");
@@ -539,15 +588,15 @@ mod tests {
         archive::save(&root, base, &db).unwrap();
         assert!(crate::archive_zet::folders(&root).unwrap().is_empty());
         assert_eq!(crate::archive_zet::list(&db, None, None).unwrap().len(), 1);
+        while !crate::chat_redaction_recheck::step(&root, &app.state::<AppState>().paths)
+            .unwrap()
+            .available
+        {}
         tauri::async_runtime::block_on(attempt(app.handle().clone(), false));
         app.state::<AutoBackup>().0.lock().unwrap().changed_at = Some(Instant::now() - QUIET);
         tauri::async_runtime::block_on(attempt(app.handle().clone(), false));
-        assert_eq!(
-            archive_auto_backup_get(app.state(), app.state())
-                .unwrap()
-                .state,
-            "idle"
-        );
+        let status = archive_auto_backup_get(app.state(), app.state()).unwrap();
+        assert_eq!(status.state, "idle", "reason: {:?}", status.reason);
         std::fs::write(
             root.join("zettels/manual/수업.md"),
             b"new unmanaged bytes\r\n",
@@ -641,6 +690,7 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path();
+        register_object_fixture(base);
         let root = base.join("archive");
         let bare = base.join("remote.git");
         let db = base.join("momso.db");
@@ -679,8 +729,22 @@ mod tests {
             })
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        crate::chat::create(&db).unwrap();
-        crate::chat::create(&db).unwrap();
+        for message in ["first fixture", "second fixture"] {
+            let chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
+            crate::chat::append(
+                &db,
+                chat["id"].as_str().unwrap(),
+                crate::chat::Role::User,
+                message,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        while !crate::chat_redaction_recheck::step(&root, &app.state::<AppState>().paths)
+            .unwrap()
+            .available
+        {}
         if std::env::var_os("MOMSO_B84_BACKUP_MEASURE").is_some() {
             let id = crate::archive_zet::create(
                 &root,
@@ -770,6 +834,10 @@ mod tests {
             .unwrap()
         };
         let first = remote_head();
+        let (_, _, paired_head) =
+            archive_remote::paired_git_context(app.handle(), &root, &db, true)
+                .expect("uploaded Git and local chat state can form a backup pair");
+        assert_eq!(paired_head, first);
         assert_eq!(
             archive_auto_backup_get(app.state(), app.state())
                 .unwrap()
@@ -951,7 +1019,16 @@ mod tests {
         let first = remote_head();
         let conn = storage::open_writable_connection(&db).unwrap();
         conn.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES('archive_auto_backup_enabled','0',CURRENT_TIMESTAMP)", []).unwrap();
-        crate::chat::create(&db).unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
+        crate::chat::append(
+            &db,
+            chat["id"].as_str().unwrap(),
+            crate::chat::Role::User,
+            "offline fixture",
+            None,
+            None,
+        )
+        .unwrap();
         tauri::async_runtime::block_on(attempt(app.handle().clone(), true));
         assert_eq!(remote_head(), first);
         conn.execute(
@@ -972,7 +1049,16 @@ mod tests {
         assert_ne!(remote_head(), first);
         assert_eq!(app.state::<AutoBackup>().0.lock().unwrap().failures, 0);
         let before_lock = remote_head();
-        crate::chat::create(&db).unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
+        crate::chat::append(
+            &db,
+            chat["id"].as_str().unwrap(),
+            crate::chat::Role::User,
+            "locked fixture",
+            None,
+            None,
+        )
+        .unwrap();
         let receive_lock = archive_remote::lock_first_receive(&db).unwrap();
         tauri::async_runtime::block_on(attempt(app.handle().clone(), true));
         assert_eq!(remote_head(), before_lock);
@@ -1001,6 +1087,7 @@ mod tests {
         };
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path();
+        register_object_fixture(base);
         let root = base.join("archive");
         let bare = base.join("remote.git");
         let db = base.join("momso.db");
@@ -1042,7 +1129,20 @@ mod tests {
                 .unwrap()
         };
         let app = make_app();
-        crate::chat::create(&db).unwrap();
+        let initial = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
+        crate::chat::append(
+            &db,
+            initial["id"].as_str().unwrap(),
+            crate::chat::Role::User,
+            "initial fixture",
+            None,
+            None,
+        )
+        .unwrap();
+        while !crate::chat_redaction_recheck::step(&root, &paths)
+            .unwrap()
+            .available
+        {}
         tauri::async_runtime::block_on(attempt(app.handle().clone(), true));
         let remote_head = || {
             archive_remote::git(
@@ -1060,17 +1160,27 @@ mod tests {
         let before = remote_head();
         let pending = serde_json::to_value(crate::chat::create(&db).unwrap()).unwrap();
         let pending_id = pending["id"].as_str().unwrap();
+        crate::chat::append(
+            &db,
+            pending_id,
+            crate::chat::Role::User,
+            "pending fixture",
+            None,
+            None,
+        )
+        .unwrap();
         let hook = bare.join("hooks/pre-receive");
         std::fs::write(
             &hook,
-            "#!/bin/sh\nprintf started > d22-slow-hook-started\nsleep 24\nexit 1\n",
+            "#!/bin/sh\nprintf started > d22-slow-hook-started\nsleep 25\nexit 1\n",
         )
         .unwrap();
         let started = Instant::now();
-        let finished = tauri::async_runtime::block_on(close_backup(
+        let finished = tauri::async_runtime::block_on(close_backup_with_timeout(
             app.handle().clone(),
             paths.clone(),
             base.to_path_buf(),
+            Duration::from_secs(15),
         ));
         let elapsed = started.elapsed();
         assert!(
@@ -1078,7 +1188,7 @@ mod tests {
             "slow remote unexpectedly completed before timeout"
         );
         assert!(
-            elapsed >= Duration::from_secs(19) && elapsed < Duration::from_secs(23),
+            elapsed >= Duration::from_secs(15) && elapsed < Duration::from_secs(20),
             "timeout took {elapsed:?}"
         );
         assert!(
