@@ -239,7 +239,8 @@ class GoogleAnywhere(GoogleWake):
     def destroy(self, *, keep_roles=False):
         p = self.p
         self._objects()
-        items = p.run("secrets", "list", parse=True)
+        from momso_server_install import owned_listing
+        items = owned_listing(p, "secrets", "list")
         owned = []
         for name in (self.transport_secret, self.session_secret):
             found = next((x for x in items if x.get("name", "").endswith("/secrets/" + name)), None)
@@ -249,7 +250,7 @@ class GoogleAnywhere(GoogleWake):
                 owned.append(name)
         from momso_anywhere_vm_resources import names
         rule = names(p)['private_firewall']
-        rules = p.run("compute", "firewall-rules", "list", f"--filter=name={rule}", parse=True)
+        rules = owned_listing(p, "compute", "firewall-rules", "list", f"--filter=name={rule}")
         matching = next((x for x in rules if x.get("name") == rule), None)
         if matching and matching.get("description") != p.marker:
             raise InstallError("방화벽의 소유권이 달라 삭제하지 않았습니다.")

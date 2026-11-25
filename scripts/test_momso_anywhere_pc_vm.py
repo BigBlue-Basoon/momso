@@ -86,7 +86,7 @@ class Tests(unittest.TestCase):
 
     def test_failed_guard_is_stopped_before_reporting_error(self):
         class FakeLease(VmLease):
-            def __init__(self): super().__init__(Provider(['RUNNING'])); self.states = iter([{'state': 'failed', 'reason': 'vm_busy'}, {'state': 'released'}]); self.commands = []
+            def __init__(self): super().__init__(Provider(['RUNNING']), busy_attempts=1); self.states = iter([{'state': 'failed', 'reason': 'vm_busy'}, {'state': 'released'}]); self.commands = []
             def _root(self, code, data=None): self.commands.append(code); return b''
             def _status(self): return next(self.states)
         lease = FakeLease()
@@ -94,6 +94,122 @@ class Tests(unittest.TestCase):
             with lease: self.fail('must not enter')
         self.assertFalse(lease.started)
         self.assertTrue(any("'stop'" in code for code in lease.commands))
+
+    def test_busy_vm_waits_and_starts_a_fresh_guard(self):
+        # S179: the VM's own updater holds lifecycle.lock, the guard ends with
+        # vm_busy and its stop hook reports "released" with the guard failure.
+        class FakeLease(VmLease):
+            def __init__(self):
+                super().__init__(Provider(['RUNNING']), sleep=lambda _: None, busy_wait=0)
+                self.states = iter([{'state': 'released', 'guard': 'failed', 'reason': 'vm_busy'}, {'state': 'released', 'guard': 'failed', 'reason': 'vm_busy'},
+                                    {'state': 'ready'}, {'state': 'released'}])
+                self.tokens = []
+            def _root(self, code, data=None):
+                if data is not None: self.tokens.append(self.token)
+                return b''
+            def _status(self): return next(self.states)
+            def _heartbeat(self): pass
+        lease = FakeLease()
+        with patch('momso_anywhere_pc_vm.ensure_vm_ready'), redirect_stdout(io.StringIO()) as out:
+            with lease:
+                entered = True
+        self.assertTrue(entered)
+        self.assertEqual(len(lease.tokens), 2)
+        self.assertNotEqual(lease.tokens[0], lease.tokens[1])
+        self.assertIn('pc_guard_waiting reason=vm_busy', out.getvalue())
+
+    def test_idle_stop_recovery_after_wake_is_waited_for_not_unreachable(self):
+        # S179b: the PC woke a VM the idle stop had stopped; idle-stop.pending was
+        # still there because its first reopen ran before the server was up.
+        class FakeLease(VmLease):
+            def __init__(self):
+                super().__init__(Provider(['RUNNING']), sleep=lambda _: None, busy_wait=0)
+                failed = {'state': 'released', 'guard': 'failed', 'reason': 'idle_stop_recovering'}
+                self.states = iter([failed, failed, {'state': 'ready'}, {'state': 'released'}])
+            def _root(self, code, data=None): return b''
+            def _status(self): return next(self.states)
+            def _heartbeat(self): pass
+        with patch('momso_anywhere_pc_vm.ensure_vm_ready'), redirect_stdout(io.StringIO()) as out:
+            with FakeLease():
+                entered = True
+        self.assertTrue(entered)
+        self.assertIn('pc_guard_waiting reason=idle_stop_recovering', out.getvalue())
+
+    def test_guard_reasons_are_reported_as_themselves(self):
+        for reason, expected in (('vm_layout_invalid', 'vm_layout_invalid'), ('something_new', 'pc_guard_failed')):
+            class FakeLease(VmLease):
+                def __init__(self):
+                    super().__init__(Provider(['RUNNING']), sleep=lambda _: None, busy_attempts=1)
+                    self.states = iter([{'state': 'failed', 'reason': reason}, {'state': 'released'}])
+                def _root(self, code, data=None): return b''
+                def _status(self): return next(self.states)
+            with patch('momso_anywhere_pc_vm.ensure_vm_ready'), self.assertRaisesRegex(InstallError, '^' + expected + '$'):
+                with FakeLease(): self.fail('must not enter')
+
+    def test_vm_restart_inside_a_lease_renews_the_guard(self):
+        # S179c: a fresh install stops and starts the VM to attach its service
+        # account while the PC guard is held; /run does not survive that.
+        from momso_anywhere_pc_vm import vm_restart
+        class FakeLease(VmLease):
+            def __init__(self):
+                super().__init__(Provider(['RUNNING']), sleep=lambda _: None)
+                self.events = []
+            def _start_guard(self):
+                self.started = True
+                self.events.append('guard:' + self.token)
+                return self
+            def release(self):
+                self.events.append('release'); self.started = False
+        lease = FakeLease()
+        with patch('momso_anywhere_pc_vm.ensure_vm_ready'):
+            with lease:
+                with vm_restart(lease.provider):
+                    lease.events.append('restart')
+        self.assertEqual([e.split(':')[0] for e in lease.events], ['guard', 'release', 'restart', 'guard', 'release'])
+        self.assertNotEqual(lease.events[0], lease.events[3])
+        self.assertIsNone(getattr(lease.provider, '_vm_lease', None))
+
+    def test_release_after_the_vm_rebooted_has_nothing_to_stop(self):
+        class FakeLease(VmLease):
+            def __init__(self):
+                super().__init__(Provider(['RUNNING']), sleep=lambda _: None)
+                self.started = True; self.boot_id = 'a' * 36; self.remote = []
+            def _current_boot(self): return 'b' * 36
+            def _root(self, code, data=None): self.remote.append(code); return b''
+        lease = FakeLease()
+        lease.release()
+        self.assertFalse(lease.started)
+        self.assertEqual(lease.remote, [])
+
+    def test_guard_that_ended_before_ready_is_not_polled_until_timeout(self):
+        class FakeLease(VmLease):
+            def __init__(self):
+                super().__init__(Provider(['RUNNING']), sleep=lambda _: None)
+                self.polls = 0
+            def _root(self, code, data=None): return b''
+            def _status(self):
+                self.polls += 1
+                return {'state': 'released'}
+        lease = FakeLease()
+        with patch('momso_anywhere_pc_vm.ensure_vm_ready'), self.assertRaisesRegex(InstallError, 'pc_guard_ended'):
+            with lease: self.fail('must not enter')
+        self.assertLessEqual(lease.polls, 3)
+
+    def test_release_failure_never_replaces_the_operation_error(self):
+        class FakeLease(VmLease):
+            def __init__(self):
+                super().__init__(Provider(['RUNNING']), sleep=lambda _: None)
+                self.states = iter([{'state': 'ready'}, {}])
+                self.provider.run = lambda *_a, **_k: [{'name': self.provider.name}]
+            def _root(self, code, data=None): return b''
+            def _status(self): return next(self.states)
+            def _heartbeat(self): pass
+        lease = FakeLease()
+        with patch('momso_anywhere_pc_vm.ensure_vm_ready'), redirect_stdout(io.StringIO()) as out:
+            with self.assertRaisesRegex(InstallError, 'vm_lifecycle_busy'):
+                with lease:
+                    raise InstallError('vm_lifecycle_busy')
+        self.assertIn('pc_guard_warning reason=pc_guard_release_unconfirmed', out.getvalue())
 
     def test_updater_repair_uses_the_vm_lease(self):
         import momso_anywhere_repair_updater as repair

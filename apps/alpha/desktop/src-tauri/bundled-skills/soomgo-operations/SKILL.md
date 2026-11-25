@@ -6,35 +6,9 @@ description: 숨고에서 제공하는 서비스와 요청을 확인하고 수�
 
 로그인이 필요하면 `browser_request_saved_login({})`을 먼저 호출한다. 저장된 로그인을 쓸 수 없거나 인증번호·캡차가 필요하면 `browser_request_human_login({"reason":"login"})`으로 사람에게 넘긴다. 비밀번호나 인증번호는 AI가 직접 읽거나 입력하지 않는다.
 
-브라우저 스킬은 사용법 안내이며 접근 가능한 사이트의 목록이 아니다. 다른 공개 웹사이트도 사용할 수 있다. `browser_open({})`, `browser_read({})`, `browser_navigate({url})`, `browser_click({elementId})`, `browser_fill({elementId,text})`을 사용한다. 메뉴·탭·검색으로 둘러보고 변경 동작은 사용자가 선택한 권한 단계를 따른다. 비밀번호와 인증번호는 입력하지 않고 사람에게 넘긴다. 아래 주소와 블록은 참고용이며 권한 설정이 아니다.
+브라우저 스킬은 사용법 안내이며 접근 가능한 사이트의 목록이 아니다. 다른 공개 웹사이트도 사용할 수 있다. `browser_open({})`, `browser_read({})`, `browser_navigate({url})`, `browser_click({elementId})`, `browser_fill({elementId,text})`을 사용한다. 메뉴·탭·검색으로 둘러보고 변경 동작은 사용자가 선택한 권한 단계를 따른다. 비밀번호와 인증번호는 입력하지 않고 사람에게 넘긴다. 시작 주소는 https://soomgo.com 이고 로그인 화면은 https://soomgo.com/login 이다. 참고용이며 다른 주소로도 갈 수 있다.
 
 선생님이 수정·삭제·등록 등 실제 변경을 요청하지 않았다면 지금 보이는 정보만 읽고 알려 준다. 선생님이 따로 요청하지 않은 수련생 이름·연락처 등은 문서에 저장하거나 다른 곳으로 옮기지 않는다. 개인정보가 AI 회사로 전달될 수 있음을 먼저 알리고 필요한 정보만 확인한다. 화면에서 원하는 항목을 찾지 못하면 추측해서 누르지 말고 멈춰 “이 화면에서 해당 항목을 찾지 못했습니다. 지금 보이는 것은 …입니다”라고 알린다.
-
-```momso-browser-reference
-version: 1
-read_only:
-  - browser_navigate
-  - browser_read
-origins:
-  - "https://soomgo.com"
-login_origins:
-  - "https://nid.naver.com"
-  - "https://kauth.kakao.com"
-  - "https://accounts.kakao.com"
-  - "https://auth.kakao.com"
-  - "https://appleid.apple.com"
-  - "https://idmsa.apple.com"
-login_paths:
-  - "https://soomgo.com/login"
-irreversible:
-  - 게시
-  - 등록
-  - 삭제
-  - 변경
-  - 알림
-  - 결제
-  - 환불
-```
 
 숨고에서 선생님의 고수 계정, 제공 서비스와 요청·견적을 확인한다. 숨고를 확인되지 않은 회원관리나 시간표 서비스로 가정하지 않는다. 견적과 메시지는 받는 사람, 금액, 캐시 차감과 내용을 확인하고 전송 직전 승인받는다. 다른 회원 정보의 동의 없는 수집·저장·공개 제한을 알린다.
 

@@ -1,12 +1,13 @@
 """Conservative IAM policy cleanup for PC deletion; no credential output."""
 import json
+import re
 import os
 import tempfile
 from pathlib import Path
 
 from momso_anywhere_iam_policy import remove_and_verify
 from momso_anywhere_vm_resources import names
-from momso_server_install import REGION, ZONE
+from momso_server_install import REGION, ZONE, owned_listing
 
 
 class PartialPolicyInventory(ValueError):
@@ -31,26 +32,38 @@ class GcloudPolicies:
             Path(path).unlink(missing_ok=True)
 
 
+SOFT_DELETED_LINE = re.compile(r'gs://([a-z0-9][a-z0-9._-]{1,220}[a-z0-9])/(?:#[0-9]{1,20})?')
+
+
 def soft_deleted_buckets(p):
-    """Read the project's soft-deleted bucket metadata without restoring it."""
-    raw = p.run('storage', 'ls', '--buckets', '--soft-deleted', '--json')
+    """Read the project's soft-deleted bucket names without restoring them.
+
+    Cloud SDK 559 answers `storage ls --buckets --soft-deleted` with one
+    `gs://NAME/` line per bucket, but fails with HTTP 404 as soon as `--json`
+    or `--full` is added, and `ls` refuses `--format=json` (S178). Only names
+    are available this way, so hardDeleteTime is reported as unknown (None);
+    nothing here decides on it. Unknown lines still fail closed.
+    """
+    try:
+        raw = p.run('storage', 'ls', '--buckets', '--soft-deleted')
+    except Exception as error:
+        # A project with no soft-deleted bucket makes gcloud exit 1 with
+        # "One or more URLs matched no objects."; any other failure stays one.
+        if getattr(error, 'no_match', False) is True:
+            return []
+        raise
     text = raw.decode('utf-8') if isinstance(raw, bytes) else raw
     if not isinstance(text, str): raise ValueError('invalid_bucket_inventory')
-    records, decoder = [], json.JSONDecoder()
-    while text.strip():
-        text = text.lstrip()
-        value, end = decoder.raw_decode(text)
-        records.extend(value if isinstance(value, list) else [value])
-        text = text[end:]
     expected = names(p)['backup_bucket']
     found = []
-    for row in records:
-        if not isinstance(row, dict): raise ValueError('invalid_bucket_inventory')
-        metadata = row.get('metadata', row)
-        if not isinstance(metadata, dict): raise ValueError('invalid_bucket_inventory')
-        name = metadata.get('name') or row.get('name')
-        if not isinstance(name, str): raise ValueError('invalid_bucket_inventory')
-        if name == expected: found.append({'name': name, 'hardDeleteTime': metadata.get('hardDeleteTime')})
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = SOFT_DELETED_LINE.fullmatch(line)
+        if match is None: raise ValueError('invalid_bucket_inventory')
+        if match.group(1) == expected and all(item['name'] != expected for item in found):
+            found.append({'name': expected, 'hardDeleteTime': None})
     return found
 
 
@@ -58,11 +71,11 @@ def owned_policy_resources(p):
     """Enumerate the known installation resources; reject ownership collisions."""
     n = names(p)
     resources = [(('projects', 'get-iam-policy', p.project), ('projects', 'set-iam-policy', p.project), ())]
-    instances = p.run('compute', 'instances', 'list', f'--zones={ZONE}', parse=True)
-    services = p.run('run', 'services', 'list', f'--region={REGION}', parse=True)
-    buckets = p.run('storage', 'buckets', 'list', parse=True)
-    secrets = p.run('secrets', 'list', parse=True)
-    rings = p.run('kms', 'keyrings', 'list', f'--location={REGION}', parse=True)
+    instances = owned_listing(p, 'compute', 'instances', 'list', f'--zones={ZONE}')
+    services = owned_listing(p, 'run', 'services', 'list', f'--region={REGION}')
+    buckets = owned_listing(p, 'storage', 'buckets', 'list')
+    secrets = owned_listing(p, 'secrets', 'list')
+    rings = owned_listing(p, 'kms', 'keyrings', 'list', f'--location={REGION}')
     if any(not isinstance(items, list) or any(not isinstance(item, dict) for item in items) for items in (instances, services, buckets, secrets, rings)):
         raise ValueError('iam_bindings_unverified')
     instance = next((x for x in instances if x.get('name') == n['machine']), None)
@@ -126,7 +139,7 @@ def inspect_installation_bindings(p):
 
 def remove_installation_bindings(p):
     n = names(p)
-    accounts = p.run('iam', 'service-accounts', 'list', parse=True)
+    accounts = owned_listing(p, 'iam', 'service-accounts', 'list')
     if not isinstance(accounts, list) or any(not isinstance(item, dict) for item in accounts): raise ValueError('iam_bindings_unverified')
     emails = [n[key] + '@' + p.project + '.iam.gserviceaccount.com' for key in ('account', 'backup_account', 'gateway_account', 'wake_account')]
     account_resources = []

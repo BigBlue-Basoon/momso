@@ -77,3 +77,30 @@ test('discovers two paused installations by their full ownership labels', async 
   ]);
   assert(calls.every(method => method === 'GET'));
 });
+
+test('skips the KMS key left behind by a deleted installation', async () => {
+  // S180: bucket soft-deleted (absent from the bucket list), vault gone, key
+  // versions scheduled for destruction. Only the paused installation remains.
+  const paused = 'a'.repeat(12), deleted = 'b'.repeat(12);
+  const provider = new GoogleBrowserProvider('fixture', { projectId: project, fetchImpl: async (raw, options) => {
+    assert.equal(options.method, 'GET');
+    const url = new URL(raw), path = url.pathname;
+    const labels = id => ({ 'momso-install-id': id });
+    if (url.hostname === 'cloudresourcemanager.googleapis.com') return response({ name: 'projects/123456789' });
+    if (url.hostname === 'storage.googleapis.com') {
+      if (!path.includes('momso-backup-')) return response({ items: [{ name: `momso-backup-${paused}`, labels: labels(paused) }] });
+      return path.endsWith('/o') ? response({ items: [{ name: 'momso-backup/slot-0.enc', updated: '2026-11-20T01:02:03Z' }] }) : response({ name: `momso-backup-${paused}`, labels: labels(paused) });
+    }
+    if (url.hostname === 'secretmanager.googleapis.com') {
+      if (!path.includes('momso-vault-')) return response({ secrets: [{ name: `projects/${project}/secrets/momso-vault-${paused}`, labels: labels(paused) }] });
+      return path.endsWith('/versions') ? response({ versions: [{ name: 'projects/fixture/secrets/vault/versions/1', state: 'ENABLED' }] }) : response({ labels: labels(paused) });
+    }
+    if (url.hostname === 'compute.googleapis.com') return path.includes('/aggregated/instances') ? response({ items: {} }) : response({}, 404);
+    if (path.endsWith('/keyRings')) return response({ keyRings: [paused, deleted].map(id => ({ name: `projects/${project}/locations/asia-northeast3/keyRings/momso-backup-${id}` })) });
+    const found = [paused, deleted].find(id => path.includes(`momso-backup-${id}`));
+    if (path.endsWith('/cryptoKeyVersions')) return response({ cryptoKeyVersions: found === deleted ? [{ state: 'DESTROY_SCHEDULED' }, { state: 'DESTROYED' }] : [{ state: 'ENABLED' }] });
+    const key = { name: `projects/${project}/locations/asia-northeast3/keyRings/momso-backup-${found}/cryptoKeys/backup`, labels: labels(found) };
+    return path.endsWith('/cryptoKeys') ? response({ cryptoKeys: [key] }) : response(key);
+  } });
+  assert.deepEqual((await provider.discoverPaused()).map(item => [item.installationId, item.assets]), [[paused, 'complete']]);
+});

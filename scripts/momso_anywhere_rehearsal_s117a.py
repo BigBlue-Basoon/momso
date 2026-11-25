@@ -187,6 +187,7 @@ def inventory_basic_resources(provider):
             if not isinstance(rows, list):
                 continue
             found = []
+            free = []
             for row in rows:
                 if not isinstance(row, dict):
                     raise ValueError('invalid_resource')
@@ -205,8 +206,15 @@ def inventory_basic_resources(provider):
                     matches = matches or subnet.endswith('/subnetworks/momso-' + provider.install_id + '-sub')
                 if matches:
                     found.append(next((value for value in names if provider.install_id in value), names[0]))
+                    # Cloud Run's internal reserved address is released by Google
+                    # later and costs nothing (VPC pricing; S161 cost notes, S181).
+                    if (kind == 'addresses' and row.get('purpose') == 'SERVERLESS'
+                            and row.get('addressType') == 'INTERNAL' and row.get('status') == 'RESERVED'):
+                        free.append(found[-1])
             # The installer creates its Cloud Run services in REGION only.
             result[kind] = {'complete': True, 'items': found}
+            if kind == 'addresses':
+                result[kind]['cleanupPending'] = free
         except Exception as error:
             # An incomplete listing is never represented as an empty complete list.
             if kind == 'bucket' and getattr(error, 'http_status', None) == 403:
@@ -565,7 +573,12 @@ def main(argv=None):
         chargeable = [v for v in result['kmsVersions'] if v['billing'] == 'billable']
         if chargeable:
             print('아직 과금 대상: KMS 키 버전', len(chargeable), '개 (위 파기 시각 참조)')
-        billable_kinds = ('vm', 'disk', 'bucket', 'gateway', 'nat') + (() if deletion.get('reason') == 'serverless_address_release_pending' else ('addresses',))
+        address_group = result['inventory'].get('addresses', {})
+        free_addresses = set(address_group.get('cleanupPending', []))
+        if free_addresses:
+            print('회수 대기: addresses', len(free_addresses), '개 (Cloud Run 내부 예약 주소, 요금 없음)')
+        address_billable = bool(set(address_group.get('items', [])) - free_addresses)
+        billable_kinds = ('vm', 'disk', 'bucket', 'gateway', 'nat') + (('addresses',) if address_billable and deletion.get('reason') != 'serverless_address_release_pending' else ())
         for kind in billable_kinds:
             if kind in remaining:
                 print('과금 가능 자원 남음:', kind)

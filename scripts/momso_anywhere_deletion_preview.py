@@ -61,7 +61,15 @@ def preview(provider):
     except Exception:
         pass
     try:
-        keys = provider.run('kms', 'keys', 'list', f'--location={REGION}', f'--keyring={name}', parse=True)
+        try:
+            keys = provider.run('kms', 'keys', 'list', f'--location={REGION}', f'--keyring={name}', parse=True)
+        except InstallError as error:
+            # The exact "KeyRing ... not found" answer means no key ring, so no
+            # key charge; any other failure stays unknown.
+            if getattr(error, 'http_status', None) != 404:
+                raise
+            keys = []
+            output['estimatedMonthly']['kms'] = 0
         if not isinstance(keys, list):
             raise ValueError('unavailable')
         expected = f'projects/{provider.project}/locations/{REGION}/keyRings/{name}/cryptoKeys/backup'

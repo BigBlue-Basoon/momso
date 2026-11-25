@@ -255,8 +255,10 @@ class IdleTests(unittest.TestCase):
              patch.object(idle_stop, "wait_for_recovery", side_effect=[OSError("private"), "resumed"]), \
              patch.object(idle_stop.time, "sleep") as sleep, patch("builtins.print") as output:
             idle_stop.main()
-        output.assert_called_once_with("idle_stop_unavailable reason=recovery:OSError", flush=True)
-        monitor.report.assert_called_once_with("error:recovery:OSError")
+        # S179b: the later success is recorded too, replacing the stale error.
+        self.assertEqual([c.args[0] for c in output.call_args_list],
+                         ["idle_stop_unavailable reason=recovery:OSError", "idle_stop_result result=resumed"])
+        self.assertEqual([c.args[0] for c in monitor.report.call_args_list], ["error:recovery:OSError", "resumed"])
         sleep.assert_called_once_with(120)
 
     def test_other_process_holds_update_lock_then_idle_can_stop(self):

@@ -50,6 +50,23 @@ class PreviewTests(unittest.TestCase):
         self.assertIsNone(value['backupExists'])
         self.assertIsNone(value['estimatedMonthly']['kms'])
 
+    def test_missing_key_ring_reads_as_no_key_charge_only_for_exact_answer(self):
+        import subprocess
+        with patch.object(momso_server_install.shutil, 'which', return_value='gcloud'):
+            real = momso_server_install.GoogleProvider('fixture@example.test', 'fixture-project', 'a' * 12, Path(tempfile.gettempdir()) / 'momso-unused-key')
+        exact = b'ERROR: (gcloud.kms.keys.list) NOT_FOUND: KeyRing projects/fixture-project/locations/asia-northeast3/keyRings/momso-backup-' + b'a' * 12 + b' not found. This command is authenticated as fixture.\n'
+        for stderr, expected in ((exact, 0), (b'ERROR: (gcloud.kms.keys.list) PERMISSION_DENIED: fixture\n', None)):
+            provider = Provider()
+            original = provider.run
+            def run(*args, **kwargs):
+                if args[:3] == ('kms', 'keys', 'list'):
+                    result = subprocess.CompletedProcess([], 1, stdout=b'[]', stderr=stderr)
+                    with patch.object(momso_server_install.subprocess, 'run', return_value=result):
+                        return real.run(*args, **kwargs)
+                return original(*args, **kwargs)
+            provider.run = run
+            self.assertEqual(preview(provider)['estimatedMonthly']['kms'], expected)
+
     def test_pc_command_uses_existing_state_without_creating_keys(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / 'state.json'

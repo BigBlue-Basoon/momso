@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+from contextlib import redirect_stdout
 import os
 import pathlib
 import sqlite3
@@ -451,6 +452,148 @@ class FlowTests(unittest.TestCase):
                     provider.run('storage', 'buckets', 'describe', 'gs://fixture', parse=True)
             self.assertEqual(caught.exception.http_status, status)
             self.assertNotIn('private fixture', str(caught.exception))
+
+    def test_real_gcloud_storage_not_found_line_is_read_as_404(self):
+        with patch.object(installer.shutil, 'which', return_value='gcloud'):
+            provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', self.root / 'fixture-key')
+        cases = [
+            (b'ERROR: (gcloud.storage.buckets.describe) gs://momso-backup-0123456789ab not found: 404.\n', 404),
+            (b'WARNING: fixture\r\nERROR: (gcloud.storage.buckets.describe) gs://momso-backup-0123456789ab not found: 404.\r\n', 404),
+            (b'ERROR: (gcloud.storage.buckets.describe) HTTPError 403: fixture does not have storage.buckets.get access\n', 403),
+            (b'ERROR: (gcloud.storage.buckets.describe) gs://momso-backup-0123456789ab not found: 404. extra\n', None),
+            (b'ERROR: (gcloud.compute.instances.describe) momso-0123456789ab not found: 404.\n', None),
+            (b'ERROR: (gcloud.storage.buckets.describe) something else failed\n', None),
+        ]
+        for stderr, expected in cases:
+            result = subprocess.CompletedProcess([], 1, stdout=b'', stderr=stderr)
+            with patch.object(installer.subprocess, 'run', return_value=result):
+                with self.assertRaises(installer.InstallError) as caught:
+                    provider.run('storage', 'buckets', 'describe', 'gs://momso-backup-0123456789ab', parse=True)
+            self.assertEqual(caught.exception.http_status, expected, stderr)
+        # Real wording for objects list on a missing bucket (stdout `[]`, exit 1).
+        result = subprocess.CompletedProcess([], 1, stdout=b'[]', stderr=b'ERROR: (gcloud.storage.objects.list) gs://momso-backup-0123456789ab not found: 404.' + bytes([10]))
+        with patch.object(installer.subprocess, 'run', return_value=result):
+            with self.assertRaises(installer.InstallError) as caught:
+                provider.run('storage', 'objects', 'list', 'gs://momso-backup-0123456789ab/**', '--soft-deleted', parse=True)
+        self.assertEqual(caught.exception.http_status, 404)
+
+    def test_upgrade_finishes_as_current_when_the_vm_updated_itself(self):
+        # S179: the VM's own updater installed the same signed sequence first.
+        import momso_anywhere_install
+        calls = []
+        class Provider:
+            install_id = '0123456789ab'; name = 'momso-0123456789ab'; network = 'momso-0123456789ab-net'; project = 'fixture-project'
+            account = 'fixture@example.test'; marker = 'momso-install-0123456789ab'
+            def __init__(self, states): self.states = list(states)
+            def run(self, *args, **kwargs):
+                if args[:3] == ('compute', 'instances', 'describe'):
+                    return {'status': 'RUNNING', 'labels': {'momso-install-id': self.install_id}, 'networkInterfaces': [{'network': 'x/' + self.network}]}
+                if args[:3] == ('run', 'services', 'describe'):
+                    return {'status': {'url': 'https://fixture.run.app'}}
+                raise AssertionError(args)
+            def vm_release_state(self):
+                calls.append('state')
+                return self.states.pop(0) if len(self.states) > 1 else self.states[0]
+            wait_for_vm_update = installer.GoogleProvider.wait_for_vm_update
+            def health(self): calls.append('health')
+            def ensure_private_proxy(self): calls.append('proxy')
+            def gateway_proxy_health(self, url): calls.append('gateway:' + url)
+            def upgrade_sequence(self, *a, **k): calls.append('upgrade_sequence')
+            def upgrade_checkpoint(self, action): calls.append('checkpoint:' + action)
+        artifact = self.root / 'server'; artifact.write_bytes(b'server')
+        web = self.root / 'web.tar.gz'
+        import io, tarfile
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode='w:gz') as tar:
+            data = b'<html></html>'; info = tarfile.TarInfo('index.html'); info.size = len(data); tar.addfile(info, io.BytesIO(data))
+        web.write_bytes(buffer.getvalue())
+        digest = hashlib.sha256(b'server').hexdigest(); web_digest = hashlib.sha256(web.read_bytes()).hexdigest()
+        state = {'anywhere': {'client_id': 'c', 'owner_sub': '1', 'login_origin': 'https://login.example', 'url': 'https://fixture.run.app'}}
+        image = 'example.invalid/gateway@sha256:' + 'a' * 64
+        class Adapter:
+            def current(self): return {'traffic': {'rev-9': 100}}
+            def _verify_revision(self, revision, expected): calls.append('image:' + revision)
+        provider = Provider([{'updateState': 'installing', 'sequence': 8}, {'updateState': 'up_to_date', 'sequence': 9, 'serverSha256': digest}])
+        with patch.object(momso_anywhere_install.GoogleAnywhere, '_objects', return_value=(True, True, True)), \
+             patch.object(momso_anywhere_install, 'cloud_run_gateway', return_value=Adapter()), \
+             patch('momso_anywhere_public_assets.from_web_archive'), \
+             patch.object(installer.time, 'sleep'), redirect_stdout(io.StringIO()) as out:
+            url = installer.upgrade_anywhere(provider, state, artifact, digest, web, web_digest, 'c', '1', 'https://login.example', image, 9)
+        self.assertEqual(url, 'https://fixture.run.app')
+        self.assertEqual(calls, ['state', 'state', 'health', 'proxy', 'image:rev-9', 'gateway:https://fixture.run.app'])
+        self.assertIn('vm_update_waiting state=installing', out.getvalue())
+        self.assertIn('already_current sequence=9', out.getvalue())
+        # A different server for the same sequence is never accepted as current.
+        calls.clear()
+        provider = Provider([{'updateState': 'up_to_date', 'sequence': 9, 'serverSha256': 'b' * 64}])
+        with patch.object(momso_anywhere_install.GoogleAnywhere, '_objects', return_value=(True, True, True)), \
+             patch('momso_anywhere_public_assets.from_web_archive'), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(installer.InstallError, 'vm_release_mismatch'):
+                installer.upgrade_anywhere(provider, state, artifact, digest, web, web_digest, 'c', '1', 'https://login.example', image, 9)
+        self.assertNotIn('checkpoint:begin', calls)
+
+    def test_vm_updater_that_never_settles_stops_with_its_own_reason(self):
+        class Provider:
+            wait_for_vm_update = installer.GoogleProvider.wait_for_vm_update
+            def vm_release_state(self): return {'updateState': 'backing_up'}
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(installer.InstallError, 'vm_update_in_progress'):
+                Provider().wait_for_vm_update(attempts=3, wait=0, sleep=lambda _: None)
+
+    def test_never_enabled_api_lists_as_empty_only_for_deletion(self):
+        # S180: an install that failed before enabling Cloud Run must still be
+        # deletable; the disabled API cannot hold any of its resources.
+        with patch.object(installer.shutil, 'which', return_value='gcloud'):
+            provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', self.root / 'fixture-key')
+        disabled = (b'ERROR: (gcloud.run.services.list) PERMISSION_DENIED: Cloud Run Admin API has not been used in project 123 before or it is disabled.'
+                    + bytes([10]) + b'- reason: SERVICE_DISABLED' + bytes([10]))
+        other = b'ERROR: (gcloud.run.services.list) PERMISSION_DENIED: caller lacks permission' + bytes([10])
+        for stderr, expected in ((disabled, []), (other, None)):
+            result = subprocess.CompletedProcess([], 1, stdout=b'', stderr=stderr)
+            with patch.object(installer.subprocess, 'run', return_value=result):
+                if expected is None:
+                    with self.assertRaises(installer.InstallError) as caught:
+                        installer.owned_listing(provider, 'run', 'services', 'list', '--region=asia-northeast3')
+                    self.assertFalse(caught.exception.service_disabled)
+                    self.assertEqual(caught.exception.command, 'run services list')
+                else:
+                    self.assertEqual(installer.owned_listing(provider, 'run', 'services', 'list', '--region=asia-northeast3'), expected)
+
+    def test_remote_failure_is_named_without_copying_messages(self):
+        nl = bytes([10])
+        cases = [
+            (b'Traceback (most recent call last):' + nl + b'  File "<momso>", line 1' + nl + b'RuntimeError: server_busy' + nl + b'ERROR: (gcloud.compute.ssh) plink exited with return code [1].' + nl, 'RuntimeError: server_busy'),
+            (b"subprocess.CalledProcessError: Command '['systemctl', 'stop', 'x']' returned non-zero exit status 5." + nl, 'CalledProcessError: exit 5'),
+            (b'ValueError: token abc123 must not be copied' + nl, None),
+        ]
+        for stderr, expected in cases:
+            self.assertEqual(installer.remote_summary(stderr), expected)
+        with patch.object(installer.shutil, 'which', return_value='gcloud'):
+            provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', self.root / 'fixture-key')
+        result = subprocess.CompletedProcess([], 1, stdout=b'', stderr=cases[0][0])
+        with patch.object(installer.subprocess, 'run', return_value=result):
+            with self.assertRaises(installer.InstallError) as caught:
+                provider._ssh_inline('pass')
+        self.assertEqual((caught.exception.command, caught.exception.remote_error), ('compute ssh', 'RuntimeError: server_busy'))
+
+    def test_only_exact_storage_ls_no_match_counts_as_empty(self):
+        with patch.object(installer.shutil, 'which', return_value='gcloud'):
+            provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', self.root / 'fixture-key')
+        exact = b'ERROR: (gcloud.storage.ls) One or more URLs matched no objects.\n'
+        cases = [
+            (('storage', 'ls', '--buckets', '--soft-deleted'), 1, exact, True),
+            (('storage', 'ls', '--buckets', '--soft-deleted'), 1, b'WARNING: fixture\r\n' + exact, True),
+            (('storage', 'ls', '--buckets', '--soft-deleted'), 2, exact, False),
+            (('storage', 'ls', '--buckets', '--soft-deleted'), 1, b'ERROR: (gcloud.storage.ls) HTTPError 404: The specified bucket does not exist.\n', False),
+            (('storage', 'ls', '--buckets', '--soft-deleted'), 1, b'ERROR: (gcloud.storage.ls) One or more URLs matched no objects. extra\n', False),
+            (('storage', 'objects', 'list', 'gs://fixture/**'), 1, exact, False),
+        ]
+        for args, code, stderr, expected in cases:
+            result = subprocess.CompletedProcess([], code, stdout=b'', stderr=stderr)
+            with patch.object(installer.subprocess, 'run', return_value=result):
+                with self.assertRaises(installer.InstallError) as caught:
+                    provider.run(*args)
+            self.assertIs(caught.exception.no_match, expected, (args, code, stderr))
 
     def test_wrong_account_cannot_reuse_state(self):
         with self.assertRaises(installer.InstallError):

@@ -311,7 +311,13 @@ def main():
     delay = args.poll_seconds
     while True:
         try:
-            wait_for_recovery(monitor, args.poll_seconds)
+            recovered = wait_for_recovery(monitor, args.poll_seconds)
+            if recovered == "resumed":
+                # Record a later success too, so the last diagnostic is not a
+                # stale recovery error from a server that was still starting.
+                print("idle_stop_result result=resumed", flush=True)
+                try: monitor.report("resumed")
+                except OSError: pass
             break
         except Exception as exc:
             reason = "recovery:" + (type(exc).__name__ if type(exc).__module__ == "builtins" else "IdleError")

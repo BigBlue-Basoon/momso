@@ -18,9 +18,10 @@ class GoogleWake:
 
     def _objects(self):
         p = self.p
-        accounts = p.run("iam", "service-accounts", "list", parse=True)
-        roles = p.run("iam", "roles", "list", parse=True)
-        services = p.run("run", "services", "list", f"--region={REGION}", parse=True)
+        from momso_server_install import owned_listing
+        accounts = owned_listing(p, "iam", "service-accounts", "list")
+        roles = owned_listing(p, "iam", "roles", "list")
+        services = owned_listing(p, "run", "services", "list", f"--region={REGION}")
         account = next((x for x in accounts if x.get("email") == self.email), None)
         role = next((x for x in roles if x.get("name", "").endswith("/roles/" + self.role)), None)
         service = next((x for x in services if x.get("metadata", {}).get("name") == self.service), None)
