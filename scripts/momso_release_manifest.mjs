@@ -1,5 +1,6 @@
 // Browser implementation of the S38 Ed25519 raw-manifest verification contract.
 import { SetupError } from './momso_anywhere_setup.mjs';
+import { resolveProductionTrust } from './momso_release_trust.mjs';
 
 function bytes64(value) {
   if (typeof value !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) throw new SetupError('release_not_ready');
@@ -19,13 +20,13 @@ async function download(url, fetchImpl, limit) {
   return data;
 }
 
-export async function verifyRelease(config, { fetchImpl = fetch, cryptoImpl = crypto } = {}) {
+export async function verifyRelease(config, { fetchImpl = fetch, cryptoImpl = crypto, storage = globalThis.localStorage } = {}) {
   try {
     const url = new URL(config.manifestUrl);
     const signature = new URL(url.href);
     signature.pathname += '.sig';
     const [manifest, sig] = await Promise.all([download(url.href, fetchImpl, 65536), download(signature.href, fetchImpl, 1024)]);
-    const spki = bytes64(config.publicKeySpki);
+    const spki = bytes64((config.channel ?? 'production') === 'production' ? await resolveProductionTrust(config, { fetchImpl, cryptoImpl, storage }) : config.publicKeySpki);
     const prefix = '302a300506032b6570032100';
     if (sig.length !== 64 || spki.length !== 44 || [...spki.slice(0, 12)].map(v => v.toString(16).padStart(2, '0')).join('') !== prefix) throw new Error();
     const key = await cryptoImpl.subtle.importKey('spki', spki, { name: 'Ed25519' }, false, ['verify']);

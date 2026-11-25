@@ -6,8 +6,9 @@ import time
 import textwrap
 
 from momso_server_install import InstallError, ZONE
-from momso_iam_retry import bind_custom_role
+from momso_iam_retry import bind_custom_role, reconcile_owned_role
 from momso_managed_history import load as load_managed_history
+from momso_anywhere_vm_resources import names as vm_resource_names
 
 SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
@@ -26,9 +27,10 @@ def _paths():
 
 def identity(provider):
     p = provider
-    name = "mv-" + p.install_id
+    name = vm_resource_names(p)['account']
     email = name + "@" + p.project + ".iam.gserviceaccount.com"
-    role = "momsoStop" + p.install_id
+    role = vm_resource_names(p)['roles'][0]
+    reconcile_owned_role(p, role, {'compute.instances.stop'})
     accounts = p.run("iam", "service-accounts", "list", parse=True)
     existing = next((item for item in accounts if item.get("email") == email), None)
     if existing:
@@ -50,7 +52,7 @@ def identity(provider):
 
 def secret(provider, email):
     p = provider
-    name = "momso-vault-" + p.install_id
+    name = vm_resource_names(p)['vault_secret']
     entries = p.run("secrets", "list", parse=True)
     found = next((v for v in entries if v.get("name", "").endswith("/secrets/" + name)), None)
     if found and found.get("labels", {}).get("momso-install-id") != p.install_id:

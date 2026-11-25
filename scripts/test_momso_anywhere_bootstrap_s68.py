@@ -7,6 +7,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from momso_anywhere_proxy_files import PROXY_FILES
 
 
 class BootstrapSandbox(unittest.TestCase):
@@ -20,10 +21,11 @@ class BootstrapSandbox(unittest.TestCase):
             bundle = root / 'release.tar.gz'
             with tarfile.open(bundle, 'w:gz') as archive:
                 archive.add(artifacts / 'momso-server', arcname='momso-server')
-                for name in ('momso_mobile_proxy.py', 'momso_anywhere_vm_proxy.py',
+                for name in (*[item for item in PROXY_FILES if item != 'server_admission.py'],
                              'momso_anywhere_backup.py', 'momso_anywhere_backup_agent.py',
                              'momso_anywhere_backup_google.py', 'momso_anywhere_vault_identity.py'):
                     archive.add(Path('scripts') / name, arcname=name)
+                archive.add(Path('apps/alpha/desktop/src-tauri/momso-server-update/server_admission.py'), arcname='server_admission.py')
                 for name in ('vault-provision.py', 'idle-stop.py'):
                     content = b'#!/usr/bin/env python3\n'
                     item = tarfile.TarInfo(name)

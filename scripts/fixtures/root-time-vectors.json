@@ -1,0 +1,12 @@
+{
+  "now": "2028-06-01T00:00:00Z",
+  "bootstrapExpires": "2031-01-01T00:00:00Z",
+  "cases": [
+    {"name":"expired_intermediate_valid_at_rotation", "firstIssued":"2026-01-01T00:00:00Z", "firstExpires":"2027-01-01T00:00:00Z", "secondIssued":"2026-06-01T00:00:00Z", "secondExpires":"2030-01-01T00:00:00Z", "signers":2, "accepted":true},
+    {"name":"previous_root_expired_at_rotation", "firstIssued":"2026-01-01T00:00:00Z", "firstExpires":"2027-01-01T00:00:00Z", "secondIssued":"2027-02-01T00:00:00Z", "secondExpires":"2030-01-01T00:00:00Z", "signers":2, "accepted":false},
+    {"name":"current_root_expired", "firstIssued":"2026-01-01T00:00:00Z", "firstExpires":"2027-01-01T00:00:00Z", "secondIssued":"2026-06-01T00:00:00Z", "secondExpires":"2028-01-01T00:00:00Z", "signers":2, "accepted":false},
+    {"name":"issuance_time_reversed", "firstIssued":"2026-06-01T00:00:00Z", "firstExpires":"2027-01-01T00:00:00Z", "secondIssued":"2026-05-01T00:00:00Z", "secondExpires":"2030-01-01T00:00:00Z", "signers":2, "accepted":false},
+    {"name":"only_one_signature", "firstIssued":"2026-01-01T00:00:00Z", "firstExpires":"2027-01-01T00:00:00Z", "secondIssued":"2026-06-01T00:00:00Z", "secondExpires":"2030-01-01T00:00:00Z", "signers":1, "accepted":false},
+    {"name":"future_issuance", "firstIssued":"2026-01-01T00:00:00Z", "firstExpires":"2030-01-01T00:00:00Z", "secondIssued":"2029-01-01T00:00:00Z", "secondExpires":"2030-01-01T00:00:00Z", "signers":2, "accepted":false}
+  ]
+}

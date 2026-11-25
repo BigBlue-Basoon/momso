@@ -29,23 +29,24 @@ test('address recovery signs in and returns discovered addresses without storing
   assert.deepEqual(result, ['https://fixture.a.run.app']);
 });
 
-test('return from Google setup retries the saved action without persisting tokens', async () => {
+test('Google setup opens a separate tab and keeps the saved action', async () => {
   clearStartAuthorization();
   const memory = new Map([['momso.start.retry.v1', JSON.stringify({ action: 'billing', projectId: 'fixture-project', billingAccountName: null, installationId: null })]]);
   const session = { getItem: k => memory.get(k) ?? null, setItem: (k, v) => memory.set(k, v), removeItem: k => memory.delete(k) };
   const location = { origin: 'https://start.example.test', href: 'https://start.example.test/start/', assign(value) { this.assigned = value; } };
-  openGoogleSetup({ destination: 'billing', session, location });
-  assert.equal(location.assigned, 'https://console.cloud.google.com/billing');
-  const result = await resumeAfterRedirect({ clientId: 'fixture.apps.googleusercontent.com', release: {}, session, location, storage: session, cryptoImpl: webcrypto, fragment: '' });
-  assert.equal(result.kind, 'redirecting');
-  assert.equal(new URL(location.assigned).hostname, 'accounts.google.com');
+  let opened;
+  openGoogleSetup({ destination: 'billing', session, open: (...args) => { opened = args; } });
+  assert.deepEqual(opened, ['https://console.cloud.google.com/billing', '_blank', 'noopener,noreferrer']);
+  assert.equal(JSON.parse(memory.get('momso.start.retry.v1')).action, 'billing');
   assert(!JSON.stringify([...memory]).includes('access_token'));
   assert.equal(memory.has('momso.start.cloud-return.v1'), false);
 });
 
-test('Google setup refuses arbitrary destinations and missing retry state', () => {
-  const session = { getItem: () => null, setItem: () => assert.fail('unexpected state') };
-  const location = { assign: () => assert.fail('unexpected navigation') };
-  assert.throws(() => openGoogleSetup({ destination: 'https://example.test', session, location }), { step: 'invalid_destination' });
-  assert.throws(() => openGoogleSetup({ destination: 'billing', session, location }), { step: 'checkpoint_unavailable' });
+test('Google setup accepts first entry and refuses arbitrary destinations', () => {
+  const data = new Map();
+  const session = { getItem: key => data.get(key), setItem: (key, value) => data.set(key, value) };
+  const open = () => {};
+  assert.throws(() => openGoogleSetup({ destination: 'https://example.test', session, open }), { step: 'invalid_destination' });
+  openGoogleSetup({ destination: 'billing', session, open });
+  assert.equal(JSON.parse(data.get('momso.start.retry.v1')).action, 'billing');
 });

@@ -146,7 +146,7 @@ class CloudStorage:
 
     @staticmethod
     def _name(slot):
-        if not isinstance(slot, int) or not 0 <= slot < 7:
+        if type(slot) is not int or not 0 <= slot < 8:
             raise ValueError("invalid backup slot")
         return f"momso-backup/slot-{slot}.enc"
 
@@ -191,6 +191,8 @@ class CloudStorage:
         self.client.request(url, data=data, content_type="application/octet-stream")
 
     def write(self, slot, data):
+        if slot == 7:
+            raise ValueError('temporary slot requires conditional creation')
         query = urllib.parse.urlencode({"uploadType": "media", "name": self._name(slot)})
         url = f"https://storage.googleapis.com/upload/storage/v1/b/{self.bucket}/o?{query}"
         self.client.request(url, data=data, content_type="application/octet-stream")
@@ -210,11 +212,25 @@ class CloudStorage:
         return generation, self.client.request(self._object(slot) + "?" + query)
 
     def replace_if_generation(self, slot, generation, data):
+        if slot == 7:
+            raise ValueError('temporary slot cannot be replaced')
         if not isinstance(generation, str) or not generation.isascii() or not generation.isdigit() or len(generation) > 32:
             raise ValueError("invalid storage generation")
         query = urllib.parse.urlencode({"uploadType": "media", "name": self._name(slot), "ifGenerationMatch": generation})
         url = f"https://storage.googleapis.com/upload/storage/v1/b/{self.bucket}/o?{query}"
         self.client.request(url, data=data, content_type="application/octet-stream")
+
+    def create_slot_if_absent(self, slot, data):
+        """Atomically create a slot without overwriting a current object."""
+        query = urllib.parse.urlencode({'uploadType': 'media', 'name': self._name(slot), 'ifGenerationMatch': '0'})
+        self.client.request(f'https://storage.googleapis.com/upload/storage/v1/b/{self.bucket}/o?{query}', data=data, content_type='application/octet-stream')
+
+    def delete_slot_if_generation(self, slot, generation):
+        """Delete only the exact generation inspected by the caller."""
+        if not isinstance(generation, str) or not generation.isascii() or not generation.isdigit() or not 0 < len(generation) <= 32 or generation == '0':
+            raise ValueError('invalid storage generation')
+        query = urllib.parse.urlencode({'ifGenerationMatch': generation})
+        self.client.request(self._object(slot) + '?' + query, method='DELETE')
 
     @staticmethod
     def _chunk_name(identifier, index):
@@ -232,7 +248,12 @@ class CloudStorage:
 
     def read_chunk(self, identifier, index):
         name = urllib.parse.quote(self._chunk_name(identifier, index), safe="")
-        return self.client.request(f"https://storage.googleapis.com/storage/v1/b/{self.bucket}/o/{name}?alt=media")
+        try:
+            return self.client.request(f"https://storage.googleapis.com/storage/v1/b/{self.bucket}/o/{name}?alt=media")
+        except GoogleBackupError as error:
+            if str(error) == 'cloud_request_failed_404':
+                raise FileNotFoundError('backup_chunk_missing') from None
+            raise
 
     def delete_current_chunk_if_unchanged(self, identifier, index):
         """Delete only the observed live generation; caller must handle retention and older versions."""

@@ -8,14 +8,15 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit
 import momso_release_keys
+import momso_anywhere_update_install
 
 
 MODULES = ("momso_anywhere_start.mjs", "momso_anywhere_google_browser.mjs",
            "momso_anywhere_deletion_contract.mjs", "momso_anywhere_delete_result.mjs",
            "momso_anywhere_discard_backup.mjs", "momso_anywhere_test_backup_cleanup_s117.mjs",
-           "momso_anywhere_project_exclusivity.mjs",
-           "momso_anywhere_setup.mjs", "momso_anywhere_vm_startup.mjs", "momso_anywhere_cloud_run_revision.mjs", "momso_anywhere_gateway_failure.mjs",
-           "momso_release_manifest.mjs",
+           "momso_anywhere_project_exclusivity.mjs", "momso_anywhere_iam_policy.mjs",
+           "momso_anywhere_setup.mjs", "momso_anywhere_vm_startup.mjs", "momso_anywhere_proxy_files.json", "momso_anywhere_cloud_run_revision.mjs", "momso_anywhere_gateway_failure.mjs",
+           "momso_release_manifest.mjs", "momso_release_trust.mjs",
            "momso_anywhere_oauth_capture.mjs", "momso_anywhere_oauth_redirect.mjs", "momso_anywhere_pause_transfer.mjs",
            "momso_anywhere_backup_setup.mjs")
 
@@ -45,14 +46,15 @@ def https_url(value, origin=False):
     return parsed.netloc in (parsed.hostname, parsed.hostname + ":443") and parsed.path.startswith("/")
 
 
-def prepare(dist, output, client_id, manifest_url, public_key, login_origin, trusted=(), channel='production'):
+def prepare(dist, output, client_id, manifest_url, public_key, login_origin, trusted=(), channel='production', root_path=None):
     dist, output = Path(dist).resolve(), Path(output).resolve()
     if not re.fullmatch(r"[A-Za-z0-9._-]+\.apps\.googleusercontent\.com", client_id):
         raise ValueError("invalid_client")
     image_pattern = r"[a-z0-9.-]+/[a-z0-9._/-]+@sha256:[a-f0-9]{64}"
     try:
         spki = momso_release_keys.validate(channel, public_key)
-    except ValueError as error:
+        bootstrap = momso_anywhere_update_install.production_bootstrap(public_key, root_path) if channel == 'production' else None
+    except (ValueError, momso_anywhere_update_install.InstallError) as error:
         raise ValueError('invalid_release') from error
     if not https_url(manifest_url) or not https_url(login_origin, origin=True) or any(not re.fullmatch(image_pattern, image) for image in trusted):
         raise ValueError("invalid_release")
@@ -102,6 +104,8 @@ def prepare(dist, output, client_id, manifest_url, public_key, login_origin, tru
     for name in MODULES:
         shutil.copyfile(scripts / name, output / name)
     release = {"manifestUrl": manifest_url, "publicKeySpki": base64.b64encode(spki).decode('ascii'), "loginOrigin": login_origin, "channel": channel}
+    if bootstrap is not None:
+        release['trustBootstrap'] = base64.b64encode(bootstrap).decode('ascii')
     if trusted:
         release["trustedGatewayImages"] = list(trusted)
     (output / "config.json").write_text(json.dumps({"clientId": client_id, "release": release}, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -114,13 +118,14 @@ def main():
     parser.add_argument("--client-id", required=True)
     parser.add_argument("--release-manifest-url", required=True)
     parser.add_argument("--release-public-key", type=Path, required=True)
+    parser.add_argument("--release-root", type=Path)
     parser.add_argument("--release-channel", choices=['production', 'development'], default='production')
     parser.add_argument("--login-origin", required=True)
     parser.add_argument("--trusted-gateway-image", action="append", default=[])
     args = parser.parse_args()
     try:
         prepare(args.dist, args.output, args.client_id, args.release_manifest_url, args.release_public_key,
-                args.login_origin, args.trusted_gateway_image, args.release_channel)
+                args.login_origin, args.trusted_gateway_image, args.release_channel, args.release_root)
     except (OSError, ValueError) as error:
         reason = str(error)
         if reason not in {"invalid_client", "invalid_release", "invalid_paths", "unsafe_build", "development_key_in_build", "build_overlap", "unsafe_build_script", "build_base_must_be_start", "missing_build_asset", "unexpected_build_asset", "screen_resume_missing", "missing_module_entry"}:

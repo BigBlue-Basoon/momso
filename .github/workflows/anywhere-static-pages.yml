@@ -17,6 +17,7 @@ jobs:
       - name: Check required reviewed inputs
         run: |
           test -f scripts/momso_release_public_key.pem
+          test -f scripts/momso_release_root.json
           test -f apps/alpha/desktop/login-page/index.html
           test -f apps/alpha/desktop/src/start/StartScreen.tsx
           test -n "$CLIENT_ID"

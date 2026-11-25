@@ -1,9 +1,8 @@
 //! Tool-enabled API conversation. The host owns policy, approvals, credentials,
 //! OTP handling, and the S22/S33/S32 tool implementations.
-use crate::{
-    transport::{Message, Role},
-    ApiKey, Provider,
-};
+#[cfg(test)]
+use crate::transport::Role;
+use crate::{transport::Message, ApiKey, Provider};
 use serde_json::{json, Value};
 use std::{collections::HashSet, future::Future, pin::Pin};
 use tokio::sync::watch;
@@ -62,21 +61,26 @@ pub struct MomsoTools<D> {
 }
 
 #[cfg(target_os = "linux")]
-impl<D: MomsoDispatch> ToolHost for MomsoTools<D> {
-    fn definitions(&self) -> Vec<Value> {
-        let mut tools = momso_server_browser::tools::tool_definitions()
+pub fn momso_tool_definitions() -> Vec<Value> {
+    let mut tools = momso_server_browser::tools::tool_definitions()
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    tools.extend(
+        momso_server_crm::tool_definitions()
             .as_array()
             .cloned()
-            .unwrap_or_default();
-        tools.extend(
-            momso_server_crm::tool_definitions()
-                .as_array()
-                .cloned()
-                .unwrap_or_default(),
-        );
-        tools.push(json!({"name":"momso_skill_read","description":"Read an enabled momso skill by name.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}));
-        tools.push(json!({"name":"momso_dictionary_search","description":"Find terms in the momso dictionary.","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}));
-        tools
+            .unwrap_or_default(),
+    );
+    tools.push(json!({"name":"momso_skill_read","description":"Read an enabled momso skill by name.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}));
+    tools.push(json!({"name":"momso_dictionary_search","description":"Find terms in the momso dictionary.","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}));
+    tools
+}
+
+#[cfg(target_os = "linux")]
+impl<D: MomsoDispatch> ToolHost for MomsoTools<D> {
+    fn definitions(&self) -> Vec<Value> {
+        momso_tool_definitions()
     }
     fn dispatch<'a>(
         &'a mut self,
@@ -163,6 +167,18 @@ pub async fn chat_with_tools(
     cancel: watch::Receiver<bool>,
     emit: impl FnMut(&str, usize),
 ) -> Result<(), &'static str> {
+    chat_with_tools_settings(turn, host, cancel, emit, None, false, None).await
+}
+
+pub async fn chat_with_tools_settings(
+    turn: ToolTurn<'_>,
+    host: &mut impl ToolHost,
+    cancel: watch::Receiver<bool>,
+    emit: impl FnMut(&str, usize),
+    effort: Option<&str>,
+    fast: bool,
+    fixture_endpoint: Option<&str>,
+) -> Result<(), &'static str> {
     let endpoint = match turn.provider {
         Provider::Claude => "https://api.anthropic.com/v1/messages".to_string(),
         Provider::Gemini => format!(
@@ -170,15 +186,47 @@ pub async fn chat_with_tools(
             turn.model
         ),
     };
-    run_at(turn, host, cancel, emit, &endpoint).await
+    let fixture_url = if let Some(value) = fixture_endpoint {
+        if !cfg!(all(debug_assertions, feature = "test-fixtures")) {
+            return Err("invalid_arguments");
+        }
+        let mut url = reqwest::Url::parse(value).map_err(|_| "invalid_arguments")?;
+        if url.scheme() != "http"
+            || url.host_str() != Some("127.0.0.1")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("invalid_arguments");
+        }
+        url.query_pairs_mut()
+            .append_pair("fixture_model", turn.model);
+        Some(url.to_string())
+    } else {
+        None
+    };
+    let endpoint = fixture_url.as_deref().unwrap_or(&endpoint);
+    run_at_with_settings(turn, host, cancel, emit, endpoint, effort, fast).await
 }
 
+#[cfg(test)]
 async fn run_at(
+    turn: ToolTurn<'_>,
+    host: &mut impl ToolHost,
+    cancel: watch::Receiver<bool>,
+    emit: impl FnMut(&str, usize),
+    endpoint: &str,
+) -> Result<(), &'static str> {
+    run_at_with_settings(turn, host, cancel, emit, endpoint, None, false).await
+}
+
+async fn run_at_with_settings(
     turn: ToolTurn<'_>,
     host: &mut impl ToolHost,
     mut cancel: watch::Receiver<bool>,
     mut emit: impl FnMut(&str, usize),
     endpoint: &str,
+    effort: Option<&str>,
+    fast: bool,
 ) -> Result<(), &'static str> {
     if turn.model.is_empty()
         || turn.model.len() > 128
@@ -193,10 +241,7 @@ async fn run_at(
         return Err("invalid_arguments");
     }
     let (tools, names) = definitions(turn.provider, &host.definitions())?;
-    let mut history:Vec<Value>=turn.messages.iter().map(|m| match turn.provider {
-        Provider::Claude=>json!({"role":match m.role {Role::User=>"user",Role::Assistant=>"assistant"},"content":m.text}),
-        Provider::Gemini=>json!({"role":match m.role {Role::User=>"user",Role::Assistant=>"model"},"parts":[{"text":m.text}]}),
-    }).collect();
+    let mut history = crate::transport::encode_messages(turn.provider, turn.messages)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -210,23 +255,74 @@ async fn run_at(
         if *cancel.borrow() {
             return Err("cancelled");
         }
+        let mut payload = match turn.provider {
+            Provider::Claude => {
+                json!({"model":turn.model,"messages":history,"max_tokens":4096,"tools":tools})
+            }
+            Provider::Gemini => {
+                json!({"contents":history,"tools":[{"functionDeclarations":tools}]})
+            }
+        };
+        if let Some(effort) = effort {
+            match turn.provider {
+                Provider::Claude
+                    if matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") =>
+                {
+                    payload["output_config"] = json!({"effort":effort})
+                }
+                Provider::Gemini if crate::models::gemini_efforts(turn.model).contains(&effort) => {
+                    payload["generationConfig"] = json!({"thinkingConfig":{"thinkingLevel":effort}})
+                }
+                _ => return Err("invalid_arguments"),
+            }
+        }
+        if fast {
+            if turn.provider != Provider::Claude
+                || !crate::models::claude_fast_supported(turn.model)
+            {
+                return Err("fast_unavailable");
+            }
+            payload["speed"] = json!("fast");
+        }
+        let limit = if turn.provider == Provider::Claude {
+            128_000_000
+        } else {
+            20_000_000
+        };
+        if serde_json::to_vec(&payload)
+            .map_err(|_| "invalid_arguments")?
+            .len()
+            > limit
+        {
+            return Err(
+                if turn
+                    .messages
+                    .iter()
+                    .any(|message| !message.attachments.is_empty())
+                {
+                    "attachment_requires_file_api"
+                } else {
+                    "provider_request_too_large"
+                },
+            );
+        }
         let req = match turn.provider {
             Provider::Claude => client
                 .post(endpoint)
                 .header("x-api-key", turn.key.expose_to_transport())
                 .header("anthropic-version", "2023-06-01")
-                .json(
-                    &json!({"model":turn.model,"messages":history,"max_tokens":4096,"tools":tools}),
-                ),
+                .json(&payload),
             Provider::Gemini => client
                 .post(endpoint)
                 .header("x-goog-api-key", turn.key.expose_to_transport())
-                .json(&json!({"contents":history,"tools":[{"functionDeclarations":tools}]})),
+                .json(&payload),
         };
         let mut response = tokio::select! { _=cancel.changed()=>return Err("cancelled"), r=req.send()=>r.map_err(|_|"provider_unavailable")? };
         if !response.status().is_success() {
             return Err(if matches!(response.status().as_u16(), 401 | 403) {
                 "auth_failed"
+            } else if fast && matches!(response.status().as_u16(), 400 | 429 | 529) {
+                "fast_unavailable"
             } else {
                 "provider_failed"
             });

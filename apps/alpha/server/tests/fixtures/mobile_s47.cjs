@@ -25,6 +25,7 @@ async function main() {
   const proxy = http.createServer((request, response) => {
     const headers = { ...request.headers, host: target.host, authorization: 'Bearer test-only-token' }
     const upstream = http.request({ hostname: target.hostname, port: target.port, path: request.url, method: request.method, headers }, (result) => {
+      if (result.statusCode >= 400) console.error('fixture upstream error:', request.method, request.url.split('?')[0], result.statusCode)
       response.writeHead(result.statusCode, result.headers)
       result.pipe(response)
     })
@@ -38,12 +39,18 @@ async function main() {
   const browser = await chromium.launch({ executablePath: process.env.MOMSO_TEST_CHROMIUM, headless: true })
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 1 })
-    await page.goto(`http://127.0.0.1:${proxy.address().port}/`, { waitUntil: 'domcontentloaded' })
+    page.on('pageerror', error => console.error('fixture page error:', error.message))
+    await page.goto(`http://127.0.0.1:${proxy.address().port}/?network`, { waitUntil: 'domcontentloaded' })
     const input = page.getByRole('textbox', { name: '메시지 입력' })
     await input.waitFor({ state: 'visible', timeout: 30000 })
     await input.fill(`otp fixture http://127.0.0.1:${site.address().port}/captcha`)
     await page.getByRole('button', { name: '보내기', exact: true }).click()
-    await page.getByText('사이트가 본인 확인을 더 요구합니다', { exact: false }).waitFor({ state: 'visible', timeout: 30000 })
+    try {
+      await page.getByText('사이트가 본인 확인을 더 요구합니다', { exact: false }).waitFor({ state: 'visible', timeout: 30000 })
+    } catch (error) {
+      console.error('fixture page text:', await page.locator('body').innerText())
+      throw error
+    }
     console.log('human-required: visible')
     await page.screenshot({ path: process.env.MOMSO_S47_SCREENSHOT })
 
@@ -57,7 +64,12 @@ async function main() {
     await input.fill(`otp fixture http://127.0.0.1:${site.address().port}/otp`)
     await page.getByRole('button', { name: '보내기', exact: true }).click()
     const otp = page.getByRole('group', { name: '인증 번호 넣기' })
-    await otp.waitFor({ state: 'visible', timeout: 30000 })
+    try {
+      await otp.waitFor({ state: 'visible', timeout: 30000 })
+    } catch (error) {
+      console.error('fixture OTP page text:', await page.locator('body').innerText())
+      throw error
+    }
     await page.screenshot({ path: `${process.env.MOMSO_S47_SCREENSHOT}.otp.png` })
     await otp.locator('input[data-field="code"]').fill('649217')
     await otp.getByRole('button', { name: '보내기', exact: true }).click()

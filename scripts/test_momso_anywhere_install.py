@@ -181,6 +181,18 @@ class Tests(unittest.TestCase):
                 gateway.upgrade_gateway('https://fixture.a.run.app', IMAGE)
         self.assertEqual(provider.traffic, 'fixture-old')
 
+    def test_failed_private_health_probe_restores_old_revision(self):
+        provider = Provider()
+        gateway = anywhere.GoogleAnywhere(provider)
+        provider.service = {'metadata': {'name': gateway.service, 'labels': {'momso-install-id': provider.install_id}}}
+        def fail():
+            raise anywhere.InstallError('proxy_not_running', gateway_code='proxy_not_running')
+        with self.assertRaises(anywhere.InstallError) as error:
+            gateway.upgrade_gateway('https://fixture.a.run.app', IMAGE, health_check=fail)
+        self.assertEqual(provider.traffic, 'fixture-old')
+        self.assertEqual(error.exception.gateway_failure['code'], 'proxy_not_running')
+        self.assertTrue(error.exception.gateway_failure['rolledBack'])
+
     def test_new_role_iam_retry_is_bounded(self):
         p = Provider()
         original = p.run

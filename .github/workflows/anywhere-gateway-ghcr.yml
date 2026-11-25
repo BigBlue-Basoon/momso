@@ -50,9 +50,5 @@ jobs:
         run: |
           set -eu
           IMAGE="ghcr.io/$OWNER/momso-gateway@$DIGEST"
-          TYPE="$(docker buildx imagetools inspect "$IMAGE" --raw | jq -er '.mediaType')"
-          case "$TYPE" in
-            application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json) ;;
-            *) printf 'Refusing non-image manifest: %s\n' "$TYPE" >&2; exit 1 ;;
-          esac
+          python3 scripts/momso_release_sign.py verify-gateway --image "$IMAGE"
           printf 'Gateway image for release signing: %s\n' "$IMAGE"

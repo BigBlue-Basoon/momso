@@ -30,9 +30,12 @@ class StaticSiteTests(unittest.TestCase):
         public.write_text('-----BEGIN PUBLIC KEY-----\n' + base64.b64encode(keys.PREFIX + b'\x11' * 32).decode() + '\n-----END PUBLIC KEY-----\n')
         for name, value in [('PRODUCTION_KEY', public), ('DEVELOPMENT_KEY', root / 'absent.pem')]:
             handle = patch.object(keys, name, value); handle.start(); self.addCleanup(handle.stop)
+        roots = [base64.b64encode(keys.PREFIX + bytes([value]) * 32).decode() for value in (0x11, 0x33, 0x44)]
+        root_file = root / 'trust.json'
+        root_file.write_text(json.dumps({'version': 0, 'expires': '2099-01-01T00:00:00Z', 'threshold': 2, 'keys': roots, 'releaseKey': roots[0]}))
         self.options = dict(output=root / 'output', login_page=login, web=web, start_dist=dist,
                             client_id='fixture.apps.googleusercontent.com', manifest_url='https://example.test/release.json',
-                            public_key=public, login_origin='https://example.test')
+                            public_key=public, login_origin='https://example.test', root_path=root_file)
 
     def test_combines_static_routes_and_preserves_login_screen(self):
         site.prepare(**self.options)

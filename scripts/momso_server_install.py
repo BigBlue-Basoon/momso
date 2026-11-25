@@ -113,12 +113,14 @@ def cleanup_keys(directory: Path, install_id: str) -> None:
 class GoogleProvider:
     def __init__(self, account: str, project: str, install_id: str, key_file: Path):
         self.account, self.project, self.install_id = account, project, install_id
-        self.name = f"momso-{install_id}"
-        self.network = f"{self.name}-net"
-        self.subnet = f"{self.name}-sub"
-        self.firewall = f"{self.name}-iap"
-        self.router = f"{self.name}-router"
-        self.nat = f"{self.name}-nat"
+        from momso_anywhere_vm_resources import names
+        resources = names(self)
+        self.name = resources['machine']
+        self.network = resources['network']
+        self.subnet = resources['subnet']
+        self.firewall = resources['firewall']
+        self.router = resources['router']
+        self.nat = resources['nat']
         self.marker = f"momso-install-{install_id}"
         self.key_file = key_file
         self.gcloud = shutil.which("gcloud") or shutil.which("gcloud.cmd")
@@ -256,6 +258,7 @@ src=SOURCE
 assert hashlib.sha256(open(src,'rb').read()).hexdigest()==DIGEST
 def run(*args): subprocess.run(args,check=True,stdout=subprocess.DEVNULL)
 missing=[name for name in ('git','ffmpeg') if not shutil.which(name)]
+if not any(shutil.which(name) for name in ('google-chrome','google-chrome-stable','chromium','chromium-browser')): missing.append('chromium')
 if missing:
  os.environ['DEBIAN_FRONTEND']='noninteractive';run('apt-get','update','-qq');run('apt-get','install','-y','-qq',*missing)
 if subprocess.run(['id','momso'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode: run('useradd','--system','--create-home','--home-dir','/var/lib/momso','--shell','/usr/sbin/nologin','momso')
@@ -299,7 +302,7 @@ req=urllib.request.Request('https://127.0.0.1:8766/health',headers={'Authorizati
 with urllib.request.urlopen(req,context=ctx,timeout=3) as response:assert json.load(response).get('state')=='ready'
 """
 for attempt in range(12):
- if subprocess.run(['sudo','python3','-c',check],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0:break
+ if subprocess.run(['systemctl','is-active','--quiet','momso-private-proxy'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0 and subprocess.run(['sudo','python3','-c',check],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0:break
  if attempt==11:raise RuntimeError('private_proxy_unavailable')
  time.sleep(1)
 '''
@@ -308,12 +311,37 @@ for attempt in range(12):
         except (InstallError, OSError, subprocess.SubprocessError) as error:
             raise InstallError("입구 연결을 다시 확인하지 못했습니다. 서버와 입구 상태를 확인하세요.") from error
 
+    def gateway_proxy_health(self, url):
+        if not re.fullmatch(r'https://[a-z0-9.-]+\.run\.app', url or ''):
+            raise InstallError('proxy_not_running')
+        code = r'''import hashlib,hmac,json,time,urllib.request
+token=open('/etc/momso-private/transport-token','rb').read().strip()
+proof=hmac.new(token,b'momso-proxy-health-v1',hashlib.sha256).hexdigest()
+request=urllib.request.Request(URL+'/__momso/proxy-health',headers={'X-Momso-Health-Proof':proof})
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+ def redirect_request(self,*args,**kwargs):return None
+opener=urllib.request.build_opener(NoRedirect())
+for attempt in range(30):
+ try:
+  with opener.open(request,timeout=5) as response:
+   if response.status==200 and json.load(response).get('state')=='ready':break
+ except Exception:pass
+ time.sleep(1)
+else:raise RuntimeError('proxy_not_running')
+'''.replace('URL', repr(url))
+        wrapper = "import base64,subprocess; subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(base64.b64encode(code.encode()).decode()) + ").decode()],check=True)"
+        try:
+            self.ssh(wrapper)
+        except (InstallError, OSError, subprocess.SubprocessError) as error:
+            raise InstallError('proxy_not_running', gateway_code='proxy_not_running') from error
+
     def upgrade_checkpoint(self, action):
         if action not in ("begin", "restore", "release", "finish"):
             raise ValueError("invalid upgrade action")
         snapshots = Path(__file__).resolve().parent.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/data_snapshots.py'
         snapshot_code = base64.b64encode(snapshots.read_bytes()).decode('ascii')
         managed_code = base64.b64encode((Path(__file__).resolve().parent / 'momso_managed_files.py').read_bytes()).decode('ascii')
+        from momso_anywhere_proxy_files import PROXY_FILES
         code = r'''import base64,fcntl,json,os,shutil,subprocess,tempfile,time,urllib.error,urllib.request
 root='/opt/momso';backup=root+'/.momso-upgrade-backup';env='/etc/momso-server.env'
 marker=root+'/releases/.momso-update-active';current=root+'/releases/current';override='/etc/systemd/system/momso-server.service.d/momso-update.conf'
@@ -379,6 +407,12 @@ if action=='begin':
    with open(stage+'/snapshot-name','w') as f:f.write(os.path.basename(snap))
    if os.path.exists(env):shutil.copy2(env,stage+'/server.env')
    if active:shutil.copy2(os.path.dirname(marker)+'/installed.json',stage+'/installed.json')
+   os.mkdir(stage+'/proxy')
+   for name in PROXY_NAMES:
+    source=os.path.join(root,name)
+    if os.path.lexists(source):
+     assert os.path.isfile(source) and not os.path.islink(source)
+     shutil.copy2(source,os.path.join(stage,'proxy',name))
    with open(stage+'/mode','w') as f:f.write(mode)
    with open(stage+'/owner','w') as f:f.write('momso-upgrade-v1')
    os.rename(stage,backup)
@@ -407,6 +441,14 @@ def restore_checkpoint():
  DataSnapshots(data,backup+'/snapshots').restore(backup+'/snapshots/'+name)
  tmp=root+'/.momso-server-restore';shutil.copy2(backup+'/momso-server',tmp);os.replace(tmp,server)
  restored_pair=True
+ if os.path.isdir(backup+'/proxy'):
+  for name in PROXY_NAMES:
+   target=os.path.join(root,name);source=os.path.join(backup,'proxy',name)
+   if os.path.isfile(source):
+    shutil.copy2(source,target+'.restore');os.replace(target+'.restore',target)
+   elif os.path.lexists(target):
+    assert os.path.isfile(target) and not os.path.islink(target)
+    os.unlink(target)
  staged=tempfile.mkdtemp(prefix='.momso-web-restore-',dir=root);os.rmdir(staged)
  try:
   shutil.copytree(backup+'/web',staged,symlinks=True)
@@ -418,6 +460,9 @@ def restore_checkpoint():
  if os.path.isfile(backup+'/installed.json'):shutil.copy2(backup+'/installed.json',os.path.dirname(marker)+'/installed.json')
  subprocess.run(['systemctl','reset-failed','momso-server'],check=False)
  subprocess.run(['systemctl','start','momso-server'],check=True)
+ if os.path.isdir(backup+'/proxy'):
+  subprocess.run(['systemctl','reset-failed','momso-private-proxy'],check=False)
+  subprocess.run(['systemctl','restart','momso-private-proxy'],check=True)
  if errors:raise RuntimeError('rollback_failed')
 if action=='restore':
  restored_pair=False
@@ -442,7 +487,7 @@ elif action=='finish':
  owned()
  if open(backup+'/mode').read()=='gated':call('/maintenance/release','POST')
  shutil.rmtree(backup)
-'''.replace("ACTION", repr(action)).replace("SNAPSHOT_CODE", repr(snapshot_code)).replace("MANAGED_CODE", repr(managed_code)).replace("INSTALL_OWNER", repr(self.install_id))
+'''.replace("ACTION", repr(action)).replace("SNAPSHOT_CODE", repr(snapshot_code)).replace("MANAGED_CODE", repr(managed_code)).replace("INSTALL_OWNER", repr(self.install_id)).replace('PROXY_NAMES', repr(PROXY_FILES))
         encoded = base64.b64encode(code.encode()).decode()
         wrapper = "import base64,subprocess,sys; r=subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],capture_output=True); print('momso_server_busy' if r.returncode and b'server_busy' in r.stderr else 'momso_restore_failed' if r.returncode and " + repr(action == 'restore') + " else 'momso_checkpoint_failed' if r.returncode else 'momso_checkpoint_ok')"
         result = self.ssh(wrapper).strip()
@@ -610,7 +655,7 @@ def deploy(provider, artifact: Path, digest: str, state_path: Path, state: dict)
         save_state(state_path, state)
 
 
-def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_id, owner_sub, login_origin, gateway_image, signed_sequence=None):
+def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_id, owner_sub, login_origin, gateway_image, signed_sequence=None, *, update_settings=None):
     import momso_anywhere_install
     from momso_anywhere_public_assets import from_web_archive
 
@@ -652,9 +697,21 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
             provider.health()
             import momso_anywhere_vm_services
             momso_anywhere_vm_services.install(provider, allow_upgrade_gate=True)
-            momso_anywhere_install.GoogleAnywhere(provider).upgrade_gateway(configured["url"], gateway_image)
+            try:
+                momso_anywhere_install.install_private_proxy(provider)
+                provider.ensure_private_proxy()
+            except (InstallError, OSError, subprocess.SubprocessError) as error:
+                raise InstallError('proxy_not_running', gateway_code='proxy_not_running', gateway_failure={'code': 'proxy_not_running', 'rolledBack': True, 'retryable': True}) from error
             if signed_sequence is not None:
                 provider.upgrade_sequence(signed_sequence, commit=True)
+            def verify_installed_gateway():
+                if update_settings is not None:
+                    import momso_anywhere_update_install
+                    momso_anywhere_update_install.install(provider, *update_settings, gate_already_held=True, health_url=configured['url'])
+                else:
+                    provider.ensure_private_proxy()
+                    provider.gateway_proxy_health(configured['url'])
+            momso_anywhere_install.GoogleAnywhere(provider).upgrade_gateway(configured["url"], gateway_image, health_check=verify_installed_gateway)
         except (InstallError, OSError, subprocess.SubprocessError) as error:
             restored = False
             gateway_detail = getattr(error, 'gateway_failure', None)
@@ -682,13 +739,14 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
         return configured["url"]
     finally:
         previous_error = sys.exc_info()[1]
-        try:
-            provider.ensure_private_proxy()
-        except (InstallError, OSError, subprocess.SubprocessError) as proxy_error:
-            detail = getattr(previous_error, 'gateway_failure', None)
-            if detail:
-                raise InstallError('입구 전환 실패 뒤 프록시 상태를 확인하지 못했습니다.', gateway_failure={**detail, 'retryable': False}) from proxy_error
-            raise
+        if previous_error is not None:
+            try:
+                provider.ensure_private_proxy()
+            except (InstallError, OSError, subprocess.SubprocessError) as proxy_error:
+                detail = getattr(previous_error, 'gateway_failure', None)
+                if detail:
+                    raise InstallError('입구 전환 실패 뒤 프록시 상태를 확인하지 못했습니다.', gateway_failure={**detail, 'retryable': False}) from proxy_error
+                raise
 
 
 # Files distributed with the installer, checked before any customer resources change.
@@ -709,6 +767,11 @@ INSTALLER_FILES = (
     "apps/alpha/desktop/src-tauri/momso-server-update/units/vault.conf",
     "apps/alpha/desktop/src-tauri/momso-server-update/ensure_gcloud.py",
     "scripts/momso_anywhere_update_install.py",
+    "scripts/momso_anywhere_proxy_files.py",
+    "scripts/momso_anywhere_proxy_files.json",
+    "scripts/momso_anywhere_vm_resources.py",
+    "scripts/momso_anywhere_iam_policy.py",
+    "scripts/momso_anywhere_iam_pc.py",
     "scripts/momso_managed_files.py",
     "scripts/momso_managed_history.py",
     "scripts/momso_managed_history.json",
@@ -748,6 +811,7 @@ def main(argv=None):
     parser.add_argument("--release-channel", choices=['production', 'development'], default='production')
     args = parser.parse_args(argv)
     state = None
+    iam_verified = False
     try:
         if args.action == "anywhere":
             validate_installer_files()
@@ -766,7 +830,17 @@ def main(argv=None):
             import momso_release_keys
             try:
                 momso_release_keys.validate(args.release_channel, args.release_public_key)
-                signed = momso_release_manifest.release(args.release_manifest_url, args.release_public_key, channel=args.release_channel)
+                if args.release_channel == 'production':
+                    import momso_anywhere_update_install
+                    import momso_anywhere_pc_trust
+                    bootstrap = momso_anywhere_update_install.production_bootstrap(args.release_public_key)
+                    active = momso_anywhere_pc_trust.active_key(bootstrap, args.state, args.release_manifest_url)
+                    with tempfile.TemporaryDirectory(prefix='momso-pc-release-key-') as directory:
+                        key = Path(directory) / 'active.pem'
+                        key.write_bytes(active)
+                        signed = momso_release_manifest.release(args.release_manifest_url, key, channel=args.release_channel)
+                else:
+                    signed = momso_release_manifest.release(args.release_manifest_url, args.release_public_key, channel=args.release_channel)
                 if args.gateway_image is not None and args.gateway_image != signed['gatewayImage']:
                     raise momso_release_manifest.ManifestError('artifact_mismatch')
                 bundle = momso_release_manifest.download(signed['bundleUrl'], 536870912)
@@ -806,14 +880,19 @@ def main(argv=None):
         provider = GoogleProvider(args.account, args.project, state["id"], key_file)
         if args.action == "destroy":
           def destroy_resources():
+            nonlocal iam_verified
+            if state.get('anywhere'):
+                from momso_anywhere_iam_pc import remove_installation_bindings
+                remove_installation_bindings(provider)
+                iam_verified = True
             if state.get("anywhere") and not state["anywhere"].get("destroyed"):
                 import momso_anywhere_install
-                momso_anywhere_install.GoogleAnywhere(provider).destroy()
+                momso_anywhere_install.GoogleAnywhere(provider).destroy(keep_roles=not args.discard_data)
                 state["anywhere"]["destroyed"] = True
                 save_state(args.state, state)
             if state.get("wake") and not state["wake"].get("destroyed"):
                 import momso_wake_install
-                momso_wake_install.GoogleWake(provider).destroy()
+                momso_wake_install.GoogleWake(provider).destroy(keep_roles=not args.discard_data)
                 state["wake"]["destroyed"] = True
                 save_state(args.state, state)
             if state.get("mobile") and not state["mobile"].get("destroyed"):
@@ -835,10 +914,15 @@ def main(argv=None):
               guarded_destroy(provider, destroy_resources)
           else:
               destroy_resources()
+          if state.get('anywhere'):
+              from momso_anywhere_vm_resources import destroy_identity
+              destroy_identity(provider, discard_data=args.discard_data)
           cleanup_keys(directory, state["id"])
           state.pop("destroy_pending", None)
           from momso_anywhere_pc_inventory import inspect_destroyed
-          inventory = inspect_destroyed(provider) if state.get('anywhere') else {}
+          inventory = inspect_destroyed(provider, discard_data=args.discard_data) if state.get('anywhere') else {}
+          if iam_verified:
+              inventory['iam_bindings'] = {'status': 'deleted', 'reason': None}
           if state.get('anywhere') and args.discard_data:
               from momso_anywhere_pc_discard import discard_backup
               from momso_anywhere_delete_result import deletion_result
@@ -870,9 +954,11 @@ def main(argv=None):
                 return 0 if deletion['complete'] else 1
         else:
             existing = state.get("anywhere", {})
-            if args.action == "anywhere" and existing.get("url") and not existing.get("destroyed"):
-                url = upgrade_anywhere(provider, state, args.artifact, args.sha256.lower(), args.web_archive, args.web_sha256.lower(), args.google_client_id, args.owner_sub, args.login_origin, args.gateway_image, signed['sequence'])
-                print("접속 주소: " + url)
+            was_upgrade = bool(existing.get('url') and not existing.get('destroyed'))
+            if args.action == "anywhere" and was_upgrade:
+                import momso_anywhere_update_install
+                momso_anywhere_update_install.grant_gateway_update(provider)
+                url = upgrade_anywhere(provider, state, args.artifact, args.sha256.lower(), args.web_archive, args.web_sha256.lower(), args.google_client_id, args.owner_sub, args.login_origin, args.gateway_image, signed['sequence'], update_settings=(args.release_channel, args.release_public_key, args.release_manifest_url))
             else:
                 deploy(provider, args.artifact, args.sha256.lower(), args.state, state)
             if args.action == "mobile":
@@ -883,15 +969,36 @@ def main(argv=None):
                     import momso_wake_install
                     url = momso_wake_install.install(momso_wake_install.GoogleWake(provider), args.state, state, args.hostname.lower(), args.wake_user)
                     print("깨우기 주소: " + url)
-            elif args.action == "anywhere" and not (existing.get("url") and not existing.get("destroyed")):
+            elif args.action == "anywhere" and not was_upgrade:
                 provider.install_web(args.web_archive, args.web_sha256.lower())
                 import momso_anywhere_install
                 url = momso_anywhere_install.install(provider, args.state, state, args.google_client_id, args.owner_sub, args.login_origin, args.gateway_image)
-                print("접속 주소: " + url)
-            if args.action == "anywhere":
+            if args.action == "anywhere" and not was_upgrade:
                 import momso_anywhere_update_install
-                momso_anywhere_update_install.grant_gateway_update(provider)
-                momso_anywhere_update_install.install(provider, args.release_channel, args.release_public_key, args.release_manifest_url)
+                check_stage = 'worker'
+                try:
+                    momso_anywhere_update_install.grant_gateway_update(provider)
+                    momso_anywhere_update_install.install(provider, args.release_channel, args.release_public_key, args.release_manifest_url, health_url=url)
+                    check_stage = 'proxy'
+                    provider.ensure_private_proxy()
+                    provider.gateway_proxy_health(url)
+                except (InstallError, OSError, subprocess.SubprocessError, ValueError) as error:
+                    if not was_upgrade and state.get('anywhere', {}).get('gatewayCreatedInAttempt'):
+                        try:
+                            import momso_anywhere_install
+                            gateway = momso_anywhere_install.GoogleAnywhere(provider)
+                            if gateway._objects()[2]:
+                                provider.run('run', 'services', 'delete', gateway.service, f'--region={REGION}')
+                            state['anywhere'].pop('url', None)
+                            state['anywhere']['gatewayCreatedInAttempt'] = False
+                            save_state(args.state, state)
+                        except (InstallError, OSError, subprocess.SubprocessError) as cleanup_error:
+                            raise InstallError('proxy_cleanup_failed', gateway_code='proxy_cleanup_failed', gateway_failure={'code': 'proxy_cleanup_failed', 'rolledBack': False, 'retryable': False}) from cleanup_error
+                    if check_stage != 'proxy' and getattr(error, 'gateway_code', None) != 'proxy_not_running':
+                        raise
+                    raise InstallError('proxy_not_running', gateway_code='proxy_not_running', gateway_failure={'code': 'proxy_not_running', 'rolledBack': None, 'retryable': None}) from error
+            if args.action == 'anywhere':
+                print("접속 주소: " + url)
         print("완료: " + args.action)
         return 0
     except (InstallError, OSError, subprocess.SubprocessError, ValueError) as error:
@@ -905,6 +1012,8 @@ def main(argv=None):
             previous = state.get('backup_discard') if isinstance(state, dict) else None
             detail = dict(previous) if isinstance(previous, dict) else {}
             detail['mode'] = 'delete_all' if args.discard_data else 'pause'
+            if not iam_verified:
+                detail.setdefault('resources', {})['iam_bindings'] = {'status': 'unverified', 'reason': 'iam_bindings_unverified'}
             if isinstance(error, PendingNetworkCleanup):
                 known = [name for name in error.resources if not name.endswith(' (확인 필요)')]
                 unknown = [name.removesuffix(' (확인 필요)') for name in error.resources if name.endswith(' (확인 필요)')]

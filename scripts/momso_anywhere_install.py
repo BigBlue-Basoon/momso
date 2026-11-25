@@ -14,6 +14,7 @@ from pathlib import Path
 from momso_server_install import InstallError, REGION, ZONE, save_state
 from momso_wake_install import GoogleWake
 from momso_iam_retry import bind_custom_role
+from momso_anywhere_proxy_files import PROXY_FILES
 
 _adapter_path = Path(__file__).resolve().parent.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/cloud_run_gateway.py'
 _adapter_spec = importlib.util.spec_from_file_location('momso_cloud_run_gateway', _adapter_path)
@@ -57,7 +58,8 @@ run('systemctl','restart','momso-server')
 
 def install_private_proxy(provider):
     here = Path(__file__).resolve().parent
-    files = {name: base64.b64encode((here / name).read_bytes()).decode() for name in ("momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py", "momso_anywhere_vm_pause.py", "momso_anywhere_pause_ticket.py", "momso_anywhere_pause_guard.py")}
+    from momso_managed_history import load as load_managed_history
+    files = {name: base64.b64encode((here / name).read_bytes()).decode() for name in PROXY_FILES if name != 'server_admission.py'}
     files['server_admission.py'] = base64.b64encode((here.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/server_admission.py').read_bytes()).decode()
     code = r'''import base64,hashlib,json,os,secrets,subprocess,sys
 data=json.load(sys.stdin); root='/etc/momso-private';os.makedirs(root,mode=0o700,exist_ok=True);os.chmod(root,0o700)
@@ -76,6 +78,18 @@ if active:
  target=os.path.realpath(current);assert os.path.commonpath((target,base+'/releases'))==base+'/releases' and target!=base+'/releases'
  base=target
 os.makedirs(base,exist_ok=True)
+manifest='/etc/momso-private/managed-update-proxy-'+hashlib.sha256(base.encode()).hexdigest()[:16]+'.json'
+recorded={}
+if os.path.exists(manifest):
+ assert not os.path.islink(manifest)
+ ledger=json.load(open(manifest));assert ledger.get('version')==1 and ledger.get('owner')==OWNER and isinstance(ledger.get('files'),dict)
+ recorded=ledger['files']
+for name,value in data.items():
+ path=base+'/'+name
+ if os.path.lexists(path):
+  assert os.path.isfile(path) and not os.path.islink(path)
+  old=hashlib.sha256(open(path,'rb').read()).hexdigest();new=hashlib.sha256(base64.b64decode(value,validate=True)).hexdigest()
+  assert old==new or old==recorded.get(name) or old in LEGACY.get(name,[])
 for name,value in data.items():
  path=base+'/'+name;temp=path+'.new'
  with open(temp,'wb') as f:f.write(base64.b64decode(value,validate=True))
@@ -98,6 +112,7 @@ while True:
 der=subprocess.check_output(['openssl','x509','-in',cert,'-outform','DER'])
 print(json.dumps({'fingerprint':hashlib.sha256(der).hexdigest(),'token':open(token).read().strip()}))
 '''
+    code = code.replace('OWNER', repr(provider.install_id)).replace('LEGACY', repr(load_managed_history()['proxy']))
     wrapper = "import base64,subprocess,sys; subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(base64.b64encode(code.encode()).decode()) + ").decode()],input=sys.stdin.buffer.read(),check=True)"
     try:
         value = json.loads(provider.ssh(wrapper, json.dumps(files).encode()))
@@ -111,12 +126,14 @@ print(json.dumps({'fingerprint':hashlib.sha256(der).hexdigest(),'token':open(tok
 class GoogleAnywhere(GoogleWake):
     def __init__(self, provider):
         super().__init__(provider)
-        self.service = "momso-any-" + provider.install_id
-        self.sa = "ma-" + provider.install_id
+        from momso_anywhere_vm_resources import names
+        resources = names(provider)
+        self.service = resources['gateway']
+        self.sa = resources['gateway_account']
         self.email = self.sa + "@" + provider.project + ".iam.gserviceaccount.com"
-        self.role = "momsoAnywhere" + provider.install_id
-        self.transport_secret = "momso-transport-" + provider.install_id
-        self.session_secret = "momso-session-" + provider.install_id
+        self.role = resources['gateway_role']
+        self.transport_secret = resources['transport_secret']
+        self.session_secret = resources['session_secret']
         self._first_attempt_absent = False
 
     def ensure_secret(self, name, value=None):
@@ -137,7 +154,7 @@ class GoogleAnywhere(GoogleWake):
                 raise InstallError("VM과 비밀 저장소의 전송 권한이 다릅니다. 기존 값을 덮어쓰지 않았습니다.")
         bind_custom_role(p, "secrets", "add-iam-policy-binding", name, f"--member=serviceAccount:{self.email}", "--role=roles/secretmanager.secretAccessor")
 
-    def activate_gateway(self, image, *, flags=(), previous=True, expected_url=None):
+    def activate_gateway(self, image, *, flags=(), previous=True, expected_url=None, health_check=None):
         p = self.p
         adapter = cloud_run_gateway(p, self.service)
         try:
@@ -155,6 +172,8 @@ class GoogleAnywhere(GoogleWake):
                 current = p.run("run", "services", "describe", self.service, f"--region={REGION}", parse=True)
                 if current.get("status", {}).get("url") != expected_url:
                     raise GatewayError('gateway_address_changed')
+            if health_check is not None:
+                health_check()
         except (GatewayError, InstallError, OSError) as error:
             if before:
                 try:
@@ -162,10 +181,12 @@ class GoogleAnywhere(GoogleWake):
                 except (GatewayError, InstallError, OSError) as rollback_error:
                     raise InstallError("입구 갱신과 이전 판 복구에 실패했습니다. 기존 revision을 확인하세요.", gateway_failure=gateway_failure('gateway_rollback_failed', False)) from rollback_error
             code = str(error) if isinstance(error, GatewayError) else getattr(error, 'gateway_code', None) or 'gateway_operation_failed'
+            if code == 'proxy_not_running':
+                raise InstallError('proxy_not_running', gateway_code=code, gateway_failure={'code': code, 'rolledBack': True if before else None, 'retryable': True if before else None}) from error
             raise InstallError("입구 갱신에 실패했습니다. 기존 판을 유지했는지 확인하세요.", gateway_failure=gateway_failure(code, True if before else None)) from error
 
-    def upgrade_gateway(self, expected_url, image):
-        self.activate_gateway(image, expected_url=expected_url)
+    def upgrade_gateway(self, expected_url, image, *, health_check=None):
+        self.activate_gateway(image, expected_url=expected_url, health_check=health_check)
 
     def install(self, proxy, client_id, owner_sub, login_origin, image):
         p = self.p
@@ -180,7 +201,8 @@ class GoogleAnywhere(GoogleWake):
                 raise InstallError("VM 인증서 지문이 달라 입구를 바꾸지 않았습니다.")
         self.ensure_secret(self.transport_secret, proxy["token"].encode())
         self.ensure_secret(self.session_secret)
-        rule = p.name + "-private"
+        from momso_anywhere_vm_resources import names
+        rule = names(p)['private_firewall']
         p.ensure("사설 통로 방화벽", rule, ["compute", "firewall-rules", "list"], ["compute", "firewall-rules", "create", rule, f"--network={p.network}", "--direction=INGRESS", "--action=ALLOW", "--rules=tcp:8766", "--source-ranges=10.42.0.0/24", f"--target-tags={p.name}", f"--description={p.marker}"])
         firewall = p.run("compute", "firewall-rules", "describe", rule, parse=True)
         if firewall.get("description") != p.marker or firewall.get("direction") != "INGRESS" or firewall.get("disabled") or not firewall.get("network", "").endswith("/" + p.network) or firewall.get("sourceRanges") != ["10.42.0.0/24"] or firewall.get("targetTags") != [p.name] or firewall.get("allowed") != [{"IPProtocol": "tcp", "ports": ["8766"]}]:
@@ -214,7 +236,7 @@ class GoogleAnywhere(GoogleWake):
                     raise InstallError('새 입구를 확인하지 못했고 정리도 확인하지 못했습니다.', gateway_failure=gateway_failure('gateway_rollback_failed', False)) from cleanup_error
             raise
 
-    def destroy(self):
+    def destroy(self, *, keep_roles=False):
         p = self.p
         self._objects()
         items = p.run("secrets", "list", parse=True)
@@ -225,12 +247,13 @@ class GoogleAnywhere(GoogleWake):
                 raise InstallError("비밀 저장소의 소유권이 달라 삭제하지 않았습니다.")
             if found:
                 owned.append(name)
-        rule = p.name + "-private"
+        from momso_anywhere_vm_resources import names
+        rule = names(p)['private_firewall']
         rules = p.run("compute", "firewall-rules", "list", f"--filter=name={rule}", parse=True)
         matching = next((x for x in rules if x.get("name") == rule), None)
         if matching and matching.get("description") != p.marker:
             raise InstallError("방화벽의 소유권이 달라 삭제하지 않았습니다.")
-        super().destroy()
+        super().destroy(keep_roles=keep_roles)
         for name in owned:
             p.run("secrets", "delete", name)
         if matching:
@@ -247,6 +270,8 @@ def install(provider, state_path, state, client_id, owner_sub, login_origin, ima
     import momso_anywhere_vm_services
     momso_anywhere_vm_services.install(provider)
     proxy = install_private_proxy(provider)
-    setup["url"] = GoogleAnywhere(provider).install(proxy, client_id, owner_sub, login_origin, image)
+    gateway = GoogleAnywhere(provider)
+    setup["url"] = gateway.install(proxy, client_id, owner_sub, login_origin, image)
+    setup['gatewayCreatedInAttempt'] = gateway._first_attempt_absent
     save_state(state_path, state)
     return setup["url"]

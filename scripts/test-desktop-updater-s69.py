@@ -24,6 +24,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parent.parent
 DESKTOP = ROOT / 'apps/alpha/desktop'
 TAURI = ROOT / 'node_modules/@tauri-apps/cli/tauri.js'
+TARGET = Path(os.environ.get('MOMSO_S137_TARGET', ROOT / 'target')).resolve()
 
 NODE_VERSION = '22.23.5'
 NODE_SHA256 = '4a191082e9706866830379d577d2cc8a50c776fcd9436a8d061b063ed0d9a0e3'
@@ -90,7 +91,7 @@ def main():
         identity = uuid.uuid4().hex[:12]
         name = 'momso-s69-' + identity
         def cleanup_artifacts():
-            debug = ROOT / 'target/debug'
+            debug = TARGET / 'debug'
             owned = [debug / (name + '.exe')]
             for version in ('0.1.1', '0.1.2'):
                 bundle = debug / 'bundle/nsis' / f'{name}_{version}_x64-setup.exe'
@@ -106,7 +107,7 @@ def main():
         for key in list(env):
             if key.startswith('TAURI_SIGNING_') or key in ('OPENAI_API_KEY', 'CODEX_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'GOOGLE_APPLICATION_CREDENTIALS', 'GH_CONFIG_DIR', 'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'):
                 env.pop(key, None)
-        env.update(CARGO_TARGET_DIR=str(ROOT / 'target'), CARGO_BUILD_JOBS='1', CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', MOMSO_TEST_LOCAL_UPDATER='1', MOMSO_TEST_LOCAL_UPDATER_FILE=str(marker), MOMSO_TEST_FAKE_CREDENTIAL_STORE='1', MOMSO_S69_TEST_ROOT=str(root / 'runtime'))
+        env.update(CARGO_TARGET_DIR=str(TARGET), CARGO_BUILD_JOBS='1', CARGO_INCREMENTAL='0', CARGO_PROFILE_DEV_DEBUG='0', CARGO_PROFILE_TEST_DEBUG='0', MOMSO_TEST_LOCAL_UPDATER='1', MOMSO_TEST_LOCAL_UPDATER_FILE=str(marker), MOMSO_TEST_FAKE_CREDENTIAL_STORE='1', MOMSO_S69_TEST_ROOT=str(root / 'runtime'))
         build_env = env.copy()
         env['USERPROFILE'] = str(root / 'user')
         env['APPDATA'] = str(root / 'user/AppData/Roaming')
@@ -151,7 +152,7 @@ def main():
                 config_path = root / ('config-' + version + '.json')
                 config_path.write_text(json.dumps(config), encoding='utf-8')
                 subprocess.run(['node', str(TAURI), 'build', '--debug', '--features', 'g61-test-probe', '--bundles', 'nsis', '--config', str(config_path), '--', '-j', '1'], cwd=DESKTOP, env=build_env, check=True)
-                artifact = ROOT / 'target/debug/bundle/nsis' / f'{name}_{version}_x64-setup.exe'
+                artifact = TARGET / 'debug/bundle/nsis' / f'{name}_{version}_x64-setup.exe'
                 if not artifact.is_file():
                     raise RuntimeError('fixture installer missing: ' + str(artifact))
                 artifacts[version] = (artifact.read_bytes(), Path(str(artifact) + '.sig').read_text(encoding='utf-8').strip())
@@ -263,11 +264,14 @@ def main():
             if sys.exc_info()[0] is not None:
                 cleanup_artifacts()
         try:
-            subprocess.run([sys.executable, str(ROOT / 'scripts/test-desktop-updater-s69-retry.py'), str(root / 'config-0.1.1.json'), str(ROOT / 'target/debug/bundle/nsis' / f'{name}_0.1.1_x64-setup.exe'), str(ROOT / 'target/debug/bundle/nsis' / f'{name}_0.1.2_x64-setup.exe')], env=env, check=True)
-            subprocess.run([sys.executable, str(ROOT / 'scripts/test-desktop-updater-s69-retry.py'), str(root / 'config-0.1.1.json'), str(ROOT / 'target/debug/bundle/nsis' / f'{name}_0.1.1_x64-setup.exe'), str(invalid_installer), 'installer'], env=env, check=True)
+            first_artifact = TARGET / 'debug/bundle/nsis' / f'{name}_0.1.1_x64-setup.exe'
+            second_artifact = TARGET / 'debug/bundle/nsis' / f'{name}_0.1.2_x64-setup.exe'
+            for mode in ('signature', 'lower', 'malformed'):
+                subprocess.run([sys.executable, str(ROOT / 'scripts/test-desktop-updater-s69-retry.py'), str(root / 'config-0.1.1.json'), str(first_artifact), str(second_artifact), mode], env=env, check=True)
+            subprocess.run([sys.executable, str(ROOT / 'scripts/test-desktop-updater-s69-retry.py'), str(root / 'config-0.1.1.json'), str(first_artifact), str(invalid_installer), 'installer'], env=env, check=True)
             if os.environ.get('MOMSO_S69_TEST_INTERRUPT') == '1':
-                subprocess.run([sys.executable, str(ROOT / 'scripts/test-desktop-updater-s69-retry.py'), str(root / 'config-0.1.1.json'), str(ROOT / 'target/debug/bundle/nsis' / f'{name}_0.1.1_x64-setup.exe'), str(interrupted), 'interrupt'], env=env, check=True)
-                subprocess.run([sys.executable, str(ROOT / 'scripts/test-desktop-updater-s69-retry.py'), str(root / 'config-0.1.1.json'), str(ROOT / 'target/debug/bundle/nsis' / f'{name}_0.1.1_x64-setup.exe'), str(interrupted), 'power'], env=env, check=True)
+                subprocess.run([sys.executable, str(ROOT / 'scripts/test-desktop-updater-s69-retry.py'), str(root / 'config-0.1.1.json'), str(first_artifact), str(interrupted), 'interrupt'], env=env, check=True)
+                subprocess.run([sys.executable, str(ROOT / 'scripts/test-desktop-updater-s69-retry.py'), str(root / 'config-0.1.1.json'), str(first_artifact), str(interrupted), 'power'], env=env, check=True)
         finally:
             cleanup_artifacts()
     if root.exists(): print('fixture_cleanup_needed=' + str(root), flush=True)

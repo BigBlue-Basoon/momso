@@ -158,6 +158,7 @@ test('actual gesture modules retry and invoke destroy with a fake provider', asy
   const providerFactory = async () => ({ ownerSub: '123456', provider });
   const fakeFetch = async raw => {
     const url = new URL(raw);
+    if (url.hostname === 'fixture.test' && /\/trust-root-\d+\.json$/.test(url.pathname)) return new Response('', { status: 404 });
     if (url.hostname === 'fixture.test') return fixture.response(url.pathname.endsWith('.sig') ? fixture.signature : fixture.raw);
     return new Response('{}', { status: 404 });
   };

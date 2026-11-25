@@ -1,5 +1,7 @@
 import http.client
 import http.server
+import hashlib
+import hmac
 import os
 import threading
 import time
@@ -21,6 +23,12 @@ class Upstream(http.server.BaseHTTPRequestHandler):
             self.send_header('X-Momso-Response', 'gateway')
             self.end_headers()
             self.wfile.write(b'upstream forbidden')
+            return
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"state":"ready"}')
             return
         self.send_response(200)
         self.end_headers()
@@ -67,6 +75,28 @@ class Tests(unittest.TestCase):
         client = http.client.HTTPConnection("127.0.0.1", self.gateway.server_address[1])
         client.request("GET", path, headers=headers)
         return client, client.getresponse()
+
+    def test_private_health_probe_requires_proof_and_strips_it_upstream(self):
+        self.auth.stop()
+        with patch.dict(os.environ, {'MOMSO_PRIVATE_PROXY_TOKEN': 'fixture-secret'}), patch.object(gateway, 'upstream_connection', side_effect=lambda: http.client.HTTPConnection('127.0.0.1', self.upstream.server_address[1])):
+            client, response = self.get('/__momso/proxy-health', {'Host': 'fixture.run.app'})
+            self.assertEqual(response.status, 403); response.read(); client.close()
+            proof = hmac.new(b'fixture-secret', b'momso-proxy-health-v1', hashlib.sha256).hexdigest()
+            client, response = self.get('/__momso/proxy-health', {'Host': 'fixture.run.app', 'X-Momso-Health-Proof': proof})
+            self.assertEqual(response.status, 200); self.assertEqual(response.read(), b'{"state":"ready"}'); client.close()
+            self.assertEqual(Upstream.seen[-1][0], '/health')
+            self.assertNotIn('X-Momso-Health-Proof', Upstream.seen[-1][1])
+
+    def test_private_health_probe_cors_only_allows_login_origin(self):
+        self.auth.stop()
+        with patch.dict(os.environ, {'MOMSO_PRIVATE_PROXY_TOKEN': 'fixture-secret', 'MOMSO_LOGIN_ORIGIN': 'https://login.example.test'}):
+            for origin, expected in [('https://login.example.test', 204), ('https://other.example.test', 403)]:
+                client = http.client.HTTPConnection('127.0.0.1', self.gateway.server_address[1])
+                client.request('OPTIONS', '/__momso/proxy-health', headers={'Host': 'fixture.run.app', 'Origin': origin, 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'x-momso-health-proof'})
+                response = client.getresponse()
+                self.assertEqual(response.status, expected)
+                if expected == 204: self.assertEqual(response.getheader('Access-Control-Allow-Origin'), origin)
+                response.read(); client.close()
 
     def test_public_ready_does_not_wake_or_expose_server(self):
         self.auth.stop()

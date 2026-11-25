@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 import update
 from cloud_run_gateway import GatewayError
 from update import Updater, UpdateError, _atomic_json
+from momso_anywhere_proxy_files import PROXY_FILES
 
 
 class Host:
@@ -63,7 +64,7 @@ class UpdateTests(unittest.TestCase):
         self.http.shutdown(); self.http.server_close(); self.thread.join(); self.tmp.cleanup()
     def publish(self):
         with tarfile.open(self.server_dir / "bundle.tar.gz", "w:gz") as archive:
-            for name in ("momso-server", "momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py", "web/index.html"):
+            for name in ("momso-server", *PROXY_FILES, "web/index.html"):
                 data = name.encode(); info = tarfile.TarInfo(name); info.size = len(data); archive.addfile(info, io.BytesIO(data))
         bundle = (self.server_dir / "bundle.tar.gz").read_bytes()
         data = {"sequence": 2, "version": "0.1.2", "bundleUrl": self.base + "/bundle.tar.gz", "bundleSha256": hashlib.sha256(bundle).hexdigest(), "gatewayImage": "registry.example/momso@sha256:" + "1" * 64}
@@ -75,6 +76,41 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.host.sequence, 2); self.assertEqual(self.host.data, "migrated")
         self.assertFalse(self.host.lease)
         self.assertEqual(self.install(), "up_to_date")
+
+    def test_concurrent_pc_upgrade_rechecks_sequence_after_maintenance(self):
+        original = self.host.acquire_maintenance
+        def acquire():
+            result = original()
+            self.host.sequence = 2
+            return result
+        self.host.acquire_maintenance = acquire
+        self.assertEqual(self.install(), 'up_to_date')
+        self.assertEqual(self.host.release, 'old')
+        self.assertFalse(self.host.lease)
+
+    def test_already_installed_sequence_refreshes_completed_journal(self):
+        _atomic_json(self.updater.state, {'phase': 'complete', 'sequence': 1, 'needsRelease': False})
+        self.host.sequence = 2
+        self.assertEqual(self.install(), 'up_to_date')
+        self.assertEqual(json.loads(self.updater.state.read_text())['sequence'], 2)
+
+    def test_stale_journal_waits_for_pc_maintenance_before_reconciling(self):
+        _atomic_json(self.updater.state, {'phase': 'complete', 'sequence': 1, 'needsRelease': False})
+        self.host.sequence = 2
+        self.host.available = False
+        self.assertEqual(self.install(), 'busy')
+        self.assertEqual(json.loads(self.updater.state.read_text())['sequence'], 1)
+        self.host.available = True
+        self.assertEqual(self.install(), 'up_to_date')
+        self.assertEqual(json.loads(self.updater.state.read_text())['sequence'], 2)
+
+    def test_dead_proxy_rolls_back_before_completion(self):
+        self.host.refresh_proxy = lambda *_: None
+        self.host.proxy_healthy = lambda: False
+        with self.assertRaisesRegex(UpdateError, 'proxy_not_running'):
+            self.install()
+        self.assertEqual((self.host.release, self.host.gateway, self.host.data, self.host.sequence), ('old', 'old-gateway', 'before', 1))
+        self.assertFalse(self.host.lease)
 
     def test_development_channel_is_not_accepted_by_production(self):
         manifest = self.server_dir / 'manifest.json'

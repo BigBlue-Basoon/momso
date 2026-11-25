@@ -300,7 +300,7 @@ _INSTALLER_CODES = frozenset(('gateway_image_permission', 'gateway_image_invalid
     'gateway_traffic_mismatch', 'gateway_probe_failed', 'gateway_rollback_failed', 'gateway_not_ready',
     'gateway_operation_failed', 'gateway_response_invalid', 'gateway_address_invalid', 'gateway_ownership',
     'gateway_policy', 'rollback_failed', 'backup_not_connected', 'backup_freshness_unverified', 'vm_unreachable',
-    'cleanup_pending', 'cleanup_incomplete', 'delete_failed'))
+    'cleanup_pending', 'cleanup_incomplete', 'delete_failed', 'proxy_not_running', 'proxy_cleanup_failed'))
 
 
 def installer_result(process, stage):
@@ -315,7 +315,14 @@ def installer_result(process, stage):
                     if value.get(key) in _INSTALLER_CODES: reason = value[key]
     except (UnicodeError, AttributeError, TypeError):
         pass
-    return {'ok': process.returncode == 0, 'stage': stage, 'reason': None if process.returncode == 0 else reason}
+    result = {'ok': process.returncode == 0, 'stage': stage, 'reason': None if process.returncode == 0 else reason}
+    if process.returncode:
+        # Installer-owned diagnostics only; never echo arbitrary tool output or secrets.
+        stderr = getattr(process, 'stderr', b'') or b''
+        lines = stderr.decode('utf-8', errors='replace').splitlines()
+        safe = [line for line in lines if line.startswith('실패: ') and len(line) <= 300 and not re.search(r'(?i)token|secret|password|credential|bearer|https?://|[A-Za-z0-9+/=_-]{48,}', line)]
+        if safe: result['stderrTail'] = safe[-1]
+    return result
 
 
 def run_rehearsal(provider, install, verify, destroy, backup_cleanup, inventory, idle=None):
@@ -326,7 +333,7 @@ def run_rehearsal(provider, install, verify, destroy, backup_cleanup, inventory,
     try:
         installed = install()
         if isinstance(installed, dict):
-            result['installFailure'] = None if installed.get('ok') else {'stage': installed.get('stage'), 'reason': installed.get('reason')}
+            result['installFailure'] = None if installed.get('ok') else {key: installed[key] for key in ('stage', 'reason', 'stderrTail') if key in installed}
             installed = installed.get('ok') is True
         if installed:
             result['install'] = 'passed'
@@ -359,6 +366,11 @@ def run_rehearsal(provider, install, verify, destroy, backup_cleanup, inventory,
             pass
         try:
             result['inventory'], result['kmsVersions'] = inventory()
+            remaining = [name for name, group in result['inventory'].items()
+                         if name != 'kms' and isinstance(group, dict) and group.get('items')]
+            if remaining:
+                result['destroy'] = 'failed'
+                result['remainingKinds'] = sorted(remaining)
         except Exception:
             pass
     return result
@@ -406,7 +418,7 @@ def main(argv=None):
                    '--owner-sub', args.owner_sub, '--login-origin', args.login_origin, '--release-manifest-url', args.release_manifest_url,
                    '--release-public-key', str(key), '--release-channel', args.channel]
         def run(command):
-            process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+            process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
             try:
                 saved = json.loads(state_path.read_text(encoding='utf-8'))
                 steps = saved.get('steps', {})

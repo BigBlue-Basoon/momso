@@ -3,16 +3,18 @@ import re
 from pathlib import Path
 
 from momso_server_install import InstallError, REGION, ZONE, save_state
-from momso_iam_retry import bind_custom_role
+from momso_iam_retry import bind_custom_role, reconcile_owned_role
 
 
 class GoogleWake:
     def __init__(self, provider):
         self.p = provider
-        self.service = "momso-wake-" + provider.install_id
-        self.sa = "mw-" + provider.install_id
+        from momso_anywhere_vm_resources import names
+        resources = names(provider)
+        self.service = resources['wake']
+        self.sa = resources['wake_account']
         self.email = self.sa + "@" + provider.project + ".iam.gserviceaccount.com"
-        self.role = "momsoWake" + provider.install_id
+        self.role = resources['wake_role']
 
     def _objects(self):
         p = self.p
@@ -36,6 +38,7 @@ class GoogleWake:
 
     def prepare_identity(self):
         p = self.p
+        reconcile_owned_role(p, self.role, {'compute.instances.get', 'compute.instances.start'})
         account, role, service = self._objects()
         if not account:
             p.run("iam", "service-accounts", "create", self.sa, f"--description={p.marker}")
@@ -65,14 +68,14 @@ class GoogleWake:
             raise InstallError("깨우기 서비스 주소를 확인하지 못했습니다.")
         return url
 
-    def destroy(self):
+    def destroy(self, *, keep_roles=False):
         p = self.p
         account, role, service = self._objects()
         if service:
             p.run("run", "services", "delete", self.service, f"--region={REGION}")
         if account:
             p.run("iam", "service-accounts", "delete", self.email)
-        if role:
+        if role and not keep_roles:
             p.run("iam", "roles", "delete", self.role)
 
 

@@ -1,5 +1,6 @@
 """Separate service entry point; configuration is provisioned by the installer."""
 import argparse
+import base64
 import json
 from pathlib import Path
 import signal
@@ -11,6 +12,7 @@ from progress_status import ProgressFile
 from server_admission import ServerAdmission
 from systemd_host import SystemdHost
 from update import Updater
+from trust_rotation import RootStore
 
 
 def make_poller(config):
@@ -22,7 +24,10 @@ def make_poller(config):
     host = SystemdHost(root, config["dataDir"], config["serverUnit"],
                        "http://127.0.0.1:8765/health", admission, gateway, progress,
                        proxy_unit=config["proxyUnit"], idle_unit=config.get("idleUnit", "momso-idle-stop.service"))
-    updater = Updater(root, config["publicKey"], host, channel=channel)
+    trust_store = None
+    if channel == 'production':
+        trust_store = RootStore(config['trustState'], base64.b64decode(config['trustBootstrap'], validate=True))
+    updater = Updater(root, config["publicKey"], host, channel=channel, trust_store=trust_store)
     return ReleasePoller(GitHubReleases(channel), updater)
 
 

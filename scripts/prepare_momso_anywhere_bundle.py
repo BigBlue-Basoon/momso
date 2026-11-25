@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import tarfile
 from pathlib import Path
+from momso_anywhere_proxy_files import PROXY_FILES
 
 
 def digest(path):
@@ -22,10 +23,10 @@ def prepare(server, expected, web, output):
         raise ValueError("output overlaps an input")
     entries = [(server, "momso-server")]
     scripts = Path(__file__).resolve().parent
-    entries += [(scripts / name, name) for name in ("momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py", "momso_anywhere_vm_pause.py", "momso_anywhere_pause_ticket.py", "momso_anywhere_pause_guard.py")]
+    entries += [(scripts / name, name) for name in PROXY_FILES if name != 'server_admission.py']
     entries += [(scripts.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/server_admission.py', 'server_admission.py')]
     entries.append((scripts / 'momso_managed_history.json', 'momso-managed-history.json'))
-    entries += [(scripts / name, name) for name in ("momso_anywhere_backup.py", "momso_anywhere_backup_agent.py", "momso_anywhere_backup_google.py", "momso_anywhere_vault_identity.py")]
+    entries += [(scripts / name, name) for name in ("momso_anywhere_backup.py", "momso_anywhere_backup_agent.py", "momso_anywhere_backup_google.py", "momso_anywhere_vault_identity.py", "momso_anywhere_prestart_restore.py")]
     tauri = scripts.parent / "apps/alpha/desktop/src-tauri"
     entries += [(tauri / "momso-vault-provision/provision.py", "vault-provision.py"),
                 (tauri / "momso-idle-stop/idle_stop.py", "idle-stop.py")]
@@ -33,8 +34,10 @@ def prepare(server, expected, web, output):
     entries += [(update / name, "momso-updater/" + name) for name in (
         "update.py", "release_manifest.py", "server_admission.py", "systemd_host.py",
         "data_snapshots.py", "cloud_run_gateway.py", "github_releases.py", "progress_status.py",
-        "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py", "managed_helpers.py")]
+        "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py", "managed_helpers.py", "trust_rotation.py")]
     entries.append((scripts / "momso_managed_files.py", "momso-updater/momso_managed_files.py"))
+    entries.append((scripts / "momso_anywhere_proxy_files.py", "momso-updater/momso_anywhere_proxy_files.py"))
+    entries.append((scripts / "momso_anywhere_proxy_files.json", "momso-updater/momso_anywhere_proxy_files.json"))
     entries.append((update / "units/momso-idle-stop.service", "momso-units/momso-idle-stop.service"))
     entries.append((update / "units/vault.conf", "momso-overrides/vault.conf"))
     for path in sorted(web.rglob("*")):

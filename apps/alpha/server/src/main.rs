@@ -1655,7 +1655,12 @@ fn begin_turn(
                 &chat,
                 &task_turn,
                 &provider,
-                (model.as_deref().unwrap_or(""), effort.as_deref(), fast),
+                (
+                    model.as_deref().unwrap_or(""),
+                    effort.as_deref(),
+                    fast,
+                    &permission_mode,
+                ),
                 (&task_message, skill_instruction.as_deref()),
                 receiver,
             )
@@ -1855,9 +1860,9 @@ async fn cancel_turn(
     Ok(Json(json!({"turnId":id,"state":latest["state"]})))
 }
 fn pending_approval(app: &App, turn_id: &str) -> Result<Option<Value>, ApiError> {
-    db(app)?.query_row("SELECT id,chat_id,kind,description,options FROM approvals WHERE turn_id=?1 AND state='pending' ORDER BY rowid LIMIT 1", [turn_id], |r| {
+    db(app)?.query_row("SELECT id,chat_id,kind,description,options,COALESCE((SELECT provider FROM turns WHERE id=approvals.turn_id),'codex') FROM approvals WHERE turn_id=?1 AND state='pending' ORDER BY rowid LIMIT 1", [turn_id], |r| {
         let options: String = r.get(4)?;
-        Ok(json!({"requestId":r.get::<_,String>(0)?,"chatId":r.get::<_,String>(1)?,"turnId":turn_id,"provider":"codex","kind":r.get::<_,String>(2)?,"description":r.get::<_,String>(3)?,"options":serde_json::from_str::<Value>(&options).unwrap_or(json!([]))}))
+        Ok(json!({"requestId":r.get::<_,String>(0)?,"chatId":r.get::<_,String>(1)?,"turnId":turn_id,"provider":r.get::<_,String>(5)?,"kind":r.get::<_,String>(2)?,"description":r.get::<_,String>(3)?,"options":serde_json::from_str::<Value>(&options).unwrap_or(json!([]))}))
     }).optional().map_err(|_| error(StatusCode::INTERNAL_SERVER_ERROR,"storage_error"))
 }
 async fn get_approval(
@@ -2145,18 +2150,225 @@ async fn send(input: &mut ChildStdin, v: Value) -> Result<(), &'static str> {
 }
 
 #[cfg(target_os = "linux")]
+async fn dispatch_server_tool(
+    app: &App,
+    chat: &str,
+    turn_id: &str,
+    name: &str,
+    arguments: Value,
+    source: (&str, &str),
+    cancel: watch::Receiver<bool>,
+) -> Value {
+    let (permission_mode, provider) = source;
+    if momso_server_crm::TOOL_NAMES.contains(&name) {
+        let app = app.clone();
+        let chat = chat.to_owned();
+        let name = name.to_owned();
+        let provider = provider.to_owned();
+        let mut approval = browser_bridge::HostApproval::new(&app, turn_id, cancel.clone());
+        tokio::task::spawn_blocking(move || {
+            match momso_server_crm::CrmStore::new(&app.data, &app.data.join("archive")) {
+                Ok(store) => {
+                    let mut result = store.dispatch(&chat, &name, &arguments, &mut approval);
+                    if name == "momso_crm_upsert" && result["status"] == "ok" {
+                        let portable = format!("chat_{chat}");
+                        let record = momso_core::receipt_store::record_action(
+                            &app.data.join("archive"),
+                            &provider,
+                            Some(&portable),
+                            "crm_upsert",
+                        )
+                        .ok();
+                        result["recordStatus"] = json!(if record.is_some() {
+                            "recorded"
+                        } else {
+                            "unavailable"
+                        });
+                        result["recordId"] = json!(record);
+                    }
+                    result
+                }
+                Err(reason) => json!({"status":reason}),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| json!({"status":"unavailable"}))
+    } else if name == "momso_document_create" {
+        let app = app.clone();
+        let chat = chat.to_owned();
+        let provider = provider.to_owned();
+        let approval = browser_bridge::HostApproval::new(&app, turn_id, cancel.clone());
+        let cancelled = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let Ok(body) = serde_json::from_value::<DocumentWrite>(arguments) else {
+                return json!({"status":"invalid_input"});
+            };
+            let title: String = body
+                .title
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(100)
+                .collect();
+            if title.is_empty()
+                || !approval.ask(&chat, "document_write", &title)
+                || *cancelled.borrow()
+            {
+                return json!({"status":"denied"});
+            }
+            match create_document_inner(&app, body) {
+                Ok(mut value) => {
+                    let chat_id = format!("chat_{chat}");
+                    let record = value["id"].as_str().and_then(|id| {
+                        momso_core::receipt_store::record_document(
+                            &app.data.join("archive"),
+                            &provider,
+                            Some(&chat_id),
+                            id,
+                            "created",
+                        )
+                        .ok()
+                    });
+                    value["recordStatus"] = json!(if record.is_some() {
+                        "recorded"
+                    } else {
+                        "unavailable"
+                    });
+                    value["recordId"] = json!(record);
+                    json!({"status":"ok","document":value})
+                }
+                Err((_, Json(value))) => json!({"status":value["error"]}),
+            }
+        })
+        .await
+        .unwrap_or_else(|_| json!({"status":"unavailable"}))
+    } else if name == "momso_skill_read" {
+        let name = arguments.get("name").and_then(Value::as_str).unwrap_or("");
+        match momso_core::filesystem::read_callable_skill(&app.data.join("archive"), name) {
+            Ok((head, body)) => json!({"status":"ok","name":head.name,"body":body}),
+            Err(reason) => json!({"status":reason}),
+        }
+    } else if name == "media_register_generated" {
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let prompt = arguments
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let parent = arguments
+            .get("regenerateOf")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let (Some(path), Some(prompt)) = (path, prompt) {
+            let work = app.clone();
+            let room = chat.to_owned();
+            let turn = turn_id.to_owned();
+            match tokio::task::spawn_blocking(move || {
+                media_output::register(
+                    &work,
+                    &room,
+                    &turn,
+                    std::path::Path::new(&path),
+                    &prompt,
+                    "reported",
+                    parent.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(Some(id))) => json!({"status":"ok","assetId":id}),
+                Ok(Ok(None)) => json!({"status":"invalid_kind"}),
+                _ => json!({"status":"registration_failed"}),
+            }
+        } else {
+            json!({"status":"invalid_arguments"})
+        }
+    } else if name == "momso_dictionary_search" {
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if query.is_empty() || query.len() > 256 {
+            json!({"status":"invalid_input"})
+        } else {
+            match momso_core::dictionary::list(&app.data.join("archive")) {
+                Ok(list) => {
+                    let terms: Vec<Value> = list["terms"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|term| term.to_string().contains(query))
+                        .take(30)
+                        .cloned()
+                        .collect();
+                    json!({"status":"ok","terms":terms})
+                }
+                Err(_) => json!({"status":"unavailable"}),
+            }
+        }
+    } else {
+        browser_bridge::dispatch(
+            app,
+            chat,
+            turn_id,
+            name,
+            arguments,
+            (permission_mode, provider),
+            cancel.clone(),
+        )
+        .await
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ProviderToolHost<'a> {
+    app: &'a App,
+    provider: &'a str,
+    permission_mode: &'a str,
+}
+
+#[cfg(target_os = "linux")]
+impl momso_server_providers::tool_loop::ToolHost for ProviderToolHost<'_> {
+    fn definitions(&self) -> Vec<Value> {
+        momso_server_providers::tool_loop::momso_tool_definitions()
+    }
+    fn dispatch<'a>(
+        &'a mut self,
+        context: &'a momso_server_providers::tool_loop::Context<'_>,
+        name: &'a str,
+        args: Value,
+        cancel: watch::Receiver<bool>,
+    ) -> momso_server_providers::tool_loop::ToolFuture<'a> {
+        Box::pin(async move {
+            Ok(dispatch_server_tool(
+                self.app,
+                context.chat_id,
+                context.turn_id,
+                name,
+                args,
+                (self.permission_mode, self.provider),
+                cancel,
+            )
+            .await)
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
 async fn run_provider(
     app: &App,
     chat: &str,
     turn_id: &str,
     name: &str,
-    settings: (&str, Option<&str>, bool),
+    settings: (&str, Option<&str>, bool, &str),
     skill: (&str, Option<&str>),
     cancel: watch::Receiver<bool>,
 ) -> Result<(), &'static str> {
-    let (model, effort, fast) = settings;
+    let (model, effort, fast, permission_mode) = settings;
     use momso_server_providers::{
-        transport::{Message, Role, Turn},
+        transport::{Message, Role},
         Provider,
     };
     let provider = if name == "claude" {
@@ -2264,49 +2476,32 @@ async fn run_provider(
             write_failed = true;
         }
     };
+    let mut host = ProviderToolHost {
+        app,
+        provider: name,
+        permission_mode,
+    };
     #[cfg(all(debug_assertions, feature = "test-fixtures"))]
-    if let Some(endpoint) = std::env::var_os("MOMSO_TEST_PROVIDER_ENDPOINT") {
-        momso_server_providers::transport::chat_fixture(
-            Turn {
-                provider,
-                model,
-                effort,
-                fast,
-                messages: &messages,
-                key: &key,
-            },
-            cancel,
-            &mut emit,
-            &endpoint.to_string_lossy(),
-        )
-        .await?;
-    } else {
-        momso_server_providers::transport::chat(
-            Turn {
-                provider,
-                model,
-                effort,
-                fast,
-                messages: &messages,
-                key: &key,
-            },
-            cancel,
-            &mut emit,
-        )
-        .await?;
-    }
+    let endpoint = std::env::var("MOMSO_TEST_PROVIDER_ENDPOINT").ok();
     #[cfg(not(all(debug_assertions, feature = "test-fixtures")))]
-    momso_server_providers::transport::chat(
-        Turn {
+    let endpoint: Option<String> = None;
+    momso_server_providers::tool_loop::chat_with_tools_settings(
+        momso_server_providers::tool_loop::ToolTurn {
             provider,
             model,
-            effort,
-            fast,
             messages: &messages,
             key: &key,
+            context: momso_server_providers::tool_loop::Context {
+                chat_id: chat,
+                turn_id,
+            },
         },
+        &mut host,
         cancel,
         &mut emit,
+        effort,
+        fast,
+        endpoint.as_deref(),
     )
     .await?;
     if write_failed {
@@ -2340,7 +2535,7 @@ async fn run_provider(
     _: &str,
     _: &str,
     _: &str,
-    _: (&str, Option<&str>, bool),
+    _: (&str, Option<&str>, bool, &str),
     _: (&str, Option<&str>),
     _: watch::Receiver<bool>,
 ) -> Result<(), &'static str> {
@@ -2486,170 +2681,16 @@ async fn run_codex(
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 let arguments = v.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-                let result = if momso_server_crm::TOOL_NAMES.contains(&name) {
-                    let app = app.clone();
-                    let chat = chat.to_owned();
-                    let name = name.to_owned();
-                    let mut approval =
-                        browser_bridge::HostApproval::new(&app, turn_id, cancel.clone());
-                    tokio::task::spawn_blocking(move || {
-                        match momso_server_crm::CrmStore::new(&app.data, &app.data.join("archive"))
-                        {
-                            Ok(store) => {
-                                let mut result =
-                                    store.dispatch(&chat, &name, &arguments, &mut approval);
-                                if name == "momso_crm_upsert" && result["status"] == "ok" {
-                                    let portable = format!("chat_{chat}");
-                                    let record = momso_core::receipt_store::record_action(
-                                        &app.data.join("archive"),
-                                        "codex",
-                                        Some(&portable),
-                                        "crm_upsert",
-                                    )
-                                    .ok();
-                                    result["recordStatus"] = json!(if record.is_some() {
-                                        "recorded"
-                                    } else {
-                                        "unavailable"
-                                    });
-                                    result["recordId"] = json!(record);
-                                }
-                                result
-                            }
-                            Err(reason) => json!({"status":reason}),
-                        }
-                    })
-                    .await
-                    .unwrap_or_else(|_| json!({"status":"unavailable"}))
-                } else if name == "momso_document_create" {
-                    let app = app.clone();
-                    let chat = chat.to_owned();
-                    let approval = browser_bridge::HostApproval::new(&app, turn_id, cancel.clone());
-                    let cancelled = cancel.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let Ok(body) = serde_json::from_value::<DocumentWrite>(arguments) else {
-                            return json!({"status":"invalid_input"});
-                        };
-                        let title: String = body
-                            .title
-                            .chars()
-                            .filter(|c| !c.is_control())
-                            .take(100)
-                            .collect();
-                        if title.is_empty()
-                            || !approval.ask(&chat, "document_write", &title)
-                            || *cancelled.borrow()
-                        {
-                            return json!({"status":"denied"});
-                        }
-                        match create_document_inner(&app, body) {
-                            Ok(mut value) => {
-                                let chat_id = format!("chat_{chat}");
-                                let record = value["id"].as_str().and_then(|id| {
-                                    momso_core::receipt_store::record_document(
-                                        &app.data.join("archive"),
-                                        "codex",
-                                        Some(&chat_id),
-                                        id,
-                                        "created",
-                                    )
-                                    .ok()
-                                });
-                                value["recordStatus"] = json!(if record.is_some() {
-                                    "recorded"
-                                } else {
-                                    "unavailable"
-                                });
-                                value["recordId"] = json!(record);
-                                json!({"status":"ok","document":value})
-                            }
-                            Err((_, Json(value))) => json!({"status":value["error"]}),
-                        }
-                    })
-                    .await
-                    .unwrap_or_else(|_| json!({"status":"unavailable"}))
-                } else if name == "momso_skill_read" {
-                    let name = arguments.get("name").and_then(Value::as_str).unwrap_or("");
-                    match momso_core::filesystem::read_callable_skill(
-                        &app.data.join("archive"),
-                        name,
-                    ) {
-                        Ok((head, body)) => json!({"status":"ok","name":head.name,"body":body}),
-                        Err(reason) => json!({"status":reason}),
-                    }
-                } else if name == "media_register_generated" {
-                    let path = arguments
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    let prompt = arguments
-                        .get("prompt")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    let parent = arguments
-                        .get("regenerateOf")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    if let (Some(path), Some(prompt)) = (path, prompt) {
-                        let work = app.clone();
-                        let room = chat.to_owned();
-                        let turn = turn_id.to_owned();
-                        match tokio::task::spawn_blocking(move || {
-                            media_output::register(
-                                &work,
-                                &room,
-                                &turn,
-                                std::path::Path::new(&path),
-                                &prompt,
-                                "reported",
-                                parent.as_deref(),
-                            )
-                        })
-                        .await
-                        {
-                            Ok(Ok(Some(id))) => json!({"status":"ok","assetId":id}),
-                            Ok(Ok(None)) => json!({"status":"invalid_kind"}),
-                            _ => json!({"status":"registration_failed"}),
-                        }
-                    } else {
-                        json!({"status":"invalid_arguments"})
-                    }
-                } else if name == "momso_dictionary_search" {
-                    let query = arguments
-                        .get("query")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim();
-                    if query.is_empty() || query.len() > 256 {
-                        json!({"status":"invalid_input"})
-                    } else {
-                        match momso_core::dictionary::list(&app.data.join("archive")) {
-                            Ok(list) => {
-                                let terms: Vec<Value> = list["terms"]
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter(|term| term.to_string().contains(query))
-                                    .take(30)
-                                    .cloned()
-                                    .collect();
-                                json!({"status":"ok","terms":terms})
-                            }
-                            Err(_) => json!({"status":"unavailable"}),
-                        }
-                    }
-                } else {
-                    browser_bridge::dispatch(
-                        app,
-                        chat,
-                        turn_id,
-                        name,
-                        arguments,
-                        permission_mode,
-                        cancel.clone(),
-                    )
-                    .await
-                };
+                let result = dispatch_server_tool(
+                    app,
+                    chat,
+                    turn_id,
+                    name,
+                    arguments,
+                    (permission_mode, "codex"),
+                    cancel.clone(),
+                )
+                .await;
                 send(&mut input,json!({"id":v["id"],"result":{"success":result["status"]=="ok" || result["status"]=="page","contentItems":[{"type":"inputText","text":result.to_string()}]}})).await?;
                 continue;
             }
@@ -2693,23 +2734,15 @@ async fn run_codex(
                 } else {
                     #[cfg(target_os = "linux")]
                     {
-                        let mut tools = momso_server_browser::tools::tool_definitions();
-                        if let (Some(dest), Some(crm)) = (
-                            tools.as_array_mut(),
-                            momso_server_crm::tool_definitions().as_array(),
-                        ) {
-                            dest.extend(crm.iter().cloned().map(|mut tool| {
-                                if let Some(object) = tool.as_object_mut() {
-                                    object.remove("annotations");
-                                }
-                                tool
-                            }));
-                            dest.push(json!({"name":"momso_skill_read","description":"Read an enabled momso skill by name.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}));
-                            dest.push(json!({"name":"momso_dictionary_search","description":"Find terms in the momso dictionary without changing the user's spelling.","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}}));
-                            dest.push(json!({"name":"momso_document_create","description":"Create a momso document after human approval.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"body":{"type":"string"},"folder":{"type":"string"}},"required":["title","summary","body"],"additionalProperties":false}}));
-                            dest.push(json!({"name":"media_register_generated","description":"Report an image or video saved in this turn's output directory, with the actual creation prompt.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"prompt":{"type":"string"},"regenerateOf":{"type":"string"}},"required":["path","prompt"],"additionalProperties":false}}));
+                        let mut tools = momso_server_providers::tool_loop::momso_tool_definitions();
+                        for tool in &mut tools {
+                            if let Some(object) = tool.as_object_mut() {
+                                object.remove("annotations");
+                            }
                         }
-                        p["dynamicTools"] = tools;
+                        tools.push(json!({"name":"momso_document_create","description":"Create a momso document after human approval.","inputSchema":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"body":{"type":"string"},"folder":{"type":"string"}},"required":["title","summary","body"],"additionalProperties":false}}));
+                        tools.push(json!({"name":"media_register_generated","description":"Report an image or video saved in this turn's output directory, with the actual creation prompt.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"prompt":{"type":"string"},"regenerateOf":{"type":"string"}},"required":["path","prompt"],"additionalProperties":false}}));
+                        p["dynamicTools"] = json!(tools);
                     }
                     "thread/start"
                 };

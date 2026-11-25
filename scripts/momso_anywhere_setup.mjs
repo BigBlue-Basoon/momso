@@ -39,6 +39,7 @@ export async function startAnywhere(provider, checkpoint, onProgress = () => {})
       onProgress({ step, state: 'failed', ...details });
       const wrapped = new SetupError(details.code ?? (error instanceof SetupError ? error.step : step));
       Object.assign(wrapped, details);
+      if (Array.isArray(error?.checks)) wrapped.checks = error.checks;
       throw wrapped;
     }
     onProgress({ step, state: 'done' });

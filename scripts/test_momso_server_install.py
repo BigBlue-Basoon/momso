@@ -42,6 +42,8 @@ class FakeProvider:
         assert hashlib.sha256(artifact.read_bytes()).hexdigest() == digest
         self.step("install")
     def health(self): self.step("health")
+    def ensure_private_proxy(self): pass
+    def gateway_proxy_health(self, _url): pass
     def install_web(self, archive, digest):
         assert hashlib.sha256(archive.read_bytes()).hexdigest() == digest
         self.step("web")
@@ -111,8 +113,15 @@ class FlowTests(unittest.TestCase):
             mock.start()
             self.addCleanup(mock.stop)
         import momso_anywhere_update_install
+        import momso_anywhere_pc_trust
+        bootstrap = patch.object(momso_anywhere_update_install, 'production_bootstrap', return_value=b'fixture')
+        active_key = patch.object(momso_anywhere_pc_trust, 'active_key', return_value=b'fixture')
+        bootstrap.start(); self.addCleanup(bootstrap.stop)
+        active_key.start(); self.addCleanup(active_key.stop)
         self.update_grant = patch.object(momso_anywhere_update_install, "grant_gateway_update")
         self.update_install = patch.object(momso_anywhere_update_install, "install")
+        refresh = patch.object(momso_anywhere_update_install, 'refresh_worker')
+        self.update_refresh_mock = refresh.start(); self.addCleanup(refresh.stop)
         self.update_grant_mock = self.update_grant.start(); self.addCleanup(self.update_grant.stop)
         self.update_install_mock = self.update_install.start(); self.addCleanup(self.update_install.stop)
 
@@ -144,23 +153,36 @@ class FlowTests(unittest.TestCase):
         installer.save_state(self.path, self.state)
         provider = FakeProvider()
         verdict = {'mode': 'delete_all', 'resources': {'bucket': {'status': 'unverified'}}, 'billable': [], 'billingZero': None, 'estimatedZeroAt': None}
-        with patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch.object(momso_anywhere_pc_discard, 'discard_backup', return_value=verdict) as cleanup, patch('momso_anywhere_pc_pause.guarded_destroy') as guard, patch('sys.stdout', new_callable=io.StringIO) as output:
+        with patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch.object(momso_anywhere_pc_discard, 'discard_backup', return_value=verdict) as cleanup, patch('momso_anywhere_iam_pc.remove_installation_bindings') as iam_cleanup, patch('momso_anywhere_vm_resources.destroy_identity') as vm_cleanup, patch('momso_anywhere_pc_pause.guarded_destroy') as guard, patch('sys.stdout', new_callable=io.StringIO) as output:
             result = installer.main(['destroy', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--discard-data'])
         self.assertEqual(result, 0)
         guard.assert_not_called()
+        vm_cleanup.assert_called_once_with(provider, discard_data=True)
+        iam_cleanup.assert_called_once_with(provider)
         cleanup.assert_called_once_with(provider, None)
-        gateway.return_value.destroy.assert_called_once()
+        gateway.return_value.destroy.assert_called_once_with(keep_roles=False)
         actual = json.loads(output.getvalue())
         self.assertEqual(actual['outcome'], 'deleted_unverified')
         self.assertIn('bucket', actual['unverified'])
         self.assertEqual(json.loads(self.path.read_text(encoding='utf-8'))['steps']['destroy'], 'ok')
+
+    def test_unreadable_iam_stops_before_any_account_or_gateway_deletion(self):
+        import momso_anywhere_install
+        self.state['anywhere'] = {'url': 'https://fixture.example.test'}
+        installer.save_state(self.path, self.state)
+        with patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch('momso_anywhere_iam_pc.remove_installation_bindings', side_effect=ValueError('iam_bindings_unverified')), patch('sys.stdout', new_callable=io.StringIO) as out, patch('sys.stderr', new_callable=io.StringIO):
+            self.assertEqual(installer.main(['destroy', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--discard-data']), 1)
+        gateway.assert_not_called()
+        result = json.loads(out.getvalue())
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertIn('iam_bindings', result['unverified'])
 
     def test_failed_destroy_keeps_previously_known_billing_deadline(self):
         import momso_anywhere_install
         self.state['anywhere'] = {'url': 'https://fixture.example.test'}
         self.state['backup_discard'] = {'billable': [{'resource': 'kms', 'endsAt': '2030-01-01T00:00:00Z'}]}
         installer.save_state(self.path, self.state)
-        with patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch('sys.stdout', new_callable=io.StringIO) as out, patch('sys.stderr', new_callable=io.StringIO):
+        with patch.object(installer, 'GoogleProvider', return_value=FakeProvider()), patch.object(momso_anywhere_install, 'GoogleAnywhere') as gateway, patch('momso_anywhere_iam_pc.remove_installation_bindings'), patch('sys.stdout', new_callable=io.StringIO) as out, patch('sys.stderr', new_callable=io.StringIO):
             gateway.return_value.destroy.side_effect = installer.InstallError('vm_unreachable')
             result = installer.main(['destroy', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--discard-data'])
         self.assertEqual(result, 1)
@@ -323,6 +345,8 @@ class FlowTests(unittest.TestCase):
                 commands.append(args)
             if args[:2] == ('compute', 'scp'):
                 packages.append(Path(args[2]).read_bytes())
+            if args[:2] == ('compute', 'ssh') and len(packages) == 3:
+                return b'worker_install_ok'
             return b'momso_checkpoint_ok'
         public = self.root / 'public.pem'; public.write_bytes(b'fixture public key')
         with patch.object(provider, 'run', side_effect=run), patch.object(provider, 'health'):
@@ -520,8 +544,43 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(provider.calls, ["network", "vm", "install", "health", "web"])
         self.update_grant_mock.assert_called_once_with(provider)
-        self.update_install_mock.assert_called_once_with(provider, "production", self.public_key, "https://example.test/release.json")
+        self.update_install_mock.assert_called_once_with(provider, "production", self.public_key, "https://example.test/release.json", health_url="https://fixture.a.run.app")
         install.assert_called_once()
+
+    def test_new_gateway_is_removed_after_proxy_check_fails(self):
+        import momso_anywhere_install
+        import momso_anywhere_public_assets
+        provider = FakeProvider()
+        provider.gateway_proxy_health = lambda _url: (_ for _ in ()).throw(installer.InstallError('proxy_not_running'))
+        provider.run = lambda *args, **_kwargs: provider.calls.append(args)
+        web = self.root / 'web.tar.gz'; web.write_bytes(b'fixture')
+        digest = hashlib.sha256(web.read_bytes()).hexdigest()
+        def install(_provider, _path, state, *_args):
+            state['anywhere'].update({'url': 'https://fixture.a.run.app', 'gatewayCreatedInAttempt': True})
+            return state['anywhere']['url']
+        gateway = SimpleNamespace(_objects=lambda: (None, None, {'owned': True}), service='momso-any-fixture')
+        with patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install, 'install', side_effect=install), patch.object(momso_anywhere_install, 'GoogleAnywhere', return_value=gateway):
+            result = installer.main(['anywhere', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--artifact', str(self.artifact), '--sha256', self.digest, '--web-archive', str(web), '--web-sha256', digest, '--google-client-id', 'fixture.apps.googleusercontent.com', '--owner-sub', '12345', '--login-origin', 'https://login.example.test', '--gateway-image', 'registry.example.test/momso/gateway@sha256:' + 'a' * 64, '--release-manifest-url', 'https://example.test/release.json', '--release-public-key', str(self.public_key)])
+        self.assertEqual(result, 1)
+        self.assertIn(('run', 'services', 'delete', 'momso-any-fixture', '--region=asia-northeast3'), provider.calls)
+        self.assertNotIn('url', json.loads(self.path.read_text(encoding='utf-8'))['anywhere'])
+
+    def test_new_gateway_is_removed_if_worker_install_fails(self):
+        import momso_anywhere_install
+        import momso_anywhere_public_assets
+        provider = FakeProvider()
+        provider.run = lambda *args, **_kwargs: provider.calls.append(args)
+        web = self.root / 'web.tar.gz'; web.write_bytes(b'fixture')
+        digest = hashlib.sha256(web.read_bytes()).hexdigest()
+        def install(_provider, _path, state, *_args):
+            state['anywhere'].update({'url': 'https://fixture.a.run.app', 'gatewayCreatedInAttempt': True})
+            return state['anywhere']['url']
+        gateway = SimpleNamespace(_objects=lambda: (None, None, {'owned': True}), service='momso-any-fixture')
+        self.update_install_mock.side_effect = installer.InstallError('worker_failed')
+        with patch.object(installer, 'GoogleProvider', return_value=provider), patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install, 'install', side_effect=install), patch.object(momso_anywhere_install, 'GoogleAnywhere', return_value=gateway):
+            result = installer.main(['anywhere', '--account', 'fixture@example.test', '--project', 'fixture-project', '--state', str(self.path), '--artifact', str(self.artifact), '--sha256', self.digest, '--web-archive', str(web), '--web-sha256', digest, '--google-client-id', 'fixture.apps.googleusercontent.com', '--owner-sub', '12345', '--login-origin', 'https://login.example.test', '--gateway-image', 'registry.example.test/momso/gateway@sha256:' + 'a' * 64, '--release-manifest-url', 'https://example.test/release.json', '--release-public-key', str(self.public_key)])
+        self.assertEqual(result, 1)
+        self.assertIn(('run', 'services', 'delete', 'momso-any-fixture', '--region=asia-northeast3'), provider.calls)
 
     def test_anywhere_wrong_web_digest_creates_no_resources(self):
         provider = FakeProvider()
@@ -558,6 +617,9 @@ class FlowTests(unittest.TestCase):
     def test_existing_anywhere_upgrade_changes_only_server_and_web(self):
         import momso_anywhere_install
         import momso_anywhere_public_assets
+        proxy_patch = patch.object(momso_anywhere_install, 'install_private_proxy', return_value={})
+        proxy_patch.start()
+        self.addCleanup(proxy_patch.stop)
         web = self.root / "web.tar.gz"
         web.write_bytes(b"new web")
         web_hash = hashlib.sha256(web.read_bytes()).hexdigest()
@@ -579,6 +641,7 @@ class FlowTests(unittest.TestCase):
                 raise AssertionError("unexpected cloud write")
             def health(self): self.calls.append(("health",))
             def ensure_private_proxy(self): self.calls.append(("private_proxy",))
+            def gateway_proxy_health(self, url): self.calls.append(('gateway_health', url))
             def upgrade_checkpoint(self, action): self.calls.append(("checkpoint", action))
             def upgrade_server(self, *args): self.calls.append(("upgrade_server",))
             def install_web(self, *args): self.calls.append(("install_web",))
@@ -593,19 +656,36 @@ class FlowTests(unittest.TestCase):
         with patch.object(momso_anywhere_public_assets, "from_web_archive", return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, "_objects", return_value=({"name": "account"}, {"name": "role"}, {"name": "service"})), patch.object(momso_anywhere_install.GoogleAnywhere, "upgrade_gateway") as upgrade_gateway, patch("momso_anywhere_vm_services.install") as install_services:
             url = installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, "client", "12345", "https://login.example.test", "registry.example.test/momso/gateway@sha256:" + "a" * 64)
         install_services.assert_called_once_with(provider, allow_upgrade_gate=True)
-        upgrade_gateway.assert_called_once_with(state["anywhere"]["url"], "registry.example.test/momso/gateway@sha256:" + "a" * 64)
+        self.assertEqual(upgrade_gateway.call_args.args, (state["anywhere"]["url"], "registry.example.test/momso/gateway@sha256:" + "a" * 64))
+        upgrade_gateway.call_args.kwargs['health_check']()
         self.assertEqual(url, state["anywhere"]["url"])
         self.assertEqual(data.read_bytes(), b"synthetic chat data")
         self.assertEqual([x[0] for x in provider.calls].count("upgrade_server"), 1)
         self.assertEqual([x[0] for x in provider.calls].count("install_web"), 1)
         self.assertFalse(any("delete" in call or "create" in call for call in provider.calls))
         self.assertEqual([call for call in provider.calls if call[0] == "checkpoint"], [("checkpoint", "begin"), ("checkpoint", "finish")])
-        self.assertEqual([call for call in provider.calls if call[0] == "private_proxy"], [("private_proxy",)])
+        self.assertEqual([call for call in provider.calls if call[0] == "private_proxy"], [("private_proxy",), ("private_proxy",)])
 
         provider.calls.clear()
         with patch.object(momso_anywhere_public_assets, "from_web_archive", return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, "_objects", return_value=({"name": "account"}, {"name": "role"}, {"name": "service"})), patch.object(momso_anywhere_install.GoogleAnywhere, "upgrade_gateway"), patch("momso_anywhere_vm_services.install"):
             installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, "client", "12345", "https://login.example.test", "registry.example.test/momso/gateway@sha256:" + "a" * 64, signed_sequence=3)
         self.assertEqual([call for call in provider.calls if call[0] == "sequence"], [("sequence", 3, False), ("sequence", 3, True)])
+
+        provider.calls.clear()
+        def verify_gateway(_url, _image, *, health_check): health_check()
+        with patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, '_objects', return_value=({'name': 'account'}, {'name': 'role'}, {'name': 'service'})), patch.object(momso_anywhere_install.GoogleAnywhere, 'upgrade_gateway', side_effect=verify_gateway), patch('momso_anywhere_vm_services.install'):
+            installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, 'client', '12345', 'https://login.example.test', 'registry.example.test/momso/gateway@sha256:' + 'a' * 64, signed_sequence=3, update_settings=('development', self.public_key, 'https://example.test/release.json'))
+        self.update_install_mock.assert_called_once_with(provider, 'development', self.public_key, 'https://example.test/release.json', gate_already_held=True, health_url=state['anywhere']['url'])
+
+        provider.calls.clear()
+        provider.gateway_proxy_health = lambda _url: (_ for _ in ()).throw(installer.InstallError('proxy_not_running', gateway_failure={'code': 'proxy_not_running', 'rolledBack': True, 'retryable': True}))
+        def probe_gateway(_url, _image, *, health_check): health_check()
+        with patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, '_objects', return_value=({'name': 'account'}, {'name': 'role'}, {'name': 'service'})), patch.object(momso_anywhere_install.GoogleAnywhere, 'upgrade_gateway', side_effect=probe_gateway), patch('momso_anywhere_vm_services.install'):
+            with self.assertRaises(installer.InstallError) as error:
+                installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, 'client', '12345', 'https://login.example.test', 'registry.example.test/momso/gateway@sha256:' + 'a' * 64)
+        self.assertEqual(error.exception.gateway_failure['code'], 'proxy_not_running')
+        self.assertEqual([call for call in provider.calls if call[0] == 'checkpoint'], [('checkpoint', 'begin'), ('checkpoint', 'restore'), ('checkpoint', 'finish')])
+        provider.gateway_proxy_health = lambda _url: None
 
         provider.calls.clear()
         health_calls = []
@@ -630,7 +710,11 @@ class FlowTests(unittest.TestCase):
         self.assertEqual([call for call in provider.calls if call[0] == "checkpoint"], [("checkpoint", "begin"), ("checkpoint", "restore"), ("checkpoint", "finish")])
 
         detail = {'code': 'gateway_probe_failed', 'rolledBack': True, 'retryable': True}
-        provider.ensure_private_proxy = lambda: (_ for _ in ()).throw(installer.InstallError('proxy failure'))
+        proxy_checks = []
+        def fail_after_gateway():
+            proxy_checks.append(1)
+            if len(proxy_checks) > 1: raise installer.InstallError('proxy failure')
+        provider.ensure_private_proxy = fail_after_gateway
         with patch.object(momso_anywhere_public_assets, 'from_web_archive', return_value={}), patch.object(momso_anywhere_install.GoogleAnywhere, '_objects', return_value=({'name': 'account'}, {'name': 'role'}, {'name': 'service'})), patch.object(momso_anywhere_install.GoogleAnywhere, 'upgrade_gateway', side_effect=installer.InstallError('gateway failure', gateway_failure=detail)), patch('momso_anywhere_vm_services.install'):
             with self.assertRaises(installer.InstallError) as error:
                 installer.upgrade_anywhere(provider, state, self.artifact, self.digest, web, web_hash, 'client', '12345', 'https://login.example.test', 'registry.example.test/momso/gateway@sha256:' + 'a' * 64)
@@ -647,6 +731,8 @@ class FlowTests(unittest.TestCase):
             result = installer.main(["anywhere", "--account", "fixture@example.test", "--project", "fixture-project", "--state", str(self.path), "--artifact", str(self.artifact), "--sha256", self.digest, "--web-archive", str(web), "--web-sha256", digest, "--google-client-id", "fixture.apps.googleusercontent.com", "--owner-sub", "12345", "--login-origin", "https://login.example.test", "--gateway-image", "registry.example.test/momso/gateway@sha256:" + "a" * 64, '--release-manifest-url', 'https://example.test/release.json', '--release-public-key', str(self.public_key)])
         self.assertEqual(result, 0)
         upgrade.assert_called_once()
+        self.update_refresh_mock.assert_not_called()
+        self.update_install_mock.assert_not_called()
         deploy.assert_not_called()
 
     def test_existing_install_passes_signed_ghcr_image_to_upgrade(self):
@@ -672,6 +758,21 @@ class FlowTests(unittest.TestCase):
         encoded = next(node.value.value for node in tree.body if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "p")
         payload = base64.b64decode(encoded).decode()
         self.assertLess(payload.index("('git','ffmpeg')"), payload.index("run('systemctl','enable'"))
+
+    def test_first_install_installs_chromium_only_when_no_browser_exists(self):
+        with patch.object(installer.shutil, "which", return_value="gcloud"):
+            provider = installer.GoogleProvider("fixture@example.test", "fixture-project", "0123456789ab", self.root / "fixture-key")
+        with patch.object(provider, "ssh", return_value=b"") as ssh:
+            provider.install(self.artifact, self.digest)
+        wrapper = ast.parse(ssh.call_args_list[1].args[0])
+        encoded = next(node.value.value for node in wrapper.body if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "p")
+        tree = ast.parse(base64.b64decode(encoded).decode())
+        assignment = next(node for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "missing" for target in node.targets))
+        browser_check = next(node for node in tree.body if isinstance(node, ast.If) and "chromium-browser" in ast.unparse(node.test))
+        for available, expected in [(set(), ["git", "ffmpeg", "chromium"]), ({"git", "ffmpeg", "chromium"}, []), ({"git", "ffmpeg", "google-chrome"}, [])]:
+            env = {"shutil": SimpleNamespace(which=lambda name: name if name in available else None)}
+            exec(compile(ast.Module(body=[assignment, browser_check], type_ignores=[]), "fixture", "exec"), env)
+            self.assertEqual(env["missing"], expected)
 
     def test_server_upgrade_payload_does_not_touch_data_or_configuration(self):
         with patch.object(installer.shutil, "which", return_value="gcloud"):
@@ -806,6 +907,14 @@ if __name__ == "__main__":
 
 
 class InstallerFilesTests(unittest.TestCase):
+    def test_private_proxy_check_requires_systemd_active_and_health(self):
+        provider = installer.GoogleProvider.__new__(installer.GoogleProvider)
+        scripts = []
+        provider.ssh = lambda code, *_args: scripts.append(code)
+        provider.ensure_private_proxy()
+        self.assertIn("'is-active','--quiet','momso-private-proxy'", scripts[0])
+        self.assertIn('https://127.0.0.1:8766/health', scripts[0])
+
     def test_missing_installer_components_have_friendly_error(self):
         import tempfile
         from pathlib import Path

@@ -27,17 +27,21 @@ def main(config_path, first, second, mode="signature"):
     if url.scheme != 'http' or url.hostname != '127.0.0.1':
         raise ValueError('fixture must use loopback')
     first, second = Path(first), Path(second)
-    if mode not in ('signature', 'installer', 'interrupt', 'power') or not first.name.startswith(name + '_0.1.1_'):
+    if mode not in ('signature', 'lower', 'malformed', 'installer', 'interrupt', 'power') or not first.name.startswith(name + '_0.1.1_'):
         raise ValueError('fixture installers do not match')
-    if mode == 'signature' and not second.name.startswith(name + '_0.1.2_'):
+    if mode in ('signature', 'lower', 'malformed') and not second.name.startswith(name + '_0.1.2_'):
         raise ValueError('fixture installers do not match')
     signature_source = first if mode == 'signature' else second
     invalid_signature = Path(str(signature_source) + '.sig').read_text(encoding='utf-8').strip()
     payload = second.read_bytes()
-    response = json.dumps({'version': '0.1.2', 'platforms': {'windows-x86_64': {'url': f'http://127.0.0.1:{url.port}/installer.exe', 'signature': invalid_signature}}}).encode()
+    response = json.dumps({'version': '0.1.0' if mode == 'lower' else '0.1.2', 'platforms': {'windows-x86_64': {'url': f'http://127.0.0.1:{url.port}/installer.exe', 'signature': invalid_signature}}}).encode()
+    if mode == 'malformed':
+        response = b'{invalid-json'
+    requests = {'manifest': 0, 'installer': 0}
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_): pass
         def do_GET(self):
+            requests['manifest' if self.path == '/latest.json' else 'installer'] += 1
             value = response if self.path == '/latest.json' else payload
             self.send_response(200); self.send_header('Content-Length', str(len(value))); self.end_headers(); self.wfile.write(value)
     httpd = http.server.ThreadingHTTPServer(('127.0.0.1', url.port), Handler)
@@ -84,6 +88,7 @@ def main(config_path, first, second, mode="signature"):
                 while time.monotonic() < deadline:
                     state = marker.read_text(encoding='utf-8') if marker.exists() else ''
                     if mode == 'signature' and state == 'download_failed': break
+                    if mode in ('lower', 'malformed') and state == 'check_failed': break
                     if mode == 'installer' and state == 'install_failed:Ok(\"failed\")': break
                     if mode in ('interrupt', 'power') and installer_pid() is not None: break
                     if state and state != 'installing': raise RuntimeError('unexpected result: ' + state)
@@ -135,6 +140,8 @@ def main(config_path, first, second, mode="signature"):
                             break
                         time.sleep(0.5)
                 assert matches_prior(), 'installed app changed'
+                if mode in ('lower', 'malformed') and (requests['manifest'] < 1 or requests['installer'] != 0):
+                    raise RuntimeError('invalid release unexpectedly downloaded installer')
                 if mode in ('interrupt', 'power'):
                     deadline = time.monotonic() + 180
                     while time.monotonic() < deadline:

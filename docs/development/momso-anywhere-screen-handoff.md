@@ -1,10 +1,11 @@
 # momso 화면 인계: 시작·연결·삭제·업데이트
 
-기준: 통합 `ddddc1b1f`의 코드와 아래 원문. 이 문서는 화면 작업을 위한 계약·미결 사항의 색인이며, 화면 문구나 모양을 결정하지 않는다. 과거 문서의 완료 여부는 그 문서의 시험 시점에 한정된다. 가짜 시험, 실제 계정·기기 확인, 배포는 서로 다르다.
+기준: 통합 `d79a3695f`의 코드와 아래 원문을 S150에서 대조했다. 이 문서는 화면 작업을 위한 계약·미결 사항의 색인이며, 화면 문구나 모양을 결정하지 않는다. 과거 문서의 완료 여부는 그 문서의 시험 시점에 한정된다. 가짜 시험, 실제 계정·기기 확인, 배포는 서로 다르다.
 
-## 이미 정한 것
+## 정해진 것
 
 - 고객에게 보이는 이름은 `momso` 또는 몸소다. `momso anywhere`와 `momso desktop`은 두 제품을 구분할 때 쓴다.
+- 삭제 선택은 자료·백업을 보존하는 `쉬기`와 자료까지 지우는 `전부 지우기` 두 단추로 구분한다. `전부 지우기`는 사람이 명시적으로 선택한다. 구현의 `discardData`와 PC의 `--discard-data`는 그 선택에 대응한다.
 - Windows 코드 서명 인증서는 사지 않고 SmartScreen 경고를 받아들인다. **Tauri 자동 업데이트 서명은 별개로 유지**하며 개인키는 개인키 소유자가 다룬다. 조직 정책이 서명 없는 파일을 막을 수 있다. [S118](desktop-release-preparation-s118.md), [결정 기록](windows-distribution-signing-decision.md)
 - 입구 이미지는 공개 GHCR의 서명 목록에 고정된 참조를 고객 Cloud Run이 직접 쓴다. 고객 Artifact Registry 원격 저장소는 기본으로 만들지 않는다. 실제 발행·고객 프로젝트 적용은 별도 확인이다. [S111](momso-anywhere-public-gateway-s111.md)
 - 공통 로그인·시작 사이트는 무료 정적 호스팅 이전을 준비했다. 운영 주소는 `https://anywhere.momso.yoga`, 소개 사이트와 별개다. 도메인 연결·실제 게시·OAuth 변경은 확인되지 않았다. 무료 상품의 정책 변경과 도메인 비용까지 0원을 보장하지 않는다. [S114](momso-anywhere-static-host-s114.md), [PWA](momso-anywhere-pwa-entry-20261121.md)
@@ -21,11 +22,12 @@
 | `findFromGesture({clientId, release})` | 조건을 확인한 고객 입구 URL 목록. 여러 개면 선택이 필요하다. |
 | `resumeAfterRedirect({clientId, release, onProgress, ...})` | 최초 진입과 `pageshow` 복원 시 중복 없이 호출. 이어갈 일이 없으면 `null`; 있으면 `kind`가 `projects`, `billing`, `start`, `find`, `destroy`, `deletion_preview`, `redirecting` 중 하나인 결과. 목록은 `projects` 또는 `billingAccounts`, 나머지는 `result`, 선택은 `selection: {projectId,billingAccountName}`이다. |
 | `retryLastAction({clientId, release, onProgress})` | 마지막 작업을 같은 `kind` 계약으로 재시도한다. 구형 `retryFromGesture`는 호환용이며 항상 Google로 이동한다. |
-| `openGoogleSetup({destination})` | 사용자 동작에서만 호출. `cloud` → `https://console.cloud.google.com/`, `billing` → `https://console.cloud.google.com/billing`, `trial` → `https://cloud.google.com/free`, `quota` → `https://console.cloud.google.com/projectcreate`. 먼저 재시도 기록이 필요하다. |
+| `openGoogleSetup({destination})` | 사용자 동작에서 호출하고 Google을 별도 탭으로 연다. `cloud` → `https://console.cloud.google.com/`, `billing` → `https://console.cloud.google.com/billing`, `trial` → `https://cloud.google.com/free`, `quota` → `https://console.cloud.google.com/projectcreate`. 기록이 없는 첫 진입은 결제·체험에서 `billing`, 그 외에는 `projects` 목록 읽기를 기록한다. |
+| `watchGoogleSetupReturn({clientId, release, onProgress, onResult, onError?, intervalMs?})` | 원래 탭이 보일 때 `visibilitychange`, `focus`, 기본 15초 간격으로 마지막 목록 읽기 또는 설치를 한 번씩 재시도한다. 성공하면 `onResult`에 `retryLastAction`과 같은 결과를 주고 감시를 끝낸다. 빈 결제 목록은 계속 기다린다. `{check, stop}`을 반환하며 화면이 이탈할 때 `stop()`으로 해제한다. 삭제는 자동 재시도하지 않는다. 토큰 만료 시 `onError`의 `authorization_expired`를 처리해 사람이 재인증해야 한다. |
 
 리디렉션 중 `{redirecting:true}` 또는 `{kind:'redirecting'}`은 실패가 아니다. 접근 토큰은 메모리에만 두고 주소·저장소·로그에 남기지 않는다. `onProgress.step`은 `project`(프로젝트), `billing`(결제), `services`(API), `privateNetwork`(사설망), `server`(VM·서버), `gateway`(입구), `gatewayReady`(입구 준비); `state`는 `working`, `done`, `failed`다. 알 수 없는 예외가 해당 단계 이름으로 전달될 수도 있다.
 
-사람만 Google에서 로그인·권한 동의·약관 결정·결제수단·본인 확인을 한다. Google 화면이 완료 후 자동으로 돌아온다는 보장은 없으며 뒤로 가기가 필요할 수 있다. 403을 약관 미동의나 카드 필요로 단정하지 않는다. `terms_not_accepted`, `card_required`는 현재 계약에 없다. 실제 새 계정·휴대폰 시험은 미확인이다.
+사람만 Google에서 로그인·권한 동의·약관 결정·결제수단·본인 확인을 한다. Google 탭이 스스로 닫히거나 원래 탭으로 돌아온다는 보장은 없다. 원래 탭이 다시 보이면 감시가 확인한다. 목록 조회의 성공만으로 약관·카드 등록 완료를 확정할 수는 없다. 일반 403의 `permission_denied`에는 `checks: ['billing_account', 'terms', 'project_permissions']`가 붙으며 원인을 단정하지 않는다. `terms_not_accepted`, `card_required`는 현재 계약에 없다. 실제 새 계정·휴대폰 시험은 미확인이다.
 
 ### 시작·연결 까닭 `SetupError.step`
 
@@ -87,18 +89,18 @@
 | `gateway_not_ready` | 새 판·트래픽·입구 준비 조건이 맞지 않는다. |
 | `gateway_probe_failed` | 입구의 공개 준비 확인이 성공하지 않았다. |
 | `gateway_rollback_failed` | 입구 실패 뒤 이전 트래픽 복구도 실패했다. |
-| `vm_unreachable` | 휴대폰의 백업 보존 삭제 경로는 VM 유지보수 문에 닿지 못해 중단된다. |
+| `vm_unreachable` | 휴대폰의 쉬기 준비·표 확인에서 VM에 닿지 못했다. 쉬기가 항상 차단된다는 뜻은 아니다. |
 | `vm_unconfirmed` | 전체 삭제 후에도 VM이 있는 것으로 조회됐다. |
 
 ## 로그인·홈 화면
 
-S133: 소유자 세션으로 요청했을 때 VM을 깨우는 중이면 입구는 `503`, `X-Momso-Response: gateway`, `Retry-After: 5`와 JSON `{"error":"waking","retryAfterSeconds":5}`를 반환한다. 화면은 지정된 시간만큼 기다린 후 요청을 다시 시도한다. 본부의 실제 확인에서는 VM 시작부터 `/health` 준비까지 약 40초가 걸렸다. 이 값은 보장이 아니다. 입구 프로세스 안에서 5초 동안 깨우기 요청을 묶으며, 여러 입구 인스턴스 사이의 전역 중복 제거는 보장하지 않는다. 변경된 입구 코드는 새 이미지와 순번 7 배포가 필요하다.
+S133: 유효한 소유자 세션의 일반 fetch가 VM에 닿지 않아 깨우기를 요청하면 입구는 `503`, `X-Momso-Response: gateway`, `Retry-After: 5`와 JSON `{"error":"waking","retryAfterSeconds":5}`를 반환한다. 화면은 지정된 시간만큼 기다린 후 요청을 다시 시도한다. 세션 없는 요청은 VM을 깨우지 않는다. 페이지 열기 요청은 별도의 200·자동 새로고침 화면을 받는다. 본부의 실제 확인은 **페이지 열기**를 통한 깨우기이며 `/health` 준비까지 약 40초가 걸렸다. fetch 깨우기와 시간 보장은 실제 미확인이다. 입구 프로세스 안에서 5초 동안 깨우기 요청을 묶으며, 여러 입구 인스턴스 사이의 전역 중복 제거는 보장하지 않는다.
 
 출처: [S42](momso-anywhere-s42-login-upgrade.md), [PWA·입구](momso-anywhere-pwa-entry-20261121.md), [S114](momso-anywhere-static-host-s114.md).
 
 - 공통 로그인은 전체 창 Google OIDC 이동이며 팝업·별도 몸소 비밀번호를 요구하지 않는다. 화면 HTML의 `#google-login`을 연결하고 `document.body.dataset.state`는 초기값 없음, `ready`, `working`, `error`, `invalid`다. `ready`와 `error`에서만 단추가 켜진다. Google 계정 선택·로그인은 사람이 한다. 세션 설정은 30일이며 실제 30일 기기 시험과 iPhone·Android 홈 화면 복귀는 별도다.
 - 입구가 직접 거절하면 JSON `{"error":"<까닭>"}`와 `X-Momso-Response: gateway`를 반환한다. VM에서 전달된 응답은 `X-Momso-Response: upstream`이며 본문은 VM의 계약을 따른다. 표식이 없으면 Cloud Run·IAM 등 입구 앞단 또는 중간 전달 경로에서 나온 응답일 수 있으며 원인을 단정하지 않는다. 허용된 로그인 출처의 표 호출에서는 CORS가 이 머리글을 노출한다. 허용되지 않은 출처는 브라우저가 응답을 읽지 못할 수 있다. `POST /__momso/auth/logout`의 화면 단추 여부는 미결이다.
-- 시작 페이지 `/start/`와 로그인 `/`은 같은 정적 출처의 다른 경로다. 홈 화면 추가 대상은 시작 페이지가 아니라 고객별 입구다. 시작 `config.json`의 `clientId`, `release.manifestUrl`, `release.publicKeySpki`, `release.channel`, `release.loginOrigin`은 공개 설정이나 변조를 막아야 한다. 실제 정적 배포·OAuth 출처와 redirect, CORS·헤더·아이콘은 별도 확인이다.
+- 시작 페이지 `/start/`와 로그인 `/`은 같은 정적 출처의 다른 경로다. 홈 화면 추가 대상은 시작 페이지가 아니라 고객별 입구다. 시작 `config.json`의 `clientId`, `release.manifestUrl`, `release.publicKeySpki`, `release.channel`, `release.loginOrigin`, 운영 채널의 `release.trustBootstrap`은 공개 설정이나 변조를 막아야 한다. 실제 정적 배포·OAuth 출처와 redirect, CORS·헤더·아이콘은 별도 확인이다.
 
 | 입구 까닭 | 뜻 |
 | --- | --- |
@@ -196,7 +198,9 @@ S117a·c는 `deleted`와 `deleted_unverified`를 삭제 단계 통과로 다루�
 
 휴대폰 앱은 소유자 세션으로 `POST /__momso/pause/prepare`를 부른다. 성공 시 받은 `ticket`, `expiresIn`과 입구 출처·프로젝트 ID·설치 ID, 발급 직후 밀리초 시각을 시작 페이지 조각에 `pause_ticket`, `gateway`, `project_id`, `installation_id`, `created_at`, `expires_at`으로 전달한다(`expires_at = created_at + expiresIn * 1000`). 시작 페이지의 `resumeAfterRedirect({clientId, release, onProgress, ...})`는 조각을 소비해 `{kind:'pause_ready', selection:{projectId, installationId}}`를 반환한다. 화면이 `destroyFromGesture`를 부르면 인증 필요 시 `{redirecting:true}`, 복귀 후 `resumeAfterRedirect`는 `{kind:'destroy', result}`를 반환한다. `cancelPauseFromGesture({session, fetchImpl})`는 준비 상태에서 해제 성공 시 `{ok:true}`, 삭제 준비가 진행 중이면 `{ok:true,pending:true}`를 반환하고 원래 삭제 호출은 해제 후 `pause_cancelled`로 끝난다. VM 삭제 요청을 이미 보내 결과를 모르면 `vm_deletion_unconfirmed`이며 문을 열지 않는다. 표가 없으면 `pause_requires_app_session`, 표가 만료·재사용됐으면 `invalid_pause_ticket`, 확인 불능은 `vm_unreachable` 또는 `maintenance_release_unconfirmed`이다. 인증 이동 중 표는 이 탭의 `sessionStorage` 한 키에만 잠시 두며 복귀 시 삭제한다. 입구 코드 적용에는 새 서명된 입구 이미지가 필요하다.
 
-`backupExists:true|false|null`, `lastBackupAt`, `lastBackupValidity`는 미리 보기이며 과거 시각만으로 마지막 변경의 백업을 보장하지 않는다. `estimatedMonthly`의 `kms`, `storage`, `subtotal`, `total`은 확인 범위별 부분 추정이다. `null`은 0이 아니라 미확인이다. `billable[].resource`, `billable[].endsAt`은 확인된 과금 가능 자원과 기한이며 `null` 기한은 모른다. `backupBillingZero`·`backupChargesEndAt`은 버킷·KMS만의 범위이고 `billingZero:null`은 전체 요금 미확인이다. `status:'complete'`도 전체 프로젝트 요금이 0이라는 뜻이 아니다. 같은 프로젝트·설치 ID로 재시도한다. S117c는 휴대폰 경로를 쓰며 대기·미확인을 통과로 기록하지 않는다.
+소유자 세션의 같은 출처 호출은 `GET /__momso/pause/status` → `{state}`, `POST /__momso/pause/owner-release`와 `POST /__momso/pause/reissue`도 제공한다. 준비 표의 기본 유효 기간은 300초다. 준비 상태에서 만료되면 문을 열지만 확정된 상태는 만료로 열지 않는다. 확인된 VM 삭제 실패에는 해제하고, 삭제 요청 결과가 불명확하면 열지 않는다. 확인·해제 표 호출은 설정된 로그인 출처만 CORS로 허용하며 쿠키 없이 표로 인증한다. 실제 휴대폰·클라우드 삭제 확인은 미확인이다. [S120](momso-anywhere-deletion-s120.md)
+
+`backupExists:true|false|null`, `lastBackupAt`, `lastBackupValidity`는 미리 보기이며 과거 시각만으로 마지막 변경의 백업을 보장하지 않는다. `estimatedMonthly`의 `kms`, `storage`, `subtotal`, `total`은 확인 범위별 부분 추정이다. `null`은 0이 아니라 미확인이다. `billable[].resource`, `billable[].endsAt`은 확인된 과금 가능 자원과 기한이며 `null` 기한은 모른다. `backupBillingZero`·`backupChargesEndAt`은 버킷·KMS만의 범위이고 `billingZero:null`은 전체 요금 미확인이다. `status:'complete'`도 전체 프로젝트 요금이 0이라는 뜻이 아니다. 같은 프로젝트·설치 ID로 재시도한다. S117c 삭제 단계는 `deleted_unverified`도 통과로 기록하되 미확인 종류를 별도로 출력한다. `remaining`은 통과가 아니다.
 
 | 값 | 뜻 |
 | --- | --- |
@@ -248,6 +252,12 @@ PC에서 접속 실패와 문 열림 미확인이 함께 있으면 `vm_unreachab
 
 휴대폰은 인증된 `GET /update/status`로 `{state,reason}`을 읽는다. 입구 전환 실패에는 공통 `{code,rolledBack,retryable}`도 붙는다. PC 설치기는 같은 객체를 표준 출력의 JSON 한 줄로 내고 사람용 오류는 표준 오류에 남긴다. 휴대폰 시작은 기존 `SetupError.step`과 함께 이 세 필드를 오류 및 단계 진행 이벤트에 제공한다. `rolledBack:true`는 이전 입구 트래픽 복구를 확인했다는 뜻이고 `false`는 복구 실패, `null`은 확인하지 못한 것이다. `retryable:null`은 재시도 가능 여부 미확인이다. 자동 업데이트 상태는 `checking`, `up_to_date`, `downloading`, `waiting_for_idle`, `backing_up`, `installing`, `updating_gateway`, `completed`, `rolling_back`, `rolled_back`, `recovery_required`, `failed`다. `reason`은 안전한 오류 이름 또는 `null`이며 서버 재시작 동안 입구가 마지막 상태를 제공하도록 설계됐다. 새 입구는 지문과 트래픽을 확인하고 `GET /__momso/ready`의 200·`{"ready":true}`를 검사한다. 이 확인은 VM·채팅의 정상 동작까지 증명하지 않는다.
 
+S129e: PC 갱신과 VM 자동 갱신은 입구 전환 실패 시 이전 실행 파일·화면·자료 스냅샷 복구를 시도한다. 자료 복원이 실패하면 실행 파일과 자료가 실패 전 새 판 그대로인지 확인된 경우에만 서버 재시작을 시도한다. 그 확인이나 재시작이 실패하면 서버가 켜졌다고 가정하지 않는다. 복구 실패는 `rollback_failed` 등 상태로 확인한다. 이 복구 경로는 가짜 시험 범위다. [S59](server-upgrade-data-s59.md)
+
+### 운영 서명키 교체
+
+운영 시작 설정의 `release.trustBootstrap`에는 순번 0의 공개키 셋과 정족수 2, 최초 릴리스 키가 들어간다. 평소 릴리스는 현재 주 키 하나로 서명하고, 신뢰 교체에는 기존·새 키 집합 각각 3개 중 2개의 서명이 필요하다. `trust-root-<순번>.json`과 `trust-root-<순번>.sigs.json`을 순서대로 확인한 뒤 현재 주 키로 릴리스를 확인한다. 교체의 서명된 `issuedAt`은 이전 root의 유효 기간 안이어야 하고 앞선 교체보다 이르거나 미래면 안 된다. 중간 root는 현재 시각으로 만료를 다시 보지 않고, 맨 끝 root는 현재 시각으로 만료를 확인한다. PC 설치기·VM 작업자는 신뢰 순번을 파일에 보존하고, 브라우저는 저장된 교체 이력을 초기 root부터 재검증한다. `issuedAt`은 서명자가 주장한 시각이지 외부에서 증명한 서명 시각이 아니다. 브라우저 저장소 삭제·새 기기에서 오래된 root가 제시되는 경우와 최신 목록을 숨기는 공격까지 방지한다고 보장하지 않는다. 개발 채널은 단일 개발 키를 쓴다. 실제 운영 키 발급·교체·휴대폰 검증은 미확인이다. [S142](momso-anywhere-key-rotation-s142.md)
+
 | 값 | 뜻 |
 | --- | --- |
 | `release_discovery_unavailable` | 공개 릴리스 목록 조회에 실패했다. |
@@ -285,6 +295,16 @@ PC에서 접속 실패와 문 열림 미확인이 함께 있으면 `vm_unreachab
 | `gateway_restore_failed` | 이전 입구 복구에 실패했다. |
 | `gateway_health_failed` | 복구한 입구의 건강 확인을 수행하지 못했다. |
 | `signature_invalid` | 서명된 목록을 검증하지 못했다. |
+| `root_invalid` | 운영 신뢰 root의 형식·공개키를 확인하지 못했다. |
+| `root_version_invalid` | 교체 순번이 현재 순번의 다음이 아니거나 자산 이름과 다르다. |
+| `root_expired` | 최종적으로 사용할 현재 신뢰 root의 유효 기간이 지났다. |
+| `root_time_invalid` | 교체 발행 시각이 앞선 root의 유효 기간 밖이거나 역행·미래다. |
+| `signature_threshold_invalid` | 이전·새 신뢰 집합이 각각 요구하는 교체 서명 수를 채우지 못했다. |
+| `root_assets_missing` | 필요한 교체 순번 또는 교체 파일 쌍이 빠졌다. |
+| `root_assets_ambiguous` | 같은 교체 자산의 출처를 하나로 확인하지 못했다. |
+| `root_assets_invalid` | 교체 서명 파일 등의 형식이 맞지 않는다. |
+| `root_chain_too_long` | PC 설치기에서 교체 이력이 허용 한도를 넘었다. |
+| `clock_invalid` | 신뢰 root 확인에 필요한 시간대가 없는 시각이다. |
 | `manifest_invalid` | 배포 목록의 채널·순번·지문·주소 등 형식이 맞지 않는다. |
 | `key_invalid` | 고정 공개키 형식을 확인하지 못했다. |
 | `openssl_unavailable` | 서명 검증에 필요한 OpenSSL을 사용할 수 없다. |
@@ -325,27 +345,46 @@ PC에서 접속 실패와 문 열림 미확인이 함께 있으면 `vm_unreachab
 
 ## 그 밖의 서버 화면 계약
 
+S136 대조 기준: [현재 server 라우터](../../apps/alpha/server/src/main.rs), [입력 요청](../../apps/alpha/server/src/human_prompt.rs), [저장 로그인](../../apps/alpha/server/src/browser_bridge.rs), [AI 연결](../../apps/alpha/server/src/provider_login.rs). 오류 본문은 `{error:<코드>}`다. 아래 과거 문서의 “미연결”은 당시 상태와 현재를 구분해 읽는다.
+
+| 화면 계약 | 현재 응답·주의 | 미연결 또는 한계 |
+|---|---|---|
+| 승인 | `GET /turns/{id}/requests` → `{approval,inputs}`; `POST /approvals/{id}/respond` `{choice}` → `{requestId,state:"answered"}`. `invalid_choice`, `approval_closed` | `provider`는 해당 턴의 공급자이며 저장된 값이 없으면 `codex`로 대체한다 |
+| 민감 입력 | `POST /input-requests/{id}/respond` → `{requestId,state:"answered"}` 또는 API 키 `{requestId,state:"credential_saved"}`; `/cancel` → `{requestId,state:"cancelled"}`. `invalid_input`, `request_closed` | 캡차·패스키를 휴대폰에서 직접 처리하는 화면은 미확인 |
+| 저장 로그인 | `GET /saved-logins` → `{logins}`, `POST /saved-logins`와 `PUT /saved-logins/{id}` → `{login}`, `DELETE /saved-logins/{id}` → `{state:"deleted"}`. 비밀번호 미반환; 오류는 `invalid_input`, `login_not_found` 및 보관소 고정 코드 | `iconDataUrl`은 서버 응답에 없음 |
+| AI 키 | `POST /providers/{provider}/key/request` → 입력 객체; `GET` → `{inputs}`. `provider`는 `claude`·`gemini`, 그 외 `invalid_provider`; `{apiKey}` 응답은 `credential_saved`, 잘못된 형식은 `invalid_key` | 저장이 키 검증 성공을 뜻하지 않음. S138에서 Claude·Gemini 브라우저·CRM 도구 루프를 서버에 연결. 화면은 기존 승인·사람 입력 이벤트를 사용하고 승인 객체의 `provider`는 턴의 공급자. 실제 계정 검증은 별도 |
+| Codex 연결 | `POST /providers/codex/login` → `{sessionId}`. `GET /providers/codex/login` 및 `/events`, `POST /providers/codex/login/cancel`에는 `x-momso-login-session`이 필요하며 틀리면 `login_not_found`. 조회는 `{provider,state,url,code,expiresInSeconds,expiresAt}`, 취소는 `{provider,state:"cancelling"}` | 기기 코드와 로그인 주소는 실제 CLI가 제공할 때만 나타남. 실제 사용자 로그인은 별도 확인 |
+
+검증: `provider_key_request_reconnect_and_cancel_contract`, `provider_keys_and_chat_use_encrypted_vault_and_fake_api`, `phone_saved_login_is_encrypted_and_never_echoed`, `approval_survives_reconnect_and_returns_to_fake_cli`는 가짜 입력·CLI·사이트 범위다. 실제 계정이나 휴대폰의 수락 시험은 아니다.
+
 - 승인·민감 입력: `POST /chats/{chatId}/turns`의 `permissionMode`는 `Ask for approval`, `Approve for me`, `Full access`. `agent-approval-request {requestId,chatId,turnId,provider,kind,description,options}`, `GET /turns/{turnId}/requests`, `POST /approvals/{requestId}/respond {choice}`, `POST /input-requests/{requestId}/respond`, `/cancel`을 쓴다. 캡차·패스키 등 `browser-human-required`는 사람에게 넘기며 휴대폰 직접 수행 화면은 원문에서 미완료다. [S23](momso-server-approval-s23.md)
 - 저장된 로그인: `POST /saved-logins` 입력에는 비밀번호가 있을 수 있으나 반환값에 비밀번호는 없다. 인증번호·비밀번호를 AI·채팅·기록에 내보내지 않는다. 사이트 로그인 성공과 저장 성공은 다르다. [S23](momso-server-approval-s23.md), [S21](server-saved-logins-s21.md)
 - 유휴 종료·깨우기: 서버가 작업·백업을 마친 뒤 멈추고 입구가 깨운다. 임시 `maintenance_in_progress`에 대한 재시도가 필요하지만 끊긴 요청의 정확히 한 번 처리는 보장되지 않는다. [S50](server-idle-stop-s50.md), [S26](momso-anywhere-onboarding-s26.md)
-- 문서·스킬·용어 사전: [S29](server-momso-core-s29.md)는 독립 공통 자료 부품의 당시 Rust 계약이며 그 문서만으로 서버 HTTP나 화면 연결을 증명하지 않는다. 현재 경로와 화면 스냅샷을 따로 대조한다. [서버 계약](momso-server-s17-contract.md)
+- 문서·스킬·용어 사전: [S29](server-momso-core-s29.md)는 독립 공통 자료 부품의 당시 Rust 계약이며 그 문서만으로 서버 HTTP나 화면 연결을 증명하지 않는다. 현재 서버 계약과 화면 스냅샷을 따로 대조한다.
 - AI 연결: `/providers`, `/providers/codex/login`, `/providers/codex/login/events`, `/providers/codex/login/cancel`, `/providers/{provider}/key/request` 등 실제 라우터 기준이다. Claude·Gemini API 키 입력의 제안 계약과 현재 구현 상태는 구분해야 한다. [S36](server-providers-s36-contract.md), `apps/alpha/server/src/main.rs`.
 
 ## 뒤쪽에서 먼저 맞춰야 할 것
 
-1. **닫음 (S129a3):** 휴대폰은 소유자 세션에서 마지막 백업과 VM 문을 확인한 뒤 일회용 표로 시작 페이지에 전달한다. 실제 휴대폰·클라우드 검증은 별도다. [S120](momso-anywhere-deletion-s120.md)
-2. **닫음 (S129b):** PC JSON과 휴대폰 결과에 공통 `outcome`과 자원·비용·오류 필드를 적용했다. 설치 기록과 휴대폰 체크포인트는 내부 재시도 기록으로 유지한다. [S120](momso-anywhere-deletion-s120.md), [S117](momso-anywhere-rehearsal-s117.md), [S117c](momso-anywhere-rehearsal-s117c.md)
-3. 프로젝트 전용 판정은 현재 `not_exclusive` 또는 `unverified`뿐이다. Asset Inventory가 모든 자원을 다루지 않으므로 `exclusive`·자동 종료를 약속할 수 없다. 프로젝트 종료 후 30일 복원 기간에도 일부 자원은 일찍 사라질 수 있고 청구 주기 말까지 비용이 생길 수 있다. [S120](momso-anywhere-deletion-s120.md)
-4. **닫음 (S129d):** 입구가 직접 내는 거절은 JSON 까닭과 `X-Momso-Response: gateway`로 구분한다. VM 전달은 `upstream`, 앞단 등에서 표식이 없을 때는 원인을 단정하지 않는다. 실제 Cloud Run·휴대폰 검증은 별도다. [PWA](momso-anywhere-pwa-entry-20261121.md)
-5. **닫음 (S129c):** 입구 전환 실패는 세 경로에서 공통 `code`, `rolledBack`, `retryable`을 전달한다. 확인하지 못한 복구는 `null`이며 실제 클라우드 검증은 별도다. [S115](momso-anywhere-revision-s115.md)
-6. `openGoogleSetup`은 기존 재시도 기록이 필요하며 Google 콘솔이 자동 복귀를 보장하지 않는다. 약관·카드 전용 오류는 확인되지 않았다. [S112](momso-anywhere-first-google-account-s112.md)
-7. 공통 로그아웃 API는 있으나 화면 단추 여부는 미결이다. 정적 호스팅은 준비 상태이며 운영 공개키·화면 원본·OAuth·DNS·실제 게시와 기기 시험은 별도다. [S114](momso-anywhere-static-host-s114.md)
-8. 서버 승인·저장 로그인·AI 입력 관련 S21/S23/S36 문서에는 제안과 이후 연결 내용이 함께 있다. 최종 화면 스냅샷과 현재 서버 응답을 다시 대조해야 하며 미연결 부분을 완료로 취급하지 않는다.
-9. **닫음 (S129e):** [S59](server-upgrade-data-s59.md)의 옛 기록과 달리 PC·자동 갱신 모두 입구 실패 시 자료 복구를 시도한다. 자료 복원 실패 시 기존 새 판의 자료와 실행 파일이 그대로인지 확인되면 server를 다시 켜고 `rollback_failed`를 알린다. 짝을 확인하지 못하거나 재시작이 실패하면 켜졌다고 보장하지 않는다. 가짜 시험과 실제 고객 환경 확인은 별도다.
+- 프로젝트 전용 판정은 `not_exclusive` 또는 `unverified`뿐이다. Asset Inventory가 모든 자원을 다루지 않으므로 `exclusive`·자동 종료를 약속할 수 없다. 프로젝트 종료 후 30일 복원 기간에도 일부 자원은 일찍 사라질 수 있고 청구 주기 말까지 비용이 생길 수 있다. [S120](momso-anywhere-deletion-s120.md)
+- 저장 로그인 응답에는 `iconDataUrl`이 없다. 휴대폰에서 캡차·패스키를 직접 수행하는 화면은 미확인이다. [S21](server-saved-logins-s21.md), [S23](momso-server-approval-s23.md)
+- 정적 호스팅 이전은 준비 상태다. 운영 도메인 연결, 운영 공개키·root 게시, OAuth 변경, 실제 게시와 기기 확인은 남아 있다. [S114](momso-anywhere-static-host-s114.md), [S142](momso-anywhere-key-rotation-s142.md)
+
+## 화면에서 정할 것
+
+- 시작 화면: Google에서 설정을 마친 뒤 돌아온 상태와 재확인 결과를 어떻게 보여 줄지.
+- 로그인·홈 화면: 로그아웃 단추를 둘지와 어디에 둘지.
+- 설정의 삭제: 정해진 두 선택과 별도 확인 단계를 화면에 어떻게 배치할지.
+- 설정의 삭제 미리 보기: 마지막 백업과 미확인 항목을 어떻게 보여 줄지.
+- 설정의 삭제 결과: 남은 자원·예상 비용·종료 시각과 미확인 항목을 어떻게 구분해 보여 줄지.
+- 설정의 프로젝트 판별: 전용이 아님과 판단 못 함을 어떻게 구분해 보여 줄지.
+- 업데이트 상태: 진행·이전 판 복구·복구 미확인을 어떻게 보여 줄지.
+- 홈 화면: VM을 깨우는 동안 기다림과 재시도를 어떻게 보여 줄지.
+- 승인·민감 입력 화면: 공급자별 승인과 사람에게 넘긴 요청을 어떻게 보여 줄지.
 
 ## 충실도 확인
 
-- 대조: S112·S114·S115·S117·S120·S110·S118과 위에 링크한 시작·로그인·업데이트·승인 원문, 현재 호출 구현을 확인했다. 과거 문서와 현재 코드가 다른 부분은 위 ‘뒤쪽에서 먼저 맞춰야 할 것’에 구분했다.
-- 결정·조건·수치: Windows 인증서 미구매와 Tauri 서명 유지, 공개 GHCR, 정적 사이트 준비·도메인 연결 대기, 30일 세션·프로젝트 복원 기간, 확인 실패 시 미확인을 원문과 대조했다. 의도적으로 의미를 바꾼 항목은 없다.
-- 작성 중 수정: 처음에는 고객 Artifact Registry를 쓴다고 잘못 적었다. S111 원문 대조 후 공개 GHCR 직접 사용과 고객 원격 저장소 기본 미생성으로 바로잡았다. 남겨 둔 의미 변형은 없다.
-- 검증 경계: 이 문서는 코드 변경·새 배포·실제 사용자 시험 결과가 아니다. 과거 문서에 남은 시점 한정 미완료 문구는 현재 코드와 구분해 링크했다.
+- S150 대조: 시작·Google 복귀는 `momso_anywhere_start.mjs`·`momso_anywhere_google_browser.mjs`, 입구와 깨우기는 `momso_anywhere_gateway.py`, 쉬기·표는 `momso_anywhere_pause_ticket.py`·`momso_anywhere_start.mjs`, 삭제 outcome은 `momso_anywhere_delete_result.mjs`·S117a·c, 입구 전환과 복구는 작업자의 `cloud_run_gateway.py`·`update.py`와 S59를 대조했다.
+- 운영 키 셋·순번·정족수와 브라우저 저장 한계는 `trust_rotation.py`·`momso_release_trust.mjs`·시작 묶음 생성기와 S140·S142를 대조했다. 승인 공급자와 서버 응답은 `apps/alpha/server/src/main.rs`·S136·S138을 대조했다. 단추 둘·표시 이름·Windows 인증서 미구매는 본부가 전달한 결정과 대조했다.
+- **고친 의미 차이:** 옛 표의 승인 `provider` 고정 설명은 현재 코드의 턴별 공급자와 달랐다. S117c가 미확인을 통과시키지 않는다는 문장도 `deleted_unverified`를 통과로 기록하는 현재 코드와 달랐다. 둘 다 위 본문에서 바로잡았다. 그 밖에 대조한 결정·조건·수치·까닭 코드에서 의도적으로 의미를 바꾼 곳은 없다. 이 차이는 코드 결함이라는 뜻은 아니다.
+- S151: 중간 root 만료를 현재 시각으로 다시 보던 브라우저·VM 경로 차이를 서명된 발행 시각 기준으로 맞췄다. 공통 가짜 벡터 시험이며 실제 운영 키 교체는 미확인이다.
+- 실제 확인은 본부 기록의 순번 6 자동 갱신, 입구 트래픽 전환, 유휴 종료, 페이지 열기에 의한 깨우기만 여기에 반영한다. fetch 깨우기, 휴대폰 삭제·운영 키 교체·정적 호스팅, 실제 새 Google 계정과 그 밖의 가짜 시험은 실제 확인으로 적지 않았다. 실제 화면·휴대폰에서 계약이 모두 연결됐는지는 **미확인**이다.

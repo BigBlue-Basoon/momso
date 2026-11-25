@@ -8,6 +8,7 @@ import managed_helpers
 import momso_managed_files as managed
 import test_update
 from update import UpdateError
+from momso_anywhere_proxy_files import PROXY_FILES
 
 
 class ManagedSignedUpdateTests(test_update.UpdateTests):
@@ -32,7 +33,7 @@ class ManagedSignedUpdateTests(test_update.UpdateTests):
 
     def publish_managed(self, sequence, idle, worker):
         import subprocess
-        payload = {name: name.encode() for name in ('momso-server', 'momso_mobile_proxy.py', 'momso_anywhere_vm_proxy.py', 'web/index.html')}
+        payload = {name: name.encode() for name in ('momso-server', *PROXY_FILES, 'web/index.html')}
         payload['idle-stop.py'] = idle
         payload['momso-units/momso-idle-stop.service'] = b'unit'
         workers = {name: (worker if name == 'worker.py' else name.encode()) for name in managed_helpers.WORKER}
