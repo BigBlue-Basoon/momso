@@ -65,6 +65,42 @@ class RestoreTests(unittest.TestCase):
         instances = [{'name': 'renamed-vm', 'labels': labels}]
         self.assertEqual(discover_preserved(buckets=buckets, secrets=secrets, keys=keys, instances=instances), [])
 
+    def test_discovery_skips_remnants_of_deleted_installations(self):
+        # S180: after "delete everything" only the KMS key is left (the bucket is
+        # soft-deleted and absent from `buckets list`, the vault secret is gone)
+        # with every version DESTROY_SCHEDULED. That is not a paused install.
+        paused, deleted, half, running, key_only = 'a' * 12, 'b' * 12, 'c' * 12, 'd' * 12, 'e' * 12
+        label = lambda ident: {'momso-install-id': ident}
+        class Provider:
+            def __init__(self): self.calls = []
+            def run(self, *args, parse=False):
+                self.calls.append(args)
+                if args[:3] == ('storage', 'buckets', 'list'):
+                    return [{'name': 'momso-backup-' + i, 'labels': label(i)} for i in (paused, half, running)]
+                if args[:2] == ('storage', 'ls'):
+                    raise AssertionError('soft-deleted buckets are not needed to rule out a remnant')
+                if args[:2] == ('secrets', 'list'):
+                    return [{'name': 'projects/fixture/secrets/momso-vault-' + i, 'labels': label(i)} for i in (paused, running)]
+                if args[:3] == ('kms', 'keyrings', 'list'):
+                    return [{'name': 'projects/fixture/locations/x/keyRings/momso-backup-' + i} for i in (paused, deleted, half, running, key_only)]
+                if args[:3] == ('kms', 'keys', 'list'):
+                    ring = next(a for a in args if a.startswith('--keyring=')).removeprefix('--keyring=')
+                    ident = ring.removeprefix('momso-backup-')
+                    return [{'name': 'projects/fixture/locations/x/keyRings/' + ring + '/cryptoKeys/backup', 'labels': label(ident)}]
+                if args[:4] == ('kms', 'keys', 'versions', 'list'):
+                    ring = next(a for a in args if a.startswith('--keyring=')).removeprefix('--keyring=')
+                    if ring == 'momso-backup-' + deleted:
+                        return [{'name': 'v/1', 'state': 'DESTROY_SCHEDULED'}, {'name': 'v/2', 'state': 'DESTROYED'}]
+                    return [{'name': 'v/1', 'state': 'ENABLED'}]
+                if args[:3] == ('compute', 'instances', 'list'):
+                    return [{'name': 'momso-' + running, 'labels': label(running)}]
+                raise AssertionError(args)
+        provider = Provider()
+        result = discover_in_project(provider)
+        self.assertEqual([(item['installationId'], item['assets']) for item in result],
+                         [(paused, 'complete'), (half, 'incomplete'), (key_only, 'incomplete')])
+        self.assertTrue(all('list' in call for call in provider.calls))
+
     def test_owned_backup_inspection_never_creates_or_changes_resources(self):
         provider = FakeProvider()
         self.assertEqual(inspect_restore(provider), {'restoreAvailable': True, 'lastBackupAt': '2026-11-20T01:02:03Z', 'requiresRestore': True})

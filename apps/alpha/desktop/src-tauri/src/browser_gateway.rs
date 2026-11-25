@@ -1,7 +1,5 @@
 //! Host-side browser policy and driver boundary. No production driver is bundled yet.
 use serde::Deserialize;
-#[cfg(test)]
-use std::path::Path;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -34,65 +32,6 @@ impl Policy {
         self.version == 1 && self.origins.len() == 1 && self.origins[0] == "*"
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_skill(root: &Path, name: &str) -> Result<Option<Self>, &'static str> {
-        let Some((_, builtin)) = crate::skills::BUNDLED_SKILLS
-            .iter()
-            .find(|(n, _)| *n == name && builtin_browser_name(n))
-        else {
-            return Ok(None);
-        };
-        let path = crate::skills::skill_path(root, "skills", name)?;
-        let content = std::fs::read_to_string(path).map_err(|_| "browser_policy_unavailable")?;
-        // Edited built-ins and user skills cannot silently broaden this authority.
-        let content = content.replace("\r\n", "\n");
-        if content != builtin.replace("\r\n", "\n") {
-            return Err("browser_policy_modified");
-        }
-        let (_, tail) = content
-            .split_once("```momso-browser-reference\n")
-            .ok_or("browser_policy_invalid")?;
-        let (yaml, _) = tail.split_once("\n```").ok_or("browser_policy_invalid")?;
-        let policy: Self = serde_yaml::from_str(yaml).map_err(|_| "browser_policy_invalid")?;
-        if policy.version != 1 || policy.origins.is_empty() || policy.irreversible.is_empty() {
-            return Err("browser_policy_invalid");
-        }
-        for origin in policy.origins.iter().chain(&policy.login_origins) {
-            let url = reqwest::Url::parse(origin).map_err(|_| "browser_policy_invalid")?;
-            if url.scheme() != "https"
-                || url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.path() != "/"
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
-                return Err("browser_policy_invalid");
-            }
-        }
-        if policy
-            .login_origins
-            .iter()
-            .any(|value| policy.origins.contains(value))
-        {
-            return Err("browser_policy_invalid");
-        }
-        for path in &policy.login_paths {
-            let url = reqwest::Url::parse(path).map_err(|_| "browser_policy_invalid")?;
-            if url.scheme() != "https"
-                || url.path() == "/"
-                || url.path().ends_with('/')
-                || url.query().is_some()
-                || url.fragment().is_some()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || !policy.origins.contains(&url.origin().ascii_serialization())
-            {
-                return Err("browser_policy_invalid");
-            }
-        }
-        Ok(Some(policy))
-    }
     pub(crate) fn allows(&self, target: &str) -> bool {
         let Ok(url) = reqwest::Url::parse(target) else {
             return false;
@@ -143,14 +82,6 @@ impl Policy {
             irreversible: vec!["게시".into()],
             read_only: vec!["browser_navigate".into(), "browser_read".into()],
         }
-    }
-    #[cfg(test)]
-    pub(crate) fn add_test_origin(&mut self, origin: String) {
-        self.origins.push(origin);
-    }
-    #[cfg(test)]
-    pub(crate) fn add_test_login_origin(&mut self, origin: String) {
-        self.login_origins.push(origin);
     }
     #[cfg(test)]
     pub(crate) fn add_test_login_path(&mut self, path: String) {
@@ -320,46 +251,6 @@ mod tests {
         Arc,
     };
     #[test]
-    fn legacy_reference_parser_detects_modified_reference() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("skills/naver-smartplace");
-        std::fs::create_dir_all(&dir).unwrap();
-        let text = crate::skills::BUNDLED_SKILLS
-            .iter()
-            .find(|(n, _)| *n == "naver-smartplace")
-            .unwrap()
-            .1;
-        std::fs::write(dir.join("SKILL.md"), text).unwrap();
-        let policy = Policy::from_skill(tmp.path(), "naver-smartplace")
-            .unwrap()
-            .unwrap();
-        assert!(policy.allows("https://smartplace.naver.com/path"));
-        assert!(policy
-            .login_origins()
-            .contains(&"https://nid.naver.com".to_string()));
-        assert!(policy.allows("https://nid.naver.com/"));
-        for url in [
-            "https://smartplace.naver.com.evil.test/",
-            "https://smartplace.naver.com@evil.test/",
-            "https://evil.test/",
-            "http://smartplace.naver.com/",
-        ] {
-            assert!(!policy.allows(url));
-        }
-        std::fs::write(
-            dir.join("SKILL.md"),
-            text.replace("https://smartplace.naver.com", "https://evil.test"),
-        )
-        .unwrap();
-        assert!(matches!(
-            Policy::from_skill(tmp.path(), "naver-smartplace"),
-            Err("browser_policy_modified")
-        ));
-        assert!(Policy::from_skill(tmp.path(), "not-a-builtin")
-            .unwrap()
-            .is_none());
-    }
-    #[test]
     fn general_policy_allows_public_sites_but_not_local_addresses() {
         let policy = Policy::general();
         assert!(policy.allows("https://crm.bodycodi.com/"));
@@ -372,42 +263,38 @@ mod tests {
     }
 
     #[test]
-    fn every_bundled_browser_skill_has_valid_policy() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn bundled_browser_skills_are_guides_without_site_lists() {
+        // Skills only explain how to work; the browser itself is not limited
+        // to the sites a skill mentions (product uses `Policy::general`).
+        let policy = Policy::general();
+        let mut count = 0;
         for &(name, content) in crate::skills::BUNDLED_SKILLS {
-            if !builtin_browser_name(name) || name == "bodycodi-operations" {
+            if !builtin_browser_name(name) {
                 continue;
             }
-            let path = tmp.path().join("skills").join(name);
-            std::fs::create_dir_all(&path).unwrap();
-            std::fs::write(path.join("SKILL.md"), content).unwrap();
-            let policy = Policy::from_skill(tmp.path(), name).unwrap().unwrap();
-            assert!(policy.allows_read_only("browser_navigate"));
-            assert!(policy.allows_read_only("browser_read"));
-            assert!(!policy.allows_read_only("browser_click"));
-            assert!(!policy.allows_read_only("browser_fill"));
-            if name == "frip-host-operations" {
-                assert_eq!(policy.origins()[0], "https://frip.host");
-                assert!(policy
-                    .login_paths()
-                    .contains(&"https://www.frip.co.kr/login".into()));
-            }
-            if name == "sssd-host-operations" {
-                assert!(policy
-                    .login_paths()
-                    .contains(&"https://www.sssd.co.kr/host".into()));
-            }
-            if name == "soomgo-operations" {
-                assert!(policy
-                    .login_paths()
-                    .contains(&"https://soomgo.com/login".into()));
-            }
-            if name == "onstudio-operations" {
-                assert!(policy
-                    .login_paths()
-                    .contains(&"https://onstudio.kr/login".into()));
-            }
+            count += 1;
+            assert!(
+                !content.contains("momso-browser-reference"),
+                "{name} still carries a site list"
+            );
+            assert!(
+                content.contains("browser_open"),
+                "{name} lacks the tool guide"
+            );
         }
+        assert_eq!(count, 7);
+        for url in [
+            "https://smartplace.naver.com/",
+            "https://frip.host/",
+            "https://soomgo.com/login",
+            "https://unrelated.example/",
+        ] {
+            assert!(policy.allows(url), "{url}");
+        }
+        assert!(policy.allows_read_only("browser_navigate"));
+        assert!(policy.allows_read_only("browser_read"));
+        assert!(!policy.allows_read_only("browser_click"));
+        assert!(!policy.allows_read_only("browser_fill"));
     }
 
     #[test]
@@ -466,19 +353,19 @@ mod tests {
         }
     }
     #[test]
-    fn each_bundled_skill_policy_handles_fake_login_read_and_denial() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn general_policy_handles_fake_login_read_and_denial_on_each_skill_site() {
         let mut count = 0;
-        for &(name, content) in crate::skills::BUNDLED_SKILLS {
-            if !builtin_browser_name(name) || name == "bodycodi-operations" {
-                continue;
-            }
+        for origin in [
+            "https://smartplace.naver.com",
+            "https://onstudio.kr",
+            "https://studiomate.kr",
+            "https://soomgo.com",
+            "https://frip.host",
+            "https://www.sssd.co.kr",
+        ] {
             count += 1;
-            let path = tmp.path().join("skills").join(name);
-            std::fs::create_dir_all(&path).unwrap();
-            std::fs::write(path.join("SKILL.md"), content).unwrap();
-            let policy = Policy::from_skill(tmp.path(), name).unwrap().unwrap();
-            let origin = policy.origins()[0].clone();
+            let policy = Policy::general();
+            let origin = origin.to_owned();
             let clicked = Arc::new(AtomicUsize::new(0));
             let closed = Arc::new(AtomicUsize::new(0));
             let mut gateway = Gateway {

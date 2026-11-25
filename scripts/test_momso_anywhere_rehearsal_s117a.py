@@ -12,6 +12,29 @@ from momso_anywhere_rehearsal_s117a import gateway_evidence, vm_evidence, invent
 from momso_server_install import InstallError
 
 
+def real_gcloud_failure(args, stderr, code=1):
+    """Raise what the real GoogleProvider.run raises for this gcloud stderr."""
+    import subprocess
+    import momso_server_install as installer
+    with patch.object(installer.shutil, 'which', return_value='gcloud'):
+        provider = installer.GoogleProvider('fixture@example.test', 'fixture-project', '0123456789ab', Path(tempfile.gettempdir()) / 'momso-unused-key')
+    result = subprocess.CompletedProcess([], code, stdout=b'', stderr=stderr)
+    with patch.object(installer.subprocess, 'run', return_value=result):
+        provider.run(*args, parse=True)
+    raise AssertionError('expected a gcloud failure')
+
+
+def real_soft_deleted_ls(args, names):
+    """Cloud SDK 559 shape: --json/--full answer HTTP 404, the plain listing
+    prints one gs://NAME/ line per soft-deleted bucket."""
+    if '--json' in args or '--full' in args or any(item.startswith('--format') for item in args):
+        raise InstallError('ls failed', http_status=404)
+    if not names:
+        # Real gcloud: exit 1, empty stdout, the exact no-match line on stderr.
+        raise InstallError('ls failed', no_match=True)
+    return ''.join('gs://' + name + '/\n' for name in names).encode()
+
+
 class FakeProvider:
     install_id = 'a' * 12
 
@@ -95,7 +118,7 @@ class RehearsalReadOnlyTests(unittest.TestCase):
                     raise RuntimeError('token must not appear in output')
                 if args[:3] == ('storage', 'buckets', 'describe'):
                     raise InstallError('absent', http_status=404)
-                if args[:2] == ('storage', 'ls'): return b'[]'
+                if args[:2] == ('storage', 'ls'): return real_soft_deleted_ls(args, [])
                 return []
         result = inventory_basic_resources(InventoryProvider())
         self.assertEqual(result['vm']['items'], ['momso-' + 'a' * 12])
@@ -123,7 +146,7 @@ class RehearsalReadOnlyTests(unittest.TestCase):
                     return [{'metadata': {'name': 'momso-any-' + self.install_id, 'labels': {}}}] if self.state == 'present' else []
                 if args[:3] == ('storage', 'buckets', 'describe'):
                     raise InstallError('absent', http_status=404)
-                if args[:2] == ('storage', 'ls'): return b'[]'
+                if args[:2] == ('storage', 'ls'): return real_soft_deleted_ls(args, [])
                 return []
         for state in ('absent', 'present', 'failed'):
             result = inventory_basic_resources(InventoryProvider(state))
@@ -146,14 +169,15 @@ class RehearsalReadOnlyTests(unittest.TestCase):
                                        http_status=403 if self.state in ('denied', 'denied-description') else 404)
                 if args[:2] == ('storage', 'ls'):
                     if self.state == 'soft':
-                        return json.dumps([{'metadata': {'name': 'momso-backup-' + self.install_id, 'hardDeleteTime': '2026-12-01T00:00:00Z'}}]).encode()
-                    return b'[]'
+                        return real_soft_deleted_ls(args, ['other-deleted-bucket', 'momso-backup-' + self.install_id])
+                    return real_soft_deleted_ls(args, ['other-deleted-bucket'])
                 return []
         for state in ('absent', 'present', 'soft', 'denied', 'denied-description'):
             value = inventory_basic_resources(InventoryProvider(state))['bucket']
             self.assertEqual(value['complete'], state not in ('denied', 'denied-description'))
             self.assertEqual(bool(value['items']), state in ('present', 'soft'))
             if state == 'denied-description': self.assertEqual(value['reason'], 'bucket_access_denied')
+            if state == 'soft': self.assertEqual(value['softDeleted'], [{'name': 'momso-backup-' + 'a' * 12, 'hardDeleteTime': None}])
 
     def test_iam_absent_present_and_query_failure(self):
         class InventoryProvider(FakeProvider):
@@ -259,19 +283,24 @@ class RehearsalReadOnlyTests(unittest.TestCase):
                 super().__init__()
                 self.collision = True
                 self.failed = False
+                self.soft_deleted = ['other-deleted-bucket']
             def run(self, *args, **kwargs):
                 if self.failed:
                     raise RuntimeError('unavailable')
                 if args[:2] == ('storage', 'ls'):
-                    return b'[]'
+                    return real_soft_deleted_ls(args, self.soft_deleted)
                 if args[:3] == ('storage', 'buckets', 'describe'):
-                    raise InstallError('absent', http_status=404)
+                    # Real Cloud SDK 559 wording for a bucket that does not exist (S178c).
+                    real_gcloud_failure(args, ('ERROR: (gcloud.storage.buckets.describe) ' + args[3] + ' not found: 404.\n').encode())
                 if args[:3] == ('run', 'services', 'list') and self.collision:
                     return [{'metadata': {'name': 'momso-any-' + self.install_id, 'labels': {}}}]
                 return []
         provider = PreflightProvider()
         self.assertFalse(rehearsal.preflight_new_id(provider))
         provider.collision = False
+        self.assertTrue(rehearsal.preflight_new_id(provider))
+        # A first-time project has no soft-deleted bucket: gcloud exits 1 (S178b).
+        provider.soft_deleted = []
         self.assertTrue(rehearsal.preflight_new_id(provider))
         provider.failed = True
         self.assertFalse(rehearsal.preflight_new_id(provider))
@@ -319,6 +348,9 @@ class RehearsalReadOnlyTests(unittest.TestCase):
         self.assertEqual(sum(call[:4] == ('kms', 'keys', 'versions', 'destroy') for call in provider.calls), 1)
 
     def test_cli_forwards_google_fields_and_runs_fake_install_and_destroy(self):
+        self._cli_run()
+
+    def _cli_run(self, adjust=None):
         import momso_release_keys, momso_release_manifest, momso_anywhere_backup_provision
         class Provider(FakeProvider):
             def __init__(self, account, project, install_id, key_file):
@@ -347,8 +379,13 @@ class RehearsalReadOnlyTests(unittest.TestCase):
             checks = {'traffic_digest': 'passed', 'public_https': 'passed', 'vm_services': 'passed', 'update_status': 'passed'}
             names = ('vm', 'disk', 'network', 'subnet', 'firewall', 'router', 'nat', 'addresses', 'gateway', 'accounts', 'roles', 'secrets', 'iam', 'bucket', 'kms')
             inventory = {name: {'complete': True, 'items': []} for name in names}
+            if adjust is not None:
+                adjust(inventory)
             with patch.object(momso_release_keys, 'validate'), patch.object(momso_release_manifest, 'release', return_value=signed), patch.object(momso_release_manifest, 'download', return_value=b'fake'), patch.object(momso_release_manifest, 'verify_inputs'), patch.object(rehearsal, 'GoogleProvider', Provider), patch.object(rehearsal, 'preflight_new_id', return_value=True), patch.object(rehearsal, 'gateway_evidence', return_value=checks), patch.object(rehearsal, 'vm_evidence', return_value={}), patch.object(rehearsal, 'collect_inventory', return_value=(inventory, [])), patch.object(rehearsal, 'schedule_owned_backup_keys', return_value='keys_absent'), patch.object(rehearsal.subprocess, 'run', side_effect=fake_run), patch.object(momso_anywhere_backup_provision, 'GoogleBackupProvisioner', Backup), patch.object(rehearsal.tempfile, 'tempdir', tmp), redirect_stdout(io.StringIO()) as out:
-                self.assertEqual(rehearsal.main(argv), 0)
+                code = rehearsal.main(argv)
+            if adjust is not None:
+                return out.getvalue()
+            self.assertEqual(code, 0)
             self.assertEqual([call[2] for call in calls], ['anywhere', 'destroy'])
             self.assertIn('--google-client-id', calls[0])
             self.assertIn('fake.apps.googleusercontent.com', calls[0])
@@ -356,6 +393,33 @@ class RehearsalReadOnlyTests(unittest.TestCase):
             self.assertIn('--login-origin', calls[0])
             self.assertNotIn('삭제 후 미확인: iam', out.getvalue())
             self.assertIn('과금되는 것: 확인한 범위에서 0', out.getvalue())
+
+    def test_free_cloud_run_internal_address_is_cleanup_pending_not_billable(self):
+        # S181: purpose SERVERLESS internal reserved addresses cost nothing.
+        def free(inventory):
+            inventory['addresses'] = {'complete': True, 'items': ['serverless-ipv4-cloudrun-fixture'], 'cleanupPending': ['serverless-ipv4-cloudrun-fixture']}
+        output = self._cli_run(free)
+        self.assertIn('회수 대기: addresses 1 개', output)
+        self.assertNotIn('과금 가능 자원 남음: addresses', output)
+        def paid(inventory):
+            inventory['addresses'] = {'complete': True, 'items': ['momso-fixture-external'], 'cleanupPending': []}
+        self.assertIn('과금 가능 자원 남음: addresses', self._cli_run(paid))
+
+    def test_address_inventory_marks_only_internal_serverless_reservations(self):
+        provider = FakeProvider()
+        class AddressProvider(FakeProvider):
+            def run(self, *args, **kwargs):
+                if args[:3] == ('compute', 'addresses', 'list'):
+                    sub = 'projects/x/regions/asia-northeast3/subnetworks/momso-' + self.install_id + '-sub'
+                    return [{'name': 'serverless-ipv4-cloudrun-a', 'purpose': 'SERVERLESS', 'addressType': 'INTERNAL', 'status': 'RESERVED', 'subnetwork': sub},
+                            {'name': 'momso-' + self.install_id + '-ip', 'addressType': 'EXTERNAL', 'status': 'RESERVED'}]
+                if args[:2] == ('storage', 'ls'): return real_soft_deleted_ls(args, [])
+                if args[:3] == ('storage', 'buckets', 'describe'):
+                    raise InstallError('absent', http_status=404)
+                return []
+        value = inventory_basic_resources(AddressProvider())['addresses']
+        self.assertEqual(sorted(value['items']), sorted(['serverless-ipv4-cloudrun-a', 'momso-' + 'a' * 12 + '-ip']))
+        self.assertEqual(value['cleanupPending'], ['serverless-ipv4-cloudrun-a'])
 
     def test_deletion_outcomes_distinguish_unverified_remaining_and_failure(self):
         for outcome, expected in [('deleted', 'passed'), ('deleted_unverified', 'passed'), ('remaining', 'failed'), ('failed', 'failed')]:

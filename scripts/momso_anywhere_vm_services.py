@@ -136,14 +136,16 @@ else:
     wrapper = "import base64,subprocess; subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(base64.b64encode(gate.encode()).decode()) + ").decode()],check=True)"
     p.ssh(wrapper)
     if not accounts:
-        stopped = False
-        try:
-            p.run("compute", "instances", "stop", p.name, f"--zone={ZONE}")
-            stopped = True
-            p.run("compute", "instances", "set-service-account", p.name, f"--zone={ZONE}", f"--service-account={email}", f"--scopes={SCOPE}")
-        finally:
-            if stopped:
-                p.run("compute", "instances", "start", p.name, f"--zone={ZONE}")
+        from momso_anywhere_pc_vm import vm_restart
+        with vm_restart(p):
+            stopped = False
+            try:
+                p.run("compute", "instances", "stop", p.name, f"--zone={ZONE}")
+                stopped = True
+                p.run("compute", "instances", "set-service-account", p.name, f"--zone={ZONE}", f"--service-account={email}", f"--scopes={SCOPE}")
+            finally:
+                if stopped:
+                    p.run("compute", "instances", "start", p.name, f"--zone={ZONE}")
         p.health()
 
 def install_scripts(provider, name, initial, backup, *, signed_files=None, start_services=True):

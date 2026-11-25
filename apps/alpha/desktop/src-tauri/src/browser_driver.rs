@@ -1778,26 +1778,37 @@ mod tests {
     #[test]
     #[ignore = "manual public-site check; uses network and an installed browser"]
     fn public_skill_entry_points_before_login() {
-        let root = profile();
-        for name in [
-            "naver-smartplace",
-            "soomgo-operations",
-            "sssd-host-operations",
-            "frip-host-operations",
-            "onstudio-operations",
-            "studiomate-operations",
+        // The product browser uses the general policy. These are only the
+        // pages this manual check visits, not a list the browser is held to.
+        let policy = crate::browser_gateway::Policy::general();
+        for (name, first, login) in [
+            (
+                "naver-smartplace",
+                "https://smartplace.naver.com",
+                Some("https://nid.naver.com"),
+            ),
+            (
+                "soomgo-operations",
+                "https://soomgo.com",
+                Some("https://soomgo.com/login"),
+            ),
+            (
+                "sssd-host-operations",
+                "https://www.sssd.co.kr",
+                Some("https://www.sssd.co.kr/host"),
+            ),
+            (
+                "frip-host-operations",
+                "https://frip.host",
+                Some("https://www.frip.co.kr/login"),
+            ),
+            (
+                "onstudio-operations",
+                "https://onstudio.kr",
+                Some("https://onstudio.kr/login"),
+            ),
+            ("studiomate-operations", "https://studiomate.kr", None),
         ] {
-            let source = crate::skills::BUNDLED_SKILLS
-                .iter()
-                .find(|(n, _)| *n == name)
-                .unwrap()
-                .1;
-            let directory = root.path().join("skills").join(name);
-            std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(directory.join("SKILL.md"), source).unwrap();
-            let policy = crate::browser_gateway::Policy::from_skill(root.path(), name)
-                .unwrap()
-                .unwrap();
             let browser_profile = profile();
             let mut browser = match launch_with_login_choice(
                 browser_profile.path(),
@@ -1813,7 +1824,6 @@ mod tests {
                     continue;
                 }
             };
-            let first = &policy.origins()[0];
             let entry = browser.navigate(first);
             println!(
                 "{name} entry {first} {}",
@@ -1853,11 +1863,7 @@ mod tests {
                     }
                 }
             }
-            if let Some(login) = policy
-                .login_paths()
-                .first()
-                .or_else(|| policy.login_origins().first())
-            {
+            if let Some(login) = login {
                 let result = browser.navigate(login);
                 println!(
                     "{name} login {login} {}",

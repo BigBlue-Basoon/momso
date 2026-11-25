@@ -2290,7 +2290,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn six_bundled_skills_run_through_mcp_with_fake_sites_and_approval() {
+    async fn six_bundled_skills_use_the_general_browser_through_mcp_with_approval() {
+        // Skills are guides, not site lists: every built-in browser skill runs
+        // on the same general policy the product uses (lib.rs).
         for &(name, content) in crate::skills::BUNDLED_SKILLS {
             if !crate::browser_gateway::builtin_browser_name(name) {
                 continue;
@@ -2311,10 +2313,8 @@ mod tests {
                     "fixture",
                 )
                 .unwrap();
-                let mut policy = Policy::from_skill(&root, name).unwrap().unwrap();
-                policy.add_test_origin(site.url.clone());
+                let policy = Policy::general();
                 let login = "https://login.fixture".to_owned();
-                policy.add_test_login_origin(login.clone());
                 let manager = Arc::new(BrowserManager::default());
                 let session = Session::fake_for_mcp_site(site.url.clone(), login.clone());
                 let entry = Arc::new(Entry {
@@ -2432,32 +2432,25 @@ mod tests {
                         call("browser_navigate", json!({"url":format!("{url}/work")}))["status"],
                         "page"
                     );
-                    assert_eq!(
-                        call(
-                            "browser_request_action",
-                            json!({"action":"게시","description":"fixture","elementId":"publish"})
-                        )["status"],
-                        "approved"
-                    );
                     let result = call("browser_click", json!({"elementId":"publish"}));
                     assert_eq!(call("browser_close", json!({}))["status"], "closed");
                     result
                 });
+                // The general policy asks before every click, links included.
+                let next = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                broker
+                    .respond(&next, ApprovalChoice::AllowOnce)
+                    .await
+                    .unwrap();
                 let risky = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
                     .await
                     .unwrap()
                     .unwrap();
                 assert_eq!(site.posted.load(Ordering::SeqCst), 0);
                 broker.respond(&risky, ApprovalChoice::Deny).await.unwrap();
-                let scope = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(site.posted.load(Ordering::SeqCst), 0);
-                broker
-                    .respond(&scope, ApprovalChoice::AllowOnce)
-                    .await
-                    .unwrap();
                 let click = tokio::time::timeout(Duration::from_secs(30), approval_rx.recv())
                     .await
                     .unwrap()

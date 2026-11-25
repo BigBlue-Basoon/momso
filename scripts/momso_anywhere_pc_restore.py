@@ -96,9 +96,11 @@ def prepare_identity(provider):
     if accounts and (len(accounts) != 1 or accounts[0].get('email') != email or services.SCOPE not in accounts[0].get('scopes', [])):
         raise InstallError('resource_ownership')
     if not accounts:
-        provider.run('compute', 'instances', 'stop', provider.name, f'--zone={ZONE}')
-        provider.run('compute', 'instances', 'set-service-account', provider.name, f'--zone={ZONE}', f'--service-account={email}', f'--scopes={services.SCOPE}')
-        provider.run('compute', 'instances', 'start', provider.name, f'--zone={ZONE}')
+        from momso_anywhere_pc_vm import vm_restart
+        with vm_restart(provider):
+            provider.run('compute', 'instances', 'stop', provider.name, f'--zone={ZONE}')
+            provider.run('compute', 'instances', 'set-service-account', provider.name, f'--zone={ZONE}', f'--service-account={email}', f'--scopes={services.SCOPE}')
+            provider.run('compute', 'instances', 'start', provider.name, f'--zone={ZONE}')
     return secret, backup
 
 

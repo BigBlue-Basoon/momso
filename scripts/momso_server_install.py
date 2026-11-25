@@ -26,9 +26,27 @@ REGION = "asia-northeast3"
 MACHINE = "e2-small"
 
 
+NO_MATCH_LINE = b'ERROR: (gcloud.storage.ls) One or more URLs matched no objects.'
+# States the VM's own updater writes to /run/momso-update/status.json while working.
+VM_UPDATE_BUSY = frozenset(('checking', 'downloading', 'waiting_for_idle', 'backing_up', 'installing', 'updating_gateway', 'rolling_back'))
+# gcloud storage reports a missing bucket or object without "HTTPError", e.g.
+# `ERROR: (gcloud.storage.buckets.describe) gs://NAME not found: 404.` (S178c).
+# A missing KMS key ring: `ERROR: (gcloud.kms.keys.list) NOT_FOUND: KeyRing projects/P/locations/L/keyRings/R not found.`
+KMS_RING_NOT_FOUND = re.compile(rb'^ERROR: \(gcloud\.kms\.keys\.list\) NOT_FOUND: KeyRing projects/[a-z0-9-]+/locations/[a-z0-9-]+/keyRings/[A-Za-z0-9_-]+ not found\.', re.M)
+STORAGE_NOT_FOUND = re.compile(rb'^ERROR: \(gcloud\.storage\.[a-z][a-z.-]*\) gs://[a-z0-9][a-z0-9._/-]* not found: (404)\.\s*$', re.M)
+
+
 class InstallError(Exception):
-    def __init__(self, message, *, role_propagating=False, managed_conflict=None, managed_conflicts=None, gateway_failure=None, gateway_code=None, http_status=None):
+    def __init__(self, message, *, role_propagating=False, managed_conflict=None, managed_conflicts=None, gateway_failure=None, gateway_code=None, http_status=None, no_match=False, service_disabled=False, command=None, remote_error=None):
         super().__init__(message)
+        # True only for gcloud storage ls exiting 1 with its exact empty-listing line.
+        self.no_match = no_match
+        # The project's API for this command was never enabled (403 SERVICE_DISABLED).
+        self.service_disabled = service_disabled
+        # gcloud command words only (e.g. 'run services list'); never values.
+        self.command = command
+        # For compute ssh: the remote exception class and exit status only.
+        self.remote_error = remote_error
         self.role_propagating = role_propagating
         self.managed_conflict = managed_conflict
         self.managed_conflicts = managed_conflicts or ([managed_conflict] if managed_conflict else [])
@@ -162,8 +180,12 @@ class GoogleProvider:
         if result.returncode:
             from momso_iam_retry import role_propagation_failure
             stderr = getattr(result, 'stderr', b'') or b''
-            match = re.search(rb'(?:HTTPError\s+|ResponseError:\s*status=\[?)(403|404)\b', stderr)
-            http_status = int(match.group(1)) if match else None
+            match = re.search(rb'(?:HTTPError\s+|ResponseError:\s*status=\[?)(403|404)\b', stderr) or STORAGE_NOT_FOUND.search(stderr)
+            http_status = int(match.group(1)) if match else 404 if KMS_RING_NOT_FOUND.search(stderr) else None
+            # `gcloud storage ls` reports an empty listing as exit 1 with this
+            # exact line (Cloud SDK 559, S178b). Nothing else counts as empty.
+            no_match = result.returncode == 1 and args[:2] == ('storage', 'ls') and any(
+                line.strip() == NO_MATCH_LINE for line in stderr.splitlines())
             matches = re.findall(rb'momso-managed-conflict: ([a-z0-9_.-]{1,80}): (unrecognized|not_regular|invalid_name|manifest_invalid|directory_untrusted)', stderr)
             if matches:
                 from momso_managed_history import load
@@ -176,7 +198,10 @@ class GoogleProvider:
             raise InstallError(f"클라우드 작업 실패: {' '.join(args[:3])}. 권한·연결·자원 상태를 확인하세요.",
                                role_propagating=role_propagation_failure(stderr),
                                gateway_code='gateway_image_permission' if args[:2] == ('run', 'deploy') and (b'artifactregistry.repositories.downloadArtifacts' in stderr or b'permission to read the image' in stderr.lower()) else None,
-                               http_status=http_status)
+                               http_status=http_status, no_match=no_match,
+                               service_disabled=b'SERVICE_DISABLED' in stderr and (http_status == 403 or b'PERMISSION_DENIED' in stderr),
+                               command=' '.join(word for word in args[:3] if re.fullmatch(r'[a-z][a-z-]{0,40}', word)) or None,
+                               remote_error=remote_summary(stderr) if args[:2] == ('compute', 'ssh') else None)
         if parse:
             try:
                 return json.loads(result.stdout.decode("utf-8"))
@@ -512,10 +537,13 @@ elif action=='finish':
  shutil.rmtree(backup)
 '''.replace("ACTION", repr(action)).replace("SNAPSHOT_CODE", repr(snapshot_code)).replace("MANAGED_CODE", repr(managed_code)).replace("INSTALL_OWNER", repr(self.install_id)).replace('PROXY_NAMES', repr(PROXY_FILES))
         encoded = base64.b64encode(code.encode()).decode()
-        wrapper = "import base64,subprocess,sys; r=subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],capture_output=True); print('momso_server_busy' if r.returncode and b'server_busy' in r.stderr else 'momso_restore_failed' if r.returncode and " + repr(action == 'restore') + " else 'momso_checkpoint_failed' if r.returncode else 'momso_checkpoint_ok')"
+        wrapper = "import base64,subprocess,sys; r=subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],capture_output=True); print('momso_server_busy' if r.returncode and b'server_busy' in r.stderr else 'momso_lifecycle_busy' if r.returncode and (b'BlockingIOError' in r.stderr or b'lifecycle_busy' in r.stderr) else 'momso_restore_failed' if r.returncode and " + repr(action == 'restore') + " else 'momso_checkpoint_failed' if r.returncode else 'momso_checkpoint_ok')"
         result = self.ssh(wrapper).strip()
         if result == b"momso_server_busy":
             raise InstallError("지금 쓰는 중이라 올리지 못했습니다. 잠시 뒤 다시 시도해 주세요.")
+        if result == b"momso_lifecycle_busy":
+            # Usually the VM's own updater (or idle stop) holds lifecycle.lock.
+            raise InstallError('vm_lifecycle_busy')
         if result == b"momso_restore_failed":
             raise InstallError("복구 중 오류가 발생했습니다. 복구 사본을 보존했습니다.", gateway_failure={'code': 'rollback_failed', 'rolledBack': False, 'retryable': False})
         if result != b"momso_checkpoint_ok":
@@ -571,6 +599,50 @@ if active:
         wrapper = "import base64,subprocess; subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],check=True)"
         self.ssh(wrapper)
 
+    def vm_release_state(self):
+        """Installed sequence, active server digest and the VM updater's state."""
+        code = r'''import hashlib,json,os
+root='/opt/momso/releases';marker=root+'/.momso-update-active';override='/etc/systemd/system/momso-server.service.d/momso-update.conf'
+active=os.path.exists(marker) or (os.path.isfile(override) and 'ExecStart=/opt/momso/releases/current/momso-server' in open(override).read())
+out={'active':active,'sequence':None,'serverSha256':None,'updateState':None}
+if active:
+ with open(root+'/installed.json') as f:seq=json.load(f).get('sequence')
+ out['sequence']=seq if type(seq) is int else None
+ server=os.path.realpath(root+'/current')+'/momso-server'
+else:server='/opt/momso/momso-server'
+if os.path.isfile(server) and not os.path.islink(server):
+ h=hashlib.sha256()
+ with open(server,'rb') as f:
+  for block in iter(lambda:f.read(1048576),b''):h.update(block)
+ out['serverSha256']=h.hexdigest()
+try:
+ with open('/run/momso-update/status.json') as f:value=json.load(f)
+ out['updateState']=value.get('state') if isinstance(value,dict) and isinstance(value.get('state'),str) else None
+except (OSError,ValueError):pass
+print(json.dumps(out))
+'''
+        encoded = base64.b64encode(code.encode()).decode()
+        wrapper = "import base64,subprocess,sys; r=subprocess.run(['sudo','python3','-c',base64.b64decode(" + repr(encoded) + ").decode()],capture_output=True,check=True); sys.stdout.write(r.stdout.decode())"
+        try:
+            value = json.loads(self.ssh(wrapper))
+        except (InstallError, OSError, subprocess.SubprocessError, ValueError):
+            raise InstallError('vm_release_state_unavailable') from None
+        if not isinstance(value, dict):
+            raise InstallError('vm_release_state_unavailable')
+        return value
+
+    def wait_for_vm_update(self, *, attempts=60, wait=15, sleep=time.sleep):
+        """Let the VM's own updater finish (about 15 minutes at most)."""
+        for _ in range(attempts):
+            state = self.vm_release_state()
+            if state.get('updateState') == 'recovery_required':
+                raise InstallError('vm_update_recovery_required')
+            if state.get('updateState') not in VM_UPDATE_BUSY:
+                return state
+            print('vm_update_waiting state=' + state['updateState'], flush=True)
+            sleep(wait)
+        raise InstallError('vm_update_in_progress')
+
     def install_web(self, archive: Path, digest: str):
         data = archive.read_bytes()
         if hashlib.sha256(data).hexdigest() != digest:
@@ -625,7 +697,7 @@ finally:
         specs = [("instances", self.name, [f"--zones={ZONE}"], [f"--zone={ZONE}"], True), ("routers", self.router, [f"--regions={REGION}"], [f"--region={REGION}"], False), ("firewall-rules", self.firewall, [], [], False), ("networks subnets", self.subnet, [f"--regions={REGION}"], [f"--region={REGION}"], False), ("networks", self.network, [], [], False)]
         for index, (resource, name, filters, flags, vm) in enumerate(specs):
             parts = resource.split()
-            items = self.run("compute", *parts, "list", *filters, f"--filter=name={name}", parse=True)
+            items = owned_listing(self, "compute", *parts, "list", *filters, f"--filter=name={name}")
             found = next((item for item in items if item.get("name") == name), None)
             if not found:
                 continue
@@ -660,6 +732,28 @@ finally:
                 raise PendingNetworkCleanup(remaining) from error
 
 
+def remote_summary(stderr):
+    """Name what failed on the VM without copying messages (they can hold values)."""
+    names = re.findall(rb'^([A-Za-z_][A-Za-z0-9_.]{0,80}(?:Error|Exception)): (?:([a-z][a-z0-9_]{0,63})$|.*?returned non-zero exit status (\d{1,3}))', stderr, re.M)
+    if not names:
+        return None
+    name, code, status = names[-1]
+    text = name.decode('ascii').rsplit('.', 1)[-1]
+    if code: text += ': ' + code.decode('ascii')
+    if status: text += ': exit ' + status.decode('ascii')
+    return text
+
+
+def owned_listing(provider, *args, **kwargs):
+    """List for deletion; a never-enabled API cannot hold resources (S180)."""
+    try:
+        return provider.run(*args, parse=True, **kwargs)
+    except InstallError as error:
+        if getattr(error, 'service_disabled', False) is True:
+            return []
+        raise
+
+
 def deploy(provider, artifact: Path, digest: str, state_path: Path, state: dict):
     if not artifact.is_file() or not re.fullmatch(r"[0-9a-f]{64}", digest):
         raise InstallError("실행 파일과 SHA-256을 확인하세요.")
@@ -676,6 +770,26 @@ def deploy(provider, artifact: Path, digest: str, state_path: Path, state: dict)
             raise InstallError(f"{name} 단계가 실패했습니다. 원인을 확인한 뒤 다시 실행하세요.") from error
         state["steps"][name] = "ok"
         save_state(state_path, state)
+
+
+def verify_current_release(provider, url, gateway_image):
+    """Check a release the VM installed itself, without redeploying anything."""
+    import momso_anywhere_install
+    provider.health()
+    provider.ensure_private_proxy()
+    if gateway_image is not None:
+        adapter = momso_anywhere_install.cloud_run_gateway(provider, 'momso-any-' + provider.install_id[:12])
+        try:
+            traffic = adapter.current()['traffic']
+            if len(traffic) != 1:
+                raise InstallError('gateway_traffic_mismatch')
+            adapter._verify_revision(next(iter(traffic)), gateway_image)
+        except InstallError:
+            raise
+        except Exception as error:
+            code = str(error) if str(error).startswith('gateway_') else 'gateway_probe_failed'
+            raise InstallError(code, gateway_code=code, gateway_failure=momso_anywhere_install.gateway_failure(code)) from None
+    provider.gateway_proxy_health(url)
 
 
 def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_id, owner_sub, login_origin, gateway_image, signed_sequence=None, *, update_settings=None):
@@ -709,9 +823,25 @@ def upgrade_anywhere(provider, state, artifact, digest, web, web_digest, client_
     if vm.get("status") != "RUNNING":
         raise InstallError('vm_unreachable')
     try:
-        if signed_sequence is not None:
-            provider.upgrade_sequence(signed_sequence)
-        provider.upgrade_checkpoint("begin")
+        for attempt in range(2):
+            if signed_sequence is not None and hasattr(provider, 'wait_for_vm_update'):
+                current_state = provider.wait_for_vm_update()
+                installed = current_state.get('sequence')
+                if type(installed) is int and installed >= signed_sequence:
+                    # The VM's own updater installed this (or a newer) release.
+                    if installed == signed_sequence and current_state.get('serverSha256') != digest:
+                        raise InstallError('vm_release_mismatch')
+                    verify_current_release(provider, configured['url'], gateway_image if installed == signed_sequence else None)
+                    print(f'already_current sequence={installed}', flush=True)
+                    return configured["url"]
+            if signed_sequence is not None:
+                provider.upgrade_sequence(signed_sequence)
+            try:
+                provider.upgrade_checkpoint("begin")
+                break
+            except InstallError as error:
+                if str(error) != 'vm_lifecycle_busy' or attempt == 1:
+                    raise
         try:
             provider.upgrade_server(artifact, digest)
             provider.install_web(web, web_digest)
@@ -1184,10 +1314,15 @@ def main(argv=None):
         if operation_lease is not None:
             try:
                 operation_lease.release()
-            except (InstallError, OSError, subprocess.SubprocessError):
-                error = InstallError('vm_unreachable')
-        if args.action != 'destroy' and str(error) in ('vm_state_unknown', 'vm_start_failed', 'vm_unreachable', 'vm_busy'):
+            except (InstallError, OSError, subprocess.SubprocessError) as release_error:
+                # Keep the real failure; the guard problem is reported beside it.
+                print(json.dumps({'warning': str(release_error) if re.fullmatch(r'[a-z][a-z0-9_]{0,79}', str(release_error)) else 'pc_guard_release_unconfirmed'}, ensure_ascii=False))
+        if args.action != 'destroy' and str(error) in ('vm_state_unknown', 'vm_start_failed', 'vm_unreachable', 'vm_busy', 'vm_layout_invalid', 'idle_stop_recovering', 'idle_stop_stop_failed', 'pc_guard_failed', 'pc_guard_ended', 'pc_guard_not_ready', 'pc_guard_status_invalid', 'pc_guard_command_failed', 'pc_guard_release_unconfirmed', 'vm_update_in_progress', 'vm_update_recovery_required', 'vm_release_mismatch', 'vm_lifecycle_busy', 'vm_release_state_unavailable'):
             print(json.dumps({'code': str(error)}, ensure_ascii=False))
+        elif args.action != 'destroy' and getattr(error, 'command', None) and not re.fullmatch(r'[a-z][a-z0-9_]{0,79}', str(error)):
+            detail = {'code': 'cloud_command_failed', 'failedCommand': error.command}
+            if getattr(error, 'remote_error', None): detail['remoteError'] = error.remote_error
+            print(json.dumps(detail, ensure_ascii=False))
         if str(error).startswith('restore_failed'):
             parts = str(error).split(': ', 1)
             detail = parts[1] if len(parts) == 2 and re.fullmatch(r'[a-z_]{1,64}', parts[1]) else 'backup_unreadable'
@@ -1197,10 +1332,14 @@ def main(argv=None):
         if args.action == 'destroy':
             from momso_anywhere_delete_result import deletion_result
             code = str(error)
+            failed_command = getattr(error, 'command', None)
             if not re.fullmatch(r'[a-z][a-z0-9_]{0,79}', code):
-                code = 'delete_failed'
+                # Name the cloud step instead of a bare delete_failed (S180).
+                code = 'cloud_command_failed' if failed_command else 'delete_failed'
             previous = state.get('backup_discard') if isinstance(state, dict) else None
             detail = dict(previous) if isinstance(previous, dict) else {}
+            if code == 'cloud_command_failed':
+                detail['failedCommand'] = failed_command
             detail['mode'] = 'delete_all' if args.discard_data else 'pause'
             if not iam_verified:
                 detail.setdefault('resources', {})['iam_bindings'] = {'status': 'unverified', 'reason': 'iam_bindings_unverified'}

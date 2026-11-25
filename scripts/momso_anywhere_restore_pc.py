@@ -4,7 +4,17 @@ from momso_anywhere_restore_plan import RestorePlanError, restore_plan
 from momso_server_install import REGION
 
 
-def discover_preserved(*, buckets, secrets, keys, instances):
+DESTROYED_KEY_STATES = frozenset(('DESTROY_SCHEDULED', 'DESTROYED'))
+
+
+def discover_preserved(*, buckets, secrets, keys, instances, destroyed_keys=frozenset()):
+    """destroyed_keys: installations whose backup key has no usable version.
+
+    After "delete everything" the bucket is soft-deleted (absent from the
+    bucket list) and the vault secret is gone, but Cloud KMS keeps the key
+    forever with its versions scheduled for destruction. Such a remnant is
+    not a paused installation and must not block a new install (S180).
+    """
     if not all(isinstance(items, list) and all(isinstance(item, dict) for item in items) for items in (buckets, secrets, keys, instances)):
         raise RestorePlanError('restore_assets_unverified')
     candidates = {}
@@ -33,6 +43,8 @@ def discover_preserved(*, buckets, secrets, keys, instances):
             if any(not isinstance(item.get('labels'), dict) or item['labels'].get('momso-install-id') != ident for item in matches):
                 raise RestorePlanError('resource_ownership')
             continue
+        if found == {'key'} and ident in destroyed_keys:
+            continue
         result.append({'installationId': ident, 'assets': 'complete' if len(found) == 3 else 'incomplete',
                        'pcIdCompatible': True})
     return result
@@ -48,6 +60,7 @@ def discover_in_project(provider):
         if not all(isinstance(value, list) for value in (buckets, secrets, rings, instances)):
             raise RestorePlanError('restore_assets_unverified')
         keys = []
+        destroyed = set()
         for ring in rings:
             name = ring.get('name', '').rsplit('/', 1)[-1]
             if not re.fullmatch(r'momso-backup-[a-f0-9]{12}', name):
@@ -56,7 +69,17 @@ def discover_in_project(provider):
             if not isinstance(found, list):
                 raise RestorePlanError('restore_assets_unverified')
             keys.extend(found)
-        return discover_preserved(buckets=buckets, secrets=secrets, keys=keys, instances=instances)
+            for key in found:
+                ident = key.get('labels', {}).get('momso-install-id', '') if isinstance(key, dict) and isinstance(key.get('labels'), dict) else ''
+                if not (isinstance(key, dict) and key.get('name', '').endswith('/keyRings/' + name + '/cryptoKeys/backup')
+                        and isinstance(ident, str) and ident[:12] == name.removeprefix('momso-backup-')):
+                    continue
+                versions = provider.run('kms', 'keys', 'versions', 'list', '--key=backup', f'--keyring={name}', f'--location={REGION}', parse=True)
+                if not isinstance(versions, list) or any(not isinstance(item, dict) for item in versions):
+                    raise RestorePlanError('restore_assets_unverified')
+                if all(item.get('state') in DESTROYED_KEY_STATES for item in versions):
+                    destroyed.add(ident)
+        return discover_preserved(buckets=buckets, secrets=secrets, keys=keys, instances=instances, destroyed_keys=destroyed)
     except RestorePlanError:
         raise
     except Exception:

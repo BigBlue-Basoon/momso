@@ -6,27 +6,9 @@ description: 스튜디오메이트의 수업과 예약을 확인하고 수정하
 
 로그인이 필요하면 `browser_request_saved_login({})`을 먼저 호출한다. 저장된 로그인을 쓸 수 없거나 인증번호·캡차가 필요하면 `browser_request_human_login({"reason":"login"})`으로 사람에게 넘긴다. 비밀번호나 인증번호는 AI가 직접 읽거나 입력하지 않는다.
 
-브라우저 스킬은 사용법 안내이며 접근 가능한 사이트의 목록이 아니다. 다른 공개 웹사이트도 사용할 수 있다. `browser_open({})`, `browser_read({})`, `browser_navigate({url})`, `browser_click({elementId})`, `browser_fill({elementId,text})`을 사용한다. 메뉴·탭·검색으로 둘러보고 변경 동작은 사용자가 선택한 권한 단계를 따른다. 비밀번호와 인증번호는 입력하지 않고 사람에게 넘긴다. 아래 주소와 블록은 참고용이며 권한 설정이 아니다.
+브라우저 스킬은 사용법 안내이며 접근 가능한 사이트의 목록이 아니다. 다른 공개 웹사이트도 사용할 수 있다. `browser_open({})`, `browser_read({})`, `browser_navigate({url})`, `browser_click({elementId})`, `browser_fill({elementId,text})`을 사용한다. 메뉴·탭·검색으로 둘러보고 변경 동작은 사용자가 선택한 권한 단계를 따른다. 비밀번호와 인증번호는 입력하지 않고 사람에게 넘긴다. 시작 주소는 https://studiomate.kr 이다. 참고용이며 다른 주소로도 갈 수 있다.
 
 선생님이 수정·삭제·등록 등 실제 변경을 요청하지 않았다면 지금 보이는 정보만 읽고 알려 준다. 선생님이 따로 요청하지 않은 수련생 이름·연락처 등은 문서에 저장하거나 다른 곳으로 옮기지 않는다. 개인정보가 AI 회사로 전달될 수 있음을 먼저 알리고 필요한 정보만 확인한다. 화면에서 원하는 항목을 찾지 못하면 추측해서 누르지 말고 멈춰 “이 화면에서 해당 항목을 찾지 못했습니다. 지금 보이는 것은 …입니다”라고 알린다.
-
-```momso-browser-reference
-version: 1
-read_only:
-  - browser_navigate
-  - browser_read
-origins:
-  - "https://studiomate.kr"
-login_origins: []
-irreversible:
-  - 게시
-  - 등록
-  - 삭제
-  - 변경
-  - 알림
-  - 결제
-  - 환불
-```
 
 공식 첫 화면은 서비스 소개 화면이다. 관리자 주소는 시설마다 다를 수 있으며 공개된 공통 로그인 주소는 확인되지 않았다. 주소를 추측하지 말고 선생님에게 확인을 부탁한다. 비밀번호나 인증번호는 묻지 않는다.
 

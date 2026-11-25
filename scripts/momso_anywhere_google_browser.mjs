@@ -316,6 +316,14 @@ export class GoogleBrowserProvider {
     const result = [];
     for (const [id, kinds] of found) {
       if (instances.some(item => item.labels?.['momso-install-id'] === id)) continue;
+      // After "delete everything" only the KMS key survives (Cloud KMS never
+      // deletes keys) with every version scheduled for destruction: a
+      // remnant, not a paused installation (S180).
+      if (kinds.size === 1 && kinds.has('key')) {
+        const key = keys.find(item => item?.labels?.['momso-install-id'] === id && /\/cryptoKeys\/backup$/.test(item.name ?? ''));
+        const versions = key ? await list(`https://cloudkms.googleapis.com/v1/${key.name}/cryptoKeyVersions`, 'cryptoKeyVersions') : null;
+        if (versions && versions.every(item => ['DESTROY_SCHEDULED', 'DESTROYED'].includes(item?.state))) continue;
+      }
       const instance = instances.find(item => item.name === `momso-${id.slice(0, 12)}`);
       if (instance && instance.labels?.['momso-install-id'] !== id) throw new SetupError('resource_ownership');
       if (!instance) {
