@@ -174,6 +174,10 @@ class AnywhereBackupTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.data = self.root / "data"
         self.data.mkdir()
+        if os.name == "posix":
+            for name in (".momso-reservation-state.lock", ".momso-reservation-operation.lock"):
+                fd = os.open(self.data / name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
         self.store = FakeStore()
         self.keys = FakeKeys()
         self.names = ["server.sqlite3", "vault.age"]
@@ -1287,11 +1291,15 @@ class AnywhereBackupTests(unittest.TestCase):
         self.assertEqual(updates, [("storage", "buckets", "update", "gs://momso-backup-abcdef123456", "--update-labels=momso-install-id=abcdef123456")])
         self.assertLess(provider.calls.index(creates[0]), provider.calls.index(updates[0]))
         self.assertEqual(set(result["bucket_permissions"]), {
-            "storage.objects.get", "storage.objects.create", "storage.objects.delete"
+            "storage.buckets.get", "storage.objects.get", "storage.objects.create", "storage.objects.delete"
         })
         bindings = [call for call in provider.calls if "add-iam-policy-binding" in call]
-        self.assertEqual(len(bindings), 2)
+        self.assertEqual(len(bindings), 3)
         self.assertTrue(all("--member=serviceAccount:" + result["service_account"] in call for call in bindings))
+        roles = {part for call in bindings for part in call if part.startswith("--role=")}
+        self.assertIn("--role=roles/cloudkms.cryptoKeyEncrypterDecrypter", roles)
+        self.assertIn("--role=roles/cloudkms.viewer", roles)
+        self.assertTrue(any(role.startswith("--role=projects/example-project/roles/") for role in roles))
         self.assertTrue(any("--public-access-prevention" in call for call in provider.calls))
         self.assertFalse(any("delete" == part for call in provider.calls for part in call))
 

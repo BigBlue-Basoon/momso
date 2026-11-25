@@ -187,6 +187,7 @@ class Updater:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise UpdateError("update_busy") from None
+            self._reservation = None
             try:
                 return self._install(manifest_url, signature_url)
             except UpdateError as error:
@@ -195,6 +196,24 @@ class Updater:
             except (OSError, ValueError):
                 self._emit("failed", "update_unavailable")
                 raise UpdateError("update_unavailable") from None
+            finally:
+                self._unreserve()
+
+    def _reserve(self, release_bytes):
+        try:
+            reservation = self.host.reserve_update(release_bytes)
+            reservation.__enter__()
+        except ValueError as error:
+            reason = str(error)
+            raise UpdateError(reason if reason in {'disk_low', 'reservation_busy'} else 'reservation_unavailable') from None
+        except OSError:
+            raise UpdateError('reservation_unavailable') from None
+        self._reservation = reservation
+
+    def _unreserve(self):
+        if getattr(self, '_reservation', None) is not None:
+            reservation, self._reservation = self._reservation, None
+            reservation.__exit__(None, None, None)
 
     def _install(self, manifest_url, signature_url):
         if self.state.exists():
@@ -224,10 +243,34 @@ class Updater:
             detail = gateway_failure(str(error))
             failure = UpdateError(detail['code']); failure.gateway_failure = detail
             raise failure from None
+        if shutil.disk_usage(self.root).free < 1536 * 1024 * 1024:
+            # Only a completed journal proves which old data remains usable.
+            if self.state.exists() and hasattr(self.host, "cleanup_old_updates"):
+                try:
+                    record = json.loads(self.state.read_text(encoding="utf-8"))
+                    if isinstance(record, dict):
+                        self.host.cleanup_old_updates(record)
+                except (OSError, ValueError, KeyError, TypeError):
+                    self._emit("checking", "cleanup_pending")
+            if shutil.disk_usage(self.root).free < 1536 * 1024 * 1024:
+                self._emit("failed", "disk_low")
+                raise UpdateError("disk_low")
         self._emit("downloading")
         bundle = _download(release["bundleUrl"], self.allow_http)
         if hashlib.sha256(bundle).hexdigest() != release["bundleSha256"]:
             raise UpdateError("digest_mismatch")
+        if hasattr(self.host, 'reserve_update'):
+            import io
+            try:
+                with tarfile.open(fileobj=io.BytesIO(bundle), mode='r:gz') as archive:
+                    members = archive.getmembers()
+                    size = sum(item.size for item in members)
+                    if len(members) > 100000 or size > 2147483648:
+                        raise UpdateError('invalid_bundle')
+            except tarfile.TarError:
+                raise UpdateError('reservation_unavailable') from None
+            # Checks room for the release and both data copies up front.
+            self._reserve(size)
         stage = Path(tempfile.mkdtemp(prefix="release-" + str(release["sequence"]) + "-", dir=self.root))
         try:
             _extract(bundle, stage)
@@ -238,6 +281,11 @@ class Updater:
         except Exception:
             shutil.rmtree(stage)
             raise
+        finally:
+            # POST /maintenance starts a fresh backup that takes the same
+            # large-write lock; holding it while waiting for idle made that
+            # backup fail with reservation_busy on every update.
+            self._unreserve()
         self._emit("waiting_for_idle")
         try:
             acquired = self.host.acquire_maintenance()
@@ -247,22 +295,33 @@ class Updater:
         if not acquired:
             shutil.rmtree(stage)
             return "busy"
+        def release_and_discard_stage():
+            try:
+                self.host.release_maintenance()
+            finally:
+                shutil.rmtree(stage)
         try:
             current_sequence = self.host.current_sequence()
         except Exception:
-            self.host.release_maintenance()
-            shutil.rmtree(stage)
+            release_and_discard_stage()
             raise UpdateError('current_state_unavailable') from None
         if current_sequence >= release['sequence']:
-            self.host.release_maintenance()
-            shutil.rmtree(stage)
+            release_and_discard_stage()
             return self._up_to_date(current_sequence)
         try:
             old_release = self.host.current_release()
             old_gateway = self.host.current_gateway()
         except Exception:
-            self.host.release_maintenance()
+            release_and_discard_stage()
             raise UpdateError("current_state_unavailable") from None
+        if hasattr(self.host, 'reserve_update'):
+            # Admission is closed and quiescent: hold the lock for the data
+            # snapshot and any restore copy until the update ends.
+            try:
+                self._reserve(0)
+            except UpdateError:
+                release_and_discard_stage()
+                raise
         snapshot = None
         try:
             # Write the recovery record before stopping the old server.
@@ -294,7 +353,8 @@ class Updater:
             if hasattr(self.host, 'gateway_proxy_healthy') and not self.host.gateway_proxy_healthy():
                 raise UpdateError('proxy_not_running')
             self.host.record_sequence(release["sequence"])
-            _atomic_json(self.state, {"phase": "complete", "sequence": release["sequence"], "needsRelease": True})
+            _atomic_json(self.state, {"phase": "complete", "sequence": release["sequence"], "needsRelease": True,
+                                      "oldRelease": old_release, "newRelease": str(stage), "snapshot": snapshot})
             if hasattr(self.host, "commit_managed"):
                 try: self.host.commit_managed()
                 except Exception: self._emit("completed", "managed_cleanup_pending")
@@ -318,6 +378,10 @@ class Updater:
                 failure_error = UpdateError(recovery_reason)
                 if gateway_detail: failure_error.gateway_failure = gateway_detail
                 raise failure_error from error
+            try:
+                shutil.rmtree(stage)
+            except OSError:
+                self._emit("rolling_back", "stage_cleanup_failed")
             if reason.startswith('gateway_'):
                 detail = gateway_failure(reason, True)
                 self._emit('rolled_back', detail['code'], detail)
@@ -336,6 +400,11 @@ class Updater:
                         raise UpdateError("maintenance_release_failed") from None
                     record["needsRelease"] = False
                     _atomic_json(self.state, record)
+                    if record.get("phase") == "complete" and hasattr(self.host, "cleanup_old_updates"):
+                        try:
+                            self.host.cleanup_old_updates(record)
+                        except (OSError, ValueError, KeyError, TypeError):
+                            self._emit("completed", "cleanup_pending")
 
     def _up_to_date(self, installed):
         if self.state.exists():
@@ -345,12 +414,39 @@ class Updater:
         self._emit('up_to_date')
         return 'up_to_date'
 
+    def _release_stale_admission(self):
+        """Reopen a gate this updater closed without any switching record.
+
+        A lost POST /maintenance answer, or a failed release before the
+        switching record was written, used to leave admission closed with no
+        record for recovery, so every later attempt saw `busy` (S173).
+        The admission marker proves the gate was closed by its owner.
+        """
+        pending = getattr(self.host, "admission_pending", None)
+        if pending is None or pending() is not True:
+            return "no_recovery"
+        try:
+            acquired = self.host.acquire_maintenance()
+        except Exception:
+            self._emit("failed", "maintenance_unavailable")
+            raise UpdateError("maintenance_unavailable") from None
+        if not acquired:
+            return "busy"
+        try:
+            self.host.release_maintenance()
+        except Exception:
+            self._emit("failed", "maintenance_release_failed")
+            raise UpdateError("maintenance_release_failed") from None
+        # Journald only: the screen status keeps its own states.
+        print("update stage=recovered reason=stale_admission_released", flush=True)
+        return "released"
+
     def recover(self):
         """Run before the host accepts requests after an interrupted update."""
         with (self.root / "update.lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if not self.state.exists():
-                return "no_recovery"
+                return self._release_stale_admission()
             try:
                 record = json.loads(self.state.read_text(encoding="utf-8"))
                 if not isinstance(record, dict): raise ValueError("invalid_record")
@@ -372,7 +468,7 @@ class Updater:
                     raise UpdateError("managed_cleanup_pending") from None
             pending_release = phase in {"complete", "rolled_back"} and record.get("needsRelease") is True
             if phase != "switching" and not pending_release:
-                return "no_recovery"
+                return self._release_stale_admission()
             acquire = getattr(self.host, "acquire_recovery_maintenance", self.host.acquire_maintenance)
             try:
                 acquired = acquire()

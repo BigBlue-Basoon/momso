@@ -1220,6 +1220,16 @@ pub(crate) async fn backup_with_mode<R: tauri::Runtime>(
     automatic: bool,
 ) -> Result<BackupProgress, &'static str> {
     let paths = state.paths.scoped().await;
+    backup_with_paths(app, paths, automatic).await
+}
+
+// The paired-backup coordinator supplies paths while holding the exclusive
+// archive lease, so it must not try to acquire another read lease here.
+pub(crate) async fn backup_with_paths<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    paths: crate::runtime::RuntimePaths,
+    automatic: bool,
+) -> Result<BackupProgress, &'static str> {
     let _guard = object_store::CONNECTION_LOCK.lock().await;
     if automatic && !crate::object_store_auto_upload::enabled(&paths.database_path)? {
         return Err("disabled");

@@ -70,6 +70,35 @@ class FakeProvider:
 
 
 class InstallerTests(unittest.TestCase):
+    def test_restore_preparation_installs_credentials_without_starting_server(self):
+        provider = FakeProvider()
+        services.install_scripts(provider, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'}, start_services=False)
+        payload = provider.payloads[-1]
+        self.assertIn('if False:', payload)
+        self.assertIn('LoadCredential=momso-vault-identity', payload)
+        self.assertNotIn(('health',), provider.calls)
+
+    @unittest.skipIf(os.name == 'nt', 'VM payload requires Linux file locks')
+    def test_idle_start_is_deferred_while_pc_lease_holds_lock(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp); root = base / 'opt'; root.mkdir(mode=0o700); private = base / 'private'; private.mkdir(mode=0o700); systemd = base / 'systemd'; systemd.mkdir(mode=0o700)
+            data = base / 'data'; life = data / 'lifecycle'; life.mkdir(parents=True)
+            p = FakeProvider()
+            with patch.object(services, '_paths', return_value={'momso_anywhere_backup.py': b'new'}):
+                services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd)).replace('/var/lib/momso', str(data)).replace('/run/momso-pc-idle-restart', str(base / 'deferred'))
+            calls = []
+            def run(args, **_kwargs): calls.append(args); return subprocess.CompletedProcess(args, 0)
+            stdin = io.TextIOWrapper(io.BytesIO(json.dumps(p.files).encode()))
+            with (life / 'pc-installer.lock').open('a+b') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch('sys.stdin', stdin), patch('shutil.which', return_value='/usr/bin/fixture'), patch.object(subprocess, 'run', side_effect=run):
+                    exec(compile(code, '<vm fixture>', 'exec'), {})
+            self.assertTrue((base / 'deferred').is_file())
+            self.assertIn(('systemctl', 'enable', 'momso-idle-stop'), calls)
+            self.assertNotIn(('systemctl', 'enable', '--now', 'momso-idle-stop'), calls)
+
     @unittest.skipIf(os.name == 'nt', 'VM payload requires Linux filesystem operations')
     def test_first_migration_adopts_generated_files_preserves_unmanaged_backups(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -92,7 +121,8 @@ class InstallerTests(unittest.TestCase):
             p = FakeProvider()
             with patch.object(services, '_paths', return_value={'momso_anywhere_backup.py': b'new worker'}):
                 services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
-            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd))
+            data = base / 'data'; data.mkdir()
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd)).replace('/var/lib/momso', str(data)).replace('/run/momso-pc-idle-restart', str(base / 'deferred'))
             stdin = io.TextIOWrapper(io.BytesIO(json.dumps(p.files).encode()))
             with patch('sys.stdin', stdin), patch('shutil.which', return_value='/usr/bin/fixture'), patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
                 exec(compile(code, '<vm fixture>', 'exec'), {})
@@ -122,7 +152,8 @@ class InstallerTests(unittest.TestCase):
             # An existing main ledger disables one-time adoption for all groups.
             (private / 'managed-files.json').write_text(json.dumps({'version': 1, 'owner': p.install_id, 'files': {}}))
             (private / 'managed-units.json').write_text('invalid fixture')
-            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd))
+            data = base / 'data'; data.mkdir()
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd)).replace('/var/lib/momso', str(data)).replace('/run/momso-pc-idle-restart', str(base / 'deferred'))
             stdin = io.TextIOWrapper(io.BytesIO(json.dumps(p.files).encode()))
             with patch('sys.stdin', stdin), patch.object(subprocess, 'run') as run:
                 with self.assertRaises(RuntimeError) as caught:
@@ -159,7 +190,8 @@ class InstallerTests(unittest.TestCase):
             p = FakeProvider()
             with patch.object(services, '_paths', return_value={'momso_anywhere_backup.py': new}), patch.object(services, 'LEGACY_FILES', {'momso_anywhere_backup.py': [hashlib.sha256(old).hexdigest()]}):
                 services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
-            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd))
+            data = base / 'data'; data.mkdir()
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd)).replace('/var/lib/momso', str(data)).replace('/run/momso-pc-idle-restart', str(base / 'deferred'))
             stdin = io.TextIOWrapper(io.BytesIO(json.dumps(p.files).encode()))
             with patch('sys.stdin', stdin), patch('shutil.which', return_value='/usr/bin/fixture'), patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
                 exec(compile(code, '<vm fixture>', 'exec'), {})
@@ -183,7 +215,8 @@ class InstallerTests(unittest.TestCase):
             p = FakeProvider()
             with patch.object(services, '_paths', return_value={'momso_anywhere_backup.py': new}), patch.object(services, 'LEGACY_FILES', {'momso_anywhere_backup.py': [hashlib.sha256(old).hexdigest()]}):
                 services.install_scripts(p, 'fixture-secret', False, {'bucket': 'fixture', 'key': 'fixture'})
-            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd))
+            data = base / 'data'; data.mkdir()
+            code = p.payloads[-1].replace('/opt/momso', str(root)).replace('/etc/momso-private', str(private)).replace('/etc/systemd/system', str(systemd)).replace('/var/lib/momso', str(data)).replace('/run/momso-pc-idle-restart', str(base / 'deferred'))
             def run(args, **kwargs):
                 if tuple(args[:2]) == ('systemctl', 'daemon-reload'):
                     raise subprocess.CalledProcessError(1, args)
@@ -208,7 +241,8 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('momso-idle-stop.service', p.payloads[1])
         self.assertEqual(set(p.files), {'vault-provision.py', 'idle-stop.py',
                          'momso_anywhere_backup.py', 'momso_anywhere_backup_agent.py',
-                         'momso_anywhere_backup_google.py', 'momso_anywhere_vault_identity.py'})
+                         'momso_anywhere_backup_google.py', 'momso_anywhere_vault_identity.py',
+                         'momso_anywhere_prestart_restore.py'})
         self.assertIn('MOMSO_BACKUP_AGENT=/opt/momso/momso_anywhere_backup_agent.py', p.payloads[1])
         self.assertIn('MOMSO_BACKUP_KMS_KEY=', p.payloads[1])
         self.assertTrue(any(c[:3] == ('storage', 'buckets', 'create') for c in p.calls))

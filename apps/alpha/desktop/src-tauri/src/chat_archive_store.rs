@@ -494,7 +494,18 @@ pub(crate) fn known_values(data_root: &Path, database: &Path) -> Result<Vec<Stri
             },
         );
     }
-    known_values_with(data_root, database, |_| Ok(None), |_| Err("unavailable"))
+    known_values_with(
+        data_root,
+        database,
+        |_| Ok(None),
+        |config| {
+            if config.endpoint == "http://127.0.0.1:1" && config.bucket == "fixture" {
+                Ok(("fixture-access".into(), "fixture-secret".into()))
+            } else {
+                Err("unavailable")
+            }
+        },
+    )
 }
 
 pub(crate) fn write(

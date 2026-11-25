@@ -39,12 +39,12 @@ class GoogleBackupProvisioner:
         self.key = "backup"
         self.sa = vm_resource_names(provider)['backup_account']
         self.email = vm_email or self.sa + "@" + provider.project + ".iam.gserviceaccount.com"
-        if vm_email and vm_email != "mv-" + provider.install_id + "@" + provider.project + ".iam.gserviceaccount.com":
+        if vm_email and vm_email != "mv-" + provider.install_id[:12] + "@" + provider.project + ".iam.gserviceaccount.com":
             raise InstallError("VM 백업 서비스 계정이 설치 기록과 다릅니다.")
         self.existing_vm_account = vm_email is not None
         self.role = vm_resource_names(provider)['roles'][1]
 
-    def provision(self):
+    def provision(self, *, preserved_only=False):
         p = self.p
         # A colliding resource must not be adopted without the install marker.
         buckets = p.run("storage", "buckets", "list", parse=True)
@@ -54,6 +54,8 @@ class GoogleBackupProvisioner:
             if not bucket_is_owned_and_private(actual, p.install_id):
                 raise InstallError("백업 버킷의 소유권이나 비공개 설정이 달라 변경하지 않았습니다.")
         else:
+            if preserved_only:
+                raise InstallError('restore_assets_incomplete')
             p.run("storage", "buckets", "create", "gs://" + self.bucket,
                   f"--location={REGION}", "--uniform-bucket-level-access",
                   "--public-access-prevention")
@@ -71,22 +73,26 @@ class GoogleBackupProvisioner:
             p.run("iam", "service-accounts", "create", self.sa, f"--description={p.marker}")
         rings = p.run("kms", "keyrings", "list", f"--location={REGION}", parse=True)
         ring_resource = f"projects/{p.project}/locations/{REGION}/keyRings/{self.ring}"
-        ring = next((x for x in rings if x.get("name") == ring_resource), None)
+        ring = next((x for x in rings if x.get("name", "").endswith(f"/locations/{REGION}/keyRings/{self.ring}")), None)
         if not ring:
+            if preserved_only:
+                raise InstallError('restore_assets_incomplete')
             p.run("kms", "keyrings", "create", self.ring, f"--location={REGION}")
         keys = p.run("kms", "keys", "list", f"--location={REGION}", f"--keyring={self.ring}", parse=True)
         key_resource = ring_resource + "/cryptoKeys/" + self.key
-        key = next((x for x in keys if x.get("name") == key_resource), None)
+        key = next((x for x in keys if x.get("name", "").endswith(f"/locations/{REGION}/keyRings/{self.ring}/cryptoKeys/{self.key}")), None)
         if key and key.get("labels", {}).get("momso-install-id") != p.install_id:
             raise InstallError("백업 암호화 키의 소유권이 달라 변경하지 않았습니다.")
         if not key:
+            if preserved_only:
+                raise InstallError('restore_assets_incomplete')
             # A pre-existing empty key ring cannot prove ownership.
             if ring:
                 raise InstallError("기존 키 보관함의 소유권을 확인하지 못했습니다.")
             p.run("kms", "keys", "create", self.key, f"--location={REGION}",
                   f"--keyring={self.ring}", "--purpose=encryption",
                   f"--labels=momso-install-id={p.install_id}")
-        permissions = ["storage.objects.get", "storage.objects.create", "storage.objects.delete"]
+        permissions = ["storage.buckets.get", "storage.objects.get", "storage.objects.create", "storage.objects.delete"]
         reconcile_owned_role(p, self.role, permissions)
         roles = p.run("iam", "roles", "list", parse=True)
         role_name = f"projects/{p.project}/roles/{self.role}"
@@ -104,6 +110,9 @@ class GoogleBackupProvisioner:
         bind_custom_role(p, "kms", "keys", "add-iam-policy-binding", self.key,
                          f"--location={REGION}", f"--keyring={self.ring}",
                          f"--member={member}", "--role=roles/cloudkms.cryptoKeyEncrypterDecrypter")
+        bind_custom_role(p, "kms", "keys", "add-iam-policy-binding", self.key,
+                         f"--location={REGION}", f"--keyring={self.ring}",
+                         f"--member={member}", "--role=roles/cloudkms.viewer")
         return {"bucket": self.bucket, "key": key_resource, "service_account": self.email,
                 "bucket_permissions": permissions}
 

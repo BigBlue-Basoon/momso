@@ -5,14 +5,15 @@ const STORAGE = 'https://storage.googleapis.com/storage/v1/';
 const KMS = 'https://cloudkms.googleapis.com/v1/';
 const REGION = 'asia-northeast3';
 
-export async function prepareBackupResources(request, project, installationId, sleep) {
-  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project) || !/^[a-f0-9]{24}$/.test(installationId)) throw new SetupError('invalid_installation');
+export async function prepareBackupResources(request, project, installationId, sleep, { preservedOnly = false } = {}) {
+  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project) || !/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(installationId)) throw new SetupError('invalid_installation');
   const short = installationId.slice(0, 12);
   const bucket = `momso-backup-${short}`;
   const member = `serviceAccount:momso-vm-${short}@${project}.iam.gserviceaccount.com`;
   const bucketUrl = `${STORAGE}b/${bucket}`;
   let storage = await request(bucketUrl, { allowMissing: true });
   if (!storage) {
+    if (preservedOnly) throw new SetupError('restore_assets_incomplete');
     await request(`${STORAGE}b?project=${encodeURIComponent(project)}`, { method: 'POST', body: { name: bucket, location: REGION, labels: { 'momso-install-id': installationId }, iamConfiguration: { uniformBucketLevelAccess: { enabled: true }, publicAccessPrevention: 'enforced' } } });
     storage = await request(bucketUrl);
   }
@@ -23,6 +24,7 @@ export async function prepareBackupResources(request, project, installationId, s
   let keyring = await request(KMS + ring, { allowMissing: true });
   let created = false;
   if (!keyring) {
+    if (preservedOnly) throw new SetupError('restore_assets_incomplete');
     await request(`${KMS}${location}/keyRings?keyRingId=momso-backup-${short}`, { method: 'POST', body: {} });
     keyring = await request(KMS + ring);
     created = true;
@@ -30,6 +32,7 @@ export async function prepareBackupResources(request, project, installationId, s
   if (keyring.name !== ring) throw new SetupError('resource_ownership');
   let cryptoKey = await request(KMS + key, { allowMissing: true });
   if (!cryptoKey) {
+    if (preservedOnly) throw new SetupError('restore_assets_incomplete');
     if (!created) throw new SetupError('resource_ownership');
     await request(`${KMS}${ring}/cryptoKeys?cryptoKeyId=backup`, { method: 'POST', body: { purpose: 'ENCRYPT_DECRYPT', versionTemplate: { algorithm: 'GOOGLE_SYMMETRIC_ENCRYPTION' }, labels: { 'momso-install-id': installationId } } });
     cryptoKey = await request(KMS + key);
@@ -46,6 +49,8 @@ export async function prepareBackupResources(request, project, installationId, s
     await bindCustomRole(() => request(url + (wrap ? ':setIamPolicy' : '/iam'), { method, body: wrap ? { policy: updated } : updated }), sleep);
   }
   await addBinding(bucketUrl, 'roles/storage.objectAdmin', 'PUT', false);
+  await addBinding(bucketUrl, 'roles/storage.legacyBucketReader', 'PUT', false);
   await addBinding(KMS + key, 'roles/cloudkms.cryptoKeyEncrypterDecrypter', 'POST', true);
+  await addBinding(KMS + key, 'roles/cloudkms.viewer', 'POST', true);
   return { bucket, key };
 }

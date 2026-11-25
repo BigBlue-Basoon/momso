@@ -27,7 +27,7 @@ export async function activatePinnedRevision({ image, service, template, read, p
   let changed = false;
   try {
     changed = true;
-    await patch({ etag: service.etag, template, traffic: previous }, 'template,traffic');
+    await patch({ etag: service.etag, scaling: { maxInstanceCount: 1 }, template, traffic: previous }, 'scaling.maxInstanceCount,template,traffic');
     let current = await read();
     const ready = current.latestCreatedRevision;
     if (current.reconciling || current.terminalCondition?.state !== 'CONDITION_SUCCEEDED' || !/^[a-z0-9-]+$/.test(ready ?? '') || ready === previousCreated) throw new SetupError('gateway_not_ready');

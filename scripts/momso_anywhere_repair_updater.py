@@ -6,6 +6,7 @@ import re
 
 from momso_anywhere_update_install import refresh_worker
 from momso_server_install import GoogleProvider, is_link_or_reparse, key_directory
+from momso_anywhere_pc_vm import VmLease
 
 
 def main():
@@ -19,12 +20,14 @@ def main():
     state = json.loads(args.state.read_text(encoding='utf-8'))
     install_id = state.get('id', '')
     if (state.get('version') != 1 or state.get('account') != args.account
-            or state.get('project') != args.project or not re.fullmatch(r'[a-f0-9]{12}', install_id)):
+            or state.get('project') != args.project or not re.fullmatch(r'[a-f0-9]{12}(?:[a-f0-9]{12})?', install_id)):
         raise SystemExit('설치 기록을 확인해 주세요.')
     key = key_directory(args.state, install_id, False) / 'ssh'
     if is_link_or_reparse(key) or not key.is_file():
         raise SystemExit('기존 설치의 연결 키를 찾지 못했습니다.')
-    refresh_worker(GoogleProvider(args.account, args.project, install_id, key))
+    provider = GoogleProvider(args.account, args.project, install_id, key)
+    with VmLease(provider):
+        refresh_worker(provider)
     print('작업자를 다시 시작했습니다. 복구와 상태를 확인해 주세요.')
 
 

@@ -72,20 +72,24 @@ def main():
             credential_root = os.environ.get("CREDENTIALS_DIRECTORY")
             credential = Path(credential_root) / "momso-vault-identity" if credential_root else None
             identity = credential.read_bytes() if credential and credential.is_file() else None
-            with tempfile.TemporaryDirectory(prefix="snapshot-", dir=runtime) as directory:
-                staged = Path(directory)
-                private = backup.stage_live_snapshot(data, staged)
-                if os.environ.get("MOMSO_BACKUP_SNAPSHOT_SIGNAL") == "1":
-                    print("momso-backup-v3:snapshot-ready", flush=True)
-                result = backup.backup(staged, store, keys, backup.DATABASE_AND_VAULT, temp_root=runtime,
-                                       vault_identity=identity, archive=staged / "archive", quiescent=True,
-                                       memory_files=private, preserve_existing_slots=protect_slots,
-                                       protected_slot=protected_slot)
-                if protect_slots and result == 'uploaded':
-                    restore_marker.unlink()
-                    directory = os.open(data, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
-                    try: os.fsync(directory)
-                    finally: os.close(directory)
+            if os.stat(data).st_dev != os.stat(runtime).st_dev:
+                raise ValueError("reservation_unavailable")
+            amount = backup.estimate_snapshot_reservation(data)
+            with backup.reserve_large_write(data, amount):
+                with tempfile.TemporaryDirectory(prefix="snapshot-", dir=runtime) as directory:
+                    staged = Path(directory)
+                    private = backup.stage_live_snapshot(data, staged)
+                    if os.environ.get("MOMSO_BACKUP_SNAPSHOT_SIGNAL") == "1":
+                        print("momso-backup-v3:snapshot-ready", flush=True)
+                    result = backup.backup(staged, store, keys, backup.DATABASE_AND_VAULT, temp_root=runtime,
+                                           vault_identity=identity, archive=staged / "archive", quiescent=True,
+                                           memory_files=private, preserve_existing_slots=protect_slots,
+                                           protected_slot=protected_slot)
+                    if protect_slots and result == 'uploaded':
+                        restore_marker.unlink()
+                        directory = os.open(data, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                        try: os.fsync(directory)
+                        finally: os.close(directory)
         elif args.action == "restore-assets":
             backup.restore_assets(data, data / "archive", store, keys, json.load(sys.stdin))
             result = "assets-restored"
@@ -97,4 +101,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as error:
+        if str(error) in {"disk_low", "reservation_busy", "reservation_unavailable"}:
+            print("momso-backup-v3:" + ("backup_disk_low" if str(error) == "disk_low" else str(error)), flush=True)
+            sys.exit(1)
+        raise

@@ -11,9 +11,9 @@ class OwnershipError(Exception):
 
 def preview(provider):
     ident = getattr(provider, 'install_id', '')
-    if not re.fullmatch(r'[a-f0-9]{12}', ident):
+    if not re.fullmatch(r'[a-f0-9]{12}(?:[a-f0-9]{12})?', ident):
         raise InstallError('설치 번호를 확인하지 못했습니다.')
-    name = 'momso-backup-' + ident
+    name = 'momso-backup-' + ident[:12]
     output = {
         'backupExists': None, 'lastBackupAt': None, 'lastBackupValidity': 'unknown',
         'vaultIdentity': 'must_retain_for_pause',

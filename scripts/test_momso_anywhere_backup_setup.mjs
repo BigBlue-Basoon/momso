@@ -24,7 +24,7 @@ test('backup resources preserve existing policy and use the VM identity', async 
   };
   assert.deepEqual(await prepareBackupResources(request, project, id), { bucket, key });
   const policies = writes.filter(call => call.url.endsWith('/iam') || call.url.endsWith(':setIamPolicy'));
-  assert.equal(policies.length, 2);
+  assert.equal(policies.length, 4);
   for (const call of policies) {
     const policy = call.body.policy ?? call.body;
     assert(policy.bindings.some(value => value.members.includes('user:kept@example.invalid')));
@@ -40,6 +40,15 @@ test('foreign bucket is rejected before changing its policy', async () => {
     return { name: 'other', labels: {} };
   }, 'fixture-project', '0123456789abcdef01234567'));
   assert.equal(changes, 0);
+});
+
+test('preserved-only mode never creates a missing bucket', async () => {
+  const writes = [];
+  await assert.rejects(prepareBackupResources(async (_url, options = {}) => {
+    if (options.method) writes.push(options.method);
+    return null;
+  }, 'fixture-project', '0123456789abcdef01234567', undefined, { preservedOnly: true }), { step: 'restore_assets_incomplete' });
+  assert.deepEqual(writes, []);
 });
 
 test('foreign encryption key is rejected before changing its policy', async () => {

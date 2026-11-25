@@ -12,7 +12,7 @@ export function beginRedirect({ clientId, action, projectId = null, billingAccou
   if (!/^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$/.test(clientId) || !ALLOWED_ACTIONS.has(action)) throw new SetupError('invalid_authorization');
   if (projectId !== null && !/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId)) throw new SetupError('invalid_project');
   if (billingAccountName !== null && !/^billingAccounts\/[A-Za-z0-9-]+$/.test(billingAccountName)) throw new SetupError('invalid_billing_account');
-  if (installationId !== null && !/^[a-f0-9]{24}$/.test(installationId)) throw new SetupError('invalid_checkpoint');
+  if (installationId !== null && !/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(installationId)) throw new SetupError('invalid_checkpoint');
   if (typeof discardData !== 'boolean' || (discardData && action !== 'destroy')) throw new SetupError('invalid_authorization');
   const page = new URL(location.href);
   if (page.protocol !== 'https:' || page.pathname !== '/start/' || page.search || page.hash) throw new SetupError('invalid_redirect');

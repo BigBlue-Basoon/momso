@@ -5,16 +5,19 @@ const watchdog = setTimeout(() => { console.error('mobile fixture timed out'); p
 async function main() {
   let otpAccepted = false
   let secondLoginAccepted = false
+  let rescheduled = false
   const site = http.createServer((request, response) => {
     let body = ''
     request.on('data', (chunk) => { body += chunk })
     request.on('end', () => {
       if (request.method === 'POST' && request.url === '/verify') otpAccepted = body.includes('code=649217')
       if (request.method === 'POST' && request.url === '/login') secondLoginAccepted = body.includes('username=s47-second') && body.includes('password=s47-fake-second')
+      if (request.method === 'POST' && request.url === '/publish?time=11%3A30') rescheduled = true
       let page = '<html><body>fixture complete</body></html>'
       if (request.method === 'GET' && request.url === '/captcha') page = '<html><body><div class="g-recaptcha">verification required</div></body></html>'
       if (request.method === 'GET' && request.url === '/otp') page = '<html><body><form action="/verify" method="post"><input name="code" autocomplete="one-time-code"></form></body></html>'
       if (request.method === 'GET' && request.url === '/login') page = '<html><body><form action="/login" method="post"><input name="username" autocomplete="username"><input name="password" type="password" autocomplete="current-password"><button>로그인</button></form></body></html>'
+      if (request.method === 'GET' && request.url === '/edit') page = `<html><body><h1>스케줄러 개인레슨스케줄 예약내역수정 시간 수정</h1><input id="time" aria-label="시간" value="10:00"><button onclick="document.querySelector('dialog').showModal()">확인</button><dialog><p>저장 전 확인</p><button onclick="fetch('/publish?time='+encodeURIComponent(document.querySelector('#time').value),{method:'POST'}).then(()=>{document.querySelector('dialog').close();document.querySelector('#result').textContent='변경 완료 11:30'})">저장</button></dialog><p id="result"></p></body></html>`
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', connection: 'close' })
       response.end(page)
     })
@@ -95,6 +98,24 @@ async function main() {
     for (let i = 0; i < 150 && !secondLoginAccepted; i++) await new Promise((resolve) => setTimeout(resolve, 100))
     if (!secondLoginAccepted) throw new Error('the fake site did not receive the selected fixture login')
     console.log('saved-login-choice: visible and delivered')
+
+    await waitForTurn()
+    await input.fill(`reschedule fixture http://127.0.0.1:${site.address().port}/edit`)
+    await page.getByRole('button', { name: '보내기', exact: true }).click()
+    await page.getByText('가상 회원의 예약을 10:00에서 11:30으로 바꿔도 될까요?', { exact: false }).waitFor({ state: 'visible', timeout: 30000 })
+    const siteApprove = page.getByRole('button', { name: '이 채팅방에서 계속 허락', exact: true })
+    try {
+      await siteApprove.waitFor({ state: 'visible', timeout: 30000 })
+    } catch (error) {
+      console.error('fixture site approval text:', await page.locator('body').innerText())
+      throw error
+    }
+    if (rescheduled) throw new Error('fixture changed before approval')
+    await page.screenshot({ path: `${process.env.MOMSO_S47_SCREENSHOT}.site-approval.png` })
+    await siteApprove.click()
+    await page.getByText('변경 확인 11:30', { exact: false }).waitFor({ state: 'visible', timeout: 30000 })
+    if (!rescheduled) throw new Error('fixture did not receive the approved change')
+    console.log('site-approval: visible and approved change confirmed')
   } finally {
     proxy.closeAllConnections?.()
     site.closeAllConnections?.()

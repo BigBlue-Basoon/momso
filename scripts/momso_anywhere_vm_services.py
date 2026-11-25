@@ -9,19 +9,24 @@ from momso_server_install import InstallError, ZONE
 from momso_iam_retry import bind_custom_role, reconcile_owned_role
 from momso_managed_history import load as load_managed_history
 from momso_anywhere_vm_resources import names as vm_resource_names
+from momso_anywhere_restore_files import RESTORE_FILES
 
 SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 LEGACY_FILES = load_managed_history()['files']
 
 
-def _paths():
+def _paths(signed_files=None):
     root = Path(__file__).resolve().parent.parent / "apps/alpha/desktop/src-tauri"
     scripts = Path(__file__).resolve().parent
     result = {"vault-provision.py": (root / "momso-vault-provision/provision.py").read_bytes(),
               "idle-stop.py": (root / "momso-idle-stop/idle_stop.py").read_bytes()}
-    for name in ("momso_anywhere_backup.py", "momso_anywhere_backup_agent.py", "momso_anywhere_backup_google.py", "momso_anywhere_vault_identity.py"):
+    for name in RESTORE_FILES:
         result[name] = (scripts / name).read_bytes()
+    if signed_files is not None:
+        if set(signed_files) != {*RESTORE_FILES, 'vault-provision.py'}:
+            raise InstallError('restore_failed')
+        result.update(signed_files)
     return result
 
 
@@ -50,7 +55,7 @@ def identity(provider):
     return email
 
 
-def secret(provider, email):
+def secret(provider, email, *, preserved_only=False):
     p = provider
     name = vm_resource_names(p)['vault_secret']
     entries = p.run("secrets", "list", parse=True)
@@ -58,9 +63,13 @@ def secret(provider, email):
     if found and found.get("labels", {}).get("momso-install-id") != p.install_id:
         raise InstallError("보관함 열쇠의 소유권이 다릅니다.")
     if not found:
+        if preserved_only:
+            raise InstallError('restore_assets_incomplete')
         p.run("secrets", "create", name, "--replication-policy=automatic", f"--labels=momso-install-id={p.install_id}")
     versions = p.run("secrets", "versions", "list", name, parse=True)
-    for role in ("roles/secretmanager.secretAccessor", "roles/secretmanager.secretVersionAdder"):
+    if preserved_only and not any(item.get('state') == 'ENABLED' and item.get('name', '').endswith('/versions/1') for item in versions):
+        raise InstallError('restore_assets_incomplete')
+    for role in (("roles/secretmanager.secretAccessor",) if preserved_only else ("roles/secretmanager.secretAccessor", "roles/secretmanager.secretVersionAdder")):
         bind_custom_role(p, "secrets", "add-iam-policy-binding", name, f"--member=serviceAccount:{email}", f"--role={role}")
     return name, not versions
 
@@ -137,9 +146,9 @@ else:
                 p.run("compute", "instances", "start", p.name, f"--zone={ZONE}")
         p.health()
 
-def install_scripts(provider, name, initial, backup):
+def install_scripts(provider, name, initial, backup, *, signed_files=None, start_services=True):
     p = provider
-    files = {key: base64.b64encode(value).decode("ascii") for key, value in _paths().items()}
+    files = {key: base64.b64encode(value).decode("ascii") for key, value in _paths(signed_files).items()}
     payload = r'''import base64,json,os,shutil,subprocess,sys,tempfile
 files=json.load(sys.stdin)
 def run(*args):subprocess.run(args,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -164,7 +173,7 @@ with os.fdopen(fd,'w') as f:f.write(token)
 os.replace(t,p)
 """
 base='[Unit]\nDescription=momso vault credential\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=oneshot\nRestart=on-failure\nRestartSec=10\nExecStart=/usr/bin/python3 /opt/momso/vault-provision.py --project '+project+' --secret '+secret+' --vault-dir /var/lib/momso\nExecStartPost=/usr/bin/python3 /opt/momso/idle-token.py\nRemainAfterExit=yes\n[Install]\nWantedBy=multi-user.target\n'
-vault='[Unit]\nRequires=momso-vault-credential.service\nAfter=momso-vault-credential.service\n[Service]\nLoadCredential=momso-vault-identity:/run/momso-vault/momso-vault-identity\n'
+vault='[Unit]\nRequires=momso-vault-credential.service\nAfter=momso-vault-credential.service\n[Service]\nOOMScoreAdjust=-500\nLoadCredential=momso-vault-identity:/run/momso-vault/momso-vault-identity\n'
 conf='/etc/systemd/system/momso-server.service.d/backup.conf'
 contents='[Service]\nEnvironment=MOMSO_BACKUP_AGENT=/opt/momso/momso_anywhere_backup_agent.py\nEnvironment=MOMSO_BACKUP_BUCKET='+BACKUP_BUCKET_VALUE+'\nEnvironment=MOMSO_BACKUP_KMS_KEY='+BACKUP_KEY_VALUE+'\n'
 idle='[Unit]\nDescription=momso idle stop\nRequires=momso-server.service momso-vault-credential.service\nAfter=momso-server.service momso-vault-credential.service\n[Service]\nUser=momso\nLoadCredential=server-token:/run/momso-vault/server-token\nExecStart=/usr/bin/python3 /opt/momso/idle-stop.py --token-file ${CREDENTIALS_DIRECTORY}/server-token --state-dir /var/lib/momso/lifecycle\nRestart=on-failure\nRestartSec=60\n[Install]\nWantedBy=multi-user.target\n'
@@ -191,8 +200,23 @@ cmd=['/usr/bin/python3','/opt/momso/vault-provision.py','--project',project,'--s
 if INITIAL:cmd.append('--create-initial')
 run(*cmd)
 run('/usr/bin/python3','/opt/momso/idle-token.py')
-run('systemctl','daemon-reload');run('systemctl','enable','--now','momso-vault-credential');run('systemctl','restart','momso-server');run('systemctl','enable','--now','momso-idle-stop');run('systemctl','restart','momso-idle-stop')
-'''.replace("PROJECT", repr(p.project)).replace("SECRET", repr(name)).replace("INITIAL", repr(initial)).replace("BACKUP_BUCKET_VALUE", repr(backup["bucket"])).replace("BACKUP_KEY_VALUE", repr(backup["key"]))
+run('systemctl','daemon-reload');run('systemctl','enable','--now','momso-vault-credential')
+if START_SERVICES:
+ run('systemctl','restart','momso-server')
+ import fcntl
+ life='/var/lib/momso/lifecycle';os.makedirs(life,mode=0o700,exist_ok=True)
+ if os.path.islink(life):raise RuntimeError('unsafe_lifecycle')
+ owner=os.stat('/var/lib/momso');fd=os.open(life+'/pc-installer.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600);os.fchown(fd,owner.st_uid,owner.st_gid)
+ try:
+  try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);busy=False
+  except BlockingIOError:busy=True
+  if busy:
+   run('systemctl','enable','momso-idle-stop')
+   marker='/run/momso-pc-idle-restart';mark=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600);os.close(mark)
+  else:
+   run('systemctl','enable','--now','momso-idle-stop');run('systemctl','restart','momso-idle-stop')
+ finally:os.close(fd)
+'''.replace("PROJECT", repr(p.project)).replace("SECRET", repr(name)).replace("INITIAL", repr(initial)).replace("BACKUP_BUCKET_VALUE", repr(backup["bucket"])).replace("BACKUP_KEY_VALUE", repr(backup["key"])).replace('START_SERVICES', repr(start_services))
     # Roll back managed files if any later installation or service step fails.
     start = payload.index("groups=[]")
     before, rest = payload[:start], payload[start:]
@@ -210,27 +234,37 @@ run('systemctl','daemon-reload');run('systemctl','enable','--now','momso-vault-c
             if error.managed_conflict or attempt == 5:
                 raise
             time.sleep(5)
-    p.health()
+    if start_services:
+        p.health()
 
 
-def install(provider, *, allow_upgrade_gate=False):
+def install(provider, *, allow_upgrade_gate=False, signed_files=None):
     vm = provider.run("compute", "instances", "describe", provider.name, f"--zone={ZONE}", parse=True)
     if vm.get("labels", {}).get("momso-install-id") != provider.install_id:
         raise InstallError("VM 소유권이 다릅니다.")
     accounts = vm.get("serviceAccounts", [])
-    expected = "mv-" + provider.install_id + "@" + provider.project + ".iam.gserviceaccount.com"
+    expected = "mv-" + provider.install_id[:12] + "@" + provider.project + ".iam.gserviceaccount.com"
     if accounts and (len(accounts) != 1 or accounts[0].get("email") != expected or SCOPE not in accounts[0].get("scopes", [])):
         raise InstallError("기존 VM 서비스 계정이나 범위가 달라 덮어쓰지 않았습니다.")
     provider.run("services", "enable", "secretmanager.googleapis.com", "storage.googleapis.com", "cloudkms.googleapis.com")
     email = identity(provider)
     from momso_anywhere_backup_provision import GoogleBackupProvisioner
-    backup = GoogleBackupProvisioner(provider, email).provision()
-    name, initial = secret(provider, email)
+    provisioner = GoogleBackupProvisioner(provider, email)
+    if signed_files is None:
+        backup = provisioner.provision()
+        name, initial = secret(provider, email)
+    else:
+        backup = provisioner.provision(preserved_only=True)
+        name, initial = secret(provider, email, preserved_only=True)
     try:
         try:
             attach(provider, email, allow_upgrade_gate=allow_upgrade_gate)
-            install_scripts(provider, name, initial, backup)
+            if signed_files is None:
+                install_scripts(provider, name, initial, backup)
+            else:
+                install_scripts(provider, name, initial, backup, signed_files=signed_files)
         finally:
             _release_gate(provider)
     finally:
-        provider.run("secrets", "remove-iam-policy-binding", name, f"--member=serviceAccount:{email}", "--role=roles/secretmanager.secretVersionAdder")
+        if signed_files is None:
+            provider.run("secrets", "remove-iam-policy-binding", name, f"--member=serviceAccount:{email}", "--role=roles/secretmanager.secretVersionAdder")

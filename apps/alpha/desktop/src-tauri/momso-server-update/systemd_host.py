@@ -1,8 +1,11 @@
 """Linux service adapter; admission and gateway are provided by their owners."""
 import json
+import datetime as dt
 import hashlib
 import hmac
 import os
+import re
+import shutil
 import ssl
 from pathlib import Path
 import subprocess
@@ -11,7 +14,7 @@ import urllib.request
 import urllib.parse
 import sys
 
-from data_snapshots import DataSnapshots
+from data_snapshots import DataSnapshots, reserve_large_write, estimate_snapshot_bytes
 from server_admission import AdmissionError
 from momso_anywhere_proxy_files import PROXY_FILES
 from update import _atomic_json
@@ -40,6 +43,9 @@ class SystemdHost:
     def current_release(self): return str(self.current.resolve(strict=True))
     def current_gateway(self): return self.gateway.current()
     def acquire_maintenance(self): return self.admission.acquire()
+    def admission_pending(self):
+        pending = getattr(self.admission, "pending", None)
+        return bool(pending and pending())
     def acquire_recovery_maintenance(self):
         if hasattr(self.admission, "reacquire_for_recovery"):
             try:
@@ -86,7 +92,50 @@ class SystemdHost:
     def _systemctl(self, operation):
         subprocess.run(["systemctl", operation, self.unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
     def snapshot_data(self): return self.snapshots.snapshot()
+
+    def reserve_update(self, release_bytes):
+        # Snapshot and release storage must be on the reservation filesystem.
+        if os.stat(self.root).st_dev != os.stat(self.snapshots.data).st_dev:
+            raise ValueError('reservation_unavailable')
+        needed = release_bytes + 2 * estimate_snapshot_bytes(self.snapshots.data)
+        return reserve_large_write(self.snapshots.data, needed)
     def restore_data(self, snapshot): self.snapshots.restore(snapshot)
+    def cleanup_old_updates(self, record):
+        """Remove only updater-owned old versions after successful release."""
+        if record.get("phase") != "complete" or record.get("needsRelease") is not False:
+            return
+        count = os.environ.get("MOMSO_UPDATE_SNAPSHOT_KEEP", "2")
+        if not re.fullmatch(r"[0-9]{1,3}", count) or int(count) < 1:
+            raise ValueError("invalid_snapshot_retention")
+        root = self.root.resolve(strict=True)
+        current = self.current.resolve(strict=True)
+        old = Path(record["oldRelease"]).resolve(strict=True)
+        new = Path(record["newRelease"]).resolve(strict=True)
+        if current != new or any(path.parent != root for path in (old, new)):
+            raise ValueError("invalid_cleanup_state")
+        for path in root.iterdir():
+            if (path.is_symlink() or not path.is_dir() or path in (old, current)
+                    or not re.fullmatch(r"release-[0-9]+-[a-z0-9_]{8}", path.name)):
+                continue
+            marker = path / "web" / ".momso-owned"
+            if marker.is_symlink() or not marker.is_file() or marker.read_text(encoding="utf-8") != "momso":
+                continue
+            shutil.rmtree(path)
+        snapshots = self.snapshots.snapshots
+        protected = Path(record["snapshot"]).resolve(strict=True)
+        if protected.parent != snapshots:
+            raise ValueError("invalid_snapshot")
+        candidates = [p for p in snapshots.iterdir() if not p.is_symlink() and p.is_dir()
+                      and re.fullmatch(r"data-[a-z0-9_]{8}", p.name)
+                      and (p / "data").is_dir() and not (p / "data").is_symlink()]
+        retained = {p for p in sorted(candidates, key=lambda p: p.stat().st_mtime_ns, reverse=True)[:int(count)]}
+        retained.add(protected)
+        for path in candidates:
+            if path not in retained:
+                shutil.rmtree(path)
+        report = root / "cleanup-status.json"
+        _atomic_json(report, {"lastCleanupAt": dt.datetime.now(dt.timezone.utc).isoformat()})
+        os.chmod(report, 0o644)
     def recovery_data_identity(self):
         try:
             path = self.snapshots.data

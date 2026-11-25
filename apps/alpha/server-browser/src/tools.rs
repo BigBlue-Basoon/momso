@@ -130,6 +130,28 @@ fn page(page: PageState) -> Value {
 }
 
 impl<A: ApprovalChannel, C: CredentialSource> BrowserTools<A, C> {
+    pub fn valid_call(name: &str, args: &Value) -> bool {
+        valid(name, args)
+    }
+    /// The host serializes admission across chat sessions before starting a browser.
+    pub fn browser_is_open(&self, chat: &str) -> bool {
+        self.browsers.is_open(chat)
+    }
+    pub fn browser_process_identity(&self, chat: &str) -> Option<(u32, u64)> {
+        self.browsers.process_identity(chat)
+    }
+
+    pub fn prepare_browser(&mut self, chat: &str) -> Result<(), DriverError> {
+        self.browsers.open(chat).map(|_| ())
+    }
+
+    pub fn close_idle_browser(&mut self, chat: &str) -> bool {
+        if !self.browsers.is_open(chat) {
+            return false;
+        }
+        self.browsers.close(chat);
+        true
+    }
     pub fn new(browsers: ServerBrowsers, approval: A, credentials: C) -> Self {
         Self {
             browsers,

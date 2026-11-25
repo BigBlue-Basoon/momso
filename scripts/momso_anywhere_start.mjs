@@ -75,25 +75,40 @@ export async function findFromGesture({ google, clientId, release, authorize, se
 }
 
 // Called directly from the screen's Start button; neither Google token nor identity is stored.
-export async function startFromGesture({ google, clientId, release, billingAccountName = null, projectId = null, onProgress, storage = localStorage, session = globalThis.sessionStorage, location = globalThis.window?.location, cryptoImpl = crypto, authorize, fetchImpl = fetch, providerFactory = providerFromToken }) {
-  if (!authorize) return runGesture({ action: 'start', clientId, release, projectId, billingAccountName, onProgress, storage, session, location, cryptoImpl, fetchImpl, providerFactory });
+export async function startFromGesture({ google, clientId, release, billingAccountName = null, projectId = null, installationId = null, onProgress, storage = localStorage, session = globalThis.sessionStorage, location = globalThis.window?.location, cryptoImpl = crypto, authorize, fetchImpl = fetch, providerFactory = providerFromToken }) {
+  if (!authorize) return runGesture({ action: 'start', clientId, release, projectId, billingAccountName, installationId, onProgress, storage, session, location, cryptoImpl, fetchImpl, providerFactory });
   const { provider, ownerSub } = await authorize({ google, clientId, release, billingAccountName, projectId });
-  return startWithProvider({ provider, ownerSub, clientId, projectId, onProgress, storage, cryptoImpl });
+  return startWithProvider({ provider, ownerSub, clientId, projectId, installationId, onProgress, storage, cryptoImpl });
 }
 
-async function startWithProvider({ provider, ownerSub, clientId, projectId, onProgress, storage, cryptoImpl }) {
+async function startWithProvider({ provider, ownerSub, clientId, projectId, installationId: selectedId = null, onProgress, storage, cryptoImpl }) {
   await provider.preflight();
   const digest = await cryptoImpl.subtle.digest('SHA-256', new TextEncoder().encode(`${clientId}:${ownerSub}${projectId ? ':' + projectId : ''}`));
   const key = `momso-setup-${[...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('')}`;
   let installationId;
   try {
     installationId = storage.getItem(key);
-    if (!installationId) {
-      installationId = [...cryptoImpl.getRandomValues(new Uint8Array(12))].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    if (!installationId || selectedId) {
+      const provisional = [...cryptoImpl.getRandomValues(new Uint8Array(12))].map(byte => byte.toString(16).padStart(2, '0')).join('');
+      if (projectId && typeof provider.discoverPaused === 'function') {
+        await provider.project(provisional);
+        await provider.billing(provisional);
+        await provider.services(provisional);
+        const candidates = await provider.discoverPaused();
+        let selected = selectedId ? candidates.find(item => item.installationId === selectedId) : candidates.length === 1 ? candidates[0] : null;
+        if (selectedId && !selected) throw new SetupError('restore_installation_not_found');
+        if (!selected && candidates.length > 1) { const error = new SetupError('restore_selection_required'); error.candidates = candidates; throw error; }
+        if (selected && selected.assets !== 'complete') throw new SetupError('restore_assets_incomplete');
+        if (selected && !selected.browserIdCompatible) { const error = new SetupError('restore_installation_format'); error.candidates = [selected]; throw error; }
+        installationId = selected?.installationId ?? provisional;
+      } else {
+        if (selectedId) throw new SetupError('restore_installation_not_found');
+        installationId = provisional;
+      }
       storage.setItem(key, installationId);
     }
-  } catch { throw new SetupError('checkpoint_unavailable'); }
-  if (!/^[a-f0-9]{24}$/.test(installationId)) throw new SetupError('invalid_checkpoint');
+  } catch (error) { if (error instanceof SetupError) throw error; throw new SetupError('checkpoint_unavailable'); }
+  if (!/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(installationId)) throw new SetupError('invalid_checkpoint');
   return startAnywhere(provider, { installationId }, onProgress);
 }
 
@@ -164,7 +179,7 @@ async function performRequest({ request, clientId, release, onProgress, storage,
   else if (request.action === 'projects') value = await provider.projects();
   else if (request.action === 'billing') value = await provider.billingAccounts();
   else if (request.action === 'deletion_preview') value = await provider.deletionPreview(request.installationId);
-  else if (request.action === 'start') value = await startWithProvider({ provider, ownerSub, clientId, projectId: request.projectId, onProgress, storage, cryptoImpl });
+  else if (request.action === 'start') value = await startWithProvider({ provider, ownerSub, clientId, projectId: request.projectId, installationId: request.installationId, onProgress, storage, cryptoImpl });
   else if (request.action === 'destroy') {
     if (!request.projectId || !request.installationId) throw new SetupError('invalid_checkpoint');
     if (!request.discardData) {

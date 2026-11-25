@@ -5,6 +5,7 @@ import hashlib
 import tarfile
 from pathlib import Path
 from momso_anywhere_proxy_files import PROXY_FILES
+from momso_anywhere_restore_files import RESTORE_FILES
 
 
 def digest(path):
@@ -26,7 +27,7 @@ def prepare(server, expected, web, output):
     entries += [(scripts / name, name) for name in PROXY_FILES if name != 'server_admission.py']
     entries += [(scripts.parent / 'apps/alpha/desktop/src-tauri/momso-server-update/server_admission.py', 'server_admission.py')]
     entries.append((scripts / 'momso_managed_history.json', 'momso-managed-history.json'))
-    entries += [(scripts / name, name) for name in ("momso_anywhere_backup.py", "momso_anywhere_backup_agent.py", "momso_anywhere_backup_google.py", "momso_anywhere_vault_identity.py", "momso_anywhere_prestart_restore.py")]
+    entries += [(scripts / name, name) for name in RESTORE_FILES]
     tauri = scripts.parent / "apps/alpha/desktop/src-tauri"
     entries += [(tauri / "momso-vault-provision/provision.py", "vault-provision.py"),
                 (tauri / "momso-idle-stop/idle_stop.py", "idle-stop.py")]
@@ -38,6 +39,8 @@ def prepare(server, expected, web, output):
     entries.append((scripts / "momso_managed_files.py", "momso-updater/momso_managed_files.py"))
     entries.append((scripts / "momso_anywhere_proxy_files.py", "momso-updater/momso_anywhere_proxy_files.py"))
     entries.append((scripts / "momso_anywhere_proxy_files.json", "momso-updater/momso_anywhere_proxy_files.json"))
+    entries.append((scripts / "momso_anywhere_restore_files.json", "momso-updater/momso_anywhere_restore_files.json"))
+    entries.append((scripts / "momso_anywhere_restore_files.py", "momso-updater/momso_anywhere_restore_files.py"))
     entries.append((update / "units/momso-idle-stop.service", "momso-units/momso-idle-stop.service"))
     entries.append((update / "units/vault.conf", "momso-overrides/vault.conf"))
     for path in sorted(web.rglob("*")):

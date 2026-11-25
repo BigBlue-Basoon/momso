@@ -22,6 +22,32 @@ pub(super) fn store(app: &App) -> Result<Store, &'static str> {
     Store::open(&data, &app.data.join("archive"))
 }
 
+pub(super) fn start_upload_cleanup(app: App) {
+    tokio::spawn(async move {
+        // The sweep marks the server busy while it runs. Starting it the moment
+        // the server comes up made a freshly started server report busy; the VM
+        // stays up at least the idle period, so the first sweep can wait.
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(3600),
+        );
+        loop {
+            interval.tick().await;
+            let app = app.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let Ok(Some(_checkpoint)) = maintenance::begin_purge(&app.maintenance, 0) else {
+                    return;
+                };
+                let _busy = ReadGuard::new(&app);
+                if let Ok(store) = store(&app) {
+                    let _ = store.cleanup_expired_uploads();
+                }
+            })
+            .await;
+        }
+    });
+}
+
 /// Fail closed until every referenced original and its metadata are present.
 pub(crate) fn verify_restored_asset(app: &App, id: &str, bytes: u64) -> Result<(), &'static str> {
     let store = store(app)?;
@@ -57,6 +83,9 @@ fn fail(reason: &'static str) -> ApiError {
         "not_found" => StatusCode::NOT_FOUND,
         "offset_mismatch" | "incomplete" | "already_complete" => StatusCode::CONFLICT,
         "invalid_arguments" | "invalid_id" | "invalid_chunk" => StatusCode::BAD_REQUEST,
+        "disk_low" => StatusCode::INSUFFICIENT_STORAGE,
+        "reservation_busy" => StatusCode::CONFLICT,
+        "reservation_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
         "integrity_error" => StatusCode::UNPROCESSABLE_ENTITY,
         "asset_trashed" | "asset_purged" => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -77,6 +106,9 @@ pub async fn begin(
     Json(body): Json<Begin>,
 ) -> Result<Json<Value>, ApiError> {
     auth(&app, &h)?;
+    if !disk_space::can_grow(&app.data, body.byte_length) {
+        return Err(error(StatusCode::INSUFFICIENT_STORAGE, "disk_low"));
+    }
     let write = WorkGuard::new(&app);
     tokio::task::spawn_blocking(move || {
         let _write = write;
@@ -119,20 +151,50 @@ pub async fn chunk(
     bytes: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     auth(&app, &h)?;
+    let has_chunk_hash = h.contains_key("x-momso-chunk-sha256");
+    if let Some(expected) = h.get("x-momso-chunk-sha256") {
+        validate_chunk_hash(
+            expected.to_str().map_err(|_| fail("invalid_chunk"))?,
+            &bytes,
+        )
+        .map_err(fail)?;
+    }
     let offset = q
         .get("offset")
         .and_then(|v| v.parse::<u64>().ok())
         .ok_or_else(|| fail("invalid_arguments"))?;
+    if !disk_space::can_grow(&app.data, bytes.len() as u64) {
+        return Err(error(StatusCode::INSUFFICIENT_STORAGE, "disk_low"));
+    }
     let write = WorkGuard::new(&app);
     tokio::task::spawn_blocking(move || {
         let _write = write;
-        Ok(Json(json!(store(&app)
-            .map_err(fail)?
+        let _reservation = disk_space::reserve(&app.data, bytes.len() as u64).map_err(fail)?;
+        let store = store(&app).map_err(fail)?;
+        if !has_chunk_hash && store.progress(&id).map_err(fail)?.sha256.is_some() {
+            return Err(fail("invalid_chunk"));
+        }
+        Ok(Json(json!(store
             .write_chunk(&id, offset, &bytes)
             .map_err(fail)?)))
     })
     .await
     .map_err(|_| fail("storage_unavailable"))?
+}
+
+fn validate_chunk_hash(expected: &str, bytes: &[u8]) -> Result<(), &'static str> {
+    use sha2::{Digest, Sha256};
+    if expected.len() != 64
+        || !expected
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return Err("invalid_chunk");
+    }
+    if format!("{:x}", Sha256::digest(bytes)) != expected {
+        return Err("integrity_error");
+    }
+    Ok(())
 }
 pub async fn finish(
     State(app): State<App>,
@@ -143,10 +205,10 @@ pub async fn finish(
     let write = WorkGuard::new(&app);
     tokio::task::spawn_blocking(move || {
         let _write = write;
-        Ok(Json(json!(store(&app)
-            .map_err(fail)?
-            .finish(&id)
-            .map_err(fail)?)))
+        let store = store(&app).map_err(fail)?;
+        let progress = store.progress(&id).map_err(fail)?;
+        let _reservation = disk_space::reserve(&app.data, progress.total).map_err(fail)?;
+        Ok(Json(json!(store.finish(&id).map_err(fail)?)))
     })
     .await
     .map_err(|_| fail("storage_unavailable"))?
@@ -802,6 +864,19 @@ pub async fn asset_download(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    #[test]
+    fn chunk_digest_rejects_changed_and_malformed_content() {
+        let hash = format!("{:x}", Sha256::digest(b"chunk"));
+        assert_eq!(validate_chunk_hash(&hash, b"chunk"), Ok(()));
+        assert_eq!(
+            validate_chunk_hash(&hash, b"different"),
+            Err("integrity_error")
+        );
+        assert_eq!(
+            validate_chunk_hash("not-a-hash", b"chunk"),
+            Err("invalid_chunk")
+        );
+    }
     #[test]
     fn cleanup_preserves_modified_and_unrelated_files() {
         let root = tempfile::tempdir().unwrap();

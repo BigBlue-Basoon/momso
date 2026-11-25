@@ -1,6 +1,21 @@
 # momso 화면 인계: 시작·연결·삭제·업데이트
 
-기준: 통합 `d79a3695f`의 코드와 아래 원문을 S150에서 대조했다. 이 문서는 화면 작업을 위한 계약·미결 사항의 색인이며, 화면 문구나 모양을 결정하지 않는다. 과거 문서의 완료 여부는 그 문서의 시험 시점에 한정된다. 가짜 시험, 실제 계정·기기 확인, 배포는 서로 다르다.
+기준: 2026-11-25 S169 대조. 현재 공유 통합 `feat/desktop-panel-browser`는 `3d6058a3a`, S168 입구 제한은 별도 `hq/s168-done`이다. S147c·S152·S155·S158·S159·S161·S162·S163은 각 담당 가지를 읽었으며 이 통합에는 아직 들어와 있지 않다. S160은 담당 가지에서 진행 중이다. **다른 가지의 계약은 통합·배포된 기능이 아니다.** 각 가지의 정확한 표시는 아래에 적는다. 이 문서는 화면 문구나 모양을 결정하지 않는다. 가짜 시험, 실제 파일·프로세스 시험, Google 실사용은 [검증 표](momso-anywhere-verification-matrix.md)에서 구분한다.
+
+## 오늘 확인한 계약과 통합 경계
+
+| 화면·호출 | 코드와 값 | 현재 경계 |
+| --- | --- | --- |
+| 쉬기 뒤 다시 시작 | `startFromGesture({clientId,release,projectId,billingAccountName,installationId?,onProgress})`. 보존된 설치 둘 이상이면 `restore_selection_required`와 `candidates`. 후보의 `installationId`, `assets`, `browserIdCompatible`, `restoreAvailable`, `lastBackupAt`을 확인한다. `restoreAvailable`·`lastBackupAt`은 확인 불가 시 `null`이다. PC 선택은 `--restore-installation-id`. | S153은 현재 통합에 있음. `restore_assets_incomplete`, `restore_assets_unverified`, `restore_installation_not_found`, `restore_installation_format`, `restore_vm_exists`는 각각 자산 불완전·조회 불가·선택 없음·휴대폰 ID 형식 불일치·기존 VM 확인 실패. `restoreAvailable`만으로 복원 성공을 뜻하지 않는다. [S153](momso-anywhere-restore-s153.md) |
+| 복원과 시작 | 성공 시 `restored`, `restoredBackupId`, `restoredAt`. 실패 시 `restore_failed`, 확인 가능한 `detail`; 서비스는 성공 전 시작하지 않는다. `restored:false`는 백업이 없다는 확인 결과일 수 있다. | S147b·S153은 현재 통합에 있음. S147c `hq/s147c-done`의 임시 여덟째 백업 칸 개선은 별도 가지다. 현재 통합은 일곱 칸이 찬 복원 직후 첫 백업에서 `restore_first_backup_no_free_slot`이 남아 있다. 개선을 통합하기 전에는 이 한계를 없어진 것으로 표시하지 않는다. 원문 `docs/development/momso-anywhere-prestart-restore-s147b.md`의 S147c 판. |
+| PC 설치·갱신·쉬기 | VM 상태 확인 뒤 필요 시 켜고 SSH를 기다린다. `vm_state_unknown`, `vm_start_failed`, `vm_unreachable`을 구분한다. VM이 필요 없는 전부 지우기는 깨우지 않는다. | S154는 현재 통합. 실제 꺼진 VM에서 이전 판의 올리기는 실패했고 수정 뒤 실제 재시험은 미확인. [S154](momso-anywhere-pc-wake-s154.md) |
+| 프록시 확인 | `proxy_not_running`은 프록시 서비스나 입구 경유 사설 상태 확인을 통과하지 못한 경우다. 새 설치와 갱신은 프록시 확인 전에 완료라고 하지 않는다. | S156은 현재 통합. 순번 7 실제 장애 뒤 수정은 가짜·리눅스 시험이며 실제 재시험은 미확인. [S156](momso-anywhere-proxy-s156.md) |
+| 삭제 결과 재조회 | `outcome`, `reason`, `retryable`, `remaining`, `billable`, `unverified`, `billingZero`, `billingScope`를 구분한다. `serverless_address_release_pending`이면 `remaining`, `retryable:true`, `retryCommand`, `retryArgs`를 확인한다. `billingScope: installation`은 해당 설치 범위만 뜻한다. | S158 `hq/s158-done`에만 있음. 이전 통합 코드의 삭제 결과가 같은 확인을 한다고 가정하지 않는다. `billingZero:null`은 미확인이고 `true`도 프로젝트 전체 과금이나 이미 발생한 청구액을 뜻하지 않는다. 원문 `docs/development/momso-anywhere-deletion-s120.md` S158 절. |
+| 유휴 종료 | 인증된 `GET /activity`, `GET /diagnostics/memory`의 선택적 `idleStop:{attemptedAt,result}`. 기록이 없거나 잘못되면 필드가 생략된다. | S162 `hq/s162-done`에만 있음. `result` 예: `stop_requested`, `resumed`, `error:activity:OSError`. 정지 요청 결과가 불명확하면 같은 부팅에서 300초 기다린다. 재시도 대기는 최대 900초다. 당시 실제 첫 실패 원인은 미확정. 원문 `docs/development/momso-idle-recovery-s162.md`. |
+| 메모리 | 인증된 `GET /diagnostics/memory`의 `memTotalKiB`, `memAvailableKiB`, `minAvailableKiB`, `browsers`, `evictionCount`, `lastEvictionAt`, `memoryLowCount`; 방별 `chatId`, `state`, `pssKiB`. 새 브라우저를 열 수 없으면 `browser_memory_low`. | S155 `hq/s155-done`, S159 `hq/s159-done`은 별도 가지다. 기준은 기본 768MiB이며 실제 안전 보장은 아니다. PSS는 측정할 수 없으면 `null`. 원문 `docs/development/server-browser-memory-s155.md`, `server-memory-resize-s159.md`. |
+| VM 크기 변경 | PC 명령 `scripts/momso_anywhere_resize.py`는 소유자 세션 파일 `--owner-session-file`이 필요하다. `health_not_ready`면 실제 상태 확인 전에 멈춘다. | S159는 별도 가지; 실제 고객 입구 전체 경로는 미확인. 휴대폰 변경은 권한·복구 경로가 없어 보류다. S163 `hq/s163-done`, 원문 `docs/development/server-resize-owner-session-s163.md`. |
+| 비용 | 상태별 구성과 가정은 S161, 입구 한도와 남는 공격 비용은 S168을 따른다. | S161 `hq/s161-done`, S168 `hq/s168-done` 모두 현재 공유 통합 밖. S168은 서비스 전체 최대 1개를 정하지만 순간 초과·요청·전송·로그 비용 때문에 청구액의 절대 상한은 아니다. 원문 `docs/development/momso-anywhere-customer-cost-s161.md`, [S168](momso-anywhere-gateway-abuse-s168.md). |
+| 데스크톱 새 PC | `archive_remote_connect`, `import_backup_recovery_key`, `app_state_restore`, `object_store_restore`. `local_data_conflict`, `restore_busy`를 구분한다. 저장 로그인과 공급자 자격 증명은 다시 입력한다. | S152 `hq/s152-done` 별도 가지; `docs/development/desktop-restore-s152.md`. S160 `codex/desktop-paired-backup-s160`은 문서상 진행 중·검증 전이다. `recovery_key_missing`, `recovery_key_unconfirmed`, `backup_original_missing`, `backup_pair_incomplete`, `restore_recovery_pending`, `restore_recovery_conflict` 등은 S160이 통합·검증되기 전 확정 계약으로 표시하지 않는다. |
 
 ## 정해진 것
 
@@ -18,7 +33,7 @@
 | --- | --- |
 | `projectsFromGesture({clientId, release, projectId?, billingAccountName?})` | 기존 프로젝트 `{projectId, displayName}[]`; 새 프로젝트는 `projectId`를 생략한다. |
 | `billingAccountsFromGesture({clientId, release, projectId?, billingAccountName?})` | 접근 가능한 열린 결제 계정 `{name, displayName}[]`; 여러 개면 선택값 `name`을 `billingAccountName`으로 전달한다. 기존 프로젝트의 결제 연결은 자동으로 바꾸지 않는다. |
-| `startFromGesture({clientId, release, projectId?, billingAccountName?, onProgress})` | `{url}`. `onProgress`는 `{step,state}`. 설치 완료 뒤 `{url}`을 여는 사용자 동작이 별도다. |
+| `startFromGesture({clientId, release, projectId?, billingAccountName?, installationId?, onProgress})` | `{url, restored?, restoredBackupId?, restoredAt?}`. 복원 계획 단계의 `onProgress`에는 `{step,state,restoreAvailable,lastBackupAt}`이 추가될 수 있다. 설치 완료 뒤 `{url}`을 여는 사용자 동작이 별도다. |
 | `findFromGesture({clientId, release})` | 조건을 확인한 고객 입구 URL 목록. 여러 개면 선택이 필요하다. |
 | `resumeAfterRedirect({clientId, release, onProgress, ...})` | 최초 진입과 `pageshow` 복원 시 중복 없이 호출. 이어갈 일이 없으면 `null`; 있으면 `kind`가 `projects`, `billing`, `start`, `find`, `destroy`, `deletion_preview`, `redirecting` 중 하나인 결과. 목록은 `projects` 또는 `billingAccounts`, 나머지는 `result`, 선택은 `selection: {projectId,billingAccountName}`이다. |
 | `retryLastAction({clientId, release, onProgress})` | 마지막 작업을 같은 `kind` 계약으로 재시도한다. 구형 `retryFromGesture`는 호환용이며 항상 Google로 이동한다. |
@@ -192,7 +207,7 @@ PC 삭제 JSON과 휴대폰 삭제 결과는 공통으로 `outcome`, `unverified
 | `remaining` | 끝나는 시각이 없는 잔존 자원이 확인됐다. `resources`, `remaining`, `retryable`을 확인한다. |
 | `failed` | 삭제 자체가 실패했다. `reason`을 확인한다. |
 
-S117a·c는 `deleted`와 `deleted_unverified`를 삭제 단계 통과로 다루고 미확인 종류를 출력한다. `remaining`·`failed`는 통과가 아니다. 다른 설치·검증 단계 실패는 별도다.
+현재 통합의 S117a·c는 `deleted`와 `deleted_unverified`를 삭제 단계 통과로 다루고 미확인 종류를 출력한다. `remaining`·`failed`는 통과가 아니다. 다른 설치·검증 단계 실패는 별도다. 별도 S158 가지의 S117a는 삭제 단계 표시와 별개로 마지막 재고 조회에 미확인이 있으면 전체 명령을 실패 종료한다. S158이 통합되기 전 두 판의 전체 종료 조건을 같다고 가정하지 않는다.
 
 기존 시작 화면의 `resumeAfterRedirect` 호환 경로는 아직 `remaining`만 읽으므로 `failed`는 기존처럼 오류를 발생시키고 `deleted_unverified`의 미확인 종류는 표시용 `remaining`에 `unverified:<종류>`로 더한다. 원래 공통 객체의 `outcome`과 `unverified`는 유지한다. 화면 담당은 네 `outcome`을 직접 읽도록 연결하고 이 임시 호환 표기를 제거해야 한다. `destroyFromGesture`와 `resumeFromRedirect`는 공통 객체를 그대로 반환한다.
 
@@ -250,7 +265,7 @@ PC에서 접속 실패와 문 열림 미확인이 함께 있으면 `vm_unreachab
 
 출처: [서버 S38](server-update-s38.md), [S90](server-release-discovery-s90.md), [입구 S115](momso-anywhere-revision-s115.md), [데스크톱 S69](desktop-update-s69.md).
 
-휴대폰은 인증된 `GET /update/status`로 `{state,reason}`을 읽는다. 입구 전환 실패에는 공통 `{code,rolledBack,retryable}`도 붙는다. PC 설치기는 같은 객체를 표준 출력의 JSON 한 줄로 내고 사람용 오류는 표준 오류에 남긴다. 휴대폰 시작은 기존 `SetupError.step`과 함께 이 세 필드를 오류 및 단계 진행 이벤트에 제공한다. `rolledBack:true`는 이전 입구 트래픽 복구를 확인했다는 뜻이고 `false`는 복구 실패, `null`은 확인하지 못한 것이다. `retryable:null`은 재시도 가능 여부 미확인이다. 자동 업데이트 상태는 `checking`, `up_to_date`, `downloading`, `waiting_for_idle`, `backing_up`, `installing`, `updating_gateway`, `completed`, `rolling_back`, `rolled_back`, `recovery_required`, `failed`다. `reason`은 안전한 오류 이름 또는 `null`이며 서버 재시작 동안 입구가 마지막 상태를 제공하도록 설계됐다. 새 입구는 지문과 트래픽을 확인하고 `GET /__momso/ready`의 200·`{"ready":true}`를 검사한다. 이 확인은 VM·채팅의 정상 동작까지 증명하지 않는다.
+휴대폰은 인증된 `GET /update/status`로 `{state,reason}`을 읽는다. 입구 전환 실패에는 공통 `{code,rolledBack,retryable}`도 붙는다. PC 설치기는 같은 객체를 표준 출력의 JSON 한 줄로 내고 사람용 오류는 표준 오류에 남긴다. 휴대폰 시작은 기존 `SetupError.step`과 함께 이 세 필드를 오류 및 단계 진행 이벤트에 제공한다. `rolledBack:true`는 이전 입구 트래픽 복구를 확인했다는 뜻이고 `false`는 복구 실패, `null`은 확인하지 못한 것이다. `retryable:null`은 재시도 가능 여부 미확인이다. 자동 업데이트 상태는 `checking`, `up_to_date`, `downloading`, `waiting_for_idle`, `backing_up`, `installing`, `updating_gateway`, `completed`, `rolling_back`, `rolled_back`, `recovery_required`, `failed`다. `reason`은 안전한 오류 이름 또는 `null`이며 서버 재시작 동안 입구가 마지막 상태를 제공하도록 설계됐다. 새 입구는 지문·트래픽과 `GET /__momso/ready`를 확인한다. S156의 설치·갱신 경로는 여기에 프록시 유닛과 비밀 proof를 쓰는 입구 경유 `/__momso/proxy-health` 검사도 더한다. 이 검사들은 채팅이나 실제 AI 답변까지 증명하지 않는다.
 
 S129e: PC 갱신과 VM 자동 갱신은 입구 전환 실패 시 이전 실행 파일·화면·자료 스냅샷 복구를 시도한다. 자료 복원이 실패하면 실행 파일과 자료가 실패 전 새 판 그대로인지 확인된 경우에만 서버 재시작을 시도한다. 그 확인이나 재시작이 실패하면 서버가 켜졌다고 가정하지 않는다. 복구 실패는 `rollback_failed` 등 상태로 확인한다. 이 복구 경로는 가짜 시험 범위다. [S59](server-upgrade-data-s59.md)
 
@@ -371,15 +386,24 @@ S136 대조 기준: [현재 server 라우터](../../apps/alpha/server/src/main.r
 
 ## 화면에서 정할 것
 
-- 시작 화면: Google에서 설정을 마친 뒤 돌아온 상태와 재확인 결과를 어떻게 보여 줄지.
-- 로그인·홈 화면: 로그아웃 단추를 둘지와 어디에 둘지.
-- 설정의 삭제: 정해진 두 선택과 별도 확인 단계를 화면에 어떻게 배치할지.
-- 설정의 삭제 미리 보기: 마지막 백업과 미확인 항목을 어떻게 보여 줄지.
-- 설정의 삭제 결과: 남은 자원·예상 비용·종료 시각과 미확인 항목을 어떻게 구분해 보여 줄지.
-- 설정의 프로젝트 판별: 전용이 아님과 판단 못 함을 어떻게 구분해 보여 줄지.
-- 업데이트 상태: 진행·이전 판 복구·복구 미확인을 어떻게 보여 줄지.
-- 홈 화면: VM을 깨우는 동안 기다림과 재시도를 어떻게 보여 줄지.
-- 승인·민감 입력 화면: 공급자별 승인과 사람에게 넘긴 요청을 어떻게 보여 줄지.
+- 시작 화면: Google 설정을 마친 뒤 재확인 상태를 어떻게 보여 줄지. [S112](momso-anywhere-first-google-account-s112.md)
+- 시작 화면: 보존된 설치가 여럿일 때 어느 것을 다시 깔지 어떻게 선택할지. [S153](momso-anywhere-restore-s153.md)
+- 시작 화면: 복원 가능 여부·마지막 백업 시각과 복원 결과를 어떻게 구분할지. [S153](momso-anywhere-restore-s153.md)
+- 로그인·홈 화면: 로그아웃 단추를 둘지와 어디에 둘지. [PWA](momso-anywhere-pwa-entry-20261121.md)
+- 설정의 삭제: 정해진 쉬기·전부 지우기 선택과 확인 단계를 어떻게 배치할지. [S120](momso-anywhere-deletion-s120.md)
+- 설정의 삭제 미리 보기: 마지막 백업과 미확인 항목을 어떻게 보여 줄지. [S120](momso-anywhere-deletion-s120.md)
+- 설정의 삭제 결과: 남은 자원·확인된 과금·끝나는 시각·재확인을 어떻게 보여 줄지. S158 `hq/s158-done`, `docs/development/momso-anywhere-deletion-s120.md`.
+- 설정의 프로젝트 판별: 전용이 아님과 판단 못 함을 어떻게 구분할지. [S120](momso-anywhere-deletion-s120.md)
+- 업데이트 상태: 진행·이전 판 복구·복구 미확인을 어떻게 보여 줄지. [S115](momso-anywhere-revision-s115.md)
+- 홈 화면: VM을 깨우는 동안 기다림과 재시도를 어떻게 보여 줄지. [S26](momso-anywhere-onboarding-s26.md)
+- 서버 상태: 유휴 종료의 마지막 시도와 실패를 어떻게 보여 줄지. S162 `hq/s162-done`, `docs/development/momso-idle-recovery-s162.md`.
+- 서버 상태: 메모리 부족과 VM 크기를 키우는 선택을 어떻게 보여 줄지. S159 `hq/s159-done`, `docs/development/server-memory-resize-s159.md`.
+- 서버 설정: 휴대폰에서 VM 크기 변경을 제공할지. S163 `hq/s163-done`, `docs/development/server-resize-owner-session-s163.md`.
+- 비용 화면: 상태별 예상 금액의 백업 크기·조건·확인 시각과 미확인 비용을 어떻게 보여 줄지. S161 `hq/s161-done`, `docs/development/momso-anywhere-customer-cost-s161.md`.
+- 데스크톱 복원: 복구 키 입력·되살리기와 기존 자료 충돌·작업 중 상태를 어디에 안내할지. S152 `hq/s152-done`, `docs/development/desktop-restore-s152.md`.
+- 데스크톱 복원: 저장된 로그인과 AI·GitHub·원자료 자격 증명의 재입력을 어디에 안내할지. S152 `hq/s152-done`, `docs/development/desktop-restore-s152.md`.
+- 데스크톱 복원: 검증 중인 묶음 백업의 복구 키 상태·충돌 선택과 Git 전용 복원 진입점을 어떻게 보여 줄지. S160 `codex/desktop-paired-backup-s160`, `docs/development/desktop-paired-backup-s160.md`; 뒤쪽 계약은 아직 진행 중.
+- 승인·민감 입력 화면: 공급자별 승인과 사람에게 넘긴 요청을 어떻게 보여 줄지. [S23](momso-server-approval-s23.md)
 
 ## 충실도 확인
 
@@ -387,4 +411,5 @@ S136 대조 기준: [현재 server 라우터](../../apps/alpha/server/src/main.r
 - 운영 키 셋·순번·정족수와 브라우저 저장 한계는 `trust_rotation.py`·`momso_release_trust.mjs`·시작 묶음 생성기와 S140·S142를 대조했다. 승인 공급자와 서버 응답은 `apps/alpha/server/src/main.rs`·S136·S138을 대조했다. 단추 둘·표시 이름·Windows 인증서 미구매는 본부가 전달한 결정과 대조했다.
 - **고친 의미 차이:** 옛 표의 승인 `provider` 고정 설명은 현재 코드의 턴별 공급자와 달랐다. S117c가 미확인을 통과시키지 않는다는 문장도 `deleted_unverified`를 통과로 기록하는 현재 코드와 달랐다. 둘 다 위 본문에서 바로잡았다. 그 밖에 대조한 결정·조건·수치·까닭 코드에서 의도적으로 의미를 바꾼 곳은 없다. 이 차이는 코드 결함이라는 뜻은 아니다.
 - S151: 중간 root 만료를 현재 시각으로 다시 보던 브라우저·VM 경로 차이를 서명된 발행 시각 기준으로 맞췄다. 공통 가짜 벡터 시험이며 실제 운영 키 교체는 미확인이다.
-- 실제 확인은 본부 기록의 순번 6 자동 갱신, 입구 트래픽 전환, 유휴 종료, 페이지 열기에 의한 깨우기만 여기에 반영한다. fetch 깨우기, 휴대폰 삭제·운영 키 교체·정적 호스팅, 실제 새 Google 계정과 그 밖의 가짜 시험은 실제 확인으로 적지 않았다. 실제 화면·휴대폰에서 계약이 모두 연결됐는지는 **미확인**이다.
+- S169: 본부가 전한 실제 성공·실패·미시도 목록을 [검증 표](momso-anywhere-verification-matrix.md)의 각 항목과 1:1로 대조했다. 순번 7에서 실패한 경로의 수정은 실제 재시험 성공으로 바꾸지 않았다. 기존 문장의 실제 확인 범위는 그때의 S150 기준이었으며 지금의 본부 기록은 검증 표를 따른다.
+- 필드와 까닭 코드는 S153·S154·S156의 현재 코드, S158·S159·S162의 각 `hq/*-done` 코드와 원문, S152·진행 중 S160 원문을 대조했다. **의미 변경:** S153의 일곱 칸 실패를 현재 통합의 한계로 남기고 S147c 가지에서는 해결됐다고 분리했다. S158·S162 등은 통합된 것처럼 쓰지 않았다. 화면과 실제 휴대폰의 연결, S160 전체 계약·완료 표시는 미확인이다.

@@ -98,14 +98,10 @@
 // 회사·모델: 이 단계는 코덱스 하나. chat_send 의 provider 가 codex 가 아니면 unavailable(말을 보내지 않음).
 import type { InvokeArgs } from '@tauri-apps/api/core'
 import type { EventCallback, EventName, UnlistenFn } from '@tauri-apps/api/event'
+import { sha256 } from '@noble/hashes/sha256'
 import { W } from './words'
-
-/** 서버가 준 실패 값(또는 signed_out·server_unreachable). */
-export class ServerError extends Error {
-  constructor(readonly code: string, readonly status: number | null) {
-    super(code)
-  }
-}
+import { createServerTransport, isSignedOut, readServerSse, ServerError } from './server-request'
+export { ServerError, getServerConnectionState, onServerConnectionChange } from './server-request'
 
 // ---- 로그인이 풀림 알림 ----
 const SIGNED_OUT_EVENT = 'momso:server-signed-out'
@@ -123,47 +119,8 @@ export function onServerSignedOut(listener: () => void) {
   return () => window.removeEventListener(SIGNED_OUT_EVENT, listener)
 }
 
-/** 같은 출처의 상대 경로로 부른다(쿠키는 같은 출처라 함께 간다). 로그인 문의 보내기는 따라가지 않고 받는다. */
-async function call(path: string, init: RequestInit = {}): Promise<Response> {
-  let response: Response
-  try {
-    response = await fetch(path, { ...init, redirect: 'manual', credentials: 'same-origin', cache: 'no-store' })
-  } catch {
-    throw new ServerError('server_unreachable', null)
-  }
-  if (response.type === 'opaqueredirect' || response.status === 401) {
-    markSignedOut()
-    throw new ServerError('signed_out', response.status || null)
-  }
-  if (response.status === 403) {
-    if ((response.headers.get('content-type') ?? '').includes('json')) throw new ServerError('forbidden', 403)
-    markSignedOut()
-    throw new ServerError('signed_out', 403)
-  }
-  return response
-}
-
-async function request<T>(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
-  const response = await call(path, {
-    method,
-    headers: body === undefined ? headers : { ...headers, 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  })
-  const type = response.headers.get('content-type') ?? ''
-  const text = await response.text()
-  // JSON 자리에 HTML 이 오면(앞단의 로그인 화면) 로그인이 풀린 것으로 본다.
-  if (!type.includes('json') && /^\s*</.test(text)) {
-    if (response.ok) { markSignedOut(); throw new ServerError('signed_out', response.status) }
-    throw new ServerError(`http_${response.status}`, response.status)
-  }
-  let value: unknown = null
-  try { value = text ? JSON.parse(text) : null } catch { value = null }
-  if (!response.ok) {
-    const code = value && typeof value === 'object' && typeof (value as { error?: unknown }).error === 'string' ? (value as { error: string }).error : `http_${response.status}`
-    throw new ServerError(code, response.status)
-  }
-  return value as T
-}
+/** 같은 출처 요청: 읽기만 깨우기를 기다리고 쓰기는 자동 재전송하지 않는다. */
+const { call, request } = createServerTransport({ signedOut: markSignedOut })
 
 /** 화면을 열 때: GET /health. ready / 로그인이 풀림 / 닿지 못함(꺼짐·5xx·그 밖). */
 export async function checkServerHealth(): Promise<'ready' | 'signed_out' | 'unreachable'> {
@@ -171,7 +128,7 @@ export async function checkServerHealth(): Promise<'ready' | 'signed_out' | 'unr
     const value = await request<{ state?: unknown }>('GET', '/health')
     return value?.state === 'ready' ? 'ready' : 'unreachable'
   } catch (error) {
-    return error instanceof ServerError && error.code === 'signed_out' ? 'signed_out' : 'unreachable'
+    return isSignedOut(error) ? 'signed_out' : 'unreachable'
   }
 }
 
@@ -191,34 +148,7 @@ export async function networkListen<T>(event: EventName, handler: EventCallback<
   return () => { set.delete(handler as EventCallback<unknown>) }
 }
 
-/** SSE 를 읽어 이벤트마다 부른다. onEvent 가 true 를 돌려주면 읽기를 그만둔다(그때 true). 스트림이 끝나면 false. */
-async function readSse(body: ReadableStream<Uint8Array>, onEvent: (name: string, payload: Record<string, unknown>) => boolean | void) {
-  const reader = body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  for (;;) {
-    const { value, done } = await reader.read()
-    if (done) return false
-    buffer += decoder.decode(value, { stream: true })
-    const blocks = buffer.split(/\r?\n\r?\n/)
-    buffer = blocks.pop() ?? ''
-    for (const block of blocks) {
-      let name = 'message'
-      const data: string[] = []
-      for (const line of block.split(/\r?\n/)) {
-        if (line.startsWith('event:')) name = line.slice(6).trim()
-        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
-      }
-      let payload: Record<string, unknown> | null = null
-      try { payload = JSON.parse(data.join('\n')) } catch { payload = null }
-      if (!payload || typeof payload !== 'object') continue
-      if (onEvent(name, payload) === true) {
-        try { await reader.cancel() } catch { /* 이미 닫힘 */ }
-        return true
-      }
-    }
-  }
-}
+const readSse = readServerSse
 
 // ---- 채팅방(server 것) ----
 type ServerChat = { id?: unknown; chatId?: unknown; title?: unknown; createdAt?: unknown; updatedAt?: unknown; messageCount?: unknown; pinned?: unknown; pinnedOrder?: unknown; archivedAt?: unknown; groupId?: unknown }
@@ -313,7 +243,7 @@ function failureKind(code: string | null) {
   }
 }
 
-function finishTurn(turnId: string, chatId: string, state: unknown, error: unknown, userMessageId: string | null) {
+function finishTurn(turnId: string, chatId: string, state: unknown, error: unknown, userMessageId: string | null, detail: unknown = null) {
   if (running.get(chatId) === turnId) running.delete(chatId)
   closeApprovals(turnId, 'provider_cancelled')
   for (const [requestId, open] of [...openInputs]) if (open.turnId === turnId) closeInput(requestId, 'provider_cancelled')
@@ -324,7 +254,7 @@ function finishTurn(turnId: string, chatId: string, state: unknown, error: unkno
   if (userMessageId) failedTurns.set(userMessageId, turnId)
   // 고속 모드를 거부당함(S62): 데스크톱과 같은 status 로(그 모델의 고속 단추를 끄고 한 줄 알림).
   if (code === 'fast_unavailable') { emit('chat-error', { chatId, status: 'fast_unavailable', userMessageId }); return }
-  emit('chat-error', { chatId, reason: code, userMessageId, error: { kind: failureKind(code), actions: ['retry'] } })
+  emit('chat-error', { chatId, reason: code, userMessageId, error: { kind: failureKind(code), actions: ['retry'], code, retryable: code === 'stream_interrupted' || code === 'server_unreachable', detail } })
   // AI 를 못 쓴 실패면 연결 상태를 다시 읽어, 연결돼 있지 않으면 연결 화면으로 이끈다(실패 줄과 다시 보내기는 그대로 남는다).
   if (code === 'cli_unavailable' || code === 'provider_failed' || code === 'auth_failed') {
     void aiConnection().then((value) => { if (value === 'needed') window.dispatchEvent(new CustomEvent(AI_NEEDED_EVENT)) })
@@ -613,7 +543,7 @@ async function saveProviderKey(provider: string, apiKey: string): Promise<'keySa
   } catch (error) {
     if (requestId) void request('POST', `/input-requests/${encodeURIComponent(requestId)}/cancel`).catch(() => {})
     if (error instanceof ServerError && (error.code === 'invalid_key' || error.code === 'invalid_input')) return 'invalidKey'
-    if (error instanceof ServerError && error.status === 503) return 'storageUnavailable'
+    if (error instanceof ServerError && error.code === 'storage_unavailable') return 'storageUnavailable'
     throw error
   }
 }
@@ -621,18 +551,42 @@ async function saveProviderKey(provider: string, apiKey: string): Promise<'keySa
 // ---- 첨부 올리기(S39) ----
 export type UploadProgress = { uploadId: string; received: number; total: number }
 const UPLOAD_CHUNK = 4 * 1024 * 1024
+const uploadHashHex = (bytes: Uint8Array) => Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+
+// S167: while a backup or another large write holds the server's disk reservation, a chunk or the final
+// copy is refused with 409 reservation_busy before anything is written. Sending the same request later is safe.
+const UPLOAD_BUSY_RETRIES = 30
+async function retryWhileReservationBusy<T>(send: () => Promise<T>): Promise<T> {
+  let delay = 2000
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await send()
+    } catch (error) {
+      if (!(error instanceof ServerError) || error.code !== 'reservation_busy' || attempt >= UPLOAD_BUSY_RETRIES) throw error
+      await new Promise<void>((resolve) => setTimeout(resolve, delay))
+      delay = Math.min(delay * 2, 30000)
+    }
+  }
+}
 
 async function putChunk(uploadId: string, offset: number, blob: Blob) {
-  const response = await call(`/uploads/${encodeURIComponent(uploadId)}/chunks?offset=${offset}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: blob })
+  const chunkHash = uploadHashHex(sha256(new Uint8Array(await blob.arrayBuffer())))
+  const response = await call(`/uploads/${encodeURIComponent(uploadId)}/chunks?offset=${offset}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', 'X-Momso-Chunk-Sha256': chunkHash }, body: blob })
   let value: Record<string, unknown> | null = null
   try { value = await response.json() } catch { value = null }
-  if (!response.ok) throw new ServerError(str(value?.error) || `http_${response.status}`, response.status)
+  if (!response.ok) throw new ServerError(str(value?.error) || `http_${response.status}`, response.status, response.status >= 500, value?.detail ?? null)
   return typeof value?.received === 'number' ? value.received : offset + blob.size
 }
 
 /** 휴대폰에서 고른 파일 하나를 올리고 원자료 번호를 돌려준다. 끊기면 server 가 받은 곳부터 이어서(연달아 3번까지). */
-export async function uploadAttachment(file: File, onProgress?: (progress: UploadProgress) => void) {
-  const begun = await request<{ uploadId?: unknown; received?: unknown; total?: unknown }>('POST', '/uploads', { fileName: file.name, mediaType: file.type || 'application/octet-stream', byteLength: file.size })
+export async function uploadAttachment(file: File, onProgress?: (progress: UploadProgress) => void, resumeUploadId?: string) {
+  const hash = sha256.create()
+  for (let offset = 0; offset < file.size; offset += UPLOAD_CHUNK) hash.update(new Uint8Array(await file.slice(offset, offset + UPLOAD_CHUNK).arrayBuffer()))
+  const fileHash = uploadHashHex(hash.digest())
+  const begun = resumeUploadId
+    ? await request<{ uploadId?: unknown; received?: unknown; total?: unknown; sha256?: unknown }>('GET', `/uploads/${encodeURIComponent(resumeUploadId)}`)
+    : await request<{ uploadId?: unknown; received?: unknown; total?: unknown; sha256?: unknown }>('POST', '/uploads', { fileName: file.name, mediaType: file.type || 'application/octet-stream', byteLength: file.size, sha256: fileHash })
+  if (resumeUploadId && (begun?.total !== file.size || begun?.sha256 !== fileHash)) throw new ServerError('upload_file_mismatch', null)
   const uploadId = str(begun?.uploadId)
   if (!uploadId) throw new ServerError('invalid_response', null)
   let received = typeof begun?.received === 'number' ? begun.received : 0
@@ -640,7 +594,8 @@ export async function uploadAttachment(file: File, onProgress?: (progress: Uploa
   let misses = 0
   while (received < file.size) {
     try {
-      received = await putChunk(uploadId, received, file.slice(received, Math.min(file.size, received + UPLOAD_CHUNK)))
+      const from = received
+      received = await retryWhileReservationBusy(() => putChunk(uploadId, from, file.slice(from, Math.min(file.size, from + UPLOAD_CHUNK))))
       misses = 0
     } catch (error) {
       const resumable = error instanceof ServerError && (error.code === 'server_unreachable' || error.code === 'offset_mismatch' || (error.status !== null && error.status >= 500))
@@ -652,7 +607,7 @@ export async function uploadAttachment(file: File, onProgress?: (progress: Uploa
     }
     onProgress?.({ uploadId, received, total: file.size })
   }
-  const done = await request<{ id?: unknown; originalFileName?: unknown; mediaType?: unknown }>('POST', `/uploads/${encodeURIComponent(uploadId)}/finish`)
+  const done = await retryWhileReservationBusy(() => request<{ id?: unknown; originalFileName?: unknown; mediaType?: unknown }>('POST', `/uploads/${encodeURIComponent(uploadId)}/finish`))
   const assetId = str(done?.id)
   if (!assetId) throw new ServerError('invalid_response', null)
   return { assetId, name: str(done?.originalFileName) || file.name, mediaType: str(done?.mediaType) || file.type || null }
@@ -758,15 +713,19 @@ async function followTurn(turnId: string, chatId: string, got: string, userMessa
       }
       if (turn?.state === 'completed' || turn?.state === 'failed') { finishTurn(turnId, chatId, turn.state, turn.error, userMessageId); return }
     } catch (error) {
+      if (error instanceof ServerError && error.code === 'waking_timeout') {
+        finishTurn(turnId, chatId, 'failed', 'stream_interrupted', userMessageId, { cause: 'waking_timeout' })
+        return
+      }
       // 로그인이 풀렸거나(문이 알림) server 가 이 답을 모르면 그만둔다. 닿지 못함·5xx 는 다시 해 본다.
-      if (error instanceof ServerError && (error.code === 'signed_out' || (error.status !== null && error.status < 500))) {
+      if (error instanceof ServerError && (isSignedOut(error) || (error.status !== null && error.status < 500))) {
         finishTurn(turnId, chatId, 'failed', error.code, userMessageId)
         return
       }
     }
     await wait(1000)
   }
-  finishTurn(turnId, chatId, 'failed', 'cli_timeout', userMessageId)
+  finishTurn(turnId, chatId, 'failed', 'stream_interrupted', userMessageId)
 }
 
 /** SSE 를 읽는다. 끊기면 받은 UTF-8 바이트를 after 로 주어 다시 붙는다(최대 5번). 그래도 안 되면 GET /turns 로. */
@@ -807,7 +766,11 @@ async function streamTurn(turnId: string, chatId: string, userMessageId: string 
       })
       if (finished) return
     } catch (error) {
-      if (error instanceof ServerError && error.code === 'signed_out') { finishTurn(turnId, chatId, 'failed', 'signed_out', userMessageId); return }
+      if (isSignedOut(error)) { finishTurn(turnId, chatId, 'failed', error instanceof ServerError ? error.code : 'signed_out', userMessageId); return }
+      if (error instanceof ServerError && error.code === 'waking_timeout') {
+        finishTurn(turnId, chatId, 'failed', 'stream_interrupted', userMessageId, { cause: 'waking_timeout' })
+        return
+      }
       // 끊겼다: after 로 다시 붙어 본다.
     }
   }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""S147 rehearsal state machine. Live adapters are intentionally not connected."""
+"""S147 disposable installation, pause and restore rehearsal."""
 import argparse
 import json
 import re
@@ -62,7 +62,9 @@ def run_rehearsal(installation_id, protected_ids, adapter, emit=lambda *_: None)
 
     def checked_inventory():
         value = adapter.inventory(installation_id)
-        if not isinstance(value, dict) or value.get('complete') is not True or value.get('remaining') != []:
+        if isinstance(value, dict):
+            result['leftovers'] = value
+        if not isinstance(value, dict) or value.get('remaining') != [] or (value.get('complete') is not True and not (value.get('deletionOutcome') == 'deleted_unverified' and isinstance(value.get('unverified'), list) and value['unverified'])):
             raise RehearsalFailure('leftovers_unverified')
         return value
 
@@ -99,13 +101,26 @@ def main(argv=None):
     for name in ('account', 'project', 'release-manifest-url', 'bundle', 'public-key', 'channel', 'google-client-id', 'owner-sub', 'login-origin'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--protect-installation-id', action='append', default=[])
-    parser.parse_args(argv)
-    # Never provision a real VM until install-time restore and its pre-backup
-    # fence are implemented and independently tested.
-    result = {'outcome': 'failed', 'steps': {'preflight': {'status': 'failed', 'reason': 'restore_not_integrated'}}, 'leftovers': {'status': 'not_created'}}
-    print('preflight: failed (restore_not_integrated)')
+    args = parser.parse_args(argv)
+    if (not re.fullmatch(r'[A-Za-z0-9._%+@-]+', args.account)
+            or not re.fullmatch(r'[a-z][a-z0-9-]{4,28}[a-z0-9]', args.project)
+            or args.channel not in ('development', 'production')
+            or not re.fullmatch(r'[A-Za-z0-9._-]+\.apps\.googleusercontent\.com', args.google_client_id)
+            or not re.fullmatch(r'[0-9]{1,40}', args.owner_sub)
+            or not re.fullmatch(r'https://[a-z0-9][a-z0-9.-]*', args.login_origin)
+            or any(not re.fullmatch(r'[a-f0-9]{12}(?:[a-f0-9]{12})?', value) for value in args.protect_installation_id)):
+        result = {'outcome': 'failed', 'steps': {'preflight': {'status': 'failed', 'reason': 'invalid_arguments'}}, 'leftovers': {'status': 'not_created'}}
+    else:
+        try:
+            from momso_anywhere_rehearsal_s147_real import make_adapter
+            adapter, identity, protected = make_adapter(args)
+            result = run_rehearsal(identity, protected, adapter)
+            result['installationId'] = identity
+            result['statePath'] = str(adapter.state_path)
+        except Exception:
+            result = {'outcome': 'failed', 'steps': {'preflight': {'status': 'failed', 'reason': 'ownership_unverified'}}, 'leftovers': {'status': 'not_created'}}
     print(json.dumps(result, ensure_ascii=False, separators=(',', ':')))
-    return 1
+    return 0 if result['outcome'] == 'ok' else 1
 
 
 if __name__ == '__main__':

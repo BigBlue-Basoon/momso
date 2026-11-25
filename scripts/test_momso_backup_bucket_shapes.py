@@ -67,6 +67,20 @@ class BucketDescribeTests(unittest.TestCase):
         with self.assertRaises(InstallError):
             GoogleBackupProvisioner(Provider()).provision()
 
+    def test_missing_preserved_bucket_is_not_created(self):
+        class Provider:
+            install_id = 'abcdef123456'
+            project = 'fixture-project'
+            marker = 'momso-install-' + install_id
+            def __init__(self): self.calls = []
+            def run(self, *args, **kwargs):
+                self.calls.append(args)
+                return []
+        provider = Provider()
+        with self.assertRaisesRegex(InstallError, 'restore_assets_incomplete'):
+            GoogleBackupProvisioner(provider).provision(preserved_only=True)
+        self.assertEqual([call[:3] for call in provider.calls], [('storage', 'buckets', 'list')])
+
 
 if __name__ == '__main__':
     unittest.main()

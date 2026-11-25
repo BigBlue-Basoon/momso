@@ -82,6 +82,27 @@ pub async fn admit(State(app): State<App>, request: Request, next: Next) -> Resp
         *method,
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     );
+    #[cfg(target_os = "linux")]
+    if changes
+        && *method != Method::DELETE
+        && !maintenance_endpoint
+        && !completion(path)
+        && !(path.starts_with("/assets/") && (path.ends_with("/trash") || path.ends_with("/purge")))
+        && auth(&app, request.headers()).is_ok()
+        && !disk_space::can_grow(&app.data, 0)
+    {
+        let browsers = app.browsers.clone();
+        let root = app.data.join("browser-profiles");
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(_registry) = browsers.lock() {
+                momso_server_browser::prune_inactive_caches(&root, std::time::SystemTime::now());
+            }
+        })
+        .await;
+        if !disk_space::can_grow(&app.data, 0) {
+            return error(StatusCode::INSUFFICIENT_STORAGE, "disk_low").into_response();
+        }
+    }
     let meaningful_read = *method == Method::GET
         && (path == "/providers"
             || path == "/chats"

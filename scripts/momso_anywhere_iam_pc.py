@@ -9,6 +9,12 @@ from momso_anywhere_vm_resources import names
 from momso_server_install import REGION, ZONE
 
 
+class PartialPolicyInventory(ValueError):
+    def __init__(self, found):
+        super().__init__('soft_deleted_bucket_policy_unavailable')
+        self.found = found
+
+
 class GcloudPolicies:
     def __init__(self, provider): self.provider = provider
 
@@ -23,6 +29,29 @@ class GcloudPolicies:
             self.provider.run(*resource[1], path, *resource[2])
         finally:
             Path(path).unlink(missing_ok=True)
+
+
+def soft_deleted_buckets(p):
+    """Read the project's soft-deleted bucket metadata without restoring it."""
+    raw = p.run('storage', 'ls', '--buckets', '--soft-deleted', '--json')
+    text = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+    if not isinstance(text, str): raise ValueError('invalid_bucket_inventory')
+    records, decoder = [], json.JSONDecoder()
+    while text.strip():
+        text = text.lstrip()
+        value, end = decoder.raw_decode(text)
+        records.extend(value if isinstance(value, list) else [value])
+        text = text[end:]
+    expected = names(p)['backup_bucket']
+    found = []
+    for row in records:
+        if not isinstance(row, dict): raise ValueError('invalid_bucket_inventory')
+        metadata = row.get('metadata', row)
+        if not isinstance(metadata, dict): raise ValueError('invalid_bucket_inventory')
+        name = metadata.get('name') or row.get('name')
+        if not isinstance(name, str): raise ValueError('invalid_bucket_inventory')
+        if name == expected: found.append({'name': name, 'hardDeleteTime': metadata.get('hardDeleteTime')})
+    return found
 
 
 def owned_policy_resources(p):
@@ -67,8 +96,32 @@ def owned_policy_resources(p):
             resources.append((('kms', 'keys', 'get-iam-policy', 'backup', *flags), ('kms', 'keys', 'set-iam-policy', 'backup'), flags))
             resources.append((('kms', 'keyrings', 'get-iam-policy', n['backup_ring'], f'--location={REGION}'), ('kms', 'keyrings', 'set-iam-policy', n['backup_ring']), (f'--location={REGION}',)))
         else:
-            raise ValueError('iam_bindings_unverified')
+            resources.append((('kms', 'keyrings', 'get-iam-policy', n['backup_ring'], f'--location={REGION}'), ('kms', 'keyrings', 'set-iam-policy', n['backup_ring']), (f'--location={REGION}',)))
     return resources
+
+
+def inspect_installation_bindings(p):
+    """Read all surviving installation policies; never modify any binding."""
+    from momso_anywhere_iam_policy import without_accounts
+    n = names(p)
+    emails = [n[key] + '@' + p.project + '.iam.gserviceaccount.com'
+              for key in ('account', 'backup_account', 'gateway_account', 'wake_account')]
+    roles = {f'projects/{p.project}/roles/{role}' for role in
+             (n['gateway_role'], n['wake_role'], *n['roles'])}
+    found = []
+    transport = GcloudPolicies(p)
+    for resource in owned_policy_resources(p):
+        policy = transport.read(resource)
+        filtered = without_accounts(policy, emails)
+        bindings = policy.get('bindings', [])
+        if filtered != policy or any(isinstance(binding.get('role'), str) and
+                                     any(binding['role'] == role or binding['role'].startswith(role + '_withcond_')
+                                         for role in roles) for binding in bindings):
+            found.append('/'.join(resource[0][:3]))
+    # Do not restore a soft-deleted bucket merely to inspect its policy.
+    if soft_deleted_buckets(p):
+        raise PartialPolicyInventory(found)
+    return found
 
 
 def remove_installation_bindings(p):

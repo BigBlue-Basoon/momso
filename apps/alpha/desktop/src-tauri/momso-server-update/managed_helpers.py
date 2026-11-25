@@ -9,13 +9,11 @@ import tempfile
 
 import momso_managed_files as managed
 
-HELPERS = ("idle-stop.py", "vault-provision.py", "momso_anywhere_backup.py",
-           "momso_anywhere_backup_agent.py", "momso_anywhere_backup_google.py",
-           "momso_anywhere_vault_identity.py")
+LEGACY_HELPERS = ("momso_anywhere_backup.py", "momso_anywhere_backup_agent.py", "momso_anywhere_backup_google.py", "momso_anywhere_vault_identity.py")
 WORKER = ("update.py", "release_manifest.py", "server_admission.py", "systemd_host.py",
           "data_snapshots.py", "cloud_run_gateway.py", "github_releases.py", "progress_status.py",
           "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py",
-          "managed_helpers.py", "momso_managed_files.py", "momso_anywhere_proxy_files.py", "momso_anywhere_proxy_files.json")
+          "managed_helpers.py", "trust_rotation.py", "momso_managed_files.py", "momso_anywhere_proxy_files.py", "momso_anywhere_proxy_files.json")
 LAUNCHER = b'''"""Stable launcher for the currently selected updater version."""\nimport runpy\nimport sys\nfrom pathlib import Path\nroot = Path(__file__).resolve().parent\ncurrent = (root / "current").resolve(strict=True)\nversions = (root / "versions").resolve(strict=True)\nif current.parent != versions or not current.is_dir():\n    raise RuntimeError("invalid_updater_version")\nsys.path.insert(0, str(current))\nrunpy.run_path(str(current / "worker.py"), run_name="__main__")\n'''
 
 
@@ -54,7 +52,7 @@ class ManagedHelpers:
             path = self.private / name
             if path.is_symlink() or not path.is_file(): raise ValueError('managed_manifest_missing')
             data = json.loads(path.read_text(encoding='utf8'))
-            if data.get('version') != 1 or not re.fullmatch(r'[a-f0-9]{12}', data.get('owner', '')):
+            if data.get('version') != 1 or not re.fullmatch(r'[a-f0-9]{12}(?:[a-f0-9]{12})?', data.get('owner', '')):
                 raise ValueError('managed_manifest_invalid')
             owners.append(data['owner'])
         if owners[0] != owners[1]: raise ValueError('managed_owner_mismatch')
@@ -86,8 +84,20 @@ class ManagedHelpers:
                     raise ValueError('invalid_release_helpers')
                 result[name] = path.read_bytes()
             return result
-        helper_files = files(release, HELPERS)
-        worker_files = files(release / 'momso-updater', WORKER, required=True)
+        restore_manifest = release / 'momso-updater/momso_anywhere_restore_files.json'
+        restore_files = LEGACY_HELPERS
+        extras = ()
+        if os.path.lexists(restore_manifest):
+            if restore_manifest.is_symlink() or not restore_manifest.is_file() or restore_manifest.stat().st_size > 4096:
+                raise ValueError('invalid_release_helpers')
+            restore_files = json.loads(restore_manifest.read_text(encoding='utf8'))
+            if not isinstance(restore_files, list) or any(not isinstance(name, str) or not re.fullmatch(r'momso_anywhere_(?:backup|backup_agent|backup_google|vault_identity|prestart_restore)\.py', name) for name in restore_files) or len(set(restore_files)) != len(restore_files):
+                raise ValueError('invalid_release_helpers')
+            if not set(LEGACY_HELPERS).issubset(restore_files) or 'momso_anywhere_prestart_restore.py' not in restore_files:
+                raise ValueError('invalid_release_helpers')
+            extras = ('momso_anywhere_restore_files.py', 'momso_anywhere_restore_files.json')
+        helper_files = files(release, ('idle-stop.py', 'vault-provision.py', *restore_files), required=bool(extras))
+        worker_files = files(release / 'momso-updater', (*WORKER, *extras), required=True)
         units = files(release / 'momso-units', ('momso-idle-stop.service',))
         overrides = files(release / 'momso-overrides', ('vault.conf',))
         installed_unit = self.units / 'momso-idle-stop.service'

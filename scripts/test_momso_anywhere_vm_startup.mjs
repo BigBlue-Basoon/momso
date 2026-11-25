@@ -23,6 +23,19 @@ test('VM startup rejects an unverified or non-HTTPS bundle', () => {
   assert.throws(() => vmStartupScript({ project: 'fixture-project', secret: 'momso-transport-aaaaaaaaaaaa', bundleUrl: 'https://example.test/a', bundleSha256: 'bad' }));
 });
 
+test('preserved VM restore is gated before server start and binds the full ID', () => {
+  const input = { project: 'fixture-project', secret: 'momso-transport-aaaaaaaaaaaa', bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'a'.repeat(64), restore: { installationId: 'a'.repeat(12) + 'b'.repeat(12) } };
+  const source = vmStartupScript(input);
+  const python = source.split("<<'MOMSO_BOOTSTRAP'\n")[1].split('\nMOMSO_BOOTSTRAP')[0];
+  const check = spawnSync(pythonBin, ['-c', 'import ast,sys; ast.parse(sys.stdin.read(),feature_version=(3,11))'], { input: python, encoding: 'utf8' });
+  assert.equal(check.status, 0, check.stderr);
+  assert(source.indexOf("status=subprocess.run(['systemctl','start','momso-restore.service']") < source.indexOf("run('systemctl','enable','--now','momso-server')"));
+  assert(source.includes('LoadCredential=momso-vault-identity:/run/momso-vault/momso-vault-identity'));
+  assert(source.includes('ExecStartPost=+/usr/bin/python3 /opt/momso/restore-complete.py'));
+  assert(source.includes("if cfg['restore'] is None:vault_args.append('--create-initial')"));
+  assert.throws(() => vmStartupScript({ ...input, restore: { installationId: 'c'.repeat(24) } }));
+});
+
 test('signed release configuration installs the update worker', () => {
   const key = Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.alloc(32, 7)]).toString('base64');
   const input = { project: 'fixture-project', secret: 'momso-transport-aaaaaaaaaaaa', bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'a'.repeat(64), update: { manifestUrl: 'https://example.test/release.json', publicKeySpki: key, channel: 'development' } };
@@ -54,6 +67,27 @@ for available,expected in [({'bwrap','age-keygen','flock','ffmpeg'},['git']),({'
   const result = spawnSync(pythonBin, ['-c', check], { input: python, encoding: 'utf8' });
   assert.equal(result.status, 0, result.stderr);
   assert(source.indexOf("('git','git')") < source.indexOf("run('systemctl','enable','--now','momso-server')"));
+});
+
+test('VM startup installs Chromium only when no supported browser exists', () => {
+  const source = vmStartupScript({ project: 'fixture-project', secret: 'momso-transport-aaaaaaaaaaaa', bundleUrl: 'https://example.test/release.tar.gz', bundleSha256: 'a'.repeat(64) });
+  const python = source.split("<<'MOMSO_BOOTSTRAP'\n")[1].split('\nMOMSO_BOOTSTRAP')[0];
+  const check = String.raw`
+import ast,sys
+from types import SimpleNamespace
+tree=ast.parse(sys.stdin.read())
+assignment=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='missing' for t in n.targets))
+browser=next(n for n in tree.body if isinstance(n,ast.If) and 'google-chrome-stable' in ast.unparse(n.test))
+branch=next(n for n in tree.body if isinstance(n,ast.If) and isinstance(n.test,ast.Name) and n.test.id=='missing')
+base={'bwrap','git','ffmpeg','age-keygen','flock'}
+for available,expected in [(base,['chromium']),(base|{'chromium'},[]),(base|{'google-chrome-stable'},[])]:
+ calls=[];env={'shutil':SimpleNamespace(which=lambda name:name if name in available else None),'os':SimpleNamespace(environ={}),'run':lambda *args:calls.append(args)}
+ exec(compile(ast.Module(body=[assignment,browser,branch],type_ignores=[]),'fixture','exec'),env)
+ assert env['missing']==expected
+ assert (calls[-1][4:]==tuple(expected)) if expected else not calls
+`;
+  const result = spawnSync(pythonBin, ['-c', check], { input: python, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test('legacy Python accepts dot entries and rejects links or escaping paths', () => {

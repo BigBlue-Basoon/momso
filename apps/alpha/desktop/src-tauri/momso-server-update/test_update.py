@@ -17,6 +17,8 @@ import update
 from cloud_run_gateway import GatewayError
 from update import Updater, UpdateError, _atomic_json
 from momso_anywhere_proxy_files import PROXY_FILES
+from data_snapshots import DataSnapshots, reserve_large_write
+from test_data_snapshots import reservation_in_another_process
 
 
 class Host:
@@ -88,6 +90,22 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.host.release, 'old')
         self.assertFalse(self.host.lease)
 
+    def test_failed_current_gateway_check_removes_only_new_stage(self):
+        self.host.current_gateway = lambda: (_ for _ in ()).throw(OSError('fixture'))
+        with self.assertRaisesRegex(UpdateError, 'current_state_unavailable'):
+            self.install()
+        self.assertFalse(self.host.lease)
+        self.assertEqual(list(self.updater.root.glob('release-2-*')), [])
+        self.assertEqual((self.host.release, self.host.data, self.host.sequence), ('old', 'before', 1))
+
+    def test_stage_removed_even_if_releasing_maintenance_fails(self):
+        self.host.current_gateway = lambda: (_ for _ in ()).throw(OSError('fixture'))
+        self.host.release_maintenance = lambda: (_ for _ in ()).throw(OSError('fixture'))
+        with self.assertRaisesRegex(UpdateError, 'update_unavailable'):
+            self.install()
+        self.assertEqual(list(self.updater.root.glob('release-2-*')), [])
+        self.assertEqual((self.host.release, self.host.data, self.host.sequence), ('old', 'before', 1))
+
     def test_already_installed_sequence_refreshes_completed_journal(self):
         _atomic_json(self.updater.state, {'phase': 'complete', 'sequence': 1, 'needsRelease': False})
         self.host.sequence = 2
@@ -111,6 +129,110 @@ class UpdateTests(unittest.TestCase):
             self.install()
         self.assertEqual((self.host.release, self.host.gateway, self.host.data, self.host.sequence), ('old', 'old-gateway', 'before', 1))
         self.assertFalse(self.host.lease)
+
+    def test_update_holds_large_write_reservation_through_snapshot(self):
+        data = self.root / 'data'; data.mkdir()
+        self.host.reserve_update = lambda size: reserve_large_write(data, size)
+        old_snapshot = self.host.snapshot_data
+        def snapshot():
+            with self.assertRaisesRegex(ValueError, 'reservation_busy'):
+                with reserve_large_write(data, 1):
+                    pass
+            return old_snapshot()
+        self.host.snapshot_data = snapshot
+        self.assertEqual(self.install(), 'completed')
+        with reserve_large_write(data, 1):
+            pass
+
+    def test_rollback_reservation_survives_data_replacement_and_release_failure(self):
+        for release_fails in (False, True):
+            with self.subTest(release_fails=release_fails):
+                data = self.root / ('data-failure' if release_fails else 'data-success')
+                data.mkdir(); (data / 'database').write_text('before')
+                snapshots = DataSnapshots(data, self.root / ('snapshots-failure' if release_fails else 'snapshots-success'))
+                self.host.reserve_update = lambda size: reserve_large_write(data, size)
+                self.host.snapshot_data = snapshots.snapshot
+                self.host.migrate_data = lambda release: (data / 'database').write_text('migrated')
+                def restore(snapshot):
+                    snapshots.restore(snapshot)
+                    self.assertEqual((data / 'database').read_text(), 'before')
+                    self.assertEqual(reservation_in_another_process(data), 'reservation_busy')
+                self.host.restore_data = restore
+                def release():
+                    self.assertEqual(reservation_in_another_process(data), 'reservation_busy')
+                    if release_fails:
+                        raise RuntimeError('injected release failure')
+                    self.host.lease = False
+                self.host.release_maintenance = release
+                self.host.healthy = False
+                expected = 'maintenance_release_failed' if release_fails else 'server_unhealthy'
+                with self.assertRaisesRegex(UpdateError, expected):
+                    self.install()
+                self.assertEqual(reservation_in_another_process(data), 'available')
+                record = json.loads(self.updater.state.read_text())
+                self.assertEqual(record['phase'], 'rolled_back')
+                self.assertEqual(record['needsRelease'], release_fails)
+
+    def test_failed_data_replacement_releases_reservation_but_keeps_maintenance(self):
+        data = self.root / 'data'; data.mkdir(); (data / 'database').write_text('before')
+        snapshots = DataSnapshots(data, self.root / 'snapshots')
+        self.host.reserve_update = lambda size: reserve_large_write(data, size)
+        self.host.snapshot_data = snapshots.snapshot
+        self.host.migrate_data = lambda release: (data / 'database').write_text('migrated')
+        original_replace = os.replace
+        def replace(source, destination):
+            if Path(source).name == 'data' and Path(destination) == data:
+                raise OSError('injected replacement failure')
+            return original_replace(source, destination)
+        def restore(snapshot):
+            try:
+                with patch('data_snapshots.os.replace', side_effect=replace):
+                    snapshots.restore(snapshot)
+            finally:
+                self.assertEqual((data / 'database').read_text(), 'migrated')
+                self.assertEqual(reservation_in_another_process(data), 'reservation_busy')
+        self.host.restore_data = restore
+        self.host.healthy = False
+        with self.assertRaisesRegex(UpdateError, 'rollback_failed'):
+            self.install()
+        self.assertTrue(self.host.lease)
+        self.assertEqual(json.loads(self.updater.state.read_text())['phase'], 'switching')
+        self.assertEqual(reservation_in_another_process(data), 'available')
+
+    def test_backup_started_by_closing_admission_can_reserve(self):
+        # The real server starts a backup on POST /maintenance; that backup
+        # takes the same large-write lock and must not find it held.
+        data = self.root / 'data'; data.mkdir()
+        self.host.reserve_update = lambda size: reserve_large_write(data, size)
+        original = self.host.acquire_maintenance
+        def acquire():
+            with reserve_large_write(data, 1):
+                pass
+            return original()
+        self.host.acquire_maintenance = acquire
+        self.assertEqual(self.install(), 'completed')
+
+    def test_reservation_failure_after_admission_releases_and_discards_stage(self):
+        data = self.root / 'data'; data.mkdir()
+        calls = []
+        def reserve(size):
+            calls.append(size)
+            if len(calls) == 2: raise ValueError('reservation_busy')
+            return reserve_large_write(data, size)
+        self.host.reserve_update = reserve
+        with self.assertRaisesRegex(UpdateError, 'reservation_busy'):
+            self.install()
+        self.assertEqual(calls[1], 0)
+        self.assertFalse(self.host.lease)
+        self.assertEqual(list(self.updater.root.glob('release-2-*')), [])
+        self.assertEqual((self.host.release, self.host.sequence), ('old', 1))
+
+    def test_cleanup_runs_only_after_success_and_lease_release(self):
+        self.host.cleanup_old_updates = Mock(side_effect=lambda record: self.assertFalse(self.host.lease))
+        self.assertEqual(self.install(), "completed")
+        record = self.host.cleanup_old_updates.call_args.args[0]
+        self.assertEqual(record["phase"], "complete")
+        self.assertFalse(record["needsRelease"])
 
     def test_development_channel_is_not_accepted_by_production(self):
         manifest = self.server_dir / 'manifest.json'
@@ -141,6 +263,7 @@ class UpdateTests(unittest.TestCase):
         with self.assertRaisesRegex(UpdateError, "server_unhealthy"): self.install()
         self.assertEqual((self.host.release, self.host.gateway, self.host.data, self.host.sequence), ("old", "old-gateway", "before", 1))
         self.assertFalse(self.host.lease)
+        self.assertEqual(list(self.updater.root.glob('release-2-*')), [])
     def test_bad_signature_or_bundle_never_switches(self):
         (self.server_dir / "manifest.sig").write_bytes(b"bad")
         with self.assertRaisesRegex(UpdateError, "signature_invalid"): self.install()

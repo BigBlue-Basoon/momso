@@ -266,6 +266,7 @@ impl RuntimePaths {
             archive,
             archive_lease: None,
         };
+        crate::paired_restore::recover_if_needed(&paths).map_err(std::io::Error::other)?;
         Ok((paths, storage))
     }
 

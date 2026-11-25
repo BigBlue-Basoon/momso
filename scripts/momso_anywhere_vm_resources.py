@@ -1,6 +1,6 @@
 """Names and ownership checks for resources provisioned for one VM."""
 def names(provider):
-    ident = provider.install_id
+    ident = provider.install_id[:12]
     machine = 'momso-' + ident
     return {'account': 'mv-' + ident, 'backup_account': 'mb-' + ident,
             'roles': ('momsoStop' + ident, 'momsoBackup' + ident, 'momsoUpdate' + ident),

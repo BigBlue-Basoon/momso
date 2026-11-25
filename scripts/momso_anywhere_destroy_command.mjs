@@ -2,7 +2,7 @@ import { GoogleBrowserProvider } from './momso_anywhere_google_browser.mjs';
 
 export async function runDestroyCommand({ projectId, installationId, token, saveState, previous = null, discardData = false, onProgress = () => {}, providerFactory = (value, options) => new GoogleBrowserProvider(value, options) }) {
   if (!token || /\s/.test(token) || typeof saveState !== 'function') throw new Error('invalid_authorization');
-  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId ?? '') || !/^[a-f0-9]{24}$/.test(installationId ?? '')) throw new Error('invalid_arguments');
+  if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(projectId ?? '') || !/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(installationId ?? '')) throw new Error('invalid_arguments');
   // No maintenance-and-backup proof can currently be supplied by this CLI.
   // Refuse before creating a provider or writing a misleading checkpoint.
   if (discardData !== true) throw Object.assign(new Error('backup_freshness_unverified'), { step: 'backup_freshness_unverified' });

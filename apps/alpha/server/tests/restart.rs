@@ -20,6 +20,137 @@ fn launch(data: &Path, cli: &Path, address: &str) -> Server {
     launch_with(data, cli, address, None, false)
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn activity_exposes_safe_idle_diagnostics_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let cli = Path::new(env!("CARGO_BIN_EXE_fake-codex"));
+    let server = launch(&data, cli, &address);
+    ready(&address);
+    let lifecycle = data.join("lifecycle");
+    std::fs::create_dir_all(&lifecycle).unwrap();
+    std::fs::write(
+        lifecycle.join("idle-stop-status.json"),
+        r#"{"attemptedAt":"2026-11-25T00:00:00+00:00","result":"error:activity:OSError"}"#,
+    )
+    .unwrap();
+    drop(server);
+    let server = launch(&data, cli, &address);
+    ready(&address);
+    let activity = request(&address, "GET", "/activity", "").unwrap();
+    assert_eq!(activity["idleStop"]["result"], "error:activity:OSError");
+    let memory = request(&address, "GET", "/diagnostics/memory", "").unwrap();
+    assert_eq!(memory["idleStop"]["result"], "error:activity:OSError");
+    std::fs::write(
+        lifecycle.join("idle-stop-status.json"),
+        r#"{"attemptedAt":"2026-11-25T00:00:00+00:00","result":"secret value"}"#,
+    )
+    .unwrap();
+    assert!(request(&address, "GET", "/activity", "")
+        .unwrap()
+        .get("idleStop")
+        .is_none());
+    drop(server);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn small_filesystem_refuses_upload_and_keeps_reads_available() {
+    let Some(root) = std::env::var_os("MOMSO_S167_TEST_TMPFS") else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let data = temp.path().join("data");
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let _server = launch(&data, Path::new(env!("CARGO_BIN_EXE_fake-codex")), &address);
+    ready(&address);
+    let response = raw_post(&address, "/uploads");
+    assert!(response.contains("disk_low"), "{response}");
+    assert!(request(&address, "GET", "/chats", "").is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_filesystem_accepts_upload_after_space_is_freed() {
+    let Some(root) = std::env::var_os("MOMSO_S167_TEST_RECOVERY_TMPFS") else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let data = temp.path().join("data");
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let _server = launch(&data, Path::new(env!("CARGO_BIN_EXE_fake-codex")), &address);
+    ready(&address);
+    let filler = temp.path().join("filler");
+    let mut file = std::fs::File::create(&filler).unwrap();
+    let block = vec![0_u8; 1024 * 1024];
+    for _ in 0..700 {
+        file.write_all(&block).unwrap();
+    }
+    drop(file);
+    assert!(raw_post(&address, "/uploads").contains("disk_low"));
+    std::fs::remove_file(filler).unwrap();
+    assert!(request(
+        &address,
+        "POST",
+        "/uploads",
+        r#"{"fileName":"fixture.txt","mediaType":"text/plain","byteLength":1}"#
+    )
+    .is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn old_browser_cache_is_removed_and_upload_recovers() {
+    let Some(root) = std::env::var_os("MOMSO_S167_TEST_RECOVERY_TMPFS") else {
+        return;
+    };
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let data = temp.path().join("data");
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let _server = launch(&data, Path::new(env!("CARGO_BIN_EXE_fake-codex")), &address);
+    ready(&address);
+    let profile = data.join("browser-profiles").join("a".repeat(64));
+    let cache = profile.join("Default/Cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(profile.join("Default/Cookies"), b"login fixture").unwrap();
+    let guard = std::fs::File::create(profile.join(".momso-profile.lock")).unwrap();
+    let mut filler = std::fs::File::create(cache.join("cache")).unwrap();
+    let block = vec![0_u8; 1024 * 1024];
+    for _ in 0..700 {
+        filler.write_all(&block).unwrap();
+    }
+    drop(filler);
+    let old = std::time::SystemTime::now() - Duration::from_secs(31 * 24 * 60 * 60);
+    let times = std::fs::FileTimes::new().set_modified(old);
+    guard.set_times(times).unwrap();
+    std::fs::File::open(&cache)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
+    let response = request(
+        &address,
+        "POST",
+        "/uploads",
+        r#"{"fileName":"fixture.txt","mediaType":"text/plain","byteLength":1}"#,
+    );
+    assert!(response.is_some());
+    assert!(!cache.exists());
+    assert_eq!(
+        std::fs::read(profile.join("Default/Cookies")).unwrap(),
+        b"login fixture"
+    );
+}
+
 #[cfg(all(target_os = "linux", debug_assertions))]
 #[test]
 fn purge_old_backup_restore_and_restart_pending() {
@@ -3045,6 +3176,79 @@ fn codex_context_uses_only_reported_values_for_the_current_thread() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn upload_insufficient_disk_reports_disk_low() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let _server = launch(
+        &temp.path().join("data"),
+        Path::new(env!("CARGO_BIN_EXE_fake-codex")),
+        &address,
+    );
+    ready(&address);
+    let body =
+        json!({"fileName":"file.bin","mediaType":"application/octet-stream","byteLength":i64::MAX})
+            .to_string();
+    let mut stream = TcpStream::connect(&address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(stream, "POST /uploads HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-only-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    assert!(raw.contains("\"disk_low\""));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn upload_rejects_bad_chunk_hash_before_writing() {
+    use sha2::{Digest, Sha256};
+    let temp = tempfile::tempdir().unwrap();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let _server = launch(
+        &temp.path().join("data"),
+        Path::new(env!("CARGO_BIN_EXE_fake-codex")),
+        &address,
+    );
+    ready(&address);
+    let hash = format!("{:x}", Sha256::digest(b"hello"));
+    let started = request(&address, "POST", "/uploads", &json!({"fileName":"file.bin","mediaType":"application/octet-stream","byteLength":5,"sha256":hash}).to_string()).unwrap();
+    let id = started["uploadId"].as_str().unwrap();
+    assert!(request(
+        &address,
+        "PUT",
+        &format!("/uploads/{id}/chunks?offset=0"),
+        "hello"
+    )
+    .is_none());
+    assert_eq!(
+        request(&address, "GET", &format!("/uploads/{id}"), "").unwrap()["received"],
+        0
+    );
+    let send = |digest: &str| {
+        let mut stream = TcpStream::connect(&address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(stream, "PUT /uploads/{id}/chunks?offset=0 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-only-token\r\nX-Momso-Chunk-Sha256: {digest}\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        raw
+    };
+    assert!(send(&"0".repeat(64)).contains(" 422 "));
+    assert_eq!(
+        request(&address, "GET", &format!("/uploads/{id}"), "").unwrap()["received"],
+        0
+    );
+    assert!(send(&hash).contains(" 200 "));
+    assert!(request(&address, "POST", &format!("/uploads/{id}/finish"), "{}").is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn upload_resume_and_authenticated_chat_download() {
     let temp = tempfile::tempdir().unwrap();
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4350,6 +4554,77 @@ fn fake_codex_public_site_open_read_click_read() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn memory_guard_returns_low_before_starting_browser() {
+    use age::secrecy::ExposeSecret;
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let credentials = temp.path().join("credentials");
+    std::fs::create_dir_all(&credentials).unwrap();
+    let identity = age::x25519::Identity::generate().to_string();
+    std::fs::write(
+        credentials.join("momso-vault-identity"),
+        identity.expose_secret(),
+    )
+    .unwrap();
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let _server = Server(
+        Command::new(env!("CARGO_BIN_EXE_momso-server"))
+            .env("MOMSO_SERVER_DATA_DIR", &data)
+            .env("MOMSO_SERVER_TOKEN", "test-only-token")
+            .env("MOMSO_SERVER_LISTEN", &address)
+            .env("MOMSO_CODEX_PATH", env!("CARGO_BIN_EXE_fake-codex"))
+            .env("MOMSO_CHROMIUM_PATH", temp.path().join("must-not-start"))
+            .env("MOMSO_BROWSER_MIN_AVAILABLE_MIB", "1048576")
+            .env("CREDENTIALS_DIRECTORY", credentials)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    ready(&address);
+    let chat = request(&address, "POST", "/chats", "{}").unwrap()["chatId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let turn = request(
+        &address,
+        "POST",
+        &format!("/chats/{chat}/turns"),
+        &json!({"text":"browser fixture https://example.test/"}).to_string(),
+    )
+    .unwrap()["turnId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let completed = wait_state(&address, &turn, "completed");
+    assert!(
+        completed["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("browser_memory_low"),
+        "{completed}"
+    );
+    let diagnostics = request(&address, "GET", "/diagnostics/memory", "").unwrap();
+    assert!(diagnostics["memTotalKiB"].as_u64().unwrap() > 0);
+    assert!(diagnostics["memAvailableKiB"].as_u64().unwrap() > 0);
+    assert_eq!(diagnostics["memoryLowCount"], 1);
+    assert_eq!(diagnostics["evictionCount"], 0);
+    assert!(diagnostics["browsers"].as_array().unwrap().is_empty());
+    let mut unauthenticated = TcpStream::connect(&address).unwrap();
+    write!(
+        unauthenticated,
+        "GET /diagnostics/memory HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut denied = String::new();
+    unauthenticated.read_to_string(&mut denied).unwrap();
+    assert!(denied.contains(" 401 "), "{denied}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 #[ignore = "requires isolated headless Chromium"]
 fn fake_cli_browser_site_approval_round_trip() {
     use age::secrecy::ExposeSecret;
@@ -4404,13 +4679,21 @@ fn fake_cli_browser_site_approval_round_trip() {
             .env("MOMSO_CODEX_PATH", cli)
             .env("CREDENTIALS_DIRECTORY", credential_dir)
             .env("MOMSO_CHROMIUM_PATH", chrome)
+            .env("MOMSO_BROWSER_MIN_AVAILABLE_MIB", "128")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
     );
     ready(&address);
-    for (choice, expected) in [("allow_once", "게시됨"), ("deny", "거절됨")] {
+    for (index, (choice, expected)) in [
+        ("allow_once", "게시됨"),
+        ("deny", "거절됨"),
+        ("deny", "거절됨"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let chat = request(&address, "POST", "/chats", "{}").unwrap()["chatId"]
             .as_str()
             .unwrap()
@@ -4442,6 +4725,19 @@ fn fake_cli_browser_site_approval_round_trip() {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert_eq!(approval["kind"], "browser_site");
+        let memory = request(&address, "GET", "/diagnostics/memory", "").unwrap();
+        let browser = memory["browsers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["chatId"] == chat)
+            .unwrap();
+        assert_eq!(browser["state"], "busy");
+        assert!(
+            browser["pssKiB"].as_u64().is_some_and(|pss| pss > 0),
+            "{memory}"
+        );
+        assert!(!memory.to_string().contains("가짜 수업"));
         let id = approval["requestId"].as_str().unwrap();
         request(
             &address,
@@ -4451,10 +4747,306 @@ fn fake_cli_browser_site_approval_round_trip() {
         )
         .unwrap();
         assert_eq!(wait_state(&address, &turn, "completed")["text"], expected);
+        let memory = request(&address, "GET", "/diagnostics/memory", "").unwrap();
+        assert_eq!(
+            memory["browsers"].as_array().unwrap().len(),
+            index + 1,
+            "{memory}"
+        );
+        assert_eq!(memory["evictionCount"], 0);
     }
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     stop.store(true, Ordering::SeqCst);
     site_thread.join().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires isolated headless Chromium"]
+fn s166_codex_reschedule_waits_for_approval_and_reads_result() {
+    use age::secrecy::ExposeSecret;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = temp.path().join("credentials");
+    std::fs::create_dir_all(&credentials).unwrap();
+    let identity = age::x25519::Identity::generate().to_string();
+    std::fs::write(
+        credentials.join("momso-vault-identity"),
+        identity.expose_secret(),
+    )
+    .unwrap();
+    let site = TcpListener::bind("127.0.0.1:0").unwrap();
+    let site_address = site.local_addr().unwrap();
+    site.set_nonblocking(true).unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let logins = Arc::new(AtomicUsize::new(0));
+    let (site_stop, site_writes, site_logins) = (stopped.clone(), writes.clone(), logins.clone());
+    let worker = std::thread::spawn(move || {
+        while !site_stop.load(Ordering::SeqCst) {
+            if let Ok((mut stream, _)) = site.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut bytes = [0; 8192];
+                let n = stream.read(&mut bytes).unwrap_or(0);
+                let post =
+                    String::from_utf8_lossy(&bytes[..n]).starts_with("POST /publish?time=11%3A30 ");
+                let request = String::from_utf8_lossy(&bytes[..n]);
+                let body = if request.starts_with("POST /login ") {
+                    site_logins.fetch_add(1, Ordering::SeqCst);
+                    "<html><body>가상 로그인 완료</body></html>"
+                } else if request.starts_with("GET /login ") {
+                    "<html><body><form action='/login' method='post'><input name='username' autocomplete='username'><input name='password' type='password' autocomplete='current-password'><button>로그인</button></form></body></html>"
+                } else if post {
+                    site_writes.fetch_add(1, Ordering::SeqCst);
+                    "<html><body>변경 완료 11:30</body></html>"
+                } else if String::from_utf8_lossy(&bytes[..n]).starts_with("GET /list1 ") {
+                    "<html><body><h1>스케줄러 그룹수업스케줄 2026-11-25 예약 명단 1/2</h1><p>가상 회원 010-0000-1001</p><a href='/list2'>다음</a></body></html>"
+                } else if String::from_utf8_lossy(&bytes[..n]).starts_with("GET /list2 ") {
+                    "<html><body><h1>스케줄러 그룹수업스케줄 예약 명단 2/2</h1><p>가상 회원 010-0000-1002</p><p>마지막 쪽</p></body></html>"
+                } else if request.starts_with("GET /members ") {
+                    "<html><body><h1>회원검색</h1><p>가상 회원 010-0000-1001</p><p>가상 회원 010-0000-1002</p></body></html>"
+                } else if request.starts_with("GET /edit ") {
+                    "<html><body><h1>스케줄러 개인레슨스케줄 예약내역수정 시간 수정</h1><p>가상 회원 010-0000-1002</p><input id='time' aria-label='시간' value='10:00'><button onclick=\"document.querySelector('dialog').showModal()\">확인</button><dialog><p>저장 전 확인: 가상 회원 010-0000-1002</p><button onclick=\"fetch('/publish?time='+encodeURIComponent(document.querySelector('#time').value),{method:'POST'}).then(()=>{document.querySelector('dialog').close();document.querySelector('#result').textContent='변경 완료 11:30'})\">저장</button></dialog><p id='result'></p></body></html>"
+                } else {
+                    "<html><body><h1>스케줄러</h1><a href='/list1'>그룹수업스케줄</a><a href='/edit'>개인레슨스케줄</a><a href='/members'>회원검색</a></body></html>"
+                };
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let _server = Server(
+        Command::new(env!("CARGO_BIN_EXE_momso-server"))
+            .env("MOMSO_SERVER_DATA_DIR", temp.path().join("data"))
+            .env("MOMSO_SERVER_TOKEN", "test-only-token")
+            .env("MOMSO_SERVER_LISTEN", &address)
+            .env("MOMSO_CODEX_PATH", env!("CARGO_BIN_EXE_fake-codex"))
+            .env("CREDENTIALS_DIRECTORY", credentials)
+            .env(
+                "MOMSO_CHROMIUM_PATH",
+                std::env::var_os("MOMSO_TEST_CHROMIUM").unwrap(),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    ready(&address);
+    for (name, expected) in momso_core::skill::BUNDLED_SKILLS
+        .iter()
+        .filter(|(name, _)| {
+            matches!(
+                *name,
+                "bodycodi-operations" | "naver-smartplace" | "onstudio-operations"
+            )
+        })
+    {
+        let installed = std::fs::read_to_string(
+            temp.path()
+                .join("data/archive/skills")
+                .join(name)
+                .join("SKILL.md"),
+        )
+        .unwrap();
+        assert_eq!(&installed, expected);
+        assert!(momso_core::skill::parse(name, &installed).is_ok());
+    }
+    for label in ["one", "two"] {
+        request(&address, "POST", "/saved-logins", &json!({"siteUrl":format!("http://{site_address}/login"),"label":label,"username":format!("test-{label}"),"password":format!("fake-{label}")}).to_string()).unwrap();
+    }
+    let saved = request(&address, "GET", "/saved-logins", "").unwrap();
+    let selected = saved["logins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["label"] == "two")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let login_chat = request(&address, "POST", "/chats", "{}").unwrap()["chatId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let login_turn = request(
+        &address,
+        "POST",
+        &format!("/chats/{login_chat}/turns"),
+        &json!({"text":format!("login fixture http://{site_address}/login")}).to_string(),
+    )
+    .unwrap()["turnId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let login_approval = loop {
+        let state = request(
+            &address,
+            "GET",
+            &format!("/turns/{login_turn}/requests"),
+            "",
+        )
+        .unwrap();
+        if !state["approval"].is_null() {
+            break state["approval"].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "login turn: {:?}",
+            request(&address, "GET", &format!("/turns/{login_turn}"), "")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(login_approval["kind"], "browser_login");
+    request(
+        &address,
+        "POST",
+        &format!(
+            "/approvals/{}/respond",
+            login_approval["requestId"].as_str().unwrap()
+        ),
+        r#"{"choice":"allow_once"}"#,
+    )
+    .unwrap();
+    let selection = loop {
+        let state = request(
+            &address,
+            "GET",
+            &format!("/turns/{login_turn}/requests"),
+            "",
+        )
+        .unwrap();
+        if let Some(item) = state["inputs"].as_array().and_then(|v| v.first()) {
+            break item.clone();
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(selection["kind"], "select_saved_login");
+    request(
+        &address,
+        "POST",
+        &format!(
+            "/input-requests/{}/respond",
+            selection["requestId"].as_str().unwrap()
+        ),
+        &json!({"selectionId":selected}).to_string(),
+    )
+    .unwrap();
+    let login_result = wait_state(&address, &login_turn, "completed");
+    assert!(!login_result.to_string().contains("fake-two"));
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
+    let list_chat = login_chat;
+    let list_turn = request(
+        &address,
+        "POST",
+        &format!("/chats/{list_chat}/turns"),
+        &json!({"text":format!("schedule-list fixture http://{site_address}/list1")}).to_string(),
+    )
+    .unwrap()["turnId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let list_deadline = Instant::now() + Duration::from_secs(40);
+    let list_approval = loop {
+        if let Some(a) = request(&address, "GET", &format!("/turns/{list_turn}/approval"), "")
+            .and_then(|v| v.get("approval").cloned())
+            .filter(|v| !v.is_null())
+        {
+            break a;
+        }
+        assert!(Instant::now() < list_deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(list_approval["kind"], "browser_site");
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    request(
+        &address,
+        "POST",
+        &format!(
+            "/approvals/{}/respond",
+            list_approval["requestId"].as_str().unwrap()
+        ),
+        r#"{"choice":"allow_once"}"#,
+    )
+    .unwrap();
+    let answer = wait_state(&address, &list_turn, "completed");
+    let text = answer["text"].as_str().unwrap();
+    assert!(
+        text.contains("010-0000-1001")
+            && text.contains("010-0000-1002")
+            && text.contains("어느 분인가요?"),
+        "{answer}"
+    );
+    // The next user turn selects the second person and explicitly approves the change.
+    // The earlier site permission remains valid for this chat, so no second site card is expected.
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    let continued_turn = request(&address, "POST", &format!("/chats/{list_chat}/turns"),
+        &json!({"text":format!("reschedule fixture http://{site_address}/edit 사용자 선택 전화번호 끝 1002, 11:30 변경 승인")}).to_string()).unwrap()["turnId"].as_str().unwrap().to_owned();
+    let continued = wait_state(&address, &continued_turn, "completed");
+    assert!(
+        continued["text"]
+            .as_str()
+            .unwrap()
+            .contains("변경 확인 11:30"),
+        "{continued}"
+    );
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    for (choice, expected, total) in [("deny", "거절됨", 1), ("allow_once", "변경 확인 11:30", 2)]
+    {
+        let chat = request(&address, "POST", "/chats", "{}").unwrap()["chatId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let turn = request(
+            &address,
+            "POST",
+            &format!("/chats/{chat}/turns"),
+            &json!({"text":format!("reschedule fixture http://{site_address}/edit")}).to_string(),
+        )
+        .unwrap()["turnId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let approval = loop {
+            if let Some(a) = request(&address, "GET", &format!("/turns/{turn}/approval"), "")
+                .and_then(|v| v.get("approval").cloned())
+                .filter(|v| !v.is_null())
+            {
+                break a;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(approval["kind"], "browser_site");
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        request(
+            &address,
+            "POST",
+            &format!(
+                "/approvals/{}/respond",
+                approval["requestId"].as_str().unwrap()
+            ),
+            &json!({"choice":choice}).to_string(),
+        )
+        .unwrap();
+        let result = wait_state(&address, &turn, "completed");
+        let text = result["text"].as_str().unwrap();
+        assert!(
+            text.contains("10:00에서 11:30") && text.contains(expected),
+            "{result}"
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), total);
+    }
+    stopped.store(true, Ordering::SeqCst);
+    worker.join().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -4487,11 +5079,17 @@ fn both_provider_server_browser_approval_round_trip() {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let mut bytes = [0; 8192];
                 let n = stream.read(&mut bytes).unwrap_or(0);
-                if String::from_utf8_lossy(&bytes[..n]).starts_with("POST /publish") {
+                let post =
+                    String::from_utf8_lossy(&bytes[..n]).starts_with("POST /publish?time=11%3A30 ");
+                if post {
                     writes_site.fetch_add(1, Ordering::SeqCst);
                 }
-                let body = "<html><title>Fixture</title><body><form action='/publish' method='post'><button>Register</button></form></body></html>";
-                let _ = write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                let body = if post {
+                    "<html><body>변경 완료 11:30</body></html>"
+                } else {
+                    "<html><title>Fixture</title><body><h1>스케줄러 개인레슨스케줄 예약내역수정 시간 수정</h1><input id='time' aria-label='시간' value='10:00'><button onclick=\"document.querySelector('dialog').showModal()\">확인</button><dialog><p>저장 전 확인</p><button onclick=\"fetch('/publish?time='+encodeURIComponent(document.querySelector('#time').value),{method:'POST'}).then(()=>{document.querySelector('dialog').close();document.querySelector('#result').textContent='변경 완료 11:30'})\">저장</button></dialog><p id='result'></p></body></html>"
+                };
+                let _ = write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
             } else {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -4501,7 +5099,7 @@ fn both_provider_server_browser_approval_round_trip() {
     let endpoint = format!("http://{}/fake", api.local_addr().unwrap());
     let fake = std::thread::spawn(move || {
         for provider in ["claude", "gemini"] {
-            for round in 0..3 {
+            for round in 0..8 {
                 let (mut stream, _) = api.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
@@ -4530,7 +5128,29 @@ fn both_provider_server_browser_approval_round_trip() {
                 }
                 let offset = bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
                 let request: Value = serde_json::from_slice(&bytes[offset..]).unwrap();
-                let response = if round == 2 {
+                if round == 6 {
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                let response = if round == 7 {
+                    let result = if provider == "claude" {
+                        serde_json::from_str::<Value>(
+                            request["messages"].as_array().unwrap().last().unwrap()["content"][0]
+                                ["content"]
+                                .as_str()
+                                .unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        request["contents"].as_array().unwrap().last().unwrap()["parts"][0]
+                            ["functionResponse"]["response"]["result"]
+                            .clone()
+                    };
+                    assert!(
+                        result["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("변경 완료 11:30")),
+                        "{result}"
+                    );
                     if provider == "claude" {
                         json!({"content":[{"type":"text","text":"fixture complete"}],"stop_reason":"end_turn"})
                     } else {
@@ -4542,7 +5162,7 @@ fn both_provider_server_browser_approval_round_trip() {
                             "browser_navigate",
                             json!({"url":format!("http://{site_address}/")}),
                         )
-                    } else {
+                    } else if matches!(round, 1 | 3 | 5) {
                         let result = if provider == "claude" {
                             serde_json::from_str::<Value>(
                                 request["messages"].as_array().unwrap().last().unwrap()["content"]
@@ -4557,18 +5177,33 @@ fn both_provider_server_browser_approval_round_trip() {
                                 .clone()
                         };
                         assert_eq!(result["status"], "page");
+                        let expected = match round {
+                            1 => "시간",
+                            3 => "확인",
+                            _ => "저장",
+                        };
                         let id = result["elements"]
                             .as_array()
                             .unwrap()
                             .iter()
-                            .find(|element| element["name"] == "Register")
+                            .find(|element| element["name"] == expected)
                             .unwrap()["id"]
                             .as_str()
                             .unwrap();
-                        ("browser_click", json!({"elementId":id}))
+                        if round == 1 {
+                            ("browser_fill", json!({"elementId":id,"text":"11:30"}))
+                        } else {
+                            ("browser_click", json!({"elementId":id}))
+                        }
+                    } else {
+                        ("browser_read", json!({}))
                     };
-                    if provider == "claude" {
+                    if provider == "claude" && round == 0 {
+                        json!({"content":[{"type":"text","text":"가상 회원의 예약을 10:00에서 11:30으로 바꿔도 될까요?"},{"type":"tool_use","id":format!("call-{round}"),"name":name,"input":args}],"stop_reason":"tool_use"})
+                    } else if provider == "claude" {
                         json!({"content":[{"type":"tool_use","id":format!("call-{round}"),"name":name,"input":args}],"stop_reason":"tool_use"})
+                    } else if round == 0 {
+                        json!({"candidates":[{"content":{"parts":[{"text":"가상 회원의 예약을 10:00에서 11:30으로 바꿔도 될까요?"},{"functionCall":{"name":name,"args":args}}]},"finishReason":"STOP"}]})
                     } else {
                         json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":name,"args":args}}]},"finishReason":"STOP"}]})
                     }
@@ -4663,9 +5298,11 @@ fn both_provider_server_browser_approval_round_trip() {
             r#"{"choice":"allow_once"}"#,
         )
         .unwrap();
-        assert_eq!(
-            wait_state(&address, &turn, "completed")["text"],
-            "fixture complete"
+        let result = wait_state(&address, &turn, "completed");
+        let text = result["text"].as_str().unwrap();
+        assert!(
+            text.contains("10:00에서 11:30") && text.contains("fixture complete"),
+            "{result}"
         );
     }
     fake.join().unwrap();

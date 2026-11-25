@@ -25,7 +25,7 @@ export async function startAnywhere(provider, checkpoint, onProgress = () => {})
   if (!provider || STEPS.some((step) => typeof provider[step] !== 'function')) {
     throw new SetupError('provider_not_ready');
   }
-  if (!checkpoint || !/^[a-f0-9]{24}$/.test(checkpoint.installationId)) {
+  if (!checkpoint || !/^[a-f0-9]{12}(?:[a-f0-9]{12})?$/.test(checkpoint.installationId)) {
     throw new SetupError('invalid_checkpoint');
   }
   if (typeof provider.preflight === 'function') await provider.preflight();
@@ -33,18 +33,25 @@ export async function startAnywhere(provider, checkpoint, onProgress = () => {})
   for (const step of STEPS) {
     onProgress({ step, state: 'working' });
     try {
+      if (step === 'privateNetwork' && typeof provider.restorePlan === 'function') {
+        const plan = await provider.restorePlan(checkpoint.installationId);
+        if (plan.requiresRestore && typeof provider.enableRestore !== 'function') throw new SetupError('restore_contract_pending');
+        if (plan.requiresRestore) provider.enableRestore(checkpoint.installationId, plan);
+        onProgress({ step, state: 'working', restoreAvailable: plan.restoreAvailable, lastBackupAt: plan.lastBackupAt });
+      }
       await provider[step](checkpoint.installationId);
     } catch (error) {
       const details = error instanceof SetupError && typeof error.code === 'string' ? { code: error.code, rolledBack: error.rolledBack ?? null, retryable: error.retryable ?? null } : error instanceof SetupError && error.step.startsWith('gateway_') ? gatewayFailure(error.step) : {};
       onProgress({ step, state: 'failed', ...details });
       const wrapped = new SetupError(details.code ?? (error instanceof SetupError ? error.step : step));
       Object.assign(wrapped, details);
+      if (typeof error?.detail === 'string' && /^[a-z_]{1,64}$/.test(error.detail)) wrapped.detail = error.detail;
       if (Array.isArray(error?.checks)) wrapped.checks = error.checks;
       throw wrapped;
     }
     onProgress({ step, state: 'done' });
   }
-  return { url: typeof provider.gatewayUrl === 'function' ? provider.gatewayUrl() : null };
+  return { url: typeof provider.gatewayUrl === 'function' ? provider.gatewayUrl() : null, ...(typeof provider.restoreResult === 'function' ? provider.restoreResult() : {}) };
 }
 
 // This preflight is deliberately read-only. It is not a complete Google provider.

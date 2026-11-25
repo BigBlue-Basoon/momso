@@ -8,14 +8,19 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
-pub const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// SQLite stores lengths as signed 64-bit integers.
+pub const MAX_BYTES: u64 = i64::MAX as u64;
 pub const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const DATABASE_NAME: &str = "attachments.sqlite3";
+const UPLOAD_STALE_SECONDS: u64 = 24 * 60 * 60;
 pub type AssetDate = (Option<(String, String)>, bool);
 
 #[derive(Debug, Serialize)]
@@ -24,6 +29,8 @@ pub struct Progress {
     pub upload_id: String,
     pub received: u64,
     pub total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +90,46 @@ fn uuid(input: &str) -> Result<(), &'static str> {
         return Err("invalid_id");
     }
     Ok(())
+}
+
+fn write_error(error: std::io::Error) -> &'static str {
+    if error.raw_os_error() == Some(libc::ENOSPC) {
+        "disk_low"
+    } else {
+        "storage_unavailable"
+    }
+}
+
+fn sqlite_write_error(error: rusqlite::Error) -> &'static str {
+    match error {
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ffi::ErrorCode::DiskFull =>
+        {
+            "disk_low"
+        }
+        _ => "storage_unavailable",
+    }
+}
+
+fn enough_space(stage: u128, archive: u128, same_device: bool, bytes: u64) -> bool {
+    let required = u128::from(bytes);
+    if same_device {
+        stage >= required * 2
+    } else {
+        stage >= required && archive >= required
+    }
+}
+
+fn available_space(path: &Path) -> Result<u128, &'static str> {
+    let path =
+        std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| "unsafe_location")?;
+    let mut value = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // statvfs initializes the output only on success.
+    if unsafe { libc::statvfs(path.as_ptr(), value.as_mut_ptr()) } != 0 {
+        return Err("storage_unavailable");
+    }
+    let value = unsafe { value.assume_init() };
+    Ok(u128::from(value.f_bavail) * u128::from(value.f_frsize))
 }
 
 fn nonnegative(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
@@ -511,6 +558,54 @@ impl Store {
         self.objects.join("sha256").join(&hash[..2]).join(hash)
     }
 
+    fn prune_stale_uploads(&self) -> Result<(), &'static str> {
+        let db = self.db()?;
+        let mut statement = db
+            .prepare("SELECT id FROM uploads WHERE asset_id IS NULL")
+            .map_err(|_| "storage_unavailable")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| "storage_unavailable")?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "storage_unavailable")?;
+        drop(statement);
+        for id in ids {
+            if uuid(&id).is_err() {
+                continue;
+            }
+            let path = self.stage(&id);
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let Ok(age) = metadata
+                .modified()
+                .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+            else {
+                continue;
+            };
+            if age.as_secs() < UPLOAD_STALE_SECONDS {
+                continue;
+            }
+            fs::remove_file(path).map_err(|_| "storage_unavailable")?;
+            db.execute("DELETE FROM generated_uploads WHERE upload_id=?1", [&id])
+                .map_err(|_| "storage_unavailable")?;
+            db.execute(
+                "DELETE FROM uploads WHERE id=?1 AND asset_id IS NULL",
+                [&id],
+            )
+            .map_err(|_| "storage_unavailable")?;
+        }
+        Ok(())
+    }
+
+    pub fn cleanup_expired_uploads(&self) -> Result<(), &'static str> {
+        let _lock = self.lock()?;
+        self.prune_stale_uploads()
+    }
+
     /// Expects authenticated host. Expected SHA-256 is optional, but if sent it
     /// must match the complete upload; a mismatch is never imported.
     pub fn begin(
@@ -531,6 +626,21 @@ impl Store {
             return Err("invalid_arguments");
         }
         let _lock = self.lock()?;
+        self.prune_stale_uploads()?;
+        let same_device = fs::metadata(&self.data)
+            .map_err(|_| "storage_unavailable")?
+            .dev()
+            == fs::metadata(&self.objects)
+                .map_err(|_| "storage_unavailable")?
+                .dev();
+        if !enough_space(
+            available_space(&self.data)?,
+            available_space(&self.objects)?,
+            same_device,
+            total,
+        ) {
+            return Err("disk_low");
+        }
         let id = Uuid::new_v4().to_string();
         let f = OpenOptions::new()
             .write(true)
@@ -538,16 +648,17 @@ impl Store {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(self.stage(&id))
-            .map_err(|_| "storage_unavailable")?;
-        f.sync_all().map_err(|_| "storage_unavailable")?;
+            .map_err(write_error)?;
+        f.sync_all().map_err(write_error)?;
         File::open(self.data.join("upload-staging"))
             .and_then(|d| d.sync_all())
             .map_err(|_| "storage_unavailable")?;
-        self.db()?.execute("INSERT INTO uploads(id,total,received,name,mime,expected) VALUES(?1,?2,0,?3,?4,?5)",params![id,total as i64,name,mime,expected]).map_err(|_| "storage_unavailable")?;
+        self.db()?.execute("INSERT INTO uploads(id,total,received,name,mime,expected) VALUES(?1,?2,0,?3,?4,?5)",params![id,total as i64,name,mime,expected]).map_err(sqlite_write_error)?;
         Ok(Progress {
             upload_id: id,
             received: 0,
             total,
+            sha256: expected.map(str::to_owned),
         })
     }
     pub fn progress(&self, id: &str) -> Result<Progress, &'static str> {
@@ -556,13 +667,14 @@ impl Store {
         let progress = self
             .db()?
             .query_row(
-                "SELECT received,total FROM uploads WHERE id=?1",
+                "SELECT received,total,expected FROM uploads WHERE id=?1",
                 [id],
                 |r| {
                     Ok(Progress {
                         upload_id: id.to_owned(),
                         received: nonnegative(r, 0)?,
                         total: nonnegative(r, 1)?,
+                        sha256: r.get(2)?,
                     })
                 },
             )
@@ -588,11 +700,11 @@ impl Store {
         }
         let _lock = self.lock()?;
         let c = self.db()?;
-        let (received, total, finished): (u64, u64, Option<String>) = c
+        let (received, total, finished, expected): (u64, u64, Option<String>, Option<String>) = c
             .query_row(
-                "SELECT received,total,asset_id FROM uploads WHERE id=?1",
+                "SELECT received,total,asset_id,expected FROM uploads WHERE id=?1",
                 [id],
-                |r| Ok((nonnegative(r, 0)?, nonnegative(r, 1)?, r.get(2)?)),
+                |r| Ok((nonnegative(r, 0)?, nonnegative(r, 1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()
             .map_err(|_| "storage_unavailable")?
@@ -623,17 +735,18 @@ impl Store {
         f.seek(SeekFrom::Start(received))
             .and_then(|_| f.write_all(bytes))
             .and_then(|_| f.sync_all())
-            .map_err(|_| "storage_unavailable")?;
+            .map_err(write_error)?;
         let next = received + bytes.len() as u64;
         c.execute(
             "UPDATE uploads SET received=?1 WHERE id=?2",
             params![next as i64, id],
         )
-        .map_err(|_| "storage_unavailable")?;
+        .map_err(sqlite_write_error)?;
         Ok(Progress {
             upload_id: id.to_owned(),
             received: next,
             total,
+            sha256: expected,
         })
     }
 
@@ -705,8 +818,8 @@ impl Store {
         f.seek(SeekFrom::Start(0))
             .map_err(|_| "storage_unavailable")?;
         let mut temp = tempfile::NamedTempFile::new_in(&dir).map_err(|_| "storage_unavailable")?;
-        std::io::copy(&mut f, &mut temp).map_err(|_| "storage_unavailable")?;
-        temp.flush().map_err(|_| "storage_unavailable")?;
+        std::io::copy(&mut f, &mut temp).map_err(write_error)?;
+        temp.flush().map_err(write_error)?;
         let (copied_hash, copied_bytes) = digest(&file(temp.path(), false)?)?;
         if copied_hash != hash || copied_bytes != bytes {
             return Err("integrity_error");
@@ -1056,6 +1169,147 @@ mod tests {
 
     fn roots() -> (tempfile::TempDir, tempfile::TempDir) {
         (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn stale_incomplete_uploads_are_pruned_without_touching_completed_files() {
+        let (data, archive) = roots();
+        let store = Store::open(data.path(), archive.path()).unwrap();
+        let old = store.begin("old", "text/plain", 5, None).unwrap();
+        let live = store.begin("live", "text/plain", 5, None).unwrap();
+        let complete = store.begin("done", "text/plain", 5, None).unwrap();
+        store.write_chunk(&complete.upload_id, 0, b"hello").unwrap();
+        let asset = store.finish(&complete.upload_id).unwrap();
+        let stage = File::open(store.stage(&old.upload_id)).unwrap();
+        stage
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(UPLOAD_STALE_SECONDS + 1),
+            ))
+            .unwrap();
+        store.begin("new", "text/plain", 5, None).unwrap();
+        assert_eq!(store.progress(&old.upload_id).unwrap_err(), "not_found");
+        assert!(store.progress(&live.upload_id).is_ok());
+        assert!(store.verify_asset(&asset.id).is_ok());
+    }
+
+    #[test]
+    fn full_disk_error_has_the_shared_reason() {
+        assert_eq!(
+            write_error(std::io::Error::from_raw_os_error(libc::ENOSPC)),
+            "disk_low"
+        );
+        assert!(!enough_space(19, 19, true, 10));
+        assert!(enough_space(20, 20, true, 10));
+        assert!(!enough_space(10, 9, false, 10));
+        assert!(enough_space(10, 10, false, 10));
+        let (data, archive) = roots();
+        let store = Store::open(data.path(), archive.path()).unwrap();
+        assert_eq!(
+            store
+                .begin("large", "application/octet-stream", MAX_BYTES, None)
+                .unwrap_err(),
+            "disk_low"
+        );
+        assert_eq!(
+            fs::read_dir(data.path().join("upload-staging"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn two_uploads_are_isolated_and_out_of_order_or_missing_parts_fail() {
+        let (data, archive) = roots();
+        let store = Store::open(data.path(), archive.path()).unwrap();
+        let first = store
+            .begin("a.bin", "application/octet-stream", 6, None)
+            .unwrap();
+        let second = store
+            .begin("b.bin", "application/octet-stream", 3, None)
+            .unwrap();
+        assert_eq!(
+            store.write_chunk(&first.upload_id, 3, b"def").unwrap_err(),
+            "offset_mismatch"
+        );
+        store.write_chunk(&first.upload_id, 0, b"abc").unwrap();
+        store.write_chunk(&second.upload_id, 0, b"xyz").unwrap();
+        assert_eq!(
+            store.write_chunk(&first.upload_id, 0, b"abc").unwrap_err(),
+            "offset_mismatch"
+        );
+        assert_eq!(store.finish(&first.upload_id).unwrap_err(), "incomplete");
+        let b = store.finish(&second.upload_id).unwrap();
+        store.write_chunk(&first.upload_id, 3, b"def").unwrap();
+        let a = store.finish(&first.upload_id).unwrap();
+        assert_ne!(a.sha256, b.sha256);
+    }
+
+    #[test]
+    fn concurrent_files_keep_their_own_data() {
+        let (data, archive) = roots();
+        Store::open(data.path(), archive.path()).unwrap();
+        std::thread::scope(|scope| {
+            let tasks: Vec<_> = (0..2u8)
+                .map(|value| {
+                    let data = data.path().to_owned();
+                    let archive = archive.path().to_owned();
+                    scope.spawn(move || {
+                        let store = Store::open(&data, &archive).unwrap();
+                        let upload = store
+                            .begin("file.bin", "application/octet-stream", 4096, None)
+                            .unwrap();
+                        for offset in 0..4u64 {
+                            store
+                                .write_chunk(&upload.upload_id, offset * 1024, &[value; 1024])
+                                .unwrap();
+                        }
+                        store.finish(&upload.upload_id).unwrap()
+                    })
+                })
+                .collect();
+            let assets: Vec<_> = tasks.into_iter().map(|task| task.join().unwrap()).collect();
+            assert_ne!(assets[0].sha256, assets[1].sha256);
+        });
+    }
+
+    #[test]
+    #[ignore = "writes multi-gigabyte temporary fixture"]
+    fn large_uploads_preserve_full_digest() {
+        let chunk = vec![0x5a; MAX_CHUNK_BYTES];
+        for mib in [10u64, 40, 200, 1024] {
+            let (data, archive) = roots();
+            let store = Store::open(data.path(), archive.path()).unwrap();
+            let total = mib * 1024 * 1024;
+            let mut expected = Sha256::new();
+            let mut left = total;
+            while left > 0 {
+                let count = (left as usize).min(chunk.len());
+                expected.update(&chunk[..count]);
+                left -= count as u64;
+            }
+            let hash = hex::encode(expected.finalize());
+            let upload = store
+                .begin(
+                    "recording.bin",
+                    "application/octet-stream",
+                    total,
+                    Some(&hash),
+                )
+                .unwrap();
+            let mut offset = 0;
+            while offset < total {
+                let count = ((total - offset) as usize).min(chunk.len());
+                store
+                    .write_chunk(&upload.upload_id, offset, &chunk[..count])
+                    .unwrap();
+                offset += count as u64;
+            }
+            let asset = store.finish(&upload.upload_id).unwrap();
+            assert_eq!(asset.byte_length, total);
+            assert_eq!(asset.sha256, hash);
+        }
     }
 
     #[test]

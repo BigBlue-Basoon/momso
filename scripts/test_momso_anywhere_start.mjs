@@ -24,6 +24,23 @@ test('no resource changes occur when a release is not ready', async () => {
   assert.equal(touched, false);
 });
 
+test('a new device resumes the sole preserved installation and lists ambiguous ones', async () => {
+  const names = ['project', 'billing', 'services', 'privateNetwork', 'server', 'gateway', 'gatewayReady'];
+  const ids = [];
+  let candidates = [{ installationId: 'a'.repeat(24), assets: 'complete', browserIdCompatible: true }];
+  const provider = { preflight: async () => {}, discoverPaused: async () => candidates, gatewayUrl: () => 'https://fixture.a.run.app', ...Object.fromEntries(names.map(name => [name, async id => { if (name === 'server') ids.push(id); }])) };
+  const makeStorage = () => { const data = new Map(); return { getItem: k => data.get(k), setItem: (k, v) => data.set(k, v) }; };
+  const options = { clientId: 'fixture-client', projectId: 'fixture-project', storage: makeStorage(), cryptoImpl: webcrypto, authorize: async () => ({ provider, ownerSub: 'fixture-subject' }) };
+  await startFromGesture(options);
+  assert.deepEqual(ids, ['a'.repeat(24)]);
+  candidates = [...candidates, { installationId: 'b'.repeat(24), assets: 'complete', browserIdCompatible: true }];
+  await assert.rejects(startFromGesture({ ...options, storage: makeStorage() }), error => error.step === 'restore_selection_required' && error.candidates.length === 2);
+  assert.deepEqual(ids, ['a'.repeat(24)]);
+  candidates = [{ installationId: 'c'.repeat(12), assets: 'complete', browserIdCompatible: true }];
+  await startFromGesture({ ...options, storage: makeStorage() });
+  assert.equal(ids.at(-1), 'c'.repeat(12));
+});
+
 test('address recovery signs in and returns discovered addresses without storing credentials', async () => {
   const result = await findFromGesture({ clientId: 'fixture', authorize: async () => ({ provider: { findExisting: async () => ['https://fixture.a.run.app'] } }) });
   assert.deepEqual(result, ['https://fixture.a.run.app']);

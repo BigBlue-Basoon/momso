@@ -14,7 +14,7 @@ const id = 'a'.repeat(24), short = id.slice(0, 12), projectId = 'fixture-project
 const marker = `momso-install-${id}`;
 const ok = (value, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => value });
 
-function fixture({ retainVm = false, rejectVm = false, loseVmResponse = false, denyPolicy = false } = {}) {
+function fixture({ retainVm = false, rejectVm = false, loseVmResponse = false, denyPolicy = false, failRouter = false } = {}) {
   const c = `https://compute.googleapis.com/compute/v1/projects/${projectId}/`;
   const i = `https://iam.googleapis.com/v1/projects/${projectId}/`;
   const s = `https://secretmanager.googleapis.com/v1/projects/${projectId}/secrets/`;
@@ -51,6 +51,7 @@ function fixture({ retainVm = false, rejectVm = false, loseVmResponse = false, d
     assert.equal(options.method, 'DELETE');
     if (path.includes('/instances/') && rejectVm) return ok({}, 403);
     if (path.includes('/instances/') && loseVmResponse) throw Error('fixture-network');
+    if (path.includes('/routers/') && failRouter) { failRouter = false; return ok({}, 503); }
     if (path.includes('/subnetworks/') && networkHeld) { networkHeld = false; return ok({}, 400); }
     deleted.push(path);
     if (!(retainVm && path.includes('/instances/'))) resources.delete(path);
@@ -148,8 +149,46 @@ test('explicit discard survives authorization and removes only owned fixture res
   const result = await resumeFromRedirect({ clientId, release: {}, session, storage, location, fragment, cryptoImpl: webcrypto, providerFactory: async () => ({ provider: f.provider, ownerSub: '12345' }) });
   assert.equal(result.value.mode, 'delete_all');
   assert.equal(result.value.status, 'pending');
+  assert.deepEqual(result.value.remaining, ['subnet', 'network']);
   assert(f.deleted.length > 0);
+  assert(f.deleted.some(path => path.includes('run.googleapis.com')), 'gateway cleanup must continue after subnet delay');
   assert(!f.deleted.some(value => value.endsWith(`/secrets/momso-vault-${short}`)));
+});
+
+test('router deletion failure still removes gateway, secrets and accounts, then resumes', async () => {
+  const f = fixture({ failRouter: true });
+  const first = await f.provider.destroy(id);
+  assert.deepEqual(first.remaining, ['router', 'subnet', 'network']);
+  assert(f.deleted.some(path => path.includes('run.googleapis.com')), 'gateway must not be skipped after a router failure');
+  assert(f.deleted.some(path => path.endsWith(`/secrets/momso-transport-${short}`)));
+  assert(f.deleted.some(path => path.includes(`/serviceAccounts/momso-gateway-${short}@`)));
+  assert(f.deleted.some(path => path.endsWith(`/firewalls/${name}-private`)));
+  assert(!f.deleted.some(path => path.endsWith(`/networks/${name}-net`)), 'network waits for its router');
+  assert.equal(first.resources.network.status, 'retained');
+  assert.equal(first.resources.gateway.status, 'deleted');
+  const second = await f.provider.destroy(id);
+  assert.deepEqual(second.remaining, []);
+  assert(!f.deleted.some(value => value.endsWith(`/secrets/momso-vault-${short}`)));
+});
+
+test('explicit discard still deletes backups after a router failure', async () => {
+  const f = fixture({ failRouter: true });
+  const mem = () => { const values = new Map(); return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) }; };
+  const session = mem(), storage = mem();
+  const clientId = 'fixture.apps.googleusercontent.com';
+  const location = { href: 'https://login.example.test/start/', origin: 'https://login.example.test', assign(value) { this.next = value; } };
+  clearStartAuthorization();
+  await destroyFromGesture({ clientId, projectId, installationId: id, discardData: true, session, location, cryptoImpl: webcrypto });
+  const state = new URL(location.next).searchParams.get('state');
+  const fragment = new URLSearchParams({ state, access_token: 'fixture-token', token_type: 'Bearer', expires_in: '60', scope: 'openid email https://www.googleapis.com/auth/cloud-platform' }).toString();
+  let discarded = false;
+  const discardBackup = f.provider.discardBackup.bind(f.provider);
+  f.provider.discardBackup = async (...args) => { discarded = true; return discardBackup(...args); };
+  const result = await resumeFromRedirect({ clientId, release: {}, session, storage, location, fragment, cryptoImpl: webcrypto, providerFactory: async () => ({ provider: f.provider, ownerSub: '12345' }) });
+  assert.equal(result.value.status, 'pending');
+  assert(discarded, 'backup deletion must run after an independent infrastructure failure');
+  for (const key of ['router', 'subnet', 'network']) assert(result.value.remaining.includes(key), key);
+  assert(f.deleted.some(path => path.includes('run.googleapis.com')));
 });
 
 test('PC command rejects invalid project without logging its input token', () => {

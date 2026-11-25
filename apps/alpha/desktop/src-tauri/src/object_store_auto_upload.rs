@@ -11,7 +11,7 @@ use tauri::{Manager, State};
 
 const QUIET: Duration = Duration::from_secs(120);
 const INTERVAL: Duration = Duration::from_secs(30);
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 struct Tracker {
@@ -304,9 +304,11 @@ pub(crate) async fn attempt<R: tauri::Runtime>(app: tauri::AppHandle<R>, closing
         app: app.clone(),
         armed: true,
     };
-    let result = object_store_transfer::backup_with_mode(app.clone(), app.state(), true)
-        .await
-        .map(|_| ());
+    let result = match object_store_transfer::backup_with_mode(app.clone(), app.state(), true).await
+    {
+        Ok(_) => crate::paired_backup::capture(app.clone()).await.map(|_| ()),
+        Err(error) => Err(error),
+    };
     let paths = state.paths.scoped().await;
     let after = tauri::async_runtime::spawn_blocking(move || fingerprint(&paths))
         .await
@@ -334,8 +336,30 @@ pub(crate) fn start(app: tauri::AppHandle) {
     });
 }
 
+/// A successful Git backup also needs an encrypted database backup.
+pub(crate) fn schedule_pair<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(auto) = app.try_state::<AutoUpload>() {
+        if let Ok(mut tracker) = auto.0.lock() {
+            tracker.pending = true;
+            tracker.changed_at = Instant::now().checked_sub(QUIET);
+            tracker.retry_at = None;
+        }
+    }
+}
+
 pub(crate) async fn close_upload<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> bool {
     tokio::time::timeout(CLOSE_TIMEOUT, async move {
+        let state = app.state::<AppState>();
+        match enabled(&state.paths.database_path) {
+            Ok(false) => return true,
+            Err(_) => return false,
+            Ok(true) => (),
+        }
+        match object_store::load_config(&state.paths.data_root) {
+            Ok(None) => return true,
+            Err(_) => return false,
+            Ok(Some(_)) => (),
+        }
         loop {
             let running = app
                 .state::<AutoUpload>()
@@ -348,10 +372,16 @@ pub(crate) async fn close_upload<R: tauri::Runtime>(app: tauri::AppHandle<R>) ->
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        attempt(app, true).await;
+        schedule_pair(&app);
+        attempt(app.clone(), true).await;
+        app.state::<AutoUpload>()
+            .0
+            .lock()
+            .map(|tracker| !tracker.running && !tracker.pending && tracker.failures == 0)
+            .unwrap_or(false)
     })
     .await
-    .is_ok()
+    .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -364,6 +394,22 @@ pub(crate) fn expedite(auto: &AutoUpload) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_recovery_key_is_visible_as_retry_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("momso.db");
+        crate::storage::initialize(&db, &temp.path().join("backups"), "test").unwrap();
+        let error = match crate::object_store_transfer::identity(&db) {
+            Err(error) => error,
+            Ok(_) => panic!("new profile must not already have a recovery key"),
+        };
+        let mut tracker = Tracker::default();
+        complete(&mut tracker, Err(error), Instant::now());
+        let value = serde_json::to_value(status(true, true, &tracker)).unwrap();
+        assert_eq!(value["state"], "retry_pending");
+        assert_eq!(value["reason"], "recovery_key_missing");
+    }
 
     #[test]
     fn batches_and_retries_with_exponential_backoff() {

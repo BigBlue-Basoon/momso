@@ -119,6 +119,9 @@ mod object_store_lock;
 mod object_store_restore;
 mod object_store_state;
 mod object_store_transfer;
+mod paired_backup;
+mod paired_git_store;
+mod paired_restore;
 mod permission_modes;
 mod process;
 mod provider_auth;
@@ -3826,6 +3829,8 @@ pub fn run() {
             object_store_restore::object_store_verify,
             object_store_state::app_state_backup,
             object_store_state::app_state_restore,
+            object_store_state::app_state_restore_use_backup,
+            object_store_state::app_state_restore_keep_current,
             chat_import_export,
             chat_import_export_preview,
             chat_import_export_progress,

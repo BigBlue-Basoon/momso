@@ -49,6 +49,29 @@ class Store:
     def write(self, slot, content):
         (root / ("slot-" + str(slot))).write_bytes(content)
 
+    def read_versioned(self, slot):
+        path = root / ("slot-" + str(slot))
+        if not path.exists():
+            return None
+        content = path.read_bytes()
+        return hashlib.sha256(content).hexdigest(), content
+
+    def create_slot_if_absent(self, slot, content):
+        with (root / ("slot-" + str(slot))).open("xb") as file:
+            file.write(content)
+
+    def replace_if_generation(self, slot, generation, content):
+        current = self.read_versioned(slot)
+        if current is None or current[0] != generation:
+            raise ValueError("generation changed")
+        self.write(slot, content)
+
+    def delete_slot_if_generation(self, slot, generation):
+        current = self.read_versioned(slot)
+        if current is None or current[0] != generation:
+            raise ValueError("generation changed")
+        (root / ("slot-" + str(slot))).unlink()
+
     def write_chunk(self, identifier, index, content):
         with (root / (identifier + "-" + str(index))).open("xb") as file:
             file.write(content)

@@ -1,7 +1,7 @@
 import json
 import unittest
 from pathlib import Path
-from momso_anywhere_iam_pc import remove_installation_bindings
+from momso_anywhere_iam_pc import remove_installation_bindings, inspect_installation_bindings
 
 
 class Provider:
@@ -18,6 +18,7 @@ class Provider:
         if args[:3] == ('compute', 'instances', 'list'): return [{'name': 'momso-' + self.install_id, 'labels': {'momso-install-id': self.install_id}}]
         if args[:3] == ('run', 'services', 'list'): return [{'metadata': {'name': 'momso-any-' + self.install_id, 'labels': {'momso-install-id': self.install_id}}}]
         if args[:3] == ('storage', 'buckets', 'list'): return [{'name': 'momso-backup-' + self.install_id}]
+        if args[:2] == ('storage', 'ls'): return b'[]'
         if args[:3] == ('storage', 'buckets', 'describe'): return {'labels': {'momso-install-id': self.install_id}}
         if args[:2] == ('secrets', 'list'): return [{'name': 'projects/x/secrets/momso-vault-' + self.install_id, 'labels': {'momso-install-id': self.install_id}}]
         if args[:3] == ('kms', 'keyrings', 'list'): return [{'name': 'projects/x/locations/x/keyRings/momso-backup-' + self.install_id}]
@@ -33,6 +34,28 @@ class Provider:
 
 
 class Tests(unittest.TestCase):
+    def test_inventory_rechecks_project_bucket_keyring_key_and_secret(self):
+        p = Provider()
+        found = inspect_installation_bindings(p)
+        self.assertEqual(len(found), 7)
+        calls = [call for call in p.calls if 'get-iam-policy' in call]
+        self.assertEqual(len(calls), 7)
+        self.assertTrue(any(call[:3] == ('storage', 'buckets', 'get-iam-policy') for call in calls))
+        self.assertTrue(any(call[:3] == ('kms', 'keys', 'get-iam-policy') for call in calls))
+        self.assertTrue(any(call[:2] == ('secrets', 'get-iam-policy') for call in calls))
+        self.assertFalse(any('set-iam-policy' in call for call in p.calls))
+
+    def test_soft_deleted_bucket_policy_is_not_claimed_absent(self):
+        p = Provider(); original = p.run
+        def run(*args, **kwargs):
+            if args[:2] == ('storage', 'ls'):
+                return json.dumps([{'metadata': {'name': 'momso-backup-' + p.install_id}}]).encode()
+            return original(*args, **kwargs)
+        p.run = run
+        with self.assertRaisesRegex(ValueError, 'soft_deleted_bucket_policy_unavailable') as caught:
+            inspect_installation_bindings(p)
+        self.assertTrue(caught.exception.found)
+        self.assertFalse(any('set-iam-policy' in call for call in p.calls))
     def test_policy_removal_is_verified_for_each_owned_resource(self):
         p = Provider(); remove_installation_bindings(p)
         self.assertEqual(len(p.policies), 8)

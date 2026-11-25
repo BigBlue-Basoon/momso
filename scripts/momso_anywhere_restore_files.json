@@ -1,0 +1,7 @@
+[
+  "momso_anywhere_backup.py",
+  "momso_anywhere_backup_agent.py",
+  "momso_anywhere_backup_google.py",
+  "momso_anywhere_vault_identity.py",
+  "momso_anywhere_prestart_restore.py"
+]

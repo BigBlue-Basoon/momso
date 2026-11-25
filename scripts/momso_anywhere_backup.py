@@ -18,7 +18,7 @@ import tarfile
 import tempfile
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path, PurePosixPath
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -33,6 +33,43 @@ DATABASE_AND_VAULT = (
     "provider-credentials/claude/vault.age", "provider-credentials/gemini/vault.age",
     "codex/auth.json", "github-repository.json", "chat-export-journal.json",
 )
+
+
+@contextmanager
+def reserve_large_write(data_dir, requested_bytes):
+    """Share the server's nonblocking, crash-released large-write reservation."""
+    import fcntl
+    root = Path(data_dir)
+    if type(requested_bytes) is not int or requested_bytes < 0 or requested_bytes > 2**64 - 1:
+        raise ValueError("reservation_unavailable")
+    owner = root.stat().st_uid
+    files = []
+    try:
+        for name in (".momso-reservation-state.lock", ".momso-reservation-operation.lock"):
+            try:
+                fd = os.open(root / name, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+            except OSError:
+                raise ValueError("reservation_unavailable") from None
+            file = os.fdopen(fd, "r+b", buffering=0); files.append(file)
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_uid != owner or metadata.st_mode & 0o077:
+                raise ValueError("reservation_unavailable")
+        state, operation = files
+        try:
+            fcntl.flock(state.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(operation.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("reservation_busy") from None
+        if shutil.disk_usage(root).free < 1536 * 1024 * 1024 + requested_bytes:
+            raise ValueError("disk_low")
+        operation.seek(0); operation.truncate(0)
+        value = (str(requested_bytes) + "\n").encode("ascii")
+        if operation.write(value) != len(value): raise ValueError("reservation_unavailable")
+        os.fsync(operation.fileno())
+        fcntl.flock(state.fileno(), fcntl.LOCK_UN)
+        yield
+    finally:
+        for file in reversed(files): file.close()
 
 
 def _relative(name):
@@ -129,6 +166,32 @@ def stage_live_snapshot(data_dir, target):
                 else:
                     shutil.copyfile(src, dst, follow_symlinks=False)
     return memory_files
+
+
+def estimate_snapshot_reservation(data_dir):
+    """Bound space for frozen inputs and a verified local restore of those inputs."""
+    root = Path(data_dir)
+    total = 0
+    for name in DATABASE_AND_VAULT:
+        path = _safe_path(root, name)
+        if path.exists():
+            total += path.stat().st_size
+        if name.endswith((".sqlite", ".sqlite3", ".db")):
+            wal = _safe_path(root, name + "-wal")
+            if wal.exists():
+                total += wal.stat().st_size
+    for name in ("archive/objects/sha256", "attachments/upload-staging"):
+        source = _safe_path(root, name)
+        if not source.exists():
+            continue
+        for directory, directories, files in os.walk(source, followlinks=False):
+            for entry in directories + files:
+                path = Path(directory) / entry
+                if path.is_symlink():
+                    raise ValueError("unsafe backup input")
+                if path.is_file():
+                    total += path.stat().st_size
+    return total * 3 + 64 * 1024 * 1024
 
 
 def _pack(files):
@@ -393,7 +456,7 @@ def _snapshot_paths(data_dir, temporary, names):
     return result
 
 
-def _backup_v3(data_dir, archive, store, key_service, names, vault_identity, memory_files=None, preserve_existing_slots=False, protected_slot=None):
+def _backup_v3(data_dir, archive, store, key_service, names, vault_identity, memory_files=None, preserve_existing_slots=False, protected_slot=None, temp_root=None):
     purged = read_purged_ledger(store, key_service)
     latest = _latest(store)
     previous_payload = _decrypt(store.read(latest[1]), key_service) if latest else None
@@ -461,7 +524,7 @@ def _backup_v3(data_dir, archive, store, key_service, names, vault_identity, mem
         if previous_payload and hashlib.sha256(previous_payload).digest() == hashlib.sha256(payload).digest():
             return "unchanged"
         _stage_and_rotate(store, key_service, names, _encrypt(payload, key_service),
-                          preserve_existing_slots, protected_slot)
+                          preserve_existing_slots, protected_slot, temp_root)
         return "uploaded"
 
 
@@ -733,7 +796,7 @@ def _latest(store):
     return max(present) if present else None
 
 
-def _finish_staged_backup(store, key_service, names, preserve_existing_slots=False, protected_slot=None):
+def _finish_staged_backup(store, key_service, names, preserve_existing_slots=False, protected_slot=None, temp_root=None):
     """Adopt the temporary slot without overwriting any existing generation."""
     staged = store.read_versioned(SLOT_COUNT)
     if staged is None:
@@ -743,7 +806,7 @@ def _finish_staged_backup(store, key_service, names, preserve_existing_slots=Fal
     generation, blob = staged
     present = [(store.modified(i), i) for i in range(SLOT_COUNT)]
     try:
-        verify_backup_blob(blob, store, key_service, names)
+        verify_backup_blob(blob, store, key_service, names, temp_root=temp_root)
         if store.read_versioned(SLOT_COUNT) != staged:
             raise ValueError("backup_changed")
     except Exception:
@@ -780,11 +843,11 @@ def _finish_staged_backup(store, key_service, names, preserve_existing_slots=Fal
     return target
 
 
-def _stage_and_rotate(store, key_service, names, blob, preserve_existing_slots=False, protected_slot=None):
+def _stage_and_rotate(store, key_service, names, blob, preserve_existing_slots=False, protected_slot=None, temp_root=None):
     if store.read_versioned(SLOT_COUNT) is not None:
         raise ValueError("backup_stage_not_recovered")
     store.create_slot_if_absent(SLOT_COUNT, blob)
-    _finish_staged_backup(store, key_service, names, preserve_existing_slots, protected_slot)
+    _finish_staged_backup(store, key_service, names, preserve_existing_slots, protected_slot, temp_root)
 
 
 def select_restore_candidate(store, key_service, names=DATABASE_AND_VAULT):
@@ -1176,9 +1239,9 @@ def backup(data_dir, store, key_service, names, temp_root=None, vault_identity=N
     data_dir = Path(data_dir)
     if archive is not None and not quiescent:
         raise ValueError("quiescence_required")
-    _finish_staged_backup(store, key_service, names, preserve_existing_slots, protected_slot)
+    _finish_staged_backup(store, key_service, names, preserve_existing_slots, protected_slot, temp_root)
     if archive is not None:
-        return _backup_v3(data_dir, Path(archive), store, key_service, names, vault_identity, memory_files, preserve_existing_slots, protected_slot)
+        return _backup_v3(data_dir, Path(archive), store, key_service, names, vault_identity, memory_files, preserve_existing_slots, protected_slot, temp_root)
     with tempfile.TemporaryDirectory(prefix="momso-backup-", dir=temp_root) as tmp:
         files = _snapshot(data_dir, Path(tmp), names)
         latest = _latest(store)
@@ -1202,7 +1265,7 @@ def backup(data_dir, store, key_service, names, temp_root=None, vault_identity=N
             if hashlib.sha256(previous_payload).digest() == hashlib.sha256(payload).digest():
                 return "unchanged"
         _stage_and_rotate(store, key_service, names, _encrypt(payload, key_service),
-                          preserve_existing_slots, protected_slot)
+                          preserve_existing_slots, protected_slot, temp_root)
         return "uploaded"
 
 

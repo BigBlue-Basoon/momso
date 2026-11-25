@@ -22,13 +22,76 @@ pub(crate) struct AppStateRestoreResult {
     state: &'static str,
     snapshot_at: String,
     safety_backup_created: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_id: Option<String>,
 }
 
-async fn backup_snapshot(
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AppStateKeepResult {
+    state: &'static str,
+}
+
+type RestoreCandidate = (
+    tempfile::NamedTempFile,
+    String,
+    Option<crate::paired_backup::CompletedPair>,
+);
+
+fn choose_restore_candidate(
+    object: Result<RestoreCandidate, &'static str>,
+    git: Result<RestoreCandidate, &'static str>,
+) -> Result<(RestoreCandidate, bool), &'static str> {
+    match (object, git) {
+        (Ok(object), Ok(git)) => {
+            let object_time =
+                chrono::DateTime::parse_from_rfc3339(&object.1).map_err(|_| "invalid_snapshot")?;
+            let git_time =
+                chrono::DateTime::parse_from_rfc3339(&git.1).map_err(|_| "invalid_snapshot")?;
+            if git_time > object_time {
+                Ok((git, false))
+            } else {
+                Ok((object, true))
+            }
+        }
+        (Ok(_), Err("local_write_failed")) | (Err("local_write_failed"), Ok(_)) => {
+            Err("local_write_failed")
+        }
+        (Ok(_), Err("local_read_failed")) | (Err("local_read_failed"), Ok(_)) => {
+            Err("local_read_failed")
+        }
+        (Ok(object), Err(_)) => Ok((object, true)),
+        (Err(_), Ok(git)) => Ok((git, false)),
+        (Err(object_error), Err(_)) => Err(object_error),
+    }
+}
+
+pub(crate) async fn backup_snapshot(
     config: &object_store::Config,
     keys: &object_store::Keys,
     identity: &x25519::Identity,
     paths: &RuntimePaths,
+) -> Result<transfer::Manifest, &'static str> {
+    backup_snapshot_inner(config, keys, identity, paths, false, false).await
+}
+
+pub(crate) async fn backup_paired_snapshot(
+    config: &object_store::Config,
+    keys: &object_store::Keys,
+    identity: &x25519::Identity,
+    paths: &RuntimePaths,
+    paired: bool,
+) -> Result<transfer::Manifest, &'static str> {
+    backup_snapshot_inner(config, keys, identity, paths, true, paired).await
+}
+
+async fn backup_snapshot_inner(
+    config: &object_store::Config,
+    keys: &object_store::Keys,
+    identity: &x25519::Identity,
+    paths: &RuntimePaths,
+    verify_originals: bool,
+    paired: bool,
 ) -> Result<transfer::Manifest, &'static str> {
     let temp = tempfile::Builder::new()
         .prefix("momso-state-")
@@ -38,6 +101,10 @@ async fn backup_snapshot(
     storage::create_snapshot_file(&paths.database_path, &snapshot)
         .map_err(|_| "snapshot_failed")?;
     storage::sanitize_user_owned_backup_snapshot(&snapshot).map_err(|_| "snapshot_failed")?;
+    if verify_originals {
+        crate::paired_backup::verify_referenced_originals(config, keys, identity, &snapshot)
+            .await?;
+    }
     let stage = paths
         .data_root
         .join("object-store-staging")
@@ -48,7 +115,11 @@ async fn backup_snapshot(
         identity,
         transfer::UploadSpec {
             source: &snapshot,
-            relative: "momso.db",
+            relative: if paired {
+                "paired-momso.db"
+            } else {
+                "momso.db"
+            },
             kind: "app_state",
             stage: &stage,
         },
@@ -115,15 +186,163 @@ fn preserve_recovery_identity_with(
     }
 }
 
-#[cfg(test)]
-fn apply_snapshot(snapshot: &Path, paths: &RuntimePaths) -> Result<PathBuf, &'static str> {
-    apply_snapshot_with_progress(snapshot, paths, None)
+/// Refuse a replacement that would discard local user records absent from the backup.
+/// An empty initial chat is allowed; imported records already in the snapshot are safe.
+fn ensure_local_content_preserved(local: &Path, snapshot: &Path) -> Result<(), &'static str> {
+    let db = Connection::open_with_flags(local, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "restore_failed")?;
+    let snapshot = snapshot.to_str().ok_or("invalid_snapshot")?;
+    db.execute("ATTACH DATABASE ?1 AS incoming", [snapshot])
+        .map_err(|_| "invalid_snapshot")?;
+    let chats = "SELECT id,title,group_id,pinned_order,archived_at FROM main.chats c \
+        WHERE title<>'' OR group_id IS NOT NULL OR pinned_order IS NOT NULL \
+        OR archived_at IS NOT NULL OR EXISTS(SELECT 1 FROM main.chat_messages m WHERE m.chat_id=c.id) \
+        EXCEPT SELECT id,title,group_id,pinned_order,archived_at FROM incoming.chats";
+    let conflict: bool = db
+        .query_row(&format!("SELECT EXISTS({chats})"), [], |row| row.get(0))
+        .map_err(|_| "local_data_conflict")?;
+    if conflict {
+        #[cfg(test)]
+        {
+            for (label, condition) in [
+                ("missing", "incoming.id IS NULL"),
+                ("title", "local.title IS NOT incoming.title"),
+                ("group", "local.group_id IS NOT incoming.group_id"),
+                ("pin", "local.pinned_order IS NOT incoming.pinned_order"),
+                ("archive", "local.archived_at IS NOT incoming.archived_at"),
+            ] {
+                let sql = format!("SELECT count(*) FROM main.chats local LEFT JOIN incoming.chats incoming ON local.id=incoming.id WHERE (local.title<>'' OR local.group_id IS NOT NULL OR local.pinned_order IS NOT NULL OR local.archived_at IS NOT NULL OR EXISTS(SELECT 1 FROM main.chat_messages m WHERE m.chat_id=local.id)) AND {condition}");
+                eprintln!(
+                    "restore comparison chats {label}: {}",
+                    db.query_row(&sql, [], |row| row.get::<_, i64>(0))
+                        .unwrap_or(-1)
+                );
+            }
+        }
+        return Err("local_data_conflict");
+    }
+    // Git chat copies redact secret-shaped text. A matching redacted copy on
+    // the new PC is represented by the original in the encrypted snapshot.
+    let columns = db
+        .prepare("PRAGMA main.table_info(chat_messages)")
+        .and_then(|mut statement| {
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|_| "restore_failed")?;
+    let columns = columns
+        .iter()
+        .filter(|column| column.as_str() != "text")
+        .map(|column| format!("\"{}\"", column.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let differs: bool = db
+        .query_row(
+            &format!("SELECT EXISTS(SELECT {columns} FROM main.chat_messages EXCEPT SELECT {columns} FROM incoming.chat_messages)"),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|_| "local_data_conflict")?;
+    if differs {
+        #[cfg(test)]
+        eprintln!("restore comparison: message metadata differs");
+        return Err("local_data_conflict");
+    }
+    let mut messages = db
+        .prepare("SELECT local.text,backup.text FROM main.chat_messages local JOIN incoming.chat_messages backup ON local.id=backup.id WHERE local.text<>backup.text")
+        .map_err(|_| "local_data_conflict")?;
+    let rows = messages
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| "local_data_conflict")?;
+    for row in rows {
+        let (local, backup) = row.map_err(|_| "local_data_conflict")?;
+        if crate::chat_archive_redact::redact(&backup).text != local {
+            #[cfg(test)]
+            eprintln!("restore comparison: message text differs");
+            return Err("local_data_conflict");
+        }
+    }
+    ensure_tables_preserved(
+        &db,
+        &[
+            "chat_groups",
+            "chat_attachments",
+            "chat_imports",
+            "media_generation",
+            "generated_output_turns",
+            "momso_source_assets",
+            "momso_records",
+            "momso_record_versions",
+            "momso_record_bodies",
+            "momso_record_source_assets",
+            "momso_transcription_terms",
+        ],
+    )
 }
 
-fn apply_snapshot_with_progress(
+fn ensure_tables_preserved(db: &Connection, tables: &[&str]) -> Result<(), &'static str> {
+    for table in tables {
+        let has_local: bool = db
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM main.{table})"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "restore_failed")?;
+        if !has_local {
+            continue;
+        }
+        let differs: bool = db
+            .query_row(
+                &format!("SELECT EXISTS(SELECT * FROM main.{table} EXCEPT SELECT * FROM incoming.{table})"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "local_data_conflict")?;
+        if differs {
+            #[cfg(test)]
+            eprintln!("restore comparison: {table} differs");
+            return Err("local_data_conflict");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_nonchat_content_preserved(
+    local: &Path,
+    snapshot: &Path,
+) -> Result<(), &'static str> {
+    let db = Connection::open_with_flags(local, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "restore_failed")?;
+    let snapshot = snapshot.to_str().ok_or("invalid_snapshot")?;
+    db.execute("ATTACH DATABASE ?1 AS incoming", [snapshot])
+        .map_err(|_| "invalid_snapshot")?;
+    ensure_tables_preserved(
+        &db,
+        &[
+            "media_generation",
+            "generated_output_turns",
+            "momso_source_assets",
+            "momso_records",
+            "momso_record_versions",
+            "momso_record_bodies",
+            "momso_record_source_assets",
+            "momso_transcription_terms",
+        ],
+    )
+}
+
+#[cfg(test)]
+fn apply_snapshot(snapshot: &Path, paths: &RuntimePaths) -> Result<PathBuf, &'static str> {
+    apply_snapshot_with_callback(snapshot, paths, |_| {})
+}
+
+fn apply_snapshot_with_progress<R: tauri::Runtime>(
     snapshot: &Path,
     paths: &RuntimePaths,
-    app: Option<&tauri::AppHandle>,
+    app: Option<&tauri::AppHandle<R>>,
 ) -> Result<PathBuf, &'static str> {
     let result = apply_snapshot_with_callback(snapshot, paths, |progress| {
         use tauri::Emitter;
@@ -212,37 +431,194 @@ pub(crate) async fn app_state_restore(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AppStateRestoreResult, &'static str> {
+    restore_with_choice(app, state, false).await
+}
+
+/// The user explicitly chose the backup after seeing a conflict. The existing
+/// database is retained by `restore_snapshot_file_with_hook` before replacement.
+#[tauri::command]
+pub(crate) async fn app_state_restore_use_backup(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AppStateRestoreResult, &'static str> {
+    restore_with_choice(app, state, true).await
+}
+
+#[tauri::command]
+pub(crate) fn app_state_restore_keep_current() -> AppStateKeepResult {
+    AppStateKeepResult { state: "kept" }
+}
+
+pub(crate) async fn restore_with_choice<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    use_backup: bool,
+) -> Result<AppStateRestoreResult, &'static str> {
     let location = state.paths.archive.current.clone().write_owned().await;
+    let active = state.chat_active.clone().lock_owned().await;
+    if !active.is_empty() {
+        return Err("restore_busy");
+    }
     let mut paths = state.paths.clone();
     paths.objects_path = location.join("objects");
     if crate::archive_remote::first_receive_pending(&location, &paths.database_path) {
         return Err("first_receive_in_progress");
     }
     let _guard = object_store::CONNECTION_LOCK.lock().await;
-    let config = object_store::load_config(&paths.data_root)?.ok_or("not_connected")?;
-    let keys = object_store::load_keys(&config)?;
     let identity = transfer::identity(&paths.database_path)?;
-    let (snapshot, manifest) = download_latest_snapshot(&config, &keys, &identity, &paths).await?;
-    let class_snapshot =
-        crate::class_student_backup::download(&config, &keys, &identity, &paths).await?;
+    let (snapshot, snapshot_at, pair, class_snapshot) =
+        match object_store::load_config(&paths.data_root)? {
+            Some(config) => {
+                let keys = object_store::load_keys(&config)?;
+                let object = crate::paired_backup::download_for_restore(
+                    &app, &paths, &config, &keys, &identity, use_backup,
+                )
+                .await
+                .map(|(snapshot, manifest, pair)| {
+                    let at = pair
+                        .as_ref()
+                        .map_or(manifest.created_at, |pair| pair.created_at.clone());
+                    (snapshot, at, pair)
+                });
+                let git = match crate::archive_remote::paired_git_context_for_restore(
+                    &app,
+                    &location,
+                    &paths.database_path,
+                    !use_backup,
+                ) {
+                    Ok((tool, target, _)) => match crate::paired_git_store::download(
+                        &tool, &location, &target, &paths, &identity,
+                    ) {
+                        Ok((snapshot, pair)) => {
+                            match crate::paired_backup::verify_referenced_originals(
+                                &config,
+                                &keys,
+                                &identity,
+                                snapshot.path(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    let at = pair.created_at.clone();
+                                    Ok((snapshot, at, Some(pair)))
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => Err(error),
+                };
+                let ((snapshot, at, pair), object_selected) =
+                    choose_restore_candidate(object, git)?;
+                let class_snapshot = if object_selected {
+                    crate::class_student_backup::download(&config, &keys, &identity, &paths).await?
+                } else {
+                    None
+                };
+                (snapshot, at, pair, class_snapshot)
+            }
+            None => {
+                let (tool, target, _) = crate::archive_remote::paired_git_context_for_restore(
+                    &app,
+                    &location,
+                    &paths.database_path,
+                    !use_backup,
+                )?;
+                let (snapshot, pair) = crate::paired_git_store::download(
+                    &tool, &location, &target, &paths, &identity,
+                )?;
+                let at = pair.created_at.clone();
+                (snapshot, at, Some(pair), None)
+            }
+        };
     preserve_recovery_identity(snapshot.path(), &identity)?;
+    let mut switch = None;
+    if let Some(pair) = &pair {
+        let (tool, _, head) = crate::archive_remote::paired_git_context_for_restore(
+            &app,
+            &location,
+            &paths.database_path,
+            !use_backup,
+        )?;
+        if head != pair.git_revision {
+            if !use_backup {
+                let db = Connection::open_with_flags(
+                    &paths.database_path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .map_err(|_| "local_state_unavailable")?;
+                let received: Option<String> = db
+                    .query_row(
+                        "SELECT value FROM app_runtime_meta WHERE key='paired_first_receive_head'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| "local_state_unavailable")?;
+                if received.as_deref() != Some(head.as_str()) {
+                    return Err("local_data_conflict");
+                }
+                ensure_nonchat_content_preserved(&paths.database_path, snapshot.path())?;
+            }
+            switch = Some((tool, head, pair.git_revision.clone()));
+        }
+    }
+    if !use_backup && switch.is_none() {
+        ensure_local_content_preserved(&paths.database_path, snapshot.path())?;
+    }
     let class_root = paths.data_root.clone();
+    let restore_paths = paths.clone();
+    let restore_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        apply_snapshot_with_progress(snapshot.path(), &paths, Some(&app))
+        // These owned guards stay with the blocking work even if the command
+        // is cancelled while Git or SQLite is being changed.
+        let _active = active;
+        let root = location;
+        let rollback = if let Some((tool, head, target)) = switch {
+            let journal = crate::paired_restore::begin(
+                &tool,
+                &root,
+                &restore_paths,
+                &head,
+                &target,
+                use_backup,
+            )?;
+            Some((tool, journal))
+        } else {
+            None
+        };
+        let result =
+            apply_snapshot_with_progress(snapshot.path(), &restore_paths, Some(&restore_app))
+                .map(|_| ())
+                .and_then(|()| {
+                    if let Some(file) = class_snapshot {
+                        crate::class_student_backup::install(file, &class_root)?;
+                    }
+                    Ok(())
+                });
+        if let Err(error) = result {
+            if let Some((tool, journal)) = &rollback {
+                crate::paired_restore::rollback(tool, &root, &restore_paths, journal)?;
+            }
+            return Err(error);
+        }
+        if rollback.is_some() {
+            crate::paired_restore::finish(&restore_paths)?;
+        }
+        Ok(())
     })
     .await
     .map_err(|_| "restore_failed")??;
-    if let Some(file) = class_snapshot {
-        crate::class_student_backup::install(file, &class_root)?;
-    }
     Ok(AppStateRestoreResult {
         state: "restored",
-        snapshot_at: manifest.created_at,
+        snapshot_at,
         safety_backup_created: true,
+        bundle_id: pair.map(|pair| pair.pair_id),
     })
 }
 
-async fn download_latest_snapshot(
+pub(crate) async fn download_latest_snapshot(
     config: &object_store::Config,
     keys: &object_store::Keys,
     identity: &x25519::Identity,
@@ -283,6 +659,208 @@ mod tests {
             Arc, Mutex,
         },
     };
+
+    #[test]
+    fn restore_selects_newest_complete_storage_candidate() {
+        let object = (
+            tempfile::NamedTempFile::new().unwrap(),
+            "2026-01-01T00:00:00Z".into(),
+            None,
+        );
+        let git = (
+            tempfile::NamedTempFile::new().unwrap(),
+            "2026-01-02T00:00:00Z".into(),
+            None,
+        );
+        let (selected, object_selected) = choose_restore_candidate(Ok(object), Ok(git)).unwrap();
+        assert!(!object_selected);
+        assert_eq!(selected.1, "2026-01-02T00:00:00Z");
+        let older = (
+            tempfile::NamedTempFile::new().unwrap(),
+            "2026-01-01T00:00:00Z".into(),
+            None,
+        );
+        let (_, object_selected) =
+            choose_restore_candidate(Ok(older), Err("backup_pair_incomplete")).unwrap();
+        assert!(object_selected);
+    }
+
+    #[test]
+    fn restore_refuses_distinct_local_conversation_without_replacing_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("local.db");
+        let backups = temp.path().join("backups");
+        storage::initialize(&database, &backups, "test").unwrap();
+        let blank = crate::chat::create(&database).unwrap();
+        let blank_id = serde_json::to_value(blank).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let snapshot = temp.path().join("snapshot.db");
+        storage::create_snapshot_file(&database, &snapshot).unwrap();
+        assert_eq!(ensure_local_content_preserved(&database, &snapshot), Ok(()));
+        crate::chat::append(
+            &database,
+            &blank_id,
+            crate::chat::Role::User,
+            "local unsaved message",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            ensure_local_content_preserved(&database, &snapshot),
+            Err("local_data_conflict")
+        );
+        let chat = serde_json::to_value(crate::chat::read(&database, &blank_id).unwrap()).unwrap();
+        assert_eq!(chat["messages"][0]["text"], "local unsaved message");
+    }
+
+    #[test]
+    fn restore_allows_local_content_already_in_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("local.db");
+        let backups = temp.path().join("backups");
+        storage::initialize(&database, &backups, "test").unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&database).unwrap()).unwrap();
+        let id = chat["id"].as_str().unwrap();
+        crate::chat::append(
+            &database,
+            id,
+            crate::chat::Role::User,
+            "same message",
+            None,
+            None,
+        )
+        .unwrap();
+        let snapshot = temp.path().join("snapshot.db");
+        storage::create_snapshot_file(&database, &snapshot).unwrap();
+        assert_eq!(ensure_local_content_preserved(&database, &snapshot), Ok(()));
+        // The untouched empty chat made on a fresh installation is not a conflict.
+        crate::chat::create(&database).unwrap();
+        assert_eq!(ensure_local_content_preserved(&database, &snapshot), Ok(()));
+    }
+
+    #[test]
+    fn restore_accepts_redacted_git_copy_but_rejects_changed_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("local.db");
+        storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&database).unwrap()).unwrap();
+        let id = chat["id"].as_str().unwrap();
+        let original = format!("sk-proj-{}", "Z".repeat(30));
+        crate::chat::append(
+            &database,
+            id,
+            crate::chat::Role::User,
+            &original,
+            None,
+            None,
+        )
+        .unwrap();
+        let snapshot = temp.path().join("snapshot.db");
+        storage::create_snapshot_file(&database, &snapshot).unwrap();
+        let db = storage::open_writable_connection(&database).unwrap();
+        db.execute(
+            "UPDATE chat_messages SET text=?1 WHERE chat_id=?2",
+            rusqlite::params![crate::chat_archive_redact::redact(&original).text, id],
+        )
+        .unwrap();
+        assert_eq!(ensure_local_content_preserved(&database, &snapshot), Ok(()));
+        db.execute(
+            "UPDATE chat_messages SET text='different message' WHERE chat_id=?1",
+            [id],
+        )
+        .unwrap();
+        assert_eq!(
+            ensure_local_content_preserved(&database, &snapshot),
+            Err("local_data_conflict")
+        );
+    }
+
+    #[test]
+    fn restore_refuses_distinct_local_asset_without_replacing_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("local.db");
+        storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
+        let snapshot = temp.path().join("snapshot.db");
+        storage::create_snapshot_file(&database, &snapshot).unwrap();
+        let hash = "a".repeat(64);
+        let db = storage::open_writable_connection(&database).unwrap();
+        db.execute(
+            "INSERT INTO momso_source_assets(id,asset_kind,content_sha256,byte_length,storage_relative_path,original_file_name,captured_by,created_at) VALUES('asset','other',?1,1,?2,'local.txt','fixture','now')",
+            rusqlite::params![hash, format!("sha256/aa/{hash}")],
+        ).unwrap();
+        drop(db);
+        assert_eq!(
+            ensure_local_content_preserved(&database, &snapshot),
+            Err("local_data_conflict")
+        );
+        let db = storage::open_writable_connection(&database).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT original_file_name FROM momso_source_assets WHERE id='asset'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "local.txt"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_database_without_touching_local_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("local.db");
+        storage::initialize(&database, &temp.path().join("backups"), "test").unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&database).unwrap()).unwrap();
+        let id = chat["id"].as_str().unwrap();
+        crate::chat::append(
+            &database,
+            id,
+            crate::chat::Role::User,
+            "preserved",
+            None,
+            None,
+        )
+        .unwrap();
+        let corrupt = temp.path().join("corrupt.db");
+        fs::write(&corrupt, b"not a sqlite snapshot").unwrap();
+        assert!(storage::validate_snapshot_file(&corrupt).is_err());
+        let result = serde_json::to_value(crate::chat::read(&database, id).unwrap()).unwrap();
+        assert_eq!(result["messages"][0]["text"], "preserved");
+    }
+
+    #[test]
+    fn restore_choice_preserves_old_database_and_keep_is_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("local.db");
+        let backups = temp.path().join("backups");
+        storage::initialize(&database, &backups, "test").unwrap();
+        let backup = temp.path().join("snapshot.db");
+        storage::create_snapshot_file(&database, &backup).unwrap();
+        let chat = serde_json::to_value(crate::chat::create(&database).unwrap()).unwrap();
+        let id = chat["id"].as_str().unwrap();
+        crate::chat::append(&database, id, crate::chat::Role::User, "local", None, None).unwrap();
+        assert_eq!(
+            ensure_local_content_preserved(&database, &backup),
+            Err("local_data_conflict")
+        );
+        assert_eq!(
+            serde_json::to_value(app_state_restore_keep_current()).unwrap()["state"],
+            "kept"
+        );
+        assert!(crate::chat::read(&database, id).is_ok());
+        let safety =
+            storage::restore_snapshot_file_with_hook(&backup, &database, &backups, || Ok(()))
+                .unwrap();
+        assert!(crate::chat::read(&database, id).is_err());
+        assert_eq!(
+            serde_json::to_value(crate::chat::read(&safety, id).unwrap()).unwrap()["messages"][0]
+                ["text"],
+            "local"
+        );
+    }
 
     #[tokio::test]
     async fn old_app_snapshot_preserves_a_deleted_chat_marker() {
@@ -862,7 +1440,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
 '{"method":"item/agentMessage/delta","params":{"delta":"hello teacher"}}'
 '{"method":"turn/completed","params":{"turn":{"status":"completed"}}}'
 "#).unwrap();
-        let mut command = tokio::process::Command::new("powershell.exe");
+        let mut command = crate::process::hidden_async_command("powershell.exe");
         command
             .args(["-NoProfile", "-NonInteractive", "-File"])
             .arg(&script)
@@ -1375,6 +1953,9 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         )
         .unwrap();
         let profile = crate::backup_profile::ensure(&paths.database_path).unwrap();
+        let aligned_snapshot = root.join("same-point-in-time.db");
+        storage::create_snapshot_file(&paths.database_path, &aligned_snapshot).unwrap();
+        storage::sanitize_user_owned_backup_snapshot(&aligned_snapshot).unwrap();
         let db = storage::open_writable_connection(&paths.database_path).unwrap();
         db.execute("INSERT INTO app_runtime_meta(key,value,updated_at) VALUES('test_state','before','now')", []).unwrap();
         db.execute(
@@ -1394,6 +1975,10 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let objects = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::new()));
+        let folder_backed = provider == "s3_compatible";
+        let object_folder = root.join("fixture-object-backup");
+        fs::create_dir_all(&object_folder).unwrap();
+        let server_folder = object_folder.clone();
         let remote = Arc::clone(&objects);
         let stopped = Arc::new(AtomicBool::new(false));
         let reconnected = Arc::new(AtomicBool::new(false));
@@ -1514,12 +2099,28 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
                 } else if method == "PUT" {
                     let mut data = remote.lock().unwrap();
                     assert!(!data.contains_key(key) || key.contains("/class-student/slot-"));
-                    data.insert(key.to_owned(), received[end..end + length].to_vec());
+                    let value = received[end..end + length].to_vec();
+                    if folder_backed {
+                        let path = server_folder.join(key);
+                        fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        fs::write(path, &value).unwrap();
+                    }
+                    data.insert(key.to_owned(), value);
                     ("200 OK", Vec::new())
                 } else {
-                    match remote.lock().unwrap().get(key) {
-                        Some(data) => ("200 OK", data.clone()),
-                        None => ("404 Not Found", Vec::new()),
+                    if folder_backed {
+                        match fs::read(server_folder.join(key)) {
+                            Ok(data) => ("200 OK", data),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                ("404 Not Found", Vec::new())
+                            }
+                            Err(error) => panic!("fixture read failed: {error}"),
+                        }
+                    } else {
+                        match remote.lock().unwrap().get(key) {
+                            Some(data) => ("200 OK", data.clone()),
+                            None => ("404 Not Found", Vec::new()),
+                        }
                     }
                 };
                 let header = format!(
@@ -1590,7 +2191,7 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             .await
             .unwrap();
         }
-        let _manifest = backup_snapshot(&config, &keys, &identity, &paths)
+        let state_manifest = backup_snapshot(&config, &keys, &identity, &paths)
             .await
             .unwrap();
         // An object-store-only recovery restores the database and objects, not Git files.
@@ -1615,6 +2216,54 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             archive: storage_location,
             archive_lease: None,
         };
+        assert!(matches!(
+            transfer::identity(&storage_db),
+            Err("recovery_key_missing")
+        ));
+        assert!(matches!(
+            object_store_restore::download_verified(
+                &config,
+                &keys,
+                &x25519::Identity::generate(),
+                &state_manifest,
+                &storage_paths.backups_path
+            )
+            .await,
+            Err("decryption_failed")
+        ));
+        let chunk = transfer::chunk_key(&state_manifest, 0);
+        if folder_backed {
+            let ciphertext = fs::read(object_folder.join(&chunk)).expect("local backup folder");
+            assert!(!ciphertext
+                .windows(b"original bytes".len())
+                .any(|part| part == b"original bytes"));
+        }
+        let original_chunk = {
+            let mut remote = objects.lock().unwrap();
+            let data = remote.get_mut(&chunk).expect("state backup chunk");
+            let original = data.clone();
+            data[0] ^= 1;
+            if folder_backed {
+                fs::write(object_folder.join(&chunk), &*data).unwrap();
+            }
+            original
+        };
+        assert!(matches!(
+            object_store_restore::download_verified(
+                &config,
+                &keys,
+                &identity,
+                &state_manifest,
+                &storage_paths.backups_path
+            )
+            .await,
+            Err("hash_mismatch")
+        ));
+        if folder_backed {
+            fs::write(object_folder.join(&chunk), &original_chunk).unwrap();
+        }
+        objects.lock().unwrap().insert(chunk, original_chunk);
+        assert!(crate::chat::list(&storage_db).unwrap().is_empty());
         if oauth {
             let crm_path = paths.data_root.join(crate::class_student_backup::FILE_NAME);
             let crm = Connection::open(&crm_path).unwrap();
@@ -1745,6 +2394,10 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             download_latest_snapshot(&config, &keys, &identity, &storage_paths)
                 .await
                 .unwrap();
+        assert_eq!(
+            ensure_local_content_preserved(&storage_db, storage_snapshot.path()),
+            Ok(())
+        );
         apply_snapshot(storage_snapshot.path(), &storage_paths).unwrap();
         object_store_restore::restore_selected(&config, &keys, &identity, &storage_paths, None)
             .await
@@ -1753,6 +2406,13 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             fs::read(storage_paths.objects_path.join(&object_relative)).unwrap(),
             b"original bytes",
             "storage only: original restored"
+        );
+        assert_eq!(
+            transfer::hash_file(&storage_paths.objects_path.join(&object_relative))
+                .unwrap()
+                .0,
+            hash,
+            "the restored attachment must match the original SHA-256"
         );
         assert_eq!(
             serde_json::to_value(crate::chat::read(&storage_db, &chat_id).unwrap()).unwrap()
@@ -1975,6 +2635,141 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             .unwrap(),
             archive_lease: None,
         };
+        let (different_time_snapshot, _) =
+            download_latest_snapshot(&config, &keys, &identity, &new_paths)
+                .await
+                .unwrap();
+        assert_eq!(
+            ensure_local_content_preserved(&database_path, different_time_snapshot.path()),
+            Err("local_data_conflict"),
+            "different Git and DB backup states must not overwrite each other"
+        );
+        let mut after_git_snapshot = None;
+        if folder_backed {
+            let aligned = transfer::upload_file(
+                &config,
+                &keys,
+                &identity,
+                transfer::UploadSpec {
+                    source: &aligned_snapshot,
+                    relative: "momso.db",
+                    kind: "app_state",
+                    stage: &root.join("stage").join("aligned"),
+                },
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+            let snapshot = object_store_restore::download_verified(
+                &config,
+                &keys,
+                &identity,
+                &aligned,
+                &new_paths.backups_path,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                ensure_local_content_preserved(&database_path, snapshot.path()),
+                Ok(()),
+                "a same-point-in-time backup must be restorable"
+            );
+            after_git_snapshot = Some(snapshot);
+            // The same new profile receives Git and then its encrypted DB and files.
+            let combined = root.join("combined-new-pc");
+            fs::create_dir_all(&combined).unwrap();
+            let combined_db = combined.join("momso.db");
+            let combined_backups = combined.join("backups");
+            storage::initialize(&combined_db, &combined_backups, "test").unwrap();
+            let combined_archive = combined.join("momso");
+            let combined_location = crate::archive_location::ArchiveLocation::load(
+                combined_db.clone(),
+                &combined,
+                vec![],
+            )
+            .unwrap();
+            crate::archive::initialize(&combined_archive, &combined).unwrap();
+            crate::archive_remote::connect_local(&tool, &combined_archive, bare.to_str().unwrap())
+                .unwrap();
+            crate::archive_remote::receive_connected(
+                &tool,
+                &combined_archive,
+                &combined_db,
+                bare.to_str().unwrap(),
+                "main",
+            )
+            .unwrap();
+            let combined_paths = RuntimePaths {
+                data_root: combined.clone(),
+                database_path: combined_db.clone(),
+                objects_path: combined_archive.join("objects"),
+                exports_path: combined.join("exports"),
+                backups_path: combined_backups,
+                logs_path: combined.join("logs"),
+                archive: combined_location,
+                archive_lease: None,
+            };
+            let snapshot = object_store_restore::download_verified(
+                &config,
+                &keys,
+                &identity,
+                &aligned,
+                &combined_paths.backups_path,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                ensure_local_content_preserved(&combined_db, snapshot.path()),
+                Ok(())
+            );
+            apply_snapshot(snapshot.path(), &combined_paths).unwrap();
+            object_store_restore::restore_selected(
+                &config,
+                &keys,
+                &identity,
+                &combined_paths,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(combined_archive
+                .join("zettels")
+                .join(format!("{id}.md"))
+                .is_file());
+            assert_eq!(
+                transfer::hash_file(&combined_paths.objects_path.join(&object_relative))
+                    .unwrap()
+                    .0,
+                hash
+            );
+            assert_eq!(
+                serde_json::to_value(crate::chat::read(&combined_db, &chat_id).unwrap()).unwrap()
+                    ["title"],
+                "fixture room"
+            );
+            #[cfg(windows)]
+            {
+                crate::source_assets::clear_readonly_attribute(
+                    &combined_paths.objects_path.join(&object_relative),
+                )
+                .unwrap();
+                for (digest, _, _) in &media_fixtures {
+                    let relative = format!("sha256/{}/{digest}", &digest[..2]);
+                    crate::source_assets::clear_readonly_attribute(
+                        &combined_paths.objects_path.join(relative),
+                    )
+                    .unwrap();
+                }
+            }
+            // Leave the original newer fixture visible to the rest of this test.
+            let manifest_key = format!(
+                "{}/manifests/{}.age",
+                object_store::PREFIX,
+                aligned.upload_id
+            );
+            objects.lock().unwrap().remove(&manifest_key);
+            fs::remove_file(object_folder.join(manifest_key)).unwrap();
+        }
         crate::chat::append(
             &database_path,
             &chat_id,
@@ -1984,6 +2779,13 @@ $change = @{method='item/completed';params=@{threadId='fixture-thread';item=@{id
             None,
         )
         .unwrap();
+        if let Some(snapshot) = &after_git_snapshot {
+            assert_eq!(
+                ensure_local_content_preserved(&database_path, snapshot.path()),
+                Err("local_data_conflict"),
+                "the old backup must not replace a new PC's later conversation"
+            );
+        }
         let reply_script = new_pc.join("fake-codex-reply.ps1");
         fs::write(&reply_script, r#"
 $null = [Console]::ReadLine()
@@ -1995,7 +2797,7 @@ $null = [Console]::ReadLine()
 '{"method":"item/agentMessage/delta","params":{"delta":"new device answer"}}'
 '{"method":"turn/completed","params":{"turn":{"status":"completed"}}}'
 "#).unwrap();
-        let mut reply_command = tokio::process::Command::new("powershell.exe");
+        let mut reply_command = crate::process::hidden_async_command("powershell.exe");
         reply_command
             .args(["-NoProfile", "-NonInteractive", "-File"])
             .arg(&reply_script)

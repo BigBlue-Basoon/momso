@@ -34,6 +34,7 @@ class CloudRunTests(unittest.TestCase):
         gateway.activate('ghcr.io/example/gateway@sha256:' + '2' * 64, first_deploy=True)
         self.assertEqual(fake.traffic, {'service-new': 100})
         self.assertFalse(any('--no-traffic' in call for call in fake.calls if 'deploy' in call))
+        self.assertTrue(any('--max=1' in call for call in fake.calls if 'deploy' in call))
 
     def test_stale_latest_created_revision_cannot_be_promoted(self):
         fake = FakeCloudRun()
@@ -98,6 +99,7 @@ class CloudRunTests(unittest.TestCase):
         gateway.activate(original)
         self.assertEqual(fake.traffic, {"service-old": 100})
         self.assertTrue(any("--no-traffic" in command for command in fake.calls))
+        self.assertTrue(any("--max=1" in command for command in fake.calls if "deploy" in command))
     def test_unpinned_image_is_rejected(self):
         gateway = CloudRunGateway("fixture-project", "asia-northeast3", "fixture-gateway", runner=FakeCloudRun())
         with self.assertRaises(GatewayError): gateway.activate("registry.example/momso:latest")

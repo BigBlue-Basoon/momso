@@ -65,6 +65,21 @@ _wake_until = 0.0
 WAKE_RETRY_SECONDS = 5
 
 
+class LimitedBody:
+    def __init__(self, source, length):
+        self.source = source
+        self.remaining = length
+
+    def read(self, size=-1):
+        if not self.remaining:
+            return b''
+        block = self.source.read(min(self.remaining, size if size >= 0 else 65536))
+        if not block:
+            raise OSError('incomplete request body')
+        self.remaining -= len(block)
+        return block
+
+
 def request_wake():
     global _wake_until
     with _wake_lock:
@@ -323,7 +338,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError("invalid token")
             headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"authorization", "cookie", "host", "x-serverless-authorization", "x-goog-iap-jwt-assertion", "x-momso-health-proof"}}
             headers["Authorization"] = "Bearer " + token
-            body = self.rfile.read(length) if length else None
+            body = LimitedBody(self.rfile, length) if length else None
             navigation = self.command == "GET" and self.headers.get("Sec-Fetch-Mode") == "navigate" and self.headers.get("Sec-Fetch-Dest") == "document"
             connection = None
             try:

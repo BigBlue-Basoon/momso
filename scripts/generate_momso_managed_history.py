@@ -10,7 +10,7 @@ OUTPUT = ROOT / 'scripts/momso_managed_history.json'
 FILES = {
     'vault-provision.py': 'apps/alpha/desktop/src-tauri/momso-vault-provision/provision.py',
     'idle-stop.py': 'apps/alpha/desktop/src-tauri/momso-idle-stop/idle_stop.py',
-    **{name: 'scripts/' + name for name in ('momso_anywhere_backup.py', 'momso_anywhere_backup_agent.py', 'momso_anywhere_backup_google.py', 'momso_anywhere_vault_identity.py')},
+    **{name: 'scripts/' + name for name in __import__('momso_anywhere_restore_files').RESTORE_FILES},
 }
 WORKER = {name: 'apps/alpha/desktop/src-tauri/momso-server-update/' + name for name in (
     'update.py', 'release_manifest.py', 'server_admission.py', 'systemd_host.py', 'data_snapshots.py', 'cloud_run_gateway.py',
@@ -20,6 +20,8 @@ WORKER['trust_rotation.py'] = 'apps/alpha/desktop/src-tauri/momso-server-update/
 WORKER['momso_managed_files.py'] = 'scripts/momso_managed_files.py'
 WORKER['momso_anywhere_proxy_files.py'] = 'scripts/momso_anywhere_proxy_files.py'
 WORKER['momso_anywhere_proxy_files.json'] = 'scripts/momso_anywhere_proxy_files.json'
+WORKER['momso_anywhere_restore_files.py'] = 'scripts/momso_anywhere_restore_files.py'
+WORKER['momso_anywhere_restore_files.json'] = 'scripts/momso_anywhere_restore_files.json'
 from momso_anywhere_proxy_files import PROXY_FILES
 PROXY = {name: ('apps/alpha/desktop/src-tauri/momso-server-update/' if name == 'server_admission.py' else 'scripts/') + name for name in PROXY_FILES}
 

@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -14,6 +16,51 @@ from momso_anywhere_proxy_files import PROXY_FILES
 
 
 class ProxyFilesTests(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'updater imports Linux fcntl')
+    def test_versioned_updater_imports_without_legacy_parent(self):
+        scripts = Path(__file__).resolve().parent
+        updater = scripts.parent / 'apps/alpha/desktop/src-tauri/momso-server-update'
+        tree = ast.parse((updater / 'managed_helpers.py').read_text(encoding='utf-8'))
+        workers = next(ast.literal_eval(item.value) for item in tree.body
+                       if isinstance(item, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == 'WORKER' for target in item.targets))
+        with tempfile.TemporaryDirectory(prefix='momso-s173-worker-') as directory:
+            target = Path(directory)
+            for name in (*workers, 'momso_anywhere_restore_files.py', 'momso_anywhere_restore_files.json'):
+                source = updater / name
+                if not source.is_file():
+                    source = scripts / name
+                shutil.copy2(source, target / name)
+            code = 'import sys; sys.path.insert(0,sys.argv[1]); import worker, update, github_releases'
+            subprocess.run([sys.executable, '-I', '-c', code, str(target)], check=True, capture_output=True)
+
+    def test_versioned_updater_includes_its_local_imports(self):
+        updater = Path(__file__).resolve().parent.parent / 'apps/alpha/desktop/src-tauri/momso-server-update'
+        tree = ast.parse((updater / 'managed_helpers.py').read_text(encoding='utf-8'))
+        workers = next(ast.literal_eval(item.value) for item in tree.body
+                       if isinstance(item, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == 'WORKER' for target in item.targets))
+        startup = (Path(__file__).resolve().parent / 'momso_anywhere_vm_startup.mjs').read_text(encoding='utf-8')
+        match = re.search(r'^update_files=(\(.*\))$', startup, re.MULTILINE)
+        self.assertIsNotNone(match, 'startup updater list is missing')
+        startup_files = set(ast.literal_eval(match.group(1)))
+        self.assertEqual(startup_files, set(workers) | {
+            'momso_anywhere_restore_files.py', 'momso_anywhere_restore_files.json',
+        })
+        local = {path.stem for path in updater.glob('*.py') if not path.name.startswith('test_')}
+        included = {Path(name).stem for name in workers}
+        for name in workers:
+            source = updater / name
+            if not source.is_file():
+                continue
+            for node in ast.walk(ast.parse(source.read_text(encoding='utf-8'))):
+                imports = ([node.module] if isinstance(node, ast.ImportFrom) else
+                           [alias.name for alias in node.names] if isinstance(node, ast.Import) else [])
+                for imported in imports:
+                    module = (imported or '').split('.')[0]
+                    if module in local:
+                        self.assertIn(module, included, f'{name} imports missing {module}.py')
+
     def test_proxy_local_import_closure_is_in_manifest(self):
         scripts = Path(__file__).resolve().parent
         updater = scripts.parent / 'apps/alpha/desktop/src-tauri/momso-server-update'

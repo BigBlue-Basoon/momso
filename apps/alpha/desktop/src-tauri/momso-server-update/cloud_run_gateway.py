@@ -135,7 +135,8 @@ class CloudRunGateway:
             before = None if first_deploy else self._describe().get('status', {}).get('latestCreatedRevisionName')
             if not first_deploy and (not before or not re.fullmatch(r'[a-z0-9-]+', before)): raise GatewayError('gateway_not_ready')
             traffic_flags = () if first_deploy else ("--no-traffic",)
-            self._run("deploy", self.service, "--image", release, *traffic_flags, *deploy_flags)
+            # The service-level cap also covers revisions during traffic switches.
+            self._run("deploy", self.service, "--image", release, "--max=1", *traffic_flags, *deploy_flags)
             revision = self._describe().get("status", {}).get("latestCreatedRevisionName")
             if not revision or not re.fullmatch(r"[a-z0-9-]+", revision) or revision == before: raise GatewayError("gateway_not_ready")
             self._verify_revision(revision, release)
