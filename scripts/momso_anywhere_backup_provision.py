@@ -2,7 +2,8 @@
 import re
 
 from momso_server_install import InstallError, REGION
-from momso_iam_retry import bind_custom_role
+from momso_iam_retry import bind_custom_role, reconcile_owned_role
+from momso_anywhere_vm_resources import names as vm_resource_names
 
 
 def bucket_is_owned_and_private(actual, install_id):
@@ -33,15 +34,15 @@ class GoogleBackupProvisioner:
         self.p = provider
         if not re.fullmatch(r"[a-z0-9]{6,24}", provider.install_id):
             raise InstallError("백업 설치 식별자를 확인하지 못했습니다.")
-        self.bucket = "momso-backup-" + provider.install_id
-        self.ring = "momso-backup-" + provider.install_id
+        self.bucket = vm_resource_names(provider)['backup_bucket']
+        self.ring = vm_resource_names(provider)['backup_ring']
         self.key = "backup"
-        self.sa = "mb-" + provider.install_id
+        self.sa = vm_resource_names(provider)['backup_account']
         self.email = vm_email or self.sa + "@" + provider.project + ".iam.gserviceaccount.com"
         if vm_email and vm_email != "mv-" + provider.install_id + "@" + provider.project + ".iam.gserviceaccount.com":
             raise InstallError("VM 백업 서비스 계정이 설치 기록과 다릅니다.")
         self.existing_vm_account = vm_email is not None
-        self.role = "momsoBackup" + provider.install_id
+        self.role = vm_resource_names(provider)['roles'][1]
 
     def provision(self):
         p = self.p
@@ -86,6 +87,7 @@ class GoogleBackupProvisioner:
                   f"--keyring={self.ring}", "--purpose=encryption",
                   f"--labels=momso-install-id={p.install_id}")
         permissions = ["storage.objects.get", "storage.objects.create", "storage.objects.delete"]
+        reconcile_owned_role(p, self.role, permissions)
         roles = p.run("iam", "roles", "list", parse=True)
         role_name = f"projects/{p.project}/roles/{self.role}"
         role = next((x for x in roles if x.get("name") == role_name), None)

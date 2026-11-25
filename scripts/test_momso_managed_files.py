@@ -52,6 +52,12 @@ class ManagedFilesTests(unittest.TestCase):
         self.assertEqual((self.root / 'foreign.py').read_bytes(), b'foreign')
         self.assertFalse(self.journal.exists())
 
+    def test_identical_unmanaged_proxy_file_is_recorded(self):
+        name, data = 'momso_anywhere_vm_pause.py', b'known signed content'
+        (self.root / name).write_bytes(data)
+        self.install({name: data})
+        self.assertEqual(json.loads(self.manifest.read_text())['files'][name], hashlib.sha256(data).hexdigest())
+
     def test_tampering_blocks_rollback_without_overwriting_it(self):
         self.install({'worker.py': b'new'})
         (self.root / 'worker.py').write_bytes(b'foreign edit')

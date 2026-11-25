@@ -14,7 +14,7 @@ const id = 'a'.repeat(24), short = id.slice(0, 12), projectId = 'fixture-project
 const marker = `momso-install-${id}`;
 const ok = (value, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => value });
 
-function fixture({ retainVm = false, rejectVm = false, loseVmResponse = false } = {}) {
+function fixture({ retainVm = false, rejectVm = false, loseVmResponse = false, denyPolicy = false } = {}) {
   const c = `https://compute.googleapis.com/compute/v1/projects/${projectId}/`;
   const i = `https://iam.googleapis.com/v1/projects/${projectId}/`;
   const s = `https://secretmanager.googleapis.com/v1/projects/${projectId}/secrets/`;
@@ -33,10 +33,17 @@ function fixture({ retainVm = false, rejectVm = false, loseVmResponse = false } 
     [`${i}roles/momsoUpdate${short}`, { name: `projects/${projectId}/roles/momsoUpdate${short}`, description: marker, includedPermissions: ['run.operations.get', 'run.revisions.get', 'run.revisions.list', 'run.services.get', 'run.services.update'] }],
   ]);
   const deleted = [];
+  const policies = new Map();
   let networkHeld = true;
   const provider = new GoogleBrowserProvider('fixture-token', { projectId, sleep: async () => {}, fetchImpl: async (raw, options) => {
     const url = new URL(raw); url.search = '';
     const path = url.href;
+    if (path.includes('getIamPolicy') || path.includes('setIamPolicy')) {
+      if (denyPolicy && path.includes('getIamPolicy')) return ok({}, 403);
+      const key = path.replace(/(?::|\/)(get|set)IamPolicy$/, '');
+      if (path.includes('getIamPolicy')) return ok(policies.get(key) ?? { etag: 'fixture', version: 3, bindings: [{ role: 'fixture-role', condition: { title: 'keep' }, members: [`serviceAccount:momso-vm-${short}@${projectId}.iam.gserviceaccount.com`, `deleted:serviceAccount:momso-gateway-${short}@${projectId}.iam.gserviceaccount.com?uid=123`, 'user:other@example.test'] }] });
+      policies.set(key, JSON.parse(options.body).policy); return ok({});
+    }
     if (path.includes('cloudresourcemanager.googleapis.com')) return ok({ projectId, state: 'ACTIVE' });
     if (path.includes('/operations/')) return path.includes('run.googleapis.com') ? ok({ done: true }) : ok({ status: 'DONE' });
     if (options.method === 'GET') return resources.has(path) ? ok(resources.get(path)) : ok({}, 404);
@@ -51,19 +58,24 @@ function fixture({ retainVm = false, rejectVm = false, loseVmResponse = false } 
     if (path.includes('compute.googleapis.com')) return ok({ name: 'fixture-op', ...(path.includes('/zones/') ? { zone: '/zones/asia-northeast3-a' } : path.includes('/regions/') ? { region: '/regions/asia-northeast3' } : {}) });
     return ok({});
   } });
-  return { provider, resources, deleted, router: `${c}regions/asia-northeast3/routers/${name}-router` };
+  return { provider, resources, deleted, policies, router: `${c}regions/asia-northeast3/routers/${name}-router` };
 }
 
 test('owned cleanup reports delayed subnet and safely resumes', async () => {
   const f = fixture();
   const first = await f.provider.destroy(id);
+  assert(f.policies.size > 0);
+  for (const policy of f.policies.values()) {
+    assert.deepEqual(policy.bindings[0].members, ['user:other@example.test']);
+    assert.equal(policy.bindings[0].condition.title, 'keep');
+  }
   assert.match(f.deleted[0], /\/instances\//);
   assert.match(f.deleted.at(-1), /run\.googleapis\.com/);
   assert.deepEqual(first.remaining, ['subnet', 'network']);
-  assert.equal(f.resources.size, 3);
+  assert.equal(f.resources.size, 6);
   const second = await f.provider.destroy(id);
   assert.deepEqual(second.remaining, []);
-  assert.equal(f.resources.size, 1);
+  assert.equal(f.resources.size, 4);
   assert([...f.resources.keys()].some(value => value.endsWith(`/secrets/momso-vault-${short}`)));
   assert(!f.deleted.some(value => value.endsWith(`/secrets/momso-vault-${short}`)));
   assert(!f.deleted.some(value => value.includes('cloudresourcemanager.googleapis.com')));
@@ -76,6 +88,12 @@ test('VM deletion reports definite rejection separately from a lost response', a
     assert.deepEqual(states, expected);
     assert([...f.resources.keys()].some(value => value.includes('run.googleapis.com')));
   }
+});
+
+test('unreadable IAM policy stops before any resource deletion', async () => {
+  const f = fixture({ denyPolicy: true });
+  await assert.rejects(f.provider.destroy(id), { step: 'iam_bindings_unverified' });
+  assert.deepEqual(f.deleted, []);
 });
 
 test('unconfirmed VM removal leaves the gateway and all other resources intact', async () => {

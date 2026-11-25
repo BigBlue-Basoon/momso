@@ -82,7 +82,7 @@ test('no accessible open billing account has a distinct reason without creating 
 
 test('a 403 is not misrepresented as terms or card failure', async () => {
   const provider = new GoogleBrowserProvider('fixture', { fetchImpl: async () => response({ error: { message: 'fixture' } }, 403) });
-  await assert.rejects(provider.billingAccounts(), { step: 'permission_denied' });
+  await assert.rejects(provider.billingAccounts(), { step: 'permission_denied', checks: ['billing_account', 'terms', 'project_permissions'] });
 });
 
 test('billing lists pages and connects only the selected open account', async () => {
@@ -237,10 +237,18 @@ test('gateway provisions pinned image and secrets privately before opening its a
   let vmPolicy = { etag: 'fixture', bindings: [{ role: 'roles/reader', members: ['user:fixture@example.test'], condition: { title: 'keep' } }] };
   let publicBindings = false;
   let bindingAttempts = 0;
+  let proxyReady = true;
   const actions = [];
   const updatePolicies = [];
   const provider = new GoogleBrowserProvider('fixture', { release, releaseVerifier: async value => value, clientId: 'fixture.apps.googleusercontent.com', ownerSub: '12345', sleep: async () => {}, fetchImpl: async (url, options) => {
     if (url === 'https://fixture.a.run.app/__momso/ready') return response({ ready: true });
+    if (url === 'https://fixture.a.run.app/__momso/proxy-health') {
+      assert.equal(options.credentials, 'omit');
+      assert.match(options.headers['X-Momso-Health-Proof'], /^[a-f0-9]{64}$/);
+      return response(proxyReady ? { state: 'ready' } : { error: 'unavailable' }, proxyReady ? 200 : 503);
+    }
+    if (url.includes('secretmanager.googleapis.com') && url.endsWith('/versions/latest:access')) return response({ payload: { data: Buffer.from('fixture-private-transport-token-value-1234567890').toString('base64') } });
+    if (url.includes('secretmanager.googleapis.com') && url.includes('/secrets/momso-transport-')) return response({ labels: { 'momso-install-id': id } });
     const method = options.method;
     if (url.includes('/getGuestAttributes')) return response({ queryValue: { items: [{ namespace: 'momso', key: 'fingerprint', value: 'b'.repeat(64) }] } });
     if (url.includes('iam.googleapis.com') && url.includes('/roles')) {
@@ -262,6 +270,7 @@ test('gateway provisions pinned image and secrets privately before opening its a
         service = { ...body, name: `projects/${projectId}/locations/asia-northeast3/services/momso-any-${id.slice(0, 12)}`, uri: 'https://fixture.a.run.app', etag: 'fixture', terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'fixture-rev-1', latestCreatedRevision: 'fixture-rev-1', trafficStatuses: [{ revision: 'fixture-rev-1', percent: 100 }] };
         return response({ name: `projects/${projectId}/locations/asia-northeast3/operations/fixture` });
       }
+      if (method === 'DELETE') { service = null; return response({ name: `projects/${projectId}/locations/asia-northeast3/operations/fixture` }); }
       if (method === 'PATCH') {
         const body = JSON.parse(options.body);
         actions.push({ type: 'patch', value: body.invokerIamDisabled });
@@ -288,6 +297,11 @@ test('gateway provisions pinned image and secrets privately before opening its a
   publicBindings = true;
   await assert.rejects(provider.gateway(id), { step: 'gateway_policy' });
   assert.equal(actions.length, 3);
+  publicBindings = false;
+  service = null;
+  proxyReady = false;
+  await assert.rejects(provider.gateway(id), { step: 'proxy_not_running' });
+  assert.equal(service, null, 'new owned gateway is removed after failed proxy health');
 });
 
 test('address recovery checks owner, trusted running revision and every project page', async () => {

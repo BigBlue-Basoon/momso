@@ -225,6 +225,58 @@ fn ready(address: &str) {
     panic!("server did not become ready");
 }
 
+#[test]
+fn provider_key_request_reconnect_and_cancel_contract() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    let cli = Path::new(env!("CARGO_BIN_EXE_fake-codex"));
+    let _server = launch(&tmp.path().join("data"), cli, &address);
+    ready(&address);
+    let pending = request(&address, "POST", "/providers/claude/key/request", "{}").unwrap();
+    assert_eq!(pending["kind"], "provider_api_key");
+    assert_eq!(pending["provider"], "claude");
+    assert_eq!(pending["origin"], Value::Null);
+    assert_eq!(pending["fields"], json!([{"id":"apiKey","secret":true}]));
+    let id = pending["requestId"].as_str().unwrap();
+    let list = request(&address, "GET", "/providers/claude/key/request", "").unwrap();
+    assert!(list["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["requestId"] == id));
+    let mut stream = TcpStream::connect(&address).unwrap();
+    write!(stream, "GET /providers/claude/key/request HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-only-token\r\nConnection: close\r\n\r\n").unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("cache-control: no-store"));
+    let path = format!("/input-requests/{id}/cancel");
+    assert_eq!(
+        request(&address, "POST", &path, "{}").unwrap()["state"],
+        "cancelled"
+    );
+    assert_eq!(
+        request(&address, "POST", &path, "{}").unwrap()["state"],
+        "cancelled"
+    );
+    assert!(
+        request(&address, "GET", "/providers/claude/key/request", "").unwrap()["inputs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let respond = format!("/input-requests/{id}/respond");
+    let mut stream = TcpStream::connect(&address).unwrap();
+    write!(stream, "POST {respond} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-only-token\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.contains(" 409 ") && response.contains("request_closed"));
+    assert!(raw_post(&address, "/providers/codex/key/request").contains("invalid_provider"));
+}
+
 #[cfg(unix)]
 #[test]
 fn customer_minimal_environment_starts_empty_and_s32_database() {
@@ -3523,7 +3575,9 @@ fn provider_keys_and_chat_use_encrypted_vault_and_fake_api() {
     let api = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}/fake", api.local_addr().unwrap());
     let fake = std::thread::spawn(move || {
-        for _ in 0..5 {
+        let mut claude_round = 0;
+        let mut gemini_round = 0;
+        for _ in 0..7 {
             let (mut stream, _) = api.accept().unwrap();
             let mut request = Vec::new();
             loop {
@@ -3572,7 +3626,14 @@ fn provider_keys_and_chat_use_encrypted_vault_and_fake_api() {
                 assert!(request.contains("\"source\":{\"data\":"));
                 assert!(request.contains("\"output_config\":{\"effort\":\"high\"}"));
                 assert!(request.contains("\"speed\":\"fast\""));
-                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"가짜 답\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+                claude_round += 1;
+                if claude_round == 1 {
+                    r#"{"content":[{"type":"tool_use","id":"crm-1","name":"momso_crm_search","input":{"kind":"student"}}],"stop_reason":"tool_use"}"#
+                } else {
+                    assert!(request.contains("tool_result"));
+                    assert!(request.contains("records"));
+                    r#"{"content":[{"type":"text","text":"가짜 답"}],"stop_reason":"end_turn"}"#
+                }
             } else {
                 assert!(lower.contains("x-goog-api-key:"));
                 assert!(request.contains(&expected_gemini));
@@ -3580,9 +3641,16 @@ fn provider_keys_and_chat_use_encrypted_vault_and_fake_api() {
                 assert!(!request.contains(&expected_claude));
                 assert!(request.contains("\"inline_data\""));
                 assert!(request.contains("\"thinkingLevel\":\"high\""));
-                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"가짜 답\"}]}}]}\n\ndata: {\"candidates\":[{\"finishReason\":\"STOP\"}]}\n\n"
+                gemini_round += 1;
+                if gemini_round == 1 {
+                    r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"momso_crm_search","args":{"kind":"student"}}}]},"finishReason":"STOP"}]}"#
+                } else {
+                    assert!(request.contains("functionResponse"));
+                    assert!(request.contains("records"));
+                    r#"{"candidates":[{"content":{"parts":[{"text":"가짜 답"}]},"finishReason":"STOP"}]}"#
+                }
             };
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
         }
     });
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4387,6 +4455,223 @@ fn fake_cli_browser_site_approval_round_trip() {
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     stop.store(true, Ordering::SeqCst);
     site_thread.join().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires isolated headless Chromium"]
+fn both_provider_server_browser_approval_round_trip() {
+    use age::secrecy::ExposeSecret;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = temp.path().join("credentials");
+    std::fs::create_dir_all(&credentials).unwrap();
+    let identity = age::x25519::Identity::generate().to_string();
+    std::fs::write(
+        credentials.join("momso-vault-identity"),
+        identity.expose_secret(),
+    )
+    .unwrap();
+    let site = TcpListener::bind("127.0.0.1:0").unwrap();
+    let site_address = site.local_addr().unwrap();
+    site.set_nonblocking(true).unwrap();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let (stop_site, writes_site) = (stopped.clone(), writes.clone());
+    let site_thread = std::thread::spawn(move || {
+        while !stop_site.load(Ordering::SeqCst) {
+            if let Ok((mut stream, _)) = site.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut bytes = [0; 8192];
+                let n = stream.read(&mut bytes).unwrap_or(0);
+                if String::from_utf8_lossy(&bytes[..n]).starts_with("POST /publish") {
+                    writes_site.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = "<html><title>Fixture</title><body><form action='/publish' method='post'><button>Register</button></form></body></html>";
+                let _ = write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    });
+    let api = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/fake", api.local_addr().unwrap());
+    let fake = std::thread::spawn(move || {
+        for provider in ["claude", "gemini"] {
+            for round in 0..3 {
+                let (mut stream, _) = api.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut chunk = [0; 8192];
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..i]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")
+                                    .and_then(|n| n.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= i + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let offset = bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
+                let request: Value = serde_json::from_slice(&bytes[offset..]).unwrap();
+                let response = if round == 2 {
+                    if provider == "claude" {
+                        json!({"content":[{"type":"text","text":"fixture complete"}],"stop_reason":"end_turn"})
+                    } else {
+                        json!({"candidates":[{"content":{"parts":[{"text":"fixture complete"}]},"finishReason":"STOP"}]})
+                    }
+                } else {
+                    let (name, args) = if round == 0 {
+                        (
+                            "browser_navigate",
+                            json!({"url":format!("http://{site_address}/")}),
+                        )
+                    } else {
+                        let result = if provider == "claude" {
+                            serde_json::from_str::<Value>(
+                                request["messages"].as_array().unwrap().last().unwrap()["content"]
+                                    [0]["content"]
+                                    .as_str()
+                                    .unwrap(),
+                            )
+                            .unwrap()
+                        } else {
+                            request["contents"].as_array().unwrap().last().unwrap()["parts"][0]
+                                ["functionResponse"]["response"]["result"]
+                                .clone()
+                        };
+                        assert_eq!(result["status"], "page");
+                        let id = result["elements"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|element| element["name"] == "Register")
+                            .unwrap()["id"]
+                            .as_str()
+                            .unwrap();
+                        ("browser_click", json!({"elementId":id}))
+                    };
+                    if provider == "claude" {
+                        json!({"content":[{"type":"tool_use","id":format!("call-{round}"),"name":name,"input":args}],"stop_reason":"tool_use"})
+                    } else {
+                        json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":name,"args":args}}]},"finishReason":"STOP"}]})
+                    }
+                };
+                let body = response.to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        }
+    });
+    let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let binary = std::env::var_os("MOMSO_TEST_SERVER_BINARY")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_momso-server").into());
+    let _server = Server(
+        Command::new(binary)
+            .env("MOMSO_SERVER_DATA_DIR", temp.path().join("data"))
+            .env("MOMSO_SERVER_TOKEN", "test-only-token")
+            .env("MOMSO_SERVER_LISTEN", &address)
+            .env("MOMSO_CODEX_PATH", env!("CARGO_BIN_EXE_fake-codex"))
+            .env("CREDENTIALS_DIRECTORY", credentials)
+            .env(
+                "MOMSO_CHROMIUM_PATH",
+                std::env::var_os("MOMSO_TEST_CHROMIUM").unwrap(),
+            )
+            .env("MOMSO_TEST_PROVIDER_ENDPOINT", endpoint)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    ready(&address);
+    for provider in ["claude", "gemini"] {
+        let pending = request(
+            &address,
+            "POST",
+            &format!("/providers/{provider}/key/request"),
+            "{}",
+        )
+        .unwrap();
+        request(
+            &address,
+            "POST",
+            &format!(
+                "/input-requests/{}/respond",
+                pending["requestId"].as_str().unwrap()
+            ),
+            &json!({"apiKey":format!("fixture-{provider}-key")}).to_string(),
+        )
+        .unwrap();
+        let chat = request(&address, "POST", "/chats", "{}").unwrap()["chatId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let turn = request(
+            &address,
+            "POST",
+            &format!("/chats/{chat}/turns"),
+            &json!({"provider":provider,"model":"fixture-model","text":"browser fixture"})
+                .to_string(),
+        )
+        .unwrap()["turnId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let approval = loop {
+            if let Some(value) = request(&address, "GET", &format!("/turns/{turn}/approval"), "")
+                .and_then(|v| v.get("approval").cloned())
+                .filter(|v| !v.is_null())
+            {
+                break value;
+            }
+            let state = request(&address, "GET", &format!("/turns/{turn}"), "").unwrap();
+            assert_eq!(state["state"], "running", "{state}");
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(approval["provider"], provider);
+        assert_eq!(approval["kind"], "browser_site");
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            if provider == "claude" { 0 } else { 1 }
+        );
+        request(
+            &address,
+            "POST",
+            &format!(
+                "/approvals/{}/respond",
+                approval["requestId"].as_str().unwrap()
+            ),
+            r#"{"choice":"allow_once"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            wait_state(&address, &turn, "completed")["text"],
+            "fixture complete"
+        );
+    }
+    fake.join().unwrap();
+    stopped.store(true, Ordering::SeqCst);
+    site_thread.join().unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(target_os = "linux")]

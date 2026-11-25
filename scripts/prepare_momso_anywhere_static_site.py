@@ -17,7 +17,7 @@ HEADERS = """/*
 """
 
 
-def prepare(*, output, login_page, web, start_dist, client_id, manifest_url, public_key, login_origin, trusted=()):
+def prepare(*, output, login_page, web, start_dist, client_id, manifest_url, public_key, login_origin, trusted=(), root_path=None):
     output = Path(output).resolve()
     sources = [Path(p).resolve() for p in (login_page, web, start_dist)]
     if output.exists() or any(output == p or output in p.parents or p in output.parents for p in sources):
@@ -26,7 +26,7 @@ def prepare(*, output, login_page, web, start_dist, client_id, manifest_url, pub
     with tempfile.TemporaryDirectory(prefix='.momso-static-', dir=output.parent) as temp:
         site = Path(temp) / 'site'
         login.prepare(site, client_id, login_page_dir=login_page, web=web)
-        start.prepare(start_dist, site / 'start', client_id, manifest_url, public_key, login_origin, trusted, channel='production')
+        start.prepare(start_dist, site / 'start', client_id, manifest_url, public_key, login_origin, trusted, channel='production', root_path=root_path)
         if any((site / name).exists() for name in ('_headers', '_redirects', '404.html', '_worker.js', 'functions')):
             raise ValueError('site_overlap')
         (site / '_headers').write_text(HEADERS, encoding='utf-8')
@@ -40,11 +40,12 @@ def main():
     for name in ('output', 'login-page', 'web', 'start-dist', 'client-id', 'manifest-url', 'public-key', 'login-origin'):
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--trusted-gateway-image', action='append', default=[])
+    parser.add_argument('--release-root')
     args = parser.parse_args()
     try:
         prepare(output=args.output, login_page=args.login_page, web=args.web, start_dist=args.start_dist,
                 client_id=args.client_id, manifest_url=args.manifest_url, public_key=args.public_key,
-                login_origin=args.login_origin, trusted=args.trusted_gateway_image)
+                login_origin=args.login_origin, trusted=args.trusted_gateway_image, root_path=args.release_root)
     except (OSError, ValueError):
         print('static_site_not_ready')
         return 1

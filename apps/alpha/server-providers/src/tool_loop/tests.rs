@@ -9,6 +9,137 @@ use std::{
     thread,
 };
 
+struct ScenarioHost {
+    scenario: &'static str,
+    count: usize,
+    cancel: watch::Sender<bool>,
+}
+impl ToolHost for ScenarioHost {
+    fn definitions(&self) -> Vec<Value> {
+        vec![
+            json!({"name":"browser_read","description":"read fixture","inputSchema":{"type":"object","properties":{}}}),
+        ]
+    }
+    fn dispatch<'a>(
+        &'a mut self,
+        _: &'a Context<'_>,
+        _: &'a str,
+        _: Value,
+        mut cancel: watch::Receiver<bool>,
+    ) -> ToolFuture<'a> {
+        Box::pin(async move {
+            self.count += 1;
+            match self.scenario {
+                "error" => Ok(json!({"status":"unavailable"})),
+                "human" => {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    Ok(json!({"status":"human_required","reason":"login"}))
+                }
+                "cancel" => {
+                    let _ = self.cancel.send(true);
+                    let _ = cancel.changed().await;
+                    Err("cancelled")
+                }
+                _ => Ok(json!({"status":"ok"})),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn both_providers_handle_multiple_calls_errors_human_wait_and_cancellation() {
+    for provider in [Provider::Claude, Provider::Gemini] {
+        for scenario in ["multiple", "error", "human", "cancel"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let worker = thread::spawn(move || {
+                let (s, _) = listener.accept().unwrap();
+                let _ = request(&s);
+                let names = if scenario == "multiple" {
+                    vec!["a", "b"]
+                } else {
+                    vec!["a"]
+                };
+                let parts: Vec<Value> = names
+                    .iter()
+                    .map(|id| match provider {
+                        Provider::Claude => {
+                            json!({"type":"tool_use","id":id,"name":"browser_read","input":{}})
+                        }
+                        Provider::Gemini => {
+                            json!({"functionCall":{"name":"browser_read","args":{},"id":id}})
+                        }
+                    })
+                    .collect();
+                let value = match provider {
+                    Provider::Claude => json!({"content":parts,"stop_reason":"tool_use"}),
+                    Provider::Gemini => {
+                        json!({"candidates":[{"content":{"parts":parts},"finishReason":"STOP"}]})
+                    }
+                };
+                reply(s, &value.to_string());
+                if scenario != "cancel" {
+                    let (s, _) = listener.accept().unwrap();
+                    let followup = request(&s);
+                    let expected = match scenario {
+                        "error" => "unavailable",
+                        "human" => "human_required",
+                        _ => "ok",
+                    };
+                    assert!(followup.contains(expected));
+                    let answer = match provider {
+                        Provider::Claude => {
+                            json!({"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"})
+                        }
+                        Provider::Gemini => {
+                            json!({"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]})
+                        }
+                    };
+                    reply(s, &answer.to_string());
+                }
+            });
+            let messages = vec![Message {
+                role: Role::User,
+                text: "fixture".into(),
+                attachments: vec![],
+            }];
+            let key = ApiKey::new("fixture-key".into()).unwrap();
+            let (tx, rx) = watch::channel(false);
+            let mut host = ScenarioHost {
+                scenario,
+                count: 0,
+                cancel: tx,
+            };
+            let mut answer = String::new();
+            let result = run_at(
+                ToolTurn {
+                    provider,
+                    model: "fixture",
+                    messages: &messages,
+                    key: &key,
+                    context: Context {
+                        chat_id: "chat",
+                        turn_id: "turn",
+                    },
+                },
+                &mut host,
+                rx,
+                |delta, _| answer.push_str(delta),
+                &endpoint,
+            )
+            .await;
+            if scenario == "cancel" {
+                assert_eq!(result, Err("cancelled"));
+            } else {
+                assert_eq!(result, Ok(()));
+                assert_eq!(answer, "done");
+            }
+            assert_eq!(host.count, if scenario == "multiple" { 2 } else { 1 });
+            worker.join().unwrap();
+        }
+    }
+}
+
 fn request(mut s: &std::net::TcpStream) -> String {
     s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
         .unwrap();

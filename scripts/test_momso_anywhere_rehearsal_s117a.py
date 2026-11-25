@@ -140,6 +140,14 @@ class RehearsalReadOnlyTests(unittest.TestCase):
         self.assertEqual(result['destroy'], 'passed')
         self.assertNotIn('sensitive text', repr(result))
 
+    def test_found_owned_account_overrides_false_deleted_result(self):
+        deletion = {'outcome': 'deleted_unverified'}
+        remaining = {'accounts': {'complete': True, 'items': ['fixture-account']}}
+        result = rehearsal.run_rehearsal(FakeProvider(), lambda: True, lambda: {}, lambda: deletion,
+                                         lambda: 'backup_absent', lambda: (remaining, []))
+        self.assertEqual(result['destroy'], 'failed')
+        self.assertEqual(result['remainingKinds'], ['accounts'])
+
     def test_installer_failure_code_is_allowlisted_and_secrets_are_not_returned(self):
         process = SimpleNamespace(returncode=1, stdout=b'{"code":"gateway_image_mismatch","token":"SECRET"}\n')
         failure = rehearsal.installer_result(process, 'after_health')
@@ -150,6 +158,14 @@ class RehearsalReadOnlyTests(unittest.TestCase):
         self.assertEqual(result['destroyFailure'], 'vm_unreachable')
         self.assertNotIn('SECRET', repr(result))
         self.assertEqual(rehearsal.installer_result(SimpleNamespace(returncode=1, stdout=b'{"code":"SECRET"}'), 'vm')['reason'], 'installer_failed')
+
+    def test_proxy_failure_includes_safe_installer_diagnostic(self):
+        process = SimpleNamespace(returncode=1, stdout=b'{"code":"proxy_not_running"}', stderr='실패: proxy_not_running\n'.encode())
+        failure = rehearsal.installer_result(process, 'after_health')
+        self.assertEqual(failure['reason'], 'proxy_not_running')
+        self.assertEqual(failure['stderrTail'], '실패: proxy_not_running')
+        process.stderr = b'failure\n\xec\x8b\xa4\xed\x8c\xa8: token=SECRET\n'
+        self.assertNotIn('stderrTail', rehearsal.installer_result(process, 'after_health'))
 
     def test_failed_verification_and_exception_have_distinct_reasons(self):
         result = rehearsal.run_rehearsal(FakeProvider(), lambda: True, lambda: {'traffic_digest': 'unverified'}, lambda: True,

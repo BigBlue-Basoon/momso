@@ -3,13 +3,40 @@ import { webcrypto } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import test, { beforeEach } from 'node:test';
 import { beginRedirect, consumeRedirect } from './momso_anywhere_oauth_redirect.mjs';
-import { billingAccountsFromGesture, clearStartAuthorization, destroyFromGesture, findFromGesture, projectsFromGesture, resumeAfterRedirect, resumeFromRedirect, retryFromGesture, retryLastAction, startFromGesture } from './momso_anywhere_start.mjs';
+import { billingAccountsFromGesture, clearStartAuthorization, destroyFromGesture, findFromGesture, projectsFromGesture, resumeAfterRedirect, resumeFromRedirect, retryFromGesture, retryLastAction, startFromGesture, watchGoogleSetupReturn } from './momso_anywhere_start.mjs';
 
 beforeEach(clearStartAuthorization);
 
 const memory = () => { const data = new Map(); return { getItem: k => data.get(k) ?? null, setItem: (k, v) => data.set(k, v), removeItem: k => data.delete(k), data }; };
 const clientId = 'fixture.apps.googleusercontent.com';
 const scopes = 'openid https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/cloud-platform';
+
+test('Google setup return checks focus and timer, waits for billing, and stops after success', async () => {
+  const session = memory(), storage = memory();
+  const location = { href: 'https://login.example.test/start/', origin: 'https://login.example.test', assign(url) { this.next = url; } };
+  let ready = false;
+  const provider = { billingAccounts: async () => ready ? [{ name: 'billingAccounts/ABC-123' }] : [] };
+  const options = { clientId, release: {}, session, storage, location, cryptoImpl: webcrypto, providerFactory: async () => ({ provider, ownerSub: '12345' }) };
+  beginRedirect({ clientId, action: 'billing', storage: session, location, cryptoImpl: webcrypto });
+  const fragment = new URLSearchParams({ state: new URL(location.next).searchParams.get('state'), access_token: 'fixture-token', token_type: 'Bearer', expires_in: '60', scope: scopes }).toString();
+  await resumeFromRedirect({ ...options, fragment });
+  session.setItem('momso.start.retry.v1', JSON.stringify({ action: 'billing' }));
+  const events = new Map();
+  const doc = { visibilityState: 'visible', addEventListener: (n, f) => events.set(n, f), removeEventListener: n => events.delete(n) };
+  const win = { addEventListener: (n, f) => events.set(n, f), removeEventListener: n => events.delete(n), setInterval: f => { events.set('timer', f); return 1; }, clearInterval: () => events.delete('timer') };
+  let result;
+  const watch = watchGoogleSetupReturn({ ...options, documentImpl: doc, windowImpl: win, onResult: value => { result = value; } });
+  await events.get('timer')();
+  assert.equal(result, undefined);
+  await events.get('focus')();
+  assert.equal(result, undefined);
+  ready = true;
+  await events.get('visibilitychange')();
+  assert.equal(result.billingAccounts.length, 1);
+  assert.equal(events.size, 0);
+  watch.stop();
+  assert(!JSON.stringify([...session.data]).includes('fixture-token'));
+});
 
 test('capture removes fragment immediately and only retains it in module memory', () => {
   const source = `globalThis.window={location:{hash:'#access_token=fixture',pathname:'/start/',search:''},history:{replaceState(_a,_b,p){globalThis.cleaned=p}}}; const m=await import('./scripts/momso_anywhere_oauth_capture.mjs'); if(cleaned!=='/start/'||!m.hasOAuthFragment()||m.takeOAuthFragment()!=='#access_token=fixture'||m.hasOAuthFragment())process.exit(1);`;

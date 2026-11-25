@@ -12,6 +12,8 @@ import urllib.request
 from urllib.parse import urlparse
 from release_manifest import ManifestError, verify as verify_manifest
 from cloud_run_gateway import GatewayError, gateway_failure
+from trust_rotation import TrustError, current_release_key
+from momso_anywhere_proxy_files import PROXY_FILES
 
 
 class UpdateError(Exception):
@@ -49,7 +51,7 @@ def _extract(bundle, output):
                 raise UpdateError("invalid_bundle")
             seen.add(item.name)
         archive.extractall(output, **({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))
-    for name in ("momso-server", "momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py", "web/index.html"):
+    for name in ("momso-server", *PROXY_FILES, "web/index.html"):
         if not (output / name).is_file():
             raise UpdateError("invalid_bundle")
     # The bootstrap and PC installer use this marker to recognize owned web files.
@@ -77,12 +79,13 @@ def _atomic_json(path, value):
 
 class Updater:
     """Host must hold an exclusive maintenance lease until release_maintenance()."""
-    def __init__(self, root, public_key, host, *, allow_http_for_tests=False, channel='production'):
+    def __init__(self, root, public_key, host, *, allow_http_for_tests=False, channel='production', trust_store=None):
         self.root = Path(root)
         self.public_key = Path(public_key)
         self.host = host
         self.allow_http = allow_http_for_tests
         self.channel = channel
+        self.trust_store = trust_store
         self.root.mkdir(mode=0o755, parents=True, exist_ok=True)
         # The service runs as the unprivileged momso user and must traverse releases.
         # Recovery records are atomic mode-0600 files; data snapshots are mode 0700.
@@ -169,8 +172,13 @@ class Updater:
         manifest = _download(manifest_url, self.allow_http, 65536)
         signature = _download(signature_url, self.allow_http, 1024)
         try:
-            return verify_manifest(manifest, signature, self.public_key, allow_http=self.allow_http, channel=self.channel)
-        except ManifestError as error:
+            if self.trust_store is None:
+                return verify_manifest(manifest, signature, self.public_key, allow_http=self.allow_http, channel=self.channel)
+            with tempfile.TemporaryDirectory(prefix='momso-release-key-') as directory:
+                key = Path(directory) / 'active.pem'
+                key.write_bytes(current_release_key(self.trust_store.current()))
+                return verify_manifest(manifest, signature, key, allow_http=self.allow_http, channel=self.channel)
+        except (ManifestError, TrustError) as error:
             raise UpdateError(str(error)) from None
 
     def install(self, manifest_url, signature_url):
@@ -189,14 +197,26 @@ class Updater:
                 raise UpdateError("update_unavailable") from None
 
     def _install(self, manifest_url, signature_url):
-        if self.state.exists() and json.loads(self.state.read_text(encoding="utf-8")).get("phase") == "switching":
-            raise UpdateError("recovery_required")
+        if self.state.exists():
+            previous = json.loads(self.state.read_text(encoding='utf-8'))
+            if previous.get('phase') == 'switching' or previous.get('needsRelease') is True:
+                raise UpdateError('recovery_required')
         self._emit("checking")
         release = self.check(manifest_url, signature_url)
         installed = self.host.current_sequence()
         if release["sequence"] <= installed:
-            self._emit("up_to_date")
-            return "up_to_date"
+            record = json.loads(self.state.read_text(encoding='utf-8')) if self.state.exists() else {}
+            if record.get('sequence') != installed:
+                if not self.host.acquire_maintenance():
+                    self._emit('waiting_for_idle')
+                    return 'busy'
+                try:
+                    installed = self.host.current_sequence()
+                    if release['sequence'] > installed:
+                        raise UpdateError('current_state_unavailable')
+                finally:
+                    self.host.release_maintenance()
+            return self._up_to_date(installed)
         try:
             if hasattr(self.host, "preflight_gateway"):
                 self.host.preflight_gateway(release["gatewayImage"])
@@ -228,6 +248,16 @@ class Updater:
             shutil.rmtree(stage)
             return "busy"
         try:
+            current_sequence = self.host.current_sequence()
+        except Exception:
+            self.host.release_maintenance()
+            shutil.rmtree(stage)
+            raise UpdateError('current_state_unavailable') from None
+        if current_sequence >= release['sequence']:
+            self.host.release_maintenance()
+            shutil.rmtree(stage)
+            return self._up_to_date(current_sequence)
+        try:
             old_release = self.host.current_release()
             old_gateway = self.host.current_gateway()
         except Exception:
@@ -249,13 +279,20 @@ class Updater:
             self.host.migrate_data(str(stage))
             self.host.start_server()
             if hasattr(self.host, "refresh_proxy"):
-                self.host.refresh_proxy(old_release, str(stage))
+                try:
+                    self.host.refresh_proxy(old_release, str(stage))
+                    if not self.host.proxy_healthy():
+                        raise ValueError('proxy_not_running')
+                except Exception:
+                    raise UpdateError('proxy_not_running') from None
             if not self.host.server_healthy():
                 raise UpdateError("server_unhealthy")
             self._emit("updating_gateway")
             self.host.activate_gateway(release["gatewayImage"])
             if not self.host.gateway_healthy():
                 raise UpdateError("gateway_unhealthy")
+            if hasattr(self.host, 'gateway_proxy_healthy') and not self.host.gateway_proxy_healthy():
+                raise UpdateError('proxy_not_running')
             self.host.record_sequence(release["sequence"])
             _atomic_json(self.state, {"phase": "complete", "sequence": release["sequence"], "needsRelease": True})
             if hasattr(self.host, "commit_managed"):
@@ -268,7 +305,7 @@ class Updater:
                        'gateway_traffic_unknown', 'gateway_probe_failed', 'gateway_unhealthy', 'gateway_health_failed',
                        'gateway_rollback_failed', 'gateway_rollback_mismatch', 'gateway_not_ready', 'gateway_operation_failed',
                        'gateway_response_invalid', 'gateway_address_invalid', 'gateway_address_changed', 'gateway_address',
-                       'gateway_ownership', 'gateway_policy', 'server_unhealthy'}
+                       'gateway_ownership', 'gateway_policy', 'server_unhealthy', 'proxy_not_running'}
             reason = str(failure) if isinstance(failure, (GatewayError, UpdateError)) and str(failure) in allowed else 'update_failed'
             self._emit("rolling_back", reason, gateway_failure(reason) if reason.startswith('gateway_') else None)
             try:
@@ -299,6 +336,14 @@ class Updater:
                         raise UpdateError("maintenance_release_failed") from None
                     record["needsRelease"] = False
                     _atomic_json(self.state, record)
+
+    def _up_to_date(self, installed):
+        if self.state.exists():
+            record = json.loads(self.state.read_text(encoding='utf-8'))
+            if record.get('phase') in ('complete', 'rolled_back') and not record.get('needsRelease'):
+                _atomic_json(self.state, {'phase': 'complete', 'sequence': installed, 'needsRelease': False})
+        self._emit('up_to_date')
+        return 'up_to_date'
 
     def recover(self):
         """Run before the host accepts requests after an interrupted update."""

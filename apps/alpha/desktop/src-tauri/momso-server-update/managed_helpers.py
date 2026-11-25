@@ -15,7 +15,7 @@ HELPERS = ("idle-stop.py", "vault-provision.py", "momso_anywhere_backup.py",
 WORKER = ("update.py", "release_manifest.py", "server_admission.py", "systemd_host.py",
           "data_snapshots.py", "cloud_run_gateway.py", "github_releases.py", "progress_status.py",
           "layout_migration.py", "install_worker.py", "worker.py", "ensure_gcloud.py",
-          "managed_helpers.py", "momso_managed_files.py")
+          "managed_helpers.py", "momso_managed_files.py", "momso_anywhere_proxy_files.py", "momso_anywhere_proxy_files.json")
 LAUNCHER = b'''"""Stable launcher for the currently selected updater version."""\nimport runpy\nimport sys\nfrom pathlib import Path\nroot = Path(__file__).resolve().parent\ncurrent = (root / "current").resolve(strict=True)\nversions = (root / "versions").resolve(strict=True)\nif current.parent != versions or not current.is_dir():\n    raise RuntimeError("invalid_updater_version")\nsys.path.insert(0, str(current))\nrunpy.run_path(str(current / "worker.py"), run_name="__main__")\n'''
 
 

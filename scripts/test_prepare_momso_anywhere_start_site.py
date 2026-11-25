@@ -21,12 +21,19 @@ class StartSiteTests(unittest.TestCase):
         key.write_text('-----BEGIN PUBLIC KEY-----\n' + base64.b64encode(bytes.fromhex('302a300506032b6570032100') + b'\x11' * 32).decode() + '\n-----END PUBLIC KEY-----\n')
         for name, value in [('PRODUCTION_KEY', key), ('DEVELOPMENT_KEY', self.root / 'dev-public.pem')]:
             p = patch.object(site.momso_release_keys, name, value); p.start(); self.addCleanup(p.stop)
+        prefix = bytes.fromhex('302a300506032b6570032100')
+        roots = [base64.b64encode(prefix + bytes([value]) * 32).decode() for value in (0x11, 0x33, 0x44)]
+        self.bootstrap = json.dumps({'version': 0, 'expires': '2099-01-01T00:00:00Z', 'threshold': 2, 'keys': roots, 'releaseKey': roots[0]}).encode()
+        root_path = self.root / 'root.json'; root_path.write_bytes(self.bootstrap)
+        original = site.momso_anywhere_update_install.production_bootstrap
+        p = patch.object(site.momso_anywhere_update_install, 'production_bootstrap', side_effect=lambda public, root=None: original(public, root or root_path)); p.start(); self.addCleanup(p.stop)
         self.args = ("fixture.apps.googleusercontent.com", "https://example.test/release.json", key, "https://login.example.test")
 
     def test_packages_modules_config_and_screen(self):
         output = self.root / "output"
         site.prepare(self.dist, output, *self.args)
         self.assertEqual(json.loads((output / "config.json").read_text(encoding="utf-8"))["release"]["manifestUrl"], "https://example.test/release.json")
+        self.assertEqual(base64.b64decode(json.loads((output / 'config.json').read_text())['release']['trustBootstrap']), self.bootstrap)
         self.assertTrue(all((output / name).is_file() for name in site.MODULES))
         for name in ('momso_anywhere_discard_backup.mjs', 'momso_anywhere_test_backup_cleanup_s117.mjs'):
             source = (output / name).read_text(encoding='utf-8')

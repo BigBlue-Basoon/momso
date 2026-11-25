@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import os
 import json
+import re
 import sys
 import tempfile
 import shutil
@@ -44,6 +45,30 @@ def main():
         elif args.action == "backup":
             if os.environ.get("MOMSO_BACKUP_QUIESCENT") != "1":
                 raise ValueError("quiescence_required")
+            restore_marker = data / '.momso-restore-pending-first-backup'
+            if restore_marker.is_symlink():
+                raise ValueError('unsafe_restore_marker')
+            protect_slots = restore_marker.exists()
+            protected_slot = None
+            if protect_slots:
+                if not restore_marker.is_file():
+                    raise ValueError('unsafe_restore_marker')
+                marker = restore_marker.read_bytes()
+                if marker == b'momso-restore-v1\n':
+                    report = data / '.momso-prestart-restore.json'
+                    if report.is_symlink() or not report.is_file():
+                        raise ValueError('restore_source_unknown')
+                    source = json.loads(report.read_bytes()).get('restoredBackupId')
+                else:
+                    match = re.fullmatch(rb'momso-restore-v2:(slot-[0-7]@[0-9]{1,32})\n', marker)
+                    source = match.group(1).decode('ascii') if match else None
+                match = re.fullmatch(r'slot-([0-7])@([0-9]{1,32})', source or '')
+                if not match:
+                    raise ValueError('unsafe_restore_marker')
+                protected_slot = int(match.group(1))
+                current = store.read_versioned(protected_slot)
+                if current is None or current[0] != match.group(2):
+                    raise ValueError('restore_source_changed')
             credential_root = os.environ.get("CREDENTIALS_DIRECTORY")
             credential = Path(credential_root) / "momso-vault-identity" if credential_root else None
             identity = credential.read_bytes() if credential and credential.is_file() else None
@@ -54,7 +79,13 @@ def main():
                     print("momso-backup-v3:snapshot-ready", flush=True)
                 result = backup.backup(staged, store, keys, backup.DATABASE_AND_VAULT, temp_root=runtime,
                                        vault_identity=identity, archive=staged / "archive", quiescent=True,
-                                       memory_files=private)
+                                       memory_files=private, preserve_existing_slots=protect_slots,
+                                       protected_slot=protected_slot)
+                if protect_slots and result == 'uploaded':
+                    restore_marker.unlink()
+                    directory = os.open(data, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                    try: os.fsync(directory)
+                    finally: os.close(directory)
         elif args.action == "restore-assets":
             backup.restore_assets(data, data / "archive", store, keys, json.load(sys.stdin))
             result = "assets-restored"

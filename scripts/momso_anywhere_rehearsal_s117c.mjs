@@ -262,12 +262,12 @@ export async function executeBrowserRehearsal({ account, projectId, installation
   try {
     const projects = await bootstrapGesture({ ...options, token });
     if (!projects.some(item => item?.projectId === projectId)) throw new Error('project_unavailable');
-    const identity = await providerFactory({ token, expiresAt: Date.now() + 3000000, clientId, release, projectId, fetchImpl });
+    const identity = await providerFactory({ token, expiresAt: Date.now() + 3000000, clientId, release, projectId, fetchImpl, trustStorage: storage });
     if (!/^[0-9]{1,40}$/.test(identity.ownerSub ?? '')) throw new Error('identity_unavailable');
     const hash = await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(`${clientId}:${identity.ownerSub}:${projectId}`));
     storage.setItem(`momso-setup-${Buffer.from(hash).toString('hex')}`, installationId);
     const interrupted = interruptGatewayOnce(identity.provider);
-    const signed = await verifyRelease(release, { fetchImpl, cryptoImpl: webcrypto });
+    const signed = await verifyRelease(release, { fetchImpl, cryptoImpl: webcrypto, storage });
     const progress = event => { if (STEPS.includes(event?.step) && ['working', 'done', 'failed'].includes(event?.state)) onProgress({ step: event.step, state: event.state }); };
     const start = async (_ctx, inject) => startFromGesture({ ...options, projectId, onProgress: progress, authorize: async () => ({ ownerSub: identity.ownerSub, provider: inject ? interrupted : identity.provider }) });
     const destroy = async ctx => { validateScope(ctx.projectId, ctx.installationId, protectedInstallationIds); return destroyFromGesture({ ...options, projectId: ctx.projectId, installationId: ctx.installationId, discardData: true }); };
@@ -279,7 +279,7 @@ export async function executeBrowserRehearsal({ account, projectId, installation
 }
 
 function parseArgs(argv) {
-  const allowed = new Set(['--account', '--project', '--manifest-url', '--public-key', '--channel', '--google-client-id', '--login-origin']);
+  const allowed = new Set(['--account', '--project', '--manifest-url', '--public-key', '--channel', '--google-client-id', '--login-origin', '--release-root']);
   const result = { protectedInstallationIds: [] };
   for (let i = 0; i < argv.length; i += 2) {
     if (argv[i] === '--protect-installation-id') {
@@ -290,7 +290,7 @@ function parseArgs(argv) {
     if (!allowed.has(argv[i]) || !argv[i + 1] || result[argv[i]]) throw new Error('invalid_arguments');
     result[argv[i]] = argv[i + 1];
   }
-  if ([...allowed].some(name => !result[name]) || !['production', 'development'].includes(result['--channel'])) throw new Error('invalid_arguments');
+  if ([...allowed].some(name => name !== '--release-root' && !result[name]) || !['production', 'development'].includes(result['--channel']) || (result['--channel'] === 'production' && !result['--release-root'])) throw new Error('invalid_arguments');
   return result;
 }
 
@@ -303,6 +303,7 @@ async function main() {
     if (origin.protocol !== 'https:' || origin.origin !== args['--login-origin'] || origin.username || origin.password) throw new Error('invalid_arguments');
     const key = createPublicKey(readFileSync(args['--public-key'])).export({ type: 'spki', format: 'der' }).toString('base64');
     const release = { manifestUrl: args['--manifest-url'], publicKeySpki: key, channel: args['--channel'], loginOrigin: origin.origin };
+    if (args['--channel'] === 'production') release.trustBootstrap = readFileSync(args['--release-root']).toString('base64');
     const token = accessToken(args['--account']);
     console.log('시험 설치 ID:', installationId);
     const result = await executeBrowserRehearsal({ account: args['--account'], projectId: args['--project'], installationId, protectedInstallationIds: args.protectedInstallationIds, clientId: args['--google-client-id'], release, token,

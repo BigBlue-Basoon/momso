@@ -7,6 +7,7 @@ from unittest.mock import patch
 from layout_migration import prepare_baseline, prepare_verified_baseline
 from test_update import UpdateTests
 from update import UpdateError, _extract
+from momso_anywhere_proxy_files import PROXY_FILES
 
 
 class LayoutMigrationTests(unittest.TestCase):
@@ -14,7 +15,7 @@ class LayoutMigrationTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.flat = Path(self.tmp.name) / "flat"
         self.flat.mkdir()
-        for name in ("momso-server", "momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py"):
+        for name in ("momso-server", *PROXY_FILES):
             (self.flat / name).write_text(name)
         (self.flat / "web").mkdir()
         (self.flat / "web" / ".momso-owned").write_text("owned")
@@ -31,6 +32,8 @@ class LayoutMigrationTests(unittest.TestCase):
         self.assertEqual(baseline.stat().st_mode & 0o777, 0o755)
         self.assertEqual(self.root.stat().st_mode & 0o777, 0o755)
         self.assertEqual((self.root / "current").resolve(), baseline)
+        for name in PROXY_FILES:
+            self.assertEqual((baseline / name).read_bytes(), (self.flat / name).read_bytes())
         self.assertEqual(json.loads((self.root / "installed.json").read_text())["sequence"], 7)
         self.assertEqual(prepare_baseline(self.flat, self.root, 7), baseline)
 

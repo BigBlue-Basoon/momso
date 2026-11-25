@@ -7,6 +7,7 @@ import shutil
 import tempfile
 
 from update import UpdateError, _atomic_json, _download, _extract
+from momso_anywhere_proxy_files import PROXY_FILES
 
 
 def prepare_baseline(flat_root, update_root, installed_sequence):
@@ -46,7 +47,7 @@ def prepare_baseline(flat_root, update_root, installed_sequence):
         return stage
     if current.exists() or current.is_symlink():
         raise ValueError("layout_already_initialized")
-    files = ("momso-server", "momso_mobile_proxy.py", "momso_anywhere_vm_proxy.py")
+    files = ("momso-server", *PROXY_FILES)
     for name in files:
         source = flat / name
         if not source.is_file() or source.is_symlink():

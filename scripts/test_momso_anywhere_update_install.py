@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -70,6 +71,7 @@ class InstallTests(unittest.TestCase):
             for folder in (opt, updater, etc): folder.chmod(0o700)
             old = b'legacy worker'; (updater / 'worker.py').write_bytes(old)
             provider = Mock(project='fixture-project', install_id='0123456789ab')
+            provider.ssh.return_value = b'worker_install_ok'
             public = root / 'public.pem'; public.write_bytes(b'fixture key')
             with patch.object(install, 'LEGACY_WORKER', {'worker.py': [hashlib.sha256(old).hexdigest()]}):
                 install.install(provider, 'development', public, 'https://fixture.invalid/release.json')
@@ -81,7 +83,7 @@ class InstallTests(unittest.TestCase):
             failure = SimpleNamespace(install=Mock(side_effect=RuntimeError('fixture failure')))
             ensure = SimpleNamespace(ensure=lambda: None)
             stdin = io.TextIOWrapper(io.BytesIO(data))
-            with patch('sys.stdin', stdin), patch.dict(sys.modules, {'worker': worker, 'install_worker': failure, 'ensure_gcloud': ensure}):
+            with patch('sys.stdin', stdin), patch('subprocess.run', return_value=subprocess.CompletedProcess([], 1)), patch.dict(sys.modules, {'worker': worker, 'install_worker': failure, 'ensure_gcloud': ensure}):
                 with self.assertRaisesRegex(RuntimeError, 'fixture failure'):
                     exec(compile(code, '<vm fixture>', 'exec'), {})
             self.assertEqual((updater / 'worker.py').read_bytes(), old)
@@ -103,6 +105,7 @@ class InstallTests(unittest.TestCase):
 
     def test_payload_contains_channel_public_key_and_independent_worker(self):
         provider = Mock(project="fixture-project", install_id="0123456789ab")
+        provider.ssh.return_value = b'worker_install_ok'
         with tempfile.TemporaryDirectory() as directory:
             public = Path(directory) / "public.pem"
             public.write_text("fixture public key")
@@ -113,6 +116,8 @@ class InstallTests(unittest.TestCase):
         code = base64.b64decode(encoded).decode()
         ast.parse(code)
         self.assertIn("install_group(folder,'update-worker'", code)
+        self.assertIn('gate_already_held=data[\'gateAlreadyHeld\']', code)
+        self.assertIn('/__momso/proxy-health', code)
         payload = json.loads(data)
         self.assertIn("sudo", wrapper)
         self.assertEqual(payload["config"]["channel"], "development")
@@ -120,8 +125,67 @@ class InstallTests(unittest.TestCase):
         self.assertIn("worker.py", payload["files"])
         self.assertIn("install_worker.py", payload["files"])
 
+    def test_remote_proxy_health_failure_has_machine_code(self):
+        provider = Mock(project='fixture-project', install_id='0123456789ab')
+        provider.ssh.return_value = b'proxy_not_running\n'
+        with tempfile.TemporaryDirectory() as directory:
+            public = Path(directory) / 'public.pem'; public.write_bytes(b'fixture')
+            with self.assertRaises(InstallError) as error:
+                install.install(provider, 'development', public, 'https://fixture.invalid/release.json', gate_already_held=True, health_url='https://fixture.a.run.app')
+        self.assertEqual(error.exception.gateway_code, 'proxy_not_running')
+
     def test_invalid_manifest_url_fails_before_contacting_vm(self):
         provider = Mock()
         with self.assertRaises(InstallError):
             install.install(provider, "development", "unused", "http://localhost/release.json")
         provider.ssh.assert_not_called()
+
+    def test_production_bootstrap_contains_three_keys_at_sequence_zero(self):
+        import momso_release_keys as keys
+        import momso_release_sign as signer
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public_keys = signer.init_production(root / 'keys')
+            encoded = [base64.b64encode(keys.public_der(path)).decode() for path in public_keys]
+            bootstrap = root / 'root.json'
+            value = {'version': 0, 'expires': '2099-01-01T00:00:00Z', 'threshold': 2, 'keys': encoded, 'releaseKey': encoded[0]}
+            bootstrap.write_text(json.dumps(value), encoding='utf-8')
+            self.assertEqual(json.loads(install.production_bootstrap(public_keys[0], bootstrap))['version'], 0)
+            with self.assertRaises(InstallError): install.production_bootstrap(public_keys[1], bootstrap)
+            with patch.object(keys, 'DEVELOPMENT_KEY', public_keys[1]):
+                with self.assertRaises(InstallError): install.production_bootstrap(public_keys[0], bootstrap)
+            value['version'] = 1
+            bootstrap.write_text(json.dumps(value), encoding='utf-8')
+            with self.assertRaises(InstallError): install.production_bootstrap(public_keys[0], bootstrap)
+
+    def test_production_installer_sends_root_zero_to_vm_worker(self):
+        import momso_release_keys as keys
+        import momso_release_sign as signer
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public = signer.init_production(root / 'keys')
+            encoded = [base64.b64encode(keys.public_der(path)).decode() for path in public]
+            raw = json.dumps({'version': 0, 'expires': '2099-01-01T00:00:00Z', 'threshold': 2, 'keys': encoded, 'releaseKey': encoded[0]}).encode()
+            root_file = root / 'root.json'; root_file.write_bytes(raw)
+            validate = install.production_bootstrap
+            provider = Mock(project='fixture-project', install_id='0123456789ab')
+            provider.ssh.return_value = b'worker_install_ok'
+            with patch.object(install, 'production_bootstrap', side_effect=lambda key: validate(key, root_file)):
+                install.install(provider, 'production', public[0], 'https://fixture.invalid/release.json')
+            payload = json.loads(provider.ssh.call_args.args[1])
+            self.assertEqual(base64.b64decode(payload['config']['trustBootstrap']), raw)
+            self.assertEqual(payload['config']['trustState'], '/var/lib/momso-update-trust')
+            self.assertIn('trust_rotation.py', payload['files'])
+            import prepare_momso_anywhere_start_site as start_site
+            dist = root / 'dist'; (dist / 'assets').mkdir(parents=True)
+            (dist / 'assets/app.js').write_text('resumeAfterRedirect')
+            (dist / 'index.html').write_text('<script type="module" src="/start/assets/app.js"></script>')
+            site = root / 'site'
+            with patch.object(keys, 'PRODUCTION_KEY', public[0]), patch.object(keys, 'DEVELOPMENT_KEY', root / 'missing-dev.pem'):
+                start_site.prepare(dist, site, 'fixture.apps.googleusercontent.com', 'https://fixture.invalid/release.json', public[0], 'https://fixture.invalid', root_path=root_file)
+            site_release = json.loads((site / 'config.json').read_text())['release']
+            self.assertEqual(site_release['trustBootstrap'], payload['config']['trustBootstrap'])
+            source = "import {vmStartupScript} from './scripts/momso_anywhere_vm_startup.mjs'; const update=JSON.parse(process.argv[1]); const s=vmStartupScript({project:'fixture-project',secret:'momso-transport-aaaaaaaaaaaa',bundleUrl:'https://fixture.invalid/bundle',bundleSha256:'a'.repeat(64),update}); if(!s.includes(update.trustBootstrap))process.exit(1); console.log(update.trustBootstrap)"
+            browser_config = site_release
+            result = subprocess.run(['node', '--input-type=module', '-e', source, json.dumps(browser_config)], check=True, capture_output=True, text=True)
+            self.assertEqual(result.stdout.strip(), payload['config']['trustBootstrap'])

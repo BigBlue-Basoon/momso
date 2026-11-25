@@ -236,6 +236,23 @@ impl ApprovalChannel for HostApproval {
     }
 }
 type ToolSession = BrowserTools<HostApproval, Credentials>;
+fn browser_executable_with(
+    override_path: Option<PathBuf>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    override_path.unwrap_or_else(|| {
+        [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| exists(path))
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/google-chrome"))
+    })
+}
 pub type Sessions = Arc<Mutex<HashMap<String, Arc<Mutex<ToolSession>>>>>;
 pub fn sessions() -> Sessions {
     Arc::new(Mutex::new(HashMap::new()))
@@ -246,9 +263,10 @@ pub async fn dispatch(
     turn: &str,
     name: &str,
     args: Value,
-    permission_mode: &str,
+    source: (&str, &str),
     cancel: watch::Receiver<bool>,
 ) -> Value {
+    let (permission_mode, provider) = source;
     let session = {
         let Ok(mut sessions) = app.browsers.lock() else {
             return json!({"status":"unavailable"});
@@ -256,9 +274,10 @@ pub async fn dispatch(
         sessions
             .entry(chat.to_owned())
             .or_insert_with(|| {
-                let binary = std::env::var_os("MOMSO_CHROMIUM_PATH")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/usr/bin/google-chrome"));
+                let binary = browser_executable_with(
+                    std::env::var_os("MOMSO_CHROMIUM_PATH").map(PathBuf::from),
+                    |path| path.is_file(),
+                );
                 Arc::new(Mutex::new(BrowserTools::new(
                     ServerBrowsers::new(binary, app.data.join("browser-profiles")),
                     HostApproval {
@@ -284,6 +303,7 @@ pub async fn dispatch(
     let turn = turn.to_owned();
     let name = name.to_owned();
     let mode = BrowserPermission::from_provider_mode("codex", permission_mode);
+    let provider = provider.to_owned();
     let redact_app = app.clone();
     match tokio::task::spawn_blocking(move || {
         let Ok(mut tools) = session.lock() else {
@@ -306,7 +326,7 @@ pub async fn dispatch(
             let portable = format!("chat_{chat}");
             let record = momso_core::receipt_store::record_action(
                 &redact_app.data.join("archive"),
-                "codex",
+                &provider,
                 Some(&portable),
                 &name,
             )
@@ -472,6 +492,20 @@ pub async fn delete_login(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installed_chromium_and_explicit_browser_are_selected() {
+        use super::browser_executable_with;
+        use std::path::PathBuf;
+        assert_eq!(
+            browser_executable_with(None, |path| path
+                == std::path::Path::new("/usr/bin/chromium")),
+            PathBuf::from("/usr/bin/chromium")
+        );
+        assert_eq!(
+            browser_executable_with(Some(PathBuf::from("/fixture/browser")), |_| true),
+            PathBuf::from("/fixture/browser")
+        );
+    }
     use super::*;
     use age::secrecy::ExposeSecret;
     #[tokio::test]

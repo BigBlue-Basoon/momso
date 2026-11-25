@@ -33,9 +33,17 @@ for (const [existing, channel] of [[false, 'production'], [true, 'production'], 
     const method = options.method;
     const body = options.body ? JSON.parse(options.body) : {};
     if (url.hostname === 'fixture.a.run.app' && path === '/__momso/ready') return ok({ ready: true });
+    if (url.hostname === 'fixture.a.run.app' && path === '/__momso/proxy-health') {
+      assert.equal(options.credentials, 'omit');
+      assert.match(options.headers['X-Momso-Health-Proof'], /^[a-f0-9]{64}$/);
+      return ok({ state: 'ready' });
+    }
+    if (url.hostname === 'fixture.test' && /\/trust-root-\d+\.json$/.test(path)) return { ok: false, status: 404 };
     if (url.hostname === 'fixture.test') return signed.response(path.endsWith('.sig') ? signed.signature : signed.raw);
     if (method !== 'GET') writes.push(`${method} ${url.hostname}${path}`);
     if (url.hostname === 'cloudresourcemanager.googleapis.com') {
+      if (path.endsWith(':getIamPolicy')) return ok({ etag: 'fixture', version: 3, bindings: [] });
+      if (path.endsWith(':setIamPolicy')) return ok(body.policy);
       if (path === '/v3/projects' && method === 'POST') { project = { ...body, state: 'ACTIVE' }; return ok({ name: 'operations/create' }); }
       if (path === '/v3/operations/create') return ok({ done: true });
       if (path === `/v3/projects/${projectId}`) return project ? ok(project) : ok({}, 404);
@@ -61,9 +69,10 @@ for (const [existing, channel] of [[false, 'production'], [true, 'production'], 
       }
       if (path.includes('/serviceAccounts/')) { const name = path.split('/').at(-1); if (method === 'DELETE') { accounts.delete(name); return ok({}); } return accounts.has(name) ? ok(accounts.get(name)) : ok({}, 404); }
       if (path.endsWith('/roles') && method === 'POST') { roles.set(body.roleId, { ...body.role, name: `projects/${projectId}/roles/${body.roleId}` }); return ok(body.role); }
-      if (path.includes('/roles/')) { const name = path.split('/').at(-1); if (method === 'DELETE') { roles.delete(name); return ok({}); } return roles.has(name) ? ok(roles.get(name)) : ok({}, 404); }
+      if (path.includes('/roles/')) { const name = path.split('/').at(-1).replace(':undelete', ''); if (method === 'DELETE') { roles.delete(name); return ok({}); } if (path.endsWith(':undelete') && method === 'POST') { roles.get(name).deleted = false; return ok({}); } if (method === 'PATCH') { roles.get(name).includedPermissions = body.includedPermissions; return ok({}); } return roles.has(name) ? ok(roles.get(name)) : ok({}, 404); }
     }
     if (url.hostname === 'secretmanager.googleapis.com') {
+      if (path.endsWith('/versions/latest:access')) return ok({ payload: { data: Buffer.from('fixture-private-transport-token-value-1234567890').toString('base64') } });
       if (path.endsWith('/secrets') && method === 'POST') { const name = url.searchParams.get('secretId'); secrets.set(name, { name: `projects/${projectId}/secrets/${name}`, labels: { 'momso-install-id': id }, versions: [] }); return ok({}); }
       const name = path.split('/secrets/')[1]?.split(/[/:]/)[0];
       if (method === 'DELETE') { secrets.delete(name); return ok({}); }
@@ -144,18 +153,26 @@ for (const [existing, channel] of [[false, 'production'], [true, 'production'], 
     }
   }
   const removal = new GoogleBrowserProvider('fixture-private-token', { fetchImpl, sleep: async () => {}, projectId });
-  assert.deepEqual(await removal.destroy(id), { remaining: [], mode: 'pause', status: 'backup_freshness_unverified', retained: [
-    { resource: 'secret_vault', status: 'retained', reason: 'backup_recovery' },
-    { resource: 'backup_bucket', status: 'unverified', reason: 'not_inspected' },
-    { resource: 'backup_kms', status: 'unverified', reason: 'not_inspected' },
-  ], billingZero: null });
+  const removed = await removal.destroy(id);
+  assert.deepEqual(removed.remaining, []);
+  assert.equal(removed.mode, 'pause');
+  assert.equal(removed.resources.iam_bindings.status, 'deleted');
+  assert(removed.retained.some(item => item.resource === 'secret_vault' && item.status === 'retained'));
+  for (const role of ['role_stop', 'role_anywhere', 'role_update']) assert(removed.retained.some(item => item.resource === role && item.status === 'retained'));
   assert.equal(resources.size, 0);
   assert.equal(secrets.size, 1);
   assert(secrets.has(`momso-vault-${short}`), 'pause must retain the vault identity');
   assert.equal(accounts.size, 0);
-  assert.equal(roles.size, 0);
+  assert.equal(roles.size, 3);
   assert.equal(service, null);
   assert(project, 'destroy must preserve the project');
+  roles.get(`momsoStop${short}`).deleted = true;
+  roles.get(`momsoAnywhere${short}`).includedPermissions = [];
+  await startFromGesture(args);
+  assert.equal(roles.get(`momsoStop${short}`).deleted, false);
+  assert.deepEqual(roles.get(`momsoAnywhere${short}`).includedPermissions, ['compute.instances.get', 'compute.instances.start']);
+  const restoredVault = secretPolicies.get(`momso-vault-${short}`).bindings.find(item => item.role === 'roles/secretmanager.secretAccessor');
+  assert(restoredVault.members.includes(`serviceAccount:momso-vm-${short}@${projectId}.iam.gserviceaccount.com`));
 });
 
 test('invalid signed release cannot start a cloud installation', async () => {

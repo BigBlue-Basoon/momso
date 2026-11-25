@@ -1,7 +1,9 @@
+import PROXY_FILES from './momso_anywhere_proxy_files.json' with { type: 'json' };
 // This is public VM metadata: never include an OAuth token or proxy secret here.
 export function vmStartupScript({ project, secret, bundleUrl, bundleSha256, update = null }) {
   if (!/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project) || !/^momso-transport-[a-f0-9]{12}$/.test(secret) || !/^https:\/\/[a-zA-Z0-9.-]+(?::443)?\//.test(bundleUrl) || !/^[a-f0-9]{64}$/.test(bundleSha256)) throw new Error('invalid_vm_release');
   if (update !== null && (!['development', 'production'].includes(update.channel) || !/^https:\/\/[a-zA-Z0-9.-]+(?::443)?\//.test(update.manifestUrl ?? '') || !/^[A-Za-z0-9+/]{58,60}={0,2}$/.test(update.publicKeySpki ?? ''))) throw new Error('invalid_vm_release');
+  if (update?.channel === 'production' && !/^[A-Za-z0-9+/]+={0,2}$/.test(update.trustBootstrap ?? '')) throw new Error('invalid_vm_release');
   const config = JSON.stringify({ project, secret, bundleUrl, bundleSha256, update });
   return `#!/bin/sh
 set -eu
@@ -9,6 +11,7 @@ install -d -m 0755 /opt/momso
 cat > /opt/momso/bootstrap.py <<'MOMSO_BOOTSTRAP'
 import base64,hashlib,io,json,os,pathlib,secrets,shutil,subprocess,tarfile,tempfile,urllib.request
 cfg=json.loads(${JSON.stringify(config)})
+proxy_files=tuple(json.loads(${JSON.stringify(JSON.stringify(PROXY_FILES))}))
 def run(*args):subprocess.run(args,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 def fetch(url,headers=None):
  with urllib.request.urlopen(urllib.request.Request(url,headers=headers or {}),timeout=120) as r:return r.read()
@@ -28,7 +31,7 @@ if missing:
  os.environ['DEBIAN_FRONTEND']='noninteractive';run('apt-get','update','-qq');run('apt-get','install','-y','-qq',*missing)
 web=os.path.join(base,'web'); marker=base+'/.bootstrap-release-installed'
 backup_files=('momso_anywhere_backup.py','momso_anywhere_backup_agent.py','momso_anywhere_backup_google.py','momso_anywhere_vault_identity.py')
-installed=all(os.path.isfile(os.path.join(base,name)) for name in ('momso-server','momso_mobile_proxy.py','momso_anywhere_vm_proxy.py','vault-provision.py','idle-stop.py','web/index.html','web/.momso-owned'))
+installed=all(os.path.isfile(os.path.join(base,name)) for name in ('momso-server','vault-provision.py','idle-stop.py','web/index.html','web/.momso-owned')+proxy_files)
 if os.path.exists(marker) and not installed:raise RuntimeError('installed_release_incomplete')
 if not os.path.exists(marker) and not installed:
  data=fetch(cfg['bundleUrl']);assert hashlib.sha256(data).hexdigest()==cfg['bundleSha256']
@@ -43,8 +46,8 @@ if not os.path.exists(marker) and not installed:
     assert parts and not m.name.startswith('/') and '..' not in parts and (m.isdir() or m.isfile())
     safe.append(m)
    tar.extractall(tmp,members=safe,**({'filter':'data'} if hasattr(tarfile,'data_filter') else {}))
-  for name in ('momso-server','momso_mobile_proxy.py','momso_anywhere_vm_proxy.py','vault-provision.py','idle-stop.py','web/index.html')+backup_files:assert os.path.isfile(os.path.join(tmp,name))
-  for name in ('momso-server','momso_mobile_proxy.py','momso_anywhere_vm_proxy.py','vault-provision.py','idle-stop.py')+backup_files:
+  for name in ('momso-server','vault-provision.py','idle-stop.py','web/index.html')+proxy_files+backup_files:assert os.path.isfile(os.path.join(tmp,name))
+  for name in ('momso-server','vault-provision.py','idle-stop.py')+proxy_files+backup_files:
    dst=os.path.join(base,name)
    if name in backup_files and os.path.lexists(dst):
     assert os.path.isfile(dst) and not os.path.islink(dst) and open(dst,'rb').read()==open(os.path.join(tmp,name),'rb').read();continue
@@ -74,7 +77,7 @@ if not all(os.path.isfile(os.path.join(base,name)) and not os.path.islink(os.pat
     with tar.extractfile(member) as src,os.fdopen(fd,'wb') as dst:shutil.copyfileobj(src,dst);dst.flush();os.fsync(dst.fileno())
     os.chmod(temporary,0o644);os.link(temporary,dest)
    finally:os.unlink(temporary)
-update_files=('update.py','release_manifest.py','server_admission.py','systemd_host.py','data_snapshots.py','cloud_run_gateway.py','github_releases.py','progress_status.py','layout_migration.py','install_worker.py','worker.py','ensure_gcloud.py')
+update_files=('update.py','release_manifest.py','server_admission.py','systemd_host.py','data_snapshots.py','cloud_run_gateway.py','github_releases.py','progress_status.py','layout_migration.py','install_worker.py','worker.py','ensure_gcloud.py','managed_helpers.py','momso_managed_files.py','momso_anywhere_proxy_files.py','momso_anywhere_proxy_files.json','trust_rotation.py')
 update_dir='/opt/momso-updater'
 if cfg.get('update') and not all(os.path.isfile(os.path.join(update_dir,name)) and not os.path.islink(os.path.join(update_dir,name)) for name in update_files):
  data=fetch(cfg['bundleUrl']);assert hashlib.sha256(data).hexdigest()==cfg['bundleSha256']
@@ -177,6 +180,8 @@ if cfg.get('update'):
  else:
   with open(public,'xb') as f:f.write(pem)
  config={'channel':cfg['update']['channel'],'updateRoot':'/opt/momso/releases','dataDir':'/var/lib/momso','statusFile':'/run/momso-update/status.json','publicKey':public,'serverTokenFile':'/run/momso-vault/server-token','lifecycleDir':'/var/lib/momso/lifecycle','serverUnit':'momso-server.service','proxyUnit':'momso-private-proxy.service','project':cfg['project'],'region':'asia-northeast3','gatewayService':'momso-any-'+backup_id}
+ if cfg['update']['channel']=='production':
+  config['trustBootstrap']=cfg['update']['trustBootstrap'];config['trustState']='/var/lib/momso-update-trust'
  active='/opt/momso/releases/.momso-update-active';config_path='/etc/momso-update.json';unit='/etc/systemd/system/momso-update.service'
  if os.path.isfile(active) and os.path.isfile(config_path) and os.path.isfile(unit):
   assert open(active).read().strip()=='momso-update-v1' and json.load(open(config_path))==config
@@ -184,7 +189,9 @@ if cfg.get('update'):
  else:
   manifest=cfg['update']['manifestUrl'];parts=urllib.parse.urlsplit(manifest);signature=urllib.parse.urlunsplit((parts.scheme,parts.netloc,parts.path+'.sig',parts.query,''))
   poller=worker.make_poller(config)
+  if config['channel']=='production':poller.source.discover();poller._apply_roots()
   install_worker.install('/opt/momso','/etc/systemd/system',update_dir,config_path,config,poller.updater,manifest,signature)
+run('systemctl','is-active','--quiet','momso-private-proxy')
 der=subprocess.check_output(['openssl','x509','-in',cert,'-outform','DER']);fp=hashlib.sha256(der).hexdigest()
 req=urllib.request.Request(metadata+'instance/guest-attributes/momso/fingerprint',data=fp.encode(),headers={'Metadata-Flavor':'Google'},method='PUT')
 with urllib.request.urlopen(req,timeout=10):pass

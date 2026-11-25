@@ -5,7 +5,7 @@ import { activatePinnedRevision } from './momso_anywhere_cloud_run_revision.mjs'
 const image = 'registry.example.test/momso/gateway@sha256:' + 'a'.repeat(64);
 const traffic = [{ revision: 'old-rev', percent: 100 }];
 
-function fixture({ mismatch = false, failSwitch = false, ignoreSwitch = false, mismatchAfterSwitch = false, probeFailure = false, staleCreated = false, cached = false, platformDigest = false } = {}) {
+function fixture({ mismatch = false, failSwitch = false, ignoreSwitch = false, mismatchAfterSwitch = false, probeFailure = false, proxyFailure = false, staleCreated = false, cached = false, platformDigest = false } = {}) {
   let service = { etag: 'v1', invokerIamDisabled: true, terminalCondition: { state: 'CONDITION_SUCCEEDED' }, latestReadyRevision: 'old-rev', latestCreatedRevision: 'old-rev', trafficStatuses: traffic };
   const writes = [];
   return {
@@ -13,7 +13,7 @@ function fixture({ mismatch = false, failSwitch = false, ignoreSwitch = false, m
     async run() {
       return activatePinnedRevision({ image, service, template: { containers: [{ image }] }, read: async () => service,
         revision: async () => ({ conditions: [{ type: 'Ready', state: 'CONDITION_SUCCEEDED', revisionReason: 'RETIRED' }], containers: [{ image: mismatch || (mismatchAfterSwitch && service.trafficStatuses[0].revision === 'new-rev') ? 'wrong' : platformDigest ? 'cache.region-docker.pkg.dev/ghcr.io/example/image@sha256:' + 'b'.repeat(64) : cached ? 'cache.region-docker.pkg.dev/ghcr.io/example/image@' + image.split('@')[1] : image }] }),
-        probe: async () => !probeFailure,
+        probe: async () => { if (proxyFailure) throw Object.assign(new Error(), { step: 'proxy_not_running' }); return !probeFailure; },
         patch: async (body, mask) => {
           writes.push({ body, mask });
           if (failSwitch && mask === 'traffic,invokerIamDisabled' && body.traffic[0].revision === 'new-rev') throw new Error('fixture failure');
@@ -42,13 +42,14 @@ test('rejects index digest resolved to a different platform manifest', async () 
   assert.equal(f.service.trafficStatuses[0].revision, 'old-rev');
 });
 
-for (const option of [{ mismatch: true }, { failSwitch: true }, { ignoreSwitch: true }, { mismatchAfterSwitch: true }, { probeFailure: true }, { staleCreated: true }]) test(`failure restores prior traffic ${JSON.stringify(option)}`, async () => {
+for (const option of [{ mismatch: true }, { failSwitch: true }, { ignoreSwitch: true }, { mismatchAfterSwitch: true }, { probeFailure: true }, { proxyFailure: true }, { staleCreated: true }]) test(`failure restores prior traffic ${JSON.stringify(option)}`, async () => {
   const f = fixture(option);
   await assert.rejects(f.run(), error => {
     assert.equal(error.rolledBack, true);
     if (option.mismatch) assert.equal(error.code, 'gateway_image_mismatch');
     if (option.ignoreSwitch) assert.equal(error.code, 'gateway_traffic_mismatch');
     if (option.probeFailure) assert.equal(error.code, 'gateway_probe_failed');
+    if (option.proxyFailure) assert.equal(error.code, 'proxy_not_running');
     return true;
   });
   assert.equal(f.service.trafficStatuses[0].revision, 'old-rev');

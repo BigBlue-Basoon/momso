@@ -90,8 +90,19 @@ class ReleaseDiscoveryTests(UpdateTests):
                       2: [self.release("2026-01-02T00:00:00Z", False)]}
         self.assertIsNotNone(self.source().discover())
 
+    def test_rotation_assets_are_discovered_for_production_only(self):
+        item = self.release('2026-01-02T00:00:00Z', False)
+        item['assets'].extend([
+            {'name': 'trust-root-1.json', 'state': 'uploaded', 'browser_download_url': self.base + '/trust-root-1.json'},
+            {'name': 'trust-root-1.sigs.json', 'state': 'uploaded', 'browser_download_url': self.base + '/trust-root-1.sigs.json'},
+        ])
+        self.items = [item]
+        source = self.source()
+        source.discover()
+        self.assertEqual(source.rotation_assets, [(1, {'json': self.base + '/trust-root-1.json', 'sigs.json': self.base + '/trust-root-1.sigs.json'})])
+
     def test_periodic_worker_retries_after_failure(self):
-        updater = Mock(channel="production")
+        updater = Mock(channel="production", trust_store=None)
         updater.recover.return_value = "no_recovery"
         updater.install.side_effect = [UpdateError("update_unavailable"), "completed"]
         source = Mock(channel="production")
@@ -112,6 +123,18 @@ class ReleaseDiscoveryTests(UpdateTests):
         stop.wait.return_value = True
         ReleasePoller(source, updater).run_forever(stop, interval_seconds=3600)
         stop.wait.assert_called_once_with(7200)
+
+    def test_busy_rechecks_after_five_seconds(self):
+        updater = Mock(channel='production', trust_store=None)
+        updater.recover.return_value = 'no_recovery'
+        updater.install.side_effect = ['busy', 'up_to_date']
+        source = Mock(channel='production')
+        source.discover.return_value = ('manifest', 'signature')
+        stop = Mock()
+        stop.is_set.return_value = False
+        stop.wait.side_effect = [False, True]
+        ReleasePoller(source, updater).run_forever(stop, interval_seconds=3600)
+        self.assertEqual([item.args[0] for item in stop.wait.call_args_list], [5, 3600])
 
     def test_failure_retried_next_tick_and_busy_waits(self):
         self.items = [self.release("2026-01-02T00:00:00Z", False)]

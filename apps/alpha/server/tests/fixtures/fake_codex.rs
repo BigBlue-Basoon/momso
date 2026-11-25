@@ -215,6 +215,7 @@ fn main() {
                     .pointer("/params/input/0/text")
                     .and_then(Value::as_str)
                     .and_then(|s| s.strip_prefix("login fixture "))
+                    .and_then(|s| s.split_whitespace().next())
                 {
                     emit(
                         json!({"id":221,"method":"item/tool/call","params":{"tool":"browser_navigate","arguments":{"url":url}}}),
@@ -225,6 +226,7 @@ fn main() {
                     .pointer("/params/input/0/text")
                     .and_then(Value::as_str)
                     .and_then(|s| s.strip_prefix("otp fixture "))
+                    .and_then(|s| s.split_whitespace().next())
                 {
                     emit(
                         json!({"id":211,"method":"item/tool/call","params":{"tool":"browser_navigate","arguments":{"url":url}}}),
@@ -235,6 +237,7 @@ fn main() {
                     .pointer("/params/input/0/text")
                     .and_then(Value::as_str)
                     .and_then(|s| s.strip_prefix("read fixture "))
+                    .and_then(|s| s.split_whitespace().next())
                 {
                     emit(
                         json!({"id":214,"method":"item/tool/call","params":{"tool":"browser_navigate","arguments":{"url":url}}}),
@@ -245,6 +248,7 @@ fn main() {
                     .pointer("/params/input/0/text")
                     .and_then(Value::as_str)
                     .and_then(|s| s.strip_prefix("browser fixture "))
+                    .and_then(|s| s.split_whitespace().next())
                 {
                     emit(
                         json!({"id":201,"method":"item/tool/call","params":{"tool":"browser_navigate","arguments":{"url":url}}}),

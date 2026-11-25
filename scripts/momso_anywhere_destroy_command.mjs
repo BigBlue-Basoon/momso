@@ -8,7 +8,7 @@ export async function runDestroyCommand({ projectId, installationId, token, save
   if (discardData !== true) throw Object.assign(new Error('backup_freshness_unverified'), { step: 'backup_freshness_unverified' });
   const provider = providerFactory(token, { projectId });
   await saveState({ projectId, installationId, remaining: ['unknown'], deletion: previous });
-  const infrastructure = await provider.destroy(installationId, onProgress);
+  const infrastructure = await provider.destroy(installationId, onProgress, { discardData: true });
   const deletion = await provider.discardBackup(installationId, previous);
   for (const name of ['vm', 'gateway', 'network', 'secrets', 'iam']) deletion.resources[name] ??= { status: 'unverified', reason: 'not_inventoried' };
   const done = ['bucket', 'kms', 'secret_vault'].every(name => deletion.resources?.[name]?.status === 'deleted');

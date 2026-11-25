@@ -6,6 +6,7 @@ import hashlib
 import html
 import hmac
 import os
+import re
 import ssl
 import json
 import threading
@@ -237,6 +238,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not host or host.lower() != os.environ.get("MOMSO_PUBLIC_HOST", "").lower() or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for c in host.lower()):
             self.json_reply(403, {'error': 'invalid_host'})
             return
+        probe_path = self.path == '/__momso/proxy-health'
+        if probe_path and self.headers.get('Origin') is not None:
+            try: allowed_origin = login_origin()
+            except ValueError:
+                self.send_error(503)
+                return
+            if self.headers.get('Origin') != allowed_origin:
+                self.json_reply(403, {'error': 'origin_not_allowed'})
+                return
+            self._pause_cors_origin = allowed_origin
+            if self.command == 'OPTIONS':
+                if self.headers.get('Access-Control-Request-Method') != 'GET' or self.headers.get('Access-Control-Request-Headers', '').lower().strip() != 'x-momso-health-proof':
+                    self.json_reply(403, {'error': 'preflight_not_allowed'})
+                    return
+                self.send_response(204)
+                self.send_header('Access-Control-Allow-Methods', 'GET')
+                self.send_header('Access-Control-Allow-Headers', 'X-Momso-Health-Proof')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+        probe_request = probe_path and self.command == 'GET'
+        if probe_request:
+            token = os.environ.get('MOMSO_PRIVATE_PROXY_TOKEN', '')
+            expected = hmac.new(token.encode(), b'momso-proxy-health-v1', hashlib.sha256).hexdigest() if token else ''
+            proof = self.headers.get('X-Momso-Health-Proof', '')
+            if not expected or not re.fullmatch(r'[a-f0-9]{64}', proof) or not hmac.compare_digest(proof, expected):
+                self.json_reply(403, {'error': 'not_owner'})
+                return
         ticket_request = self.path in PAUSE_TICKET
         if self.path.startswith('/__momso/pause/') and not ticket_request and self.path not in PAUSE_OWNER:
             self.send_error(404)
@@ -265,7 +295,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.command != 'POST':
                 self.send_error(405)
                 return
-        elif not self.authorized(host):
+        elif not probe_request and not self.authorized(host):
             return
         if self.path in PAUSE_OWNER and self.command != PAUSE_OWNER[self.path]:
             self.send_error(405)
@@ -291,7 +321,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             token = os.environ["MOMSO_PRIVATE_PROXY_TOKEN"]
             if not token or "\n" in token or "\r" in token:
                 raise ValueError("invalid token")
-            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"authorization", "cookie", "host", "x-serverless-authorization", "x-goog-iap-jwt-assertion"}}
+            headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"authorization", "cookie", "host", "x-serverless-authorization", "x-goog-iap-jwt-assertion", "x-momso-health-proof"}}
             headers["Authorization"] = "Bearer " + token
             body = self.rfile.read(length) if length else None
             navigation = self.command == "GET" and self.headers.get("Sec-Fetch-Mode") == "navigate" and self.headers.get("Sec-Fetch-Dest") == "document"
@@ -300,7 +330,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 connection = upstream_connection()
                 connection.connect()
                 connection.sock.settimeout(None)
-                connection.request(self.command, self.path, body=body, headers=headers)
+                connection.request(self.command, '/health' if probe_request else self.path, body=body, headers=headers)
                 response = connection.getresponse()
             except ssl.SSLError:
                 if connection:
@@ -309,7 +339,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (OSError, http.client.HTTPException):
                 if connection:
                     connection.close()
-                if ticket_request:
+                if ticket_request or probe_request:
                     raise
                 request_wake()
                 if not navigation:

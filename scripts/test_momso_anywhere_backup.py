@@ -76,6 +76,16 @@ class FakeStore:
             raise ValueError("generation changed")
         self.write(slot, content)
 
+    def create_slot_if_absent(self, slot, content):
+        if slot in self.objects:
+            raise ValueError("slot exists")
+        self.write(slot, content)
+
+    def delete_slot_if_generation(self, slot, generation):
+        if slot not in self.objects or str(self.objects[slot][0]) != generation:
+            raise ValueError("generation changed")
+        del self.objects[slot]
+
     def write_chunk(self, identifier, index, content):
         key = (identifier, index)
         if key in self.chunks:
@@ -132,6 +142,13 @@ class FileStore:
     def replace_if_generation(self, slot, generation, value):
         if self._generation("slot-" + str(slot)) != generation: raise ValueError("generation changed")
         self.write(slot, value)
+    def create_slot_if_absent(self, slot, value):
+        if self.read_versioned(slot) is not None: raise ValueError("slot exists")
+        self.write(slot, value)
+    def delete_slot_if_generation(self, slot, generation):
+        if self._generation("slot-" + str(slot)) != generation: raise ValueError("generation changed")
+        self._path("slot-" + str(slot)).unlink()
+        self._path("slot-" + str(slot) + ".generation").unlink()
     def write_chunk(self, identifier, index, value):
         path = self._path("chunk-" + identifier + "-" + str(index))
         with path.open("xb") as output: output.write(value)
@@ -160,6 +177,64 @@ class AnywhereBackupTests(unittest.TestCase):
         self.store = FakeStore()
         self.keys = FakeKeys()
         self.names = ["server.sqlite3", "vault.age"]
+
+    def test_verify_backup_checks_all_chunks_and_leaves_live_files_alone(self):
+        self.write_db("original")
+        archive = self.data / "archive"
+        archive.mkdir()
+        self.assertEqual(backup.backup(self.data, self.store, self.keys, self.names,
+                                       archive=archive, quiescent=True), "uploaded")
+        blob = self.store.read(0)
+        backup.verify_backup_blob(blob, self.store, self.keys, self.names, self.root)
+        self.assertFalse(any(self.root.glob(".momso-verify-*")))
+        key = next(iter(self.store.chunks))
+        self.store.chunks[key] = b"corrupted"
+        with self.assertRaises(ValueError):
+            backup.verify_backup_blob(blob, self.store, self.keys, self.names, self.root)
+        self.assertFalse(any(self.root.glob(".momso-verify-*")))
+        with closing(sqlite3.connect(self.data / "server.sqlite3")) as db:
+            self.assertEqual(db.execute("SELECT body FROM messages").fetchone()[0], "original")
+
+    def test_verify_backup_with_file_store_detects_chunk_damage(self):
+        self.write_db("file store fixture")
+        store = FileStore(self.root / "remote")
+        archive = self.data / "archive"
+        archive.mkdir()
+        backup.backup(self.data, store, self.keys, self.names, archive=archive, quiescent=True)
+        blob = store.read(0)
+        backup.verify_backup_blob(blob, store, self.keys, self.names, self.root)
+        chunk = next((self.root / "remote").glob("chunk-*"))
+        chunk.write_bytes(b"damaged")
+        with self.assertRaises(ValueError):
+            backup.verify_backup_blob(blob, store, self.keys, self.names, self.root)
+        self.assertFalse(any(self.root.glob(".momso-verify-*")))
+
+    @unittest.skipUnless(os.name == "posix", "backup agent requires POSIX locking")
+    def test_restore_marker_is_removed_only_after_confirmed_backup(self):
+        import momso_anywhere_backup_agent as agent
+        self.write_db('fixture')
+        backup.backup(self.data, self.store, self.keys, self.names, archive=self.data / 'archive', quiescent=True)
+        source_generation = self.store.read_versioned(0)[0]
+        marker = self.data / '.momso-restore-pending-first-backup'
+        marker.write_bytes(f'momso-restore-v2:slot-0@{source_generation}\n'.encode())
+        env = {'MOMSO_SERVER_DATA_DIR': str(self.data), 'MOMSO_BACKUP_BUCKET': 'fixture',
+               'MOMSO_BACKUP_KMS_KEY': 'fixture', 'MOMSO_BACKUP_QUIESCENT': '1'}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(agent, 'GoogleClient'), \
+             mock.patch.object(agent, 'CloudStorage', return_value=self.store), \
+             mock.patch.object(agent, 'CloudKms', return_value=self.keys), \
+             mock.patch('sys.argv', ['agent', 'backup']), mock.patch('sys.stdout', new_callable=io.StringIO):
+            with mock.patch.object(backup, 'backup', side_effect=OSError('fixture failure')):
+                with self.assertRaises(OSError): agent.main()
+            self.assertTrue(marker.exists())
+            with mock.patch.object(backup, 'backup', return_value='unchanged'):
+                agent.main()
+            self.assertTrue(marker.exists())
+            with sqlite3.connect(self.data / 'server.sqlite3') as db:
+                db.execute('update messages set body = ?', ('changed',))
+            with mock.patch.object(backup, 'backup', wraps=backup.backup) as call:
+                agent.main()
+            self.assertTrue(call.call_args.kwargs['preserve_existing_slots'])
+            self.assertFalse(marker.exists())
 
     @unittest.skipUnless(os.name == "posix", "backup agent requires POSIX locking")
     def test_snapshot_signal_is_opt_in_for_older_servers(self):
@@ -1066,6 +1141,26 @@ class AnywhereBackupTests(unittest.TestCase):
         self.assertIn("ifGenerationMatch=123", client.calls[-1][0])
         with self.assertRaises(ValueError): store.delete_chunk_generation("a" * 32, 0, "123&other=1")
         with self.assertRaises(ValueError): store.delete_current_chunk_if_unchanged("../escape", 0)
+
+    def test_temporary_slot_creation_and_deletion_are_generation_conditional(self):
+        class Client:
+            def __init__(self): self.calls = []
+            def request(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return b'{}'
+        client = Client()
+        store = CloudStorage(client, 'example-private-bucket')
+        store.create_slot_if_absent(7, b'fixture ciphertext')
+        self.assertIn('slot-7.enc', client.calls[-1][0])
+        self.assertIn('ifGenerationMatch=0', client.calls[-1][0])
+        store.delete_slot_if_generation(7, '123')
+        self.assertEqual(client.calls[-1][1]['method'], 'DELETE')
+        self.assertIn('ifGenerationMatch=123', client.calls[-1][0])
+        for generation in ('0', '', '1&other=1'):
+            with self.assertRaises(ValueError): store.delete_slot_if_generation(7, generation)
+        with self.assertRaises(ValueError): store.write(7, b'unsafe')
+        with self.assertRaises(ValueError): store.replace_if_generation(7, '123', b'unsafe')
+        with self.assertRaises(ValueError): store.create_slot_if_absent(True, b'unsafe')
 
     def test_cloud_fence_recovery_never_releases_another_owner(self):
         class Client:

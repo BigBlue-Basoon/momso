@@ -20,17 +20,51 @@ export function hasPendingRedirect() { return hasOAuthFragment(); }
 export function clearStartAuthorization() { authorization = null; }
 
 // Only fixed Google URLs are accepted; the saved retry contains no credentials.
-export function openGoogleSetup({ destination, session = sessionStorage, location = window.location }) {
+export function openGoogleSetup({ destination, session = sessionStorage, open = window.open.bind(window) }) {
   const target = CLOUD_SETUP_URLS[destination];
   if (!target || !Object.hasOwn(CLOUD_SETUP_URLS, destination)) throw new SetupError('invalid_destination');
   try {
-    if (!session.getItem(RETRY_KEY)) throw new SetupError('checkpoint_unavailable');
-    session.setItem(CLOUD_RETURN_KEY, '1');
+    if (!session.getItem(RETRY_KEY)) session.setItem(RETRY_KEY, JSON.stringify({ action: ['billing', 'trial'].includes(destination) ? 'billing' : 'projects', projectId: null, billingAccountName: null }));
   } catch (error) {
     if (error instanceof SetupError) throw error;
     throw new SetupError('checkpoint_unavailable');
   }
-  location.assign(target);
+  open(target, '_blank', 'noopener,noreferrer');
+}
+
+// A screen owns the returned cleanup function and shows retry errors itself.
+export function watchGoogleSetupReturn({ onResult, onError = () => {}, intervalMs = 15000, documentImpl = document, windowImpl = window, retry = retryLastAction, ...options }) {
+  if (typeof onResult !== 'function' || !Number.isFinite(intervalMs) || intervalMs < 1000) throw new SetupError('invalid_authorization');
+  let stopped = false, running = false;
+  const check = async () => {
+    if (stopped || running || documentImpl.visibilityState !== 'visible') return;
+    let request;
+    try { request = JSON.parse((options.session ?? sessionStorage).getItem(RETRY_KEY) || 'null'); }
+    catch { onError(new SetupError('checkpoint_unavailable')); return; }
+    if (!request || !['projects', 'billing', 'start'].includes(request.action)) return;
+    // A background check must never initiate an OAuth redirect.
+    const origin = (options.location ?? window.location).origin;
+    if (!authorization || authorization.clientId !== options.clientId || authorization.origin !== origin || Date.now() >= authorization.expiresAt) {
+      onError(new SetupError('authorization_expired')); return;
+    }
+    running = true;
+    try {
+      const result = await retry({ ...options, background: true });
+      if (result?.kind === 'billing' && !result.billingAccounts?.length) return;
+      if (!stopped) { stopped = true; cleanup(); onResult(result); }
+    } catch (error) { if (!stopped) onError(error); }
+    finally { running = false; }
+  };
+  const cleanup = () => {
+    stopped = true;
+    documentImpl.removeEventListener('visibilitychange', check);
+    windowImpl.removeEventListener('focus', check);
+    windowImpl.clearInterval(timer);
+  };
+  documentImpl.addEventListener('visibilitychange', check);
+  windowImpl.addEventListener('focus', check);
+  const timer = windowImpl.setInterval(check, intervalMs);
+  return { check, stop: cleanup };
 }
 
 // User gesture -> Google authorization -> search only this account's owned installations.
@@ -91,7 +125,9 @@ function failedDeletion(error, discardData, { storage, projectId, installationId
     const saved = JSON.parse(storage?.getItem(`momso.destroy.${projectId}.${installationId}`) ?? 'null');
     if (saved?.projectId === projectId && saved?.installationId === installationId && saved.deletion && typeof saved.deletion === 'object') previous = saved.deletion;
   } catch { /* Prior billing evidence is unavailable. */ }
-  return deletionResult({ ...previous, mode: discardData ? 'delete_all' : 'pause', failed: true, reason });
+  const resources = { ...(previous.resources ?? {}) };
+  if (reason === 'iam_bindings_unverified') resources.iam_bindings = { status: 'unverified', reason };
+  return deletionResult({ ...previous, resources, mode: discardData ? 'delete_all' : 'pause', failed: true, reason });
 }
 
 export async function cancelPauseFromGesture({ session = globalThis.sessionStorage, fetchImpl = fetch } = {}) {
@@ -118,11 +154,11 @@ export async function deletionPreviewFromGesture({ clientId, release, projectId,
   return runGesture({ action: 'deletion_preview', clientId, release, projectId, installationId, session, location, cryptoImpl, storage, fetchImpl, providerFactory });
 }
 
-async function performRequest({ request, clientId, release, onProgress, storage, session, cryptoImpl, fetchImpl, providerFactory }) {
+async function performRequest({ request, clientId, release, onProgress, storage, session, cryptoImpl, fetchImpl, providerFactory, background = false }) {
   if (request.action === 'destroy' && request.discardData !== true && !pendingPause) throw new SetupError('pause_requires_app_session');
   try { session.setItem(RETRY_KEY, JSON.stringify({ action: request.action, projectId: request.projectId, billingAccountName: request.billingAccountName, installationId: request.installationId, discardData: request.discardData === true })); }
   catch { throw new SetupError('checkpoint_unavailable'); }
-  const { provider, ownerSub } = await providerFactory({ ...request, clientId, release, fetchImpl });
+  const { provider, ownerSub } = await providerFactory({ ...request, clientId, release, fetchImpl, trustStorage: storage });
   let value;
   if (request.action === 'find') value = await provider.findExisting();
   else if (request.action === 'projects') value = await provider.projects();
@@ -158,7 +194,7 @@ async function performRequest({ request, clientId, release, onProgress, storage,
       }
       try {
         if (active.cancelled) throw new SetupError('pause_cancelled');
-        const removed = await provider.destroy(request.installationId, onProgress, { onVmState: state => {
+        const removed = await provider.destroy(request.installationId, onProgress, { discardData: false, onVmState: state => {
           if (state === 'unknown' && active.cancelled) throw new SetupError('pause_cancelled');
           vmState = state; active.vmState = state;
         } });
@@ -184,7 +220,7 @@ async function performRequest({ request, clientId, release, onProgress, storage,
       if (saved?.projectId === request.projectId && saved?.installationId === request.installationId) previous = saved.deletion ?? null;
     } catch { throw new SetupError('invalid_checkpoint'); }
     storage.setItem(key, JSON.stringify({ projectId: request.projectId, installationId: request.installationId, remaining: ['unknown'], deletion: previous }));
-    const infrastructure = await provider.destroy(request.installationId, onProgress);
+    const infrastructure = await provider.destroy(request.installationId, onProgress, { discardData: true });
     const deletion = await provider.discardBackup(request.installationId, previous);
     Object.assign(deletion.resources ??= {}, infrastructure.resources ?? {});
     for (const name of ['vm', 'disk', 'gateway', 'network', 'secrets', 'iam', 'iam_bindings']) deletion.resources[name] ??= { status: 'unverified', reason: 'not_inventoried' };
@@ -194,7 +230,7 @@ async function performRequest({ request, clientId, release, onProgress, storage,
     else storage.removeItem(key);
   }
   else throw new SetupError('invalid_authorization');
-  session.removeItem(RETRY_KEY);
+  if (!(background && request.action === 'billing' && Array.isArray(value) && value.length === 0)) session.removeItem(RETRY_KEY);
   return value;
 }
 
@@ -202,6 +238,7 @@ async function runGesture(options) {
   const { action, clientId, session, location, cryptoImpl } = options;
   const request = { action, projectId: options.projectId ?? null, billingAccountName: options.billingAccountName ?? null, installationId: options.installationId ?? null, discardData: options.discardData === true };
   const redirect = async () => {
+    if (options.background) throw new SetupError('authorization_expired');
     try { return beginRedirect({ ...request, clientId, storage: session, location, cryptoImpl }); }
     catch (error) {
       if (action === 'destroy' && !request.discardData) {
@@ -285,12 +322,12 @@ function screenResult(action, value, selection) {
 }
 
 // Unlike the legacy synchronous retry, this returns the completed operation to the screen.
-export async function retryLastAction({ clientId, release, onProgress, storage = localStorage, session = sessionStorage, location = window.location, cryptoImpl = crypto, fetchImpl = fetch, providerFactory = providerFromToken }) {
+export async function retryLastAction({ clientId, release, onProgress, storage = localStorage, session = sessionStorage, location = window.location, cryptoImpl = crypto, fetchImpl = fetch, providerFactory = providerFromToken, background = false }) {
   let request;
   try { request = JSON.parse(session.getItem(RETRY_KEY) || 'null'); }
   catch { throw new SetupError('checkpoint_unavailable'); }
   if (!request) throw new SetupError('checkpoint_unavailable');
-  const value = await runGesture({ ...request, clientId, release, onProgress, storage, session, location, cryptoImpl, fetchImpl, providerFactory });
+  const value = await runGesture({ ...request, clientId, release, onProgress, storage, session, location, cryptoImpl, fetchImpl, providerFactory, background });
   if (value?.redirecting === true) return { kind: 'redirecting' };
   return screenResult(request.action, value, { projectId: request.projectId, billingAccountName: request.billingAccountName });
 }

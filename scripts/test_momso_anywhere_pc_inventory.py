@@ -1,7 +1,9 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from momso_anywhere_pc_inventory import inspect_destroyed
+from momso_anywhere_vm_resources import names
 
 
 class Tests(unittest.TestCase):
@@ -38,6 +40,31 @@ class Tests(unittest.TestCase):
                 return [{'name': 'momso-' + 'a' * 12, 'labels': {'momso-install-id': 'a' * 12}}]
             return []
         self.assertEqual(inspect_destroyed(self.provider(run))['vm']['status'], 'retained')
+
+    def test_backup_role_and_vault_are_counted_for_discard(self):
+        def run(*args, **_kwargs):
+            if args[:3] == ('iam', 'roles', 'list'):
+                return [{'name': 'projects/test/roles/momsoBackup' + 'a' * 12, 'description': 'momso-install-' + 'a' * 12}]
+            if args[:2] == ('secrets', 'list'):
+                return [{'name': 'projects/test/secrets/momso-vault-' + 'a' * 12, 'labels': {'momso-install-id': 'a' * 12}}]
+            return []
+        result = inspect_destroyed(self.provider(run), discard_data=True)
+        self.assertEqual(result['iam']['status'], 'retained')
+        self.assertEqual(result['secrets']['status'], 'retained')
+        self.assertEqual(inspect_destroyed(self.provider(run))['secrets']['status'], 'deleted')
+
+    def test_new_declared_role_is_inventoried(self):
+        p = self.provider(lambda *_args, **_kwargs: [])
+        declared = names(p)
+        declared['roles'] = (*declared['roles'], 'fixtureExtra' + p.install_id)
+        def run(*args, **_kwargs):
+            if args[:3] == ('iam', 'roles', 'list'):
+                return [{'name': 'projects/test/roles/' + declared['roles'][-1], 'description': p.marker}]
+            return []
+        p.run = run
+        with patch('momso_anywhere_pc_inventory.vm_resource_names', return_value=declared):
+            self.assertEqual(inspect_destroyed(p, discard_data=True)['iam']['status'], 'retained')
+            self.assertEqual(inspect_destroyed(p)['free_roles']['names'], [declared['roles'][-1]])
 
 
 if __name__ == '__main__':

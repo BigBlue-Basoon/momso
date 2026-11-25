@@ -1,14 +1,19 @@
 """Linux service adapter; admission and gateway are provided by their owners."""
 import json
+import hashlib
+import hmac
 import os
+import ssl
 from pathlib import Path
 import subprocess
 import time
 import urllib.request
+import urllib.parse
 import sys
 
 from data_snapshots import DataSnapshots
 from server_admission import AdmissionError
+from momso_anywhere_proxy_files import PROXY_FILES
 from update import _atomic_json
 from managed_helpers import ManagedHelpers
 
@@ -119,8 +124,7 @@ class SystemdHost:
             self.helpers.commit()
     def refresh_proxy(self, old_release, new_release):
         if not self.proxy_unit or not old_release or not new_release: return
-        names = ('momso_mobile_proxy.py', 'momso_anywhere_vm_proxy.py')
-        if any((Path(old_release) / name).read_bytes() != (Path(new_release) / name).read_bytes() for name in names):
+        if any(not (Path(old_release) / name).is_file() or (Path(old_release) / name).read_bytes() != (Path(new_release) / name).read_bytes() for name in PROXY_FILES):
             subprocess.run(["systemctl", "restart", self.proxy_unit], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
     def restart_worker(self):
         os.execv(sys.executable, [sys.executable, str(self.helpers.worker / 'worker.py'), *sys.argv[1:]])
@@ -128,6 +132,40 @@ class SystemdHost:
     def preflight_gateway(self, image):
         if hasattr(self.gateway, "preflight"): return self.gateway.preflight(image)
     def gateway_healthy(self): return self.gateway.healthy()
+    def gateway_proxy_healthy(self):
+        try:
+            url = self.gateway._describe().get('status', {}).get('url', '')
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme != 'https' or not parsed.hostname or not parsed.hostname.endswith('.run.app') or parsed.netloc != parsed.hostname or parsed.path or parsed.query or parsed.fragment:
+                return False
+            token = Path('/etc/momso-private/transport-token').read_bytes().strip()
+            if not token: return False
+            proof = hmac.new(token, b'momso-proxy-health-v1', hashlib.sha256).hexdigest()
+            request = urllib.request.Request(url + '/__momso/proxy-health', headers={'X-Momso-Health-Proof': proof})
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *args, **kwargs): return None
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+                return response.status == 200 and json.load(response).get('state') == 'ready'
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+            return False
+    def proxy_healthy(self):
+        if not self.proxy_unit:
+            return False
+        for _ in range(30):
+            try:
+                active = subprocess.run(['systemctl', 'is-active', '--quiet', self.proxy_unit], timeout=5).returncode == 0
+                token = Path('/etc/momso-private/transport-token').read_text(encoding='utf-8').strip()
+                request = urllib.request.Request('https://127.0.0.1:8766/health', headers={'Authorization': 'Bearer ' + token})
+                context = ssl.create_default_context(cafile='/etc/momso-private/certificate.pem')
+                context.check_hostname = False
+                if active:
+                    with urllib.request.urlopen(request, context=context, timeout=3) as response:
+                        if response.status == 200 and json.load(response).get('state') == 'ready':
+                            return True
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            time.sleep(1)
+        return False
     def server_healthy(self):
         for _ in range(40):
             try:

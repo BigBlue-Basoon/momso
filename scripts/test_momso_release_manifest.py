@@ -1,4 +1,5 @@
 import hashlib
+import base64
 import io
 import json
 import subprocess
@@ -11,6 +12,8 @@ from unittest.mock import patch
 import momso_release_manifest as release
 import momso_release_keys as keys
 import momso_server_install as installer
+import momso_anywhere_update_install as update_install
+import momso_anywhere_pc_trust as pc_trust
 
 
 class SignedReleaseTests(unittest.TestCase):
@@ -23,6 +26,20 @@ class SignedReleaseTests(unittest.TestCase):
         subprocess.run(['openssl', 'pkey', '-in', str(self.private), '-pubout', '-out', str(self.public)], check=True, capture_output=True)
         for name, value in [('PRODUCTION_KEY', self.public), ('DEVELOPMENT_KEY', self.root / 'absent-dev.pem')]:
             item = patch.object(keys, name, value); item.start(); self.addCleanup(item.stop)
+        public_keys = [base64.b64encode(keys.public_der(self.public)).decode()]
+        for number in range(2):
+            private, public = self.root / f'recovery-{number}', self.root / f'recovery-{number}.pub'
+            subprocess.run(['openssl', 'genpkey', '-algorithm', 'ED25519', '-out', str(private)], check=True, capture_output=True)
+            subprocess.run(['openssl', 'pkey', '-in', str(private), '-pubout', '-out', str(public)], check=True, capture_output=True)
+            public_keys.append(base64.b64encode(keys.public_der(public)).decode())
+        root_path = self.root / 'root.json'
+        root_path.write_text(json.dumps({'version': 0, 'expires': '2099-01-01T00:00:00Z', 'threshold': 2, 'keys': public_keys, 'releaseKey': public_keys[0]}))
+        self.root_path = root_path
+        bootstrap = update_install.production_bootstrap
+        patcher = patch.object(update_install, 'production_bootstrap', side_effect=lambda public: bootstrap(public, root_path))
+        patcher.start(); self.addCleanup(patcher.stop)
+        patcher = patch.object(pc_trust, 'active_key', side_effect=lambda *_: self.public.read_bytes())
+        patcher.start(); self.addCleanup(patcher.stop)
         self.server = self.root / 'server'
         self.server.write_bytes(b'fixture server')
         self.web = self.root / 'web.tar.gz'
@@ -44,8 +61,8 @@ class SignedReleaseTests(unittest.TestCase):
         raw, sig = self.manifest.read_bytes(), self.signature.read_bytes()
         info = release.verify(raw, sig, self.public)
         release.verify_inputs(self.bundle.read_bytes(), info['bundleSha256'], self.server, self.web)
-        js = """import {webcrypto} from 'node:crypto'; import {readFileSync} from 'node:fs'; import {verifyRelease} from './scripts/momso_release_manifest.mjs'; const raw=readFileSync(process.argv[1]),sig=readFileSync(process.argv[2]),pem=readFileSync(process.argv[3],'utf8'),key=pem.replace(/-----[^-]+-----|\\s/g,''); const fetchImpl=async url=>({ok:true,arrayBuffer:async()=>{const b=url.endsWith('.sig')?sig:raw; return b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength)}}); const v=await verifyRelease({manifestUrl:'https://fixture.test/release.json',publicKeySpki:key,loginOrigin:'https://login.example.test'},{fetchImpl,cryptoImpl:webcrypto}); if(v.gatewayImage!==process.argv[4])process.exit(1);"""
-        subprocess.run(['node', '--input-type=module', '-e', js, str(self.manifest), str(self.signature), str(self.public), self.image], check=True, capture_output=True)
+        js = """import {webcrypto} from 'node:crypto'; import {readFileSync} from 'node:fs'; import {verifyRelease} from './scripts/momso_release_manifest.mjs'; const raw=readFileSync(process.argv[1]),sig=readFileSync(process.argv[2]),pem=readFileSync(process.argv[3],'utf8'),key=pem.replace(/-----[^-]+-----|\\s/g,''); const storage={getItem:()=>null,setItem:()=>{}}; const fetchImpl=async url=>url.includes('trust-root-')?{ok:false,status:404}:{ok:true,arrayBuffer:async()=>{const b=url.endsWith('.sig')?sig:raw; return b.buffer.slice(b.byteOffset,b.byteOffset+b.byteLength)}}; const v=await verifyRelease({manifestUrl:'https://fixture.test/release.json',publicKeySpki:key,trustBootstrap:readFileSync(process.argv[5]).toString('base64'),loginOrigin:'https://login.example.test'},{fetchImpl,cryptoImpl:webcrypto,storage}); if(v.gatewayImage!==process.argv[4])process.exit(1);"""
+        subprocess.run(['node', '--input-type=module', '-e', js, str(self.manifest), str(self.signature), str(self.public), self.image, str(self.root_path)], check=True, capture_output=True)
         with self.assertRaisesRegex(release.ManifestError, 'signature_invalid'):
             release.verify(raw + b' ', sig, self.public)
         self.server.write_bytes(b'changed')

@@ -34,4 +34,4 @@ The named publisher project's actual inventory and billing-account totals were *
 No free-tier estimate guarantees a zero bill. In particular, budgets are notifications rather than automatic hard limits; a verified zero-GCP-cost design requires removing or relocating the billable publisher services, not merely configuring a budget. No live resource was removed here.
 # S131: Cloud Run 이미지 지문
 
-Cloud Run은 GHCR의 OCI index를 가져올 때 linux/amd64 manifest 지문으로 기록할 수 있다. 서명 목록에는 index가 아닌 단일 linux/amd64 manifest 지문을 넣는다. GHCR workflow는 provenance와 sbom을 끄고 레지스트리의 mediaType을 확인한 뒤 서명에 쓸 주소를 출력한다. `momso_release_sign.py sign --verify-gateway-registry ...`는 Docker buildx로 공개 레지스트리를 조회해 index나 manifest list를 거절한다. 이 선택 검사를 쓰려면 Docker buildx와 레지스트리 접근이 필요하다. 진짜 릴리스 발행은 별도다.
+Cloud Run은 GHCR의 OCI index를 가져올 때 linux/amd64 manifest 지문으로 기록할 수 있다. 서명 목록에는 index가 아닌 단일 linux/amd64 manifest 지문을 넣는다. GHCR workflow는 provenance와 sbom을 끄고 레지스트리의 mediaType을 확인한 뒤 서명에 쓸 주소를 출력한다. S141 이후 `momso_release_sign.py sign --verify-gateway-registry ...`, 운영 서명과 workflow는 같은 GHCR 익명 HTTP 검사를 쓰므로 Docker 없이 공개 여부·manifest 종류·응답 지문을 확인한다. 이전 방식은 Docker buildx가 필요했다. 진짜 릴리스 발행은 별도다.

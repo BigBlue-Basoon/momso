@@ -22,6 +22,7 @@ from contextlib import closing
 from pathlib import Path, PurePosixPath
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 
 SLOT_COUNT = 7
 FORMAT = b"momso-anywhere-backup-v1"
@@ -332,6 +333,49 @@ def restore_objects(archive, store, key_service, descriptors):
             os.unlink(temporary)
 
 
+def verify_backup_blob(blob, store, key_service, names, temp_root=None):
+    """Verify an encrypted snapshot by restoring it into a disposable directory.
+
+    The caller must compare the storage generation again before pruning anything.
+    This does not change the live data directory or the remote backup.
+    """
+    class SnapshotStore:
+        def modified(self, slot):
+            return 1 if slot == 0 else None
+
+        def read(self, slot):
+            if slot != 0:
+                raise ValueError("invalid verification slot")
+            return blob
+
+        def read_purge_ledger(self):
+            return store.read_purge_ledger()
+
+        def read_chunk(self, identifier, index):
+            return store.read_chunk(identifier, index)
+
+    with tempfile.TemporaryDirectory(prefix=".momso-verify-", dir=temp_root) as directory:
+        root = Path(directory)
+        result = restore(root / "data", SnapshotStore(), key_service, names, slot=0,
+                         vault_identity_writer=lambda _identity: "created",
+                         archive=root / "archive")
+        if result["status"] == "no_backup":
+            raise ValueError("backup_changed")
+        if result["status"] != "restored" or result["conflicts"]:
+            raise ValueError("backup_verification_failed")
+        files = _unpack(_decrypt(blob, key_service))
+        ledger = read_purged_ledger(store, key_service)
+        if ledger:
+            files = without_originals(files, ledger)
+        if ".momso-v3.json" in files:
+            descriptors = json.loads(files[".momso-v3.json"])["descriptors"]
+        else:
+            descriptors = json.loads(files.get(".momso-objects.json", b"[]"))
+        if not isinstance(descriptors, list):
+            raise ValueError("invalid object manifest")
+        restore_objects(root / "all-objects", store, key_service, descriptors)
+
+
 def _snapshot_paths(data_dir, temporary, names):
     result = {}
     for name in sorted(set(names)):
@@ -349,7 +393,7 @@ def _snapshot_paths(data_dir, temporary, names):
     return result
 
 
-def _backup_v3(data_dir, archive, store, key_service, names, vault_identity, memory_files=None):
+def _backup_v3(data_dir, archive, store, key_service, names, vault_identity, memory_files=None, preserve_existing_slots=False, protected_slot=None):
     purged = read_purged_ledger(store, key_service)
     latest = _latest(store)
     previous_payload = _decrypt(store.read(latest[1]), key_service) if latest else None
@@ -416,10 +460,8 @@ def _backup_v3(data_dir, archive, store, key_service, names, vault_identity, mem
         payload = _pack(packed)
         if previous_payload and hashlib.sha256(previous_payload).digest() == hashlib.sha256(payload).digest():
             return "unchanged"
-        times = [(store.modified(i), i) for i in range(SLOT_COUNT)]
-        missing = [i for when, i in times if when is None]
-        slot = missing[0] if missing else min(times)[1]
-        store.write(slot, _encrypt(payload, key_service))
+        _stage_and_rotate(store, key_service, names, _encrypt(payload, key_service),
+                          preserve_existing_slots, protected_slot)
         return "uploaded"
 
 
@@ -689,6 +731,87 @@ def _latest(store):
     slots = [(store.modified(i), i) for i in range(SLOT_COUNT)]
     present = [(when, i) for when, i in slots if when is not None]
     return max(present) if present else None
+
+
+def _finish_staged_backup(store, key_service, names, preserve_existing_slots=False, protected_slot=None):
+    """Adopt the temporary slot without overwriting any existing generation."""
+    staged = store.read_versioned(SLOT_COUNT)
+    if staged is None:
+        return None
+    if preserve_existing_slots and protected_slot == SLOT_COUNT:
+        raise ValueError('restored_temporary_backup_requires_recovery')
+    generation, blob = staged
+    present = [(store.modified(i), i) for i in range(SLOT_COUNT)]
+    try:
+        verify_backup_blob(blob, store, key_service, names)
+        if store.read_versioned(SLOT_COUNT) != staged:
+            raise ValueError("backup_changed")
+    except Exception:
+        # Regular slots are never removed: replacement is atomic. An invalid
+        # staged value can therefore be discarded without touching them.
+        if protected_slot != SLOT_COUNT:
+            store.delete_slot_if_generation(SLOT_COUNT, generation)
+        raise
+    for _, i in present:
+        existing = store.read_versioned(i)
+        if existing is not None and existing[1] == blob:
+            store.delete_slot_if_generation(SLOT_COUNT, generation)
+            return i
+    missing = [i for when, i in present if when is None]
+    if missing:
+        target = missing[0]
+    else:
+        if preserve_existing_slots and protected_slot is None:
+            raise ValueError("restore_source_unknown")
+        eligible = [(when, i) for when, i in present if i != protected_slot]
+        if not eligible:
+            raise ValueError("no_unprotected_backup")
+        _, target = min(eligible)
+        previous = store.read_versioned(target)
+        if previous is None or store.read_versioned(SLOT_COUNT) != staged:
+            raise ValueError("backup_changed")
+        store.replace_if_generation(target, previous[0], blob)
+    if missing:
+        store.create_slot_if_absent(target, blob)
+    copy = store.read_versioned(target)
+    if not copy or copy[1] != blob or store.read_versioned(SLOT_COUNT) != staged:
+        raise ValueError("backup_changed")
+    store.delete_slot_if_generation(SLOT_COUNT, generation)
+    return target
+
+
+def _stage_and_rotate(store, key_service, names, blob, preserve_existing_slots=False, protected_slot=None):
+    if store.read_versioned(SLOT_COUNT) is not None:
+        raise ValueError("backup_stage_not_recovered")
+    store.create_slot_if_absent(SLOT_COUNT, blob)
+    _finish_staged_backup(store, key_service, names, preserve_existing_slots, protected_slot)
+
+
+def select_restore_candidate(store, key_service, names=DATABASE_AND_VAULT):
+    """Prefer a verified regular slot; use the temporary slot only as last resort."""
+    times = [(store.modified(i), i) for i in range(SLOT_COUNT)]
+    regular = sorted(((when, i) for when, i in times if when is not None), reverse=True)
+    candidates = [slot for _, slot in regular]
+    if store.modified(SLOT_COUNT) is not None:
+        candidates.append(SLOT_COUNT)
+    last_error = None
+    for slot in candidates:
+        version = store.read_versioned(slot)
+        if version is None:
+            raise ValueError('backup_changed')
+        try:
+            verify_backup_blob(version[1], store, key_service, names)
+        except (ValueError, InvalidTag, KeyError, FileNotFoundError) as error:
+            if str(error) == 'backup_changed':
+                raise
+            last_error = error
+            continue
+        if store.read_versioned(slot) != version:
+            raise ValueError('backup_changed')
+        return slot, version
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 def _decode_purged_ledger(encrypted, key_service):
@@ -1048,13 +1171,14 @@ def _latest_retention_time(items):
         raise ValueError("invalid retention time") from None
 
 
-def backup(data_dir, store, key_service, names, temp_root=None, vault_identity=None, archive=None, quiescent=False, memory_files=None):
+def backup(data_dir, store, key_service, names, temp_root=None, vault_identity=None, archive=None, quiescent=False, memory_files=None, preserve_existing_slots=False, protected_slot=None):
     """Backup changed data, rotating fixed slots. The caller schedules daily."""
     data_dir = Path(data_dir)
     if archive is not None and not quiescent:
         raise ValueError("quiescence_required")
+    _finish_staged_backup(store, key_service, names, preserve_existing_slots, protected_slot)
     if archive is not None:
-        return _backup_v3(data_dir, Path(archive), store, key_service, names, vault_identity, memory_files)
+        return _backup_v3(data_dir, Path(archive), store, key_service, names, vault_identity, memory_files, preserve_existing_slots, protected_slot)
     with tempfile.TemporaryDirectory(prefix="momso-backup-", dir=temp_root) as tmp:
         files = _snapshot(data_dir, Path(tmp), names)
         latest = _latest(store)
@@ -1077,17 +1201,15 @@ def backup(data_dir, store, key_service, names, temp_root=None, vault_identity=N
         if previous_payload:
             if hashlib.sha256(previous_payload).digest() == hashlib.sha256(payload).digest():
                 return "unchanged"
-        times = [(store.modified(i), i) for i in range(SLOT_COUNT)]
-        missing = [i for when, i in times if when is None]
-        slot = missing[0] if missing else min(times)[1]
-        store.write(slot, _encrypt(payload, key_service))
+        _stage_and_rotate(store, key_service, names, _encrypt(payload, key_service),
+                          preserve_existing_slots, protected_slot)
         return "uploaded"
 
 
-def restore(data_dir, store, key_service, names=DATABASE_AND_VAULT, vault_identity_writer=None, archive=None):
+def restore(data_dir, store, key_service, names=DATABASE_AND_VAULT, vault_identity_writer=None, archive=None, slot=None):
     """Restore only missing destinations; preserve conflicts separately."""
     data_dir = Path(data_dir)
-    latest = _latest(store)
+    latest = _latest(store) if slot is None else (True, slot)
     if not latest:
         return {"status": "no_backup", "conflicts": []}
     files = _unpack(_decrypt(store.read(latest[1]), key_service))
